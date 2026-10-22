@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebCodex ACP Permission</title>
+<style>
+  :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px; background: transparent; color: CanvasText; }
+  .card { display: grid; gap: 10px; max-width: 420px; }
+  .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .title { margin: 0; font-size: 15px; font-weight: 650; line-height: 1.35; }
+  .badge { flex-shrink: 0; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); white-space: nowrap; }
+  .tool-title { font-size: 13px; line-height: 1.45; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, CanvasText 6%, transparent); border: 1px solid color-mix(in srgb, CanvasText 14%, transparent); overflow-wrap: anywhere; }
+  .meta { display: grid; gap: 4px; font-size: 11px; color: color-mix(in srgb, CanvasText 68%, transparent); }
+  .meta b { color: CanvasText; font-weight: 600; overflow-wrap: anywhere; }
+  .hint { font-size: 11px; line-height: 1.45; color: color-mix(in srgb, CanvasText 62%, transparent); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  button { font: inherit; font-size: 13px; padding: 8px 12px; border-radius: 8px; border: 1px solid color-mix(in srgb, CanvasText 28%, transparent); background: color-mix(in srgb, CanvasText 4%, Canvas); cursor: pointer; min-height: 36px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: color-mix(in srgb, #2563eb 88%, Canvas); color: #fff; border-color: color-mix(in srgb, #2563eb 70%, transparent); }
+  button.danger { background: color-mix(in srgb, #dc2626 12%, Canvas); border-color: color-mix(in srgb, #dc2626 45%, transparent); }
+  .status { font-size: 12px; min-height: 1.35em; color: color-mix(in srgb, CanvasText 72%, transparent); }
+  .status.error { color: color-mix(in srgb, #dc2626 85%, CanvasText); }
+  .option-note { font-size: 11px; color: color-mix(in srgb, CanvasText 58%, transparent); margin-top: -4px; }
+  @media (max-width: 360px) {
+    .actions { flex-direction: column; }
+    button { width: 100%; }
+  }
+</style>
+</head>
+<body>
+<main class="card" aria-live="polite">
+  <div class="head">
+    <h1 class="title" id="heading">Cursor ACP 权限</h1>
+    <span class="badge" id="stateBadge">连接中</span>
+  </div>
+  <div class="tool-title" id="toolTitle">—</div>
+  <div class="meta">
+    <div><span id="projectLabel">项目</span> <b id="project">—</b></div>
+    <div><span id="runLabel">Run</span> <b id="runId">—</b></div>
+  </div>
+  <p class="hint" id="deadlineHint"></p>
+  <p class="hint" id="optionHints" hidden></p>
+  <div class="actions" id="actions" hidden></div>
+  <p class="option-note" id="alwaysNote" hidden></p>
+  <p class="status" id="status"></p>
+</main>
+<script>
+(() => {
+  "use strict";
+  const APP_PROTOCOL = "2026-01-26";
+  const RUN_ID = /^wc_agent_run_[A-Za-z0-9_.-]+$/;
+  const PERM_TOKEN = /^wc_acp_perm_[A-Za-z0-9_.-]+$/;
+  const MAX_IDENTITY_KEY_BYTES = 128;
+  const MAX_TITLE = 512;
+  const MAX_OPTIONS = 16;
+  const MAX_ERROR_TEXT = 160;
+  const MAX_JSON_TEXT = 256 * 1024;
+  const CALL_TIMEOUT_MS = 15000;
+  const KIND_ALLOW_ONCE = "allow_once";
+  const KIND_ALLOW_ALWAYS = "allow_always";
+  const KIND_REJECT_ONCE = "reject_once";
+  const KIND_REJECT_ALWAYS = "reject_always";
+
+  const zh = (navigator.language || "").toLowerCase().startsWith("zh");
+  const L = zh ? {
+    heading: "Cursor ACP 权限",
+    connecting: "连接中",
+    ready: "待处理",
+    waiting: "等待授权",
+    submitting: "提交中…",
+    refreshing: "刷新状态…",
+    submitted: "已提交选择，等待 Run 继续",
+    resolved: "此权限请求已结束",
+    stale: "请求已过期或不再待处理",
+    noPending: "当前观察结果无待处理权限",
+    invalidResult: "工具结果无效",
+    hostError: "Host 调用失败",
+    appliedFalse: "服务端未接受此次选择",
+    rejectUnavailable: "提供商未提供可点的拒绝选项",
+    allowOnce: "允许一次",
+    allowAlways: "始终允许",
+    reject: "拒绝",
+    project: "项目",
+    run: "Run",
+    deadline: "请在 Runner 配置的权限超时窗口内响应；超时后该次 ACP 请求将被取消（非拒绝整次 Run）。",
+    alwaysScope: "「始终允许」的作用范围与持久性由 Cursor Provider 管理；WebCodex 不会为任意工具保存白名单。",
+    initFail: "初始化失败",
+    mismatch: "Run 身份不一致",
+    noAllowOptions: "提供商未提供可点的允许选项（单次或始终）",
+    unconfirmed: "结果未确认，请重新观察原 Run",
+    closed: "已关闭",
+  } : {
+    heading: "Cursor ACP permission",
+    connecting: "Connecting",
+    ready: "Pending",
+    waiting: "Awaiting approval",
+    submitting: "Submitting…",
+    refreshing: "Refreshing…",
+    submitted: "Choice submitted; waiting for the Run to continue",
+    resolved: "This permission request is no longer active",
+    stale: "Request expired or is no longer pending",
+    noPending: "No pending permission in this observation",
+    invalidResult: "Invalid tool result",
+    hostError: "Host call failed",
+    appliedFalse: "Server did not apply this choice",
+    rejectUnavailable: "Provider did not advertise a reject option",
+    allowOnce: "Allow once",
+    allowAlways: "Always allow",
+    reject: "Reject",
+    project: "Project",
+    run: "Run",
+    deadline: "Respond within the Runner permission timeout; after expiry the ACP request is cancelled (not a full Run reject).",
+    alwaysScope: "Always-allow scope and persistence are owned by the Cursor Provider; WebCodex does not store a global tool whitelist.",
+    initFail: "Initialization failed",
+    mismatch: "Run identity mismatch",
+    noAllowOptions: "Provider did not advertise a clickable allow option",
+    unconfirmed: "Outcome unconfirmed; re-observe the same Run",
+    closed: "Closed",
+  };
+
+  const el = id => document.getElementById(id);
+  el("heading").textContent = L.heading;
+  el("projectLabel").textContent = L.project;
+  el("runLabel").textContent = L.run;
+  el("deadlineHint").textContent = L.deadline;
+
+  let nextId = 1;
+  const pending = new Map();
+  let tornDown = false;
+  let hostReady = false;
+  let inFlight = false;
+  let lockedRunId = null;
+  let boundToken = null;
+  let boundGeneration = null;
+  let lastSubmittedOptionId = null;
+  let lastWaitingOutput = null;
+  let cachedEarlyResult = null;
+
+  function identityKeyBounded(key) {
+    if (typeof key !== "string" || key.length === 0) return null;
+    if (key.includes("\0") || key.includes("\r") || key.includes("\n")) return null;
+    if (new TextEncoder().encode(key).length > MAX_IDENTITY_KEY_BYTES) return null;
+    return key;
+  }
+
+  function boundedText(value, max) {
+    if (typeof value !== "string" || value.length === 0) return null;
+    if (value.length > max) return value.slice(0, max) + "…";
+    if (/[\u0000-\u001f]/.test(value)) return null;
+    return value;
+  }
+
+  function safeErrorMessage(error) {
+    if (!error) return L.hostError;
+    const msg = String(error.message || error);
+    if (msg === "timeout" || msg === "torn down" || msg === "App torn down") return L.hostError;
+    if (Object.values(L).includes(msg)) return msg;
+    return L.hostError;
+  }
+
+  function shortId(value) {
+    if (typeof value !== "string" || value.length < 12) return value || "—";
+    return value.slice(0, 10) + "…" + value.slice(-4);
+  }
+
+  function request(method, params, timeoutMs = CALL_TIMEOUT_MS) {
+    if (tornDown) return Promise.reject(new Error("torn down"));
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error("timeout"));
+      }, timeoutMs);
+      pending.set(id, { resolve, reject, timeout });
+      parent.postMessage({ jsonrpc: "2.0", id, method, params: params || {} }, "*");
+    });
+  }
+
+  function notify(method, params) {
+    if (!tornDown) parent.postMessage({ jsonrpc: "2.0", method, params }, "*");
+  }
+
+  function callToolResultOf(result) {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const nested = result.result;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)
+      && (nested.structuredContent || nested.structured_content || Array.isArray(nested.content)
+        || typeof nested.success === "boolean" || Object.prototype.hasOwnProperty.call(nested, "isError"))) {
+      return nested;
+    }
+    return result;
+  }
+
+  function canonicalEnvelope(value) {
+    return !!(value && typeof value === "object" && !Array.isArray(value)
+      && typeof value.success === "boolean"
+      && (Object.prototype.hasOwnProperty.call(value, "output")
+        || Object.prototype.hasOwnProperty.call(value, "error")));
+  }
+
+  function structuredOf(result) {
+    const callResult = callToolResultOf(result);
+    if (!callResult || typeof callResult !== "object" || Array.isArray(callResult)) return null;
+    if (canonicalEnvelope(callResult)) return callResult;
+    if (callResult.isError === true) return null;
+    const blocks = Array.isArray(callResult.content) ? callResult.content : [];
+    let bytes = 0;
+    for (const block of blocks) {
+      if (!block || block.type !== "text" || typeof block.text !== "string") continue;
+      bytes += new TextEncoder().encode(block.text).length;
+      if (bytes > MAX_JSON_TEXT) break;
+      try {
+        const parsed = JSON.parse(block.text);
+        if (canonicalEnvelope(parsed)) return parsed;
+      } catch (_) {}
+    }
+    const direct = callResult.structuredContent || callResult.structured_content;
+    return canonicalEnvelope(direct) ? direct : null;
+  }
+
+  function outputOf(result) {
+    const structured = structuredOf(result);
+    return structured && structured.success === true && structured.output
+      && typeof structured.output === "object" && !Array.isArray(structured.output)
+      ? structured.output : null;
+  }
+
+  function setStatus(text, isError) {
+    el("status").textContent = text || "";
+    el("status").classList.toggle("error", !!isError);
+  }
+
+  function setBadge(text) {
+    el("stateBadge").textContent = text;
+  }
+
+  function validPending(pending) {
+    if (!pending || typeof pending !== "object" || Array.isArray(pending)) return null;
+    const token = boundedText(pending.request_token, 192);
+    if (!token || !PERM_TOKEN.test(token)) return null;
+    const generation = pending.generation;
+    if (!Number.isInteger(generation) || generation <= 0) return null;
+    const title = boundedText(pending.title, MAX_TITLE);
+    if (!title) return null;
+    const options = Array.isArray(pending.options) ? pending.options : [];
+    if (options.length === 0 || options.length > MAX_OPTIONS) return null;
+    const normalized = [];
+    for (const opt of options) {
+      if (!opt || typeof opt !== "object") return null;
+      const optionId = identityKeyBounded(opt.option_id);
+      const name = boundedText(opt.name, 256);
+      const kind = boundedText(opt.kind, 64);
+      if (!optionId || !name || !kind) return null;
+      normalized.push({ option_id: optionId, name, kind });
+    }
+    return {
+      request_token: token,
+      generation,
+      title,
+      options: normalized,
+      tool_call_id: boundedText(pending.tool_call_id, 128) || "",
+    };
+  }
+
+  function optionByKind(options, kind) {
+    return options.find(o => o.kind === kind) || null;
+  }
+
+  function rejectOption(options) {
+    return optionByKind(options, KIND_REJECT_ONCE)
+      || optionByKind(options, KIND_REJECT_ALWAYS)
+      || null;
+  }
+
+  function clearActions() {
+    el("actions").replaceChildren();
+    el("actions").hidden = true;
+    el("alwaysNote").hidden = true;
+    el("optionHints").hidden = true;
+    el("optionHints").textContent = "";
+  }
+
+  function makeButton(label, className, option, onPick) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = className || "";
+    btn.textContent = label;
+    btn.dataset.optionId = option.option_id;
+    btn.title = option.name;
+    btn.onclick = () => { if (!tornDown) void onPick(option); };
+    return btn;
+  }
+
+  function renderActions(pending, interactive) {
+    clearActions();
+    const allowOnce = optionByKind(pending.options, KIND_ALLOW_ONCE);
+    const allowAlways = optionByKind(pending.options, KIND_ALLOW_ALWAYS);
+    const reject = rejectOption(pending.options);
+    const container = el("actions");
+    if (interactive && allowOnce) {
+      container.append(makeButton(L.allowOnce, "primary", allowOnce, submitChoice));
+    }
+    if (interactive && allowAlways) {
+      container.append(makeButton(L.allowAlways, "", allowAlways, submitChoice));
+      el("alwaysNote").textContent = L.alwaysScope;
+      el("alwaysNote").hidden = false;
+    }
+    if (interactive && reject) {
+      container.append(makeButton(L.reject, "danger", reject, submitChoice));
+    } else if (interactive && !reject) {
+      setStatus(L.rejectUnavailable, false);
+    }
+    if (interactive && !allowOnce && !allowAlways) {
+      setStatus(L.noAllowOptions, false);
+    }
+    container.hidden = container.childElementCount === 0;
+    if (interactive) {
+      const hints = pending.options.map(o => o.name).filter(Boolean).join(" · ");
+      if (hints) {
+        el("optionHints").textContent = hints;
+        el("optionHints").hidden = false;
+      }
+    }
+  }
+
+  function renderObservation(output, interactive) {
+    if (tornDown) return;
+    if (!output || typeof output !== "object") {
+      setBadge(L.ready);
+      setStatus(L.invalidResult, true);
+      clearActions();
+      return;
+    }
+    const runId = boundedText(output.run_id, 128);
+    const project = boundedText(output.project, 128);
+    const state = boundedText(output.state, 64);
+    if (!runId || !RUN_ID.test(runId)) {
+      setStatus(L.invalidResult, true);
+      return;
+    }
+    if (lockedRunId && runId !== lockedRunId) {
+      setStatus(L.mismatch, true);
+      return;
+    }
+    if (!lockedRunId) lockedRunId = runId;
+    el("runId").textContent = shortId(lockedRunId);
+    el("project").textContent = project ? shortId(project) : "—";
+
+    const pending = validPending(output.pending_permission);
+    const waiting = state === "waiting_permission" && pending;
+
+    if (waiting) {
+      boundToken = pending.request_token;
+      boundGeneration = pending.generation;
+      lastWaitingOutput = {
+        run_id: runId,
+        project,
+        state,
+        pending_permission: output.pending_permission,
+      };
+      el("toolTitle").textContent = pending.title;
+      setBadge(L.waiting);
+      const canAct = interactive && !inFlight;
+      renderActions(pending, canAct);
+      if (!interactive || inFlight) return;
+      const hasClickable = canAct && (
+        optionByKind(pending.options, KIND_ALLOW_ONCE)
+        || optionByKind(pending.options, KIND_ALLOW_ALWAYS)
+        || rejectOption(pending.options)
+      );
+      if (hasClickable) setStatus("", false);
+      return;
+    }
+
+    if (lastSubmittedOptionId && runId === lockedRunId) {
+      setBadge(L.ready);
+      el("toolTitle").textContent = pending ? pending.title : "—";
+      clearActions();
+      if (state === "waiting_permission") {
+        setStatus(L.stale, true);
+      } else {
+        setStatus(L.resolved, false);
+      }
+      return;
+    }
+
+    setBadge(L.ready);
+    clearActions();
+    el("toolTitle").textContent = pending ? pending.title : "—";
+    if (state === "waiting_permission" && !pending) {
+      setStatus(L.stale, true);
+    } else {
+      setStatus(L.noPending, false);
+    }
+  }
+
+  async function callTool(name, args) {
+    return request("tools/call", { name, arguments: args });
+  }
+
+  async function submitChoice(option) {
+    if (tornDown || inFlight || !hostReady || !lockedRunId || !boundToken || !option) return;
+    if (!identityKeyBounded(option.option_id)) return;
+    inFlight = true;
+    lastSubmittedOptionId = option.option_id;
+    setBadge(L.submitting);
+    clearActions();
+    setStatus(L.submitting, false);
+    try {
+      const raw = await callTool("respond_coding_agent_permission", {
+        run_id: lockedRunId,
+        permission_request_token: boundToken,
+        option_id: option.option_id,
+      });
+      const structured = structuredOf(raw);
+      const callResult = callToolResultOf(raw);
+      if (!structured || structured.success !== true) {
+        throw new Error(callResult && callResult.isError ? L.hostError : L.appliedFalse);
+      }
+      const output = structured.output;
+      if (!output || output.run_id !== lockedRunId) throw new Error(L.mismatch);
+      if (output.applied !== true) throw new Error(L.appliedFalse);
+
+      setBadge(L.refreshing);
+      setStatus(L.refreshing, false);
+      const observeRaw = await callTool("observe_coding_agent", {
+        run_id: lockedRunId,
+        wait_secs: 0,
+      });
+      const observeOut = outputOf(observeRaw);
+      if (!observeOut || observeOut.run_id !== lockedRunId) throw new Error(L.mismatch);
+      renderObservation(observeOut, false);
+      if (observeOut.state === "waiting_permission" && validPending(observeOut.pending_permission)) {
+        setStatus(L.stale, true);
+      } else {
+        setStatus(L.submitted, false);
+      }
+    } catch (_) {
+      let reconciled = false;
+      try {
+        if (!tornDown && lockedRunId) {
+          setBadge(L.refreshing);
+          setStatus(L.refreshing, false);
+          const observeRaw = await callTool("observe_coding_agent", {
+            run_id: lockedRunId,
+            wait_secs: 0,
+          });
+          const observeOut = outputOf(observeRaw);
+          if (observeOut && observeOut.run_id === lockedRunId) {
+            const livePending = observeOut.state === "waiting_permission"
+              ? validPending(observeOut.pending_permission)
+              : null;
+            const sameToken = livePending
+              && livePending.request_token === boundToken
+              && livePending.generation === boundGeneration;
+            lastSubmittedOptionId = null;
+            renderObservation(observeOut, false);
+            if (sameToken) {
+              setStatus(L.unconfirmed, true);
+            } else if (observeOut.state === "waiting_permission" && livePending) {
+              setStatus(L.stale, true);
+            } else {
+              setStatus(L.submitted, false);
+            }
+            reconciled = true;
+          }
+        }
+      } catch (_) {}
+      if (!reconciled) {
+        clearActions();
+        setBadge(L.waiting);
+        setStatus(L.unconfirmed, true);
+      }
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  function acceptToolInput(params) {
+    if (tornDown) return;
+    const args = params && params.arguments;
+    const candidate = args && !Array.isArray(args) ? boundedText(args.run_id, 128) : null;
+    if (!candidate || !RUN_ID.test(candidate)) return;
+    if (lockedRunId && lockedRunId !== candidate) return;
+    lockedRunId = candidate;
+    el("runId").textContent = shortId(lockedRunId);
+  }
+
+  function acceptToolResult(params) {
+    if (tornDown) return;
+    if (!params || typeof params !== "object") return;
+    const output = outputOf(params);
+    if (!output) {
+      if (hostReady) setStatus(L.invalidResult, true);
+      else cachedEarlyResult = params;
+      return;
+    }
+    const runId = boundedText(output.run_id, 128);
+    if (!runId || !RUN_ID.test(runId)) return;
+    if (lockedRunId && lockedRunId !== runId) return;
+    if (!lockedRunId) lockedRunId = runId;
+    if (!hostReady) {
+      cachedEarlyResult = params;
+      return;
+    }
+    renderObservation(output, true);
+  }
+
+  function teardown() {
+    if (tornDown) return;
+    tornDown = true;
+    hostReady = false;
+    lockedRunId = null;
+    boundToken = null;
+    boundGeneration = null;
+    lastSubmittedOptionId = null;
+    lastWaitingOutput = null;
+    cachedEarlyResult = null;
+    inFlight = false;
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timeout);
+      entry.reject(new Error("App torn down"));
+    }
+    pending.clear();
+    clearActions();
+    setBadge(L.closed);
+    setStatus("", false);
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== parent) return;
+    const message = event.data;
+    if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") return;
+    if (tornDown && message.method !== "ui/resource-teardown") return;
+    if (message.id !== undefined && pending.has(message.id)) {
+      const item = pending.get(message.id);
+      pending.delete(message.id);
+      clearTimeout(item.timeout);
+      if (message.error !== undefined) item.reject(message.error);
+      else item.resolve(message.result);
+      return;
+    }
+    if (message.method === "ui/notifications/tool-input") {
+      acceptToolInput(message.params);
+      return;
+    }
+    if (message.method === "ui/notifications/tool-result") {
+      acceptToolResult(message.params);
+      return;
+    }
+    if (message.method === "ui/resource-teardown") {
+      teardown();
+      if (Object.prototype.hasOwnProperty.call(message, "id")) {
+        parent.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*");
+      }
+    }
+  }, { passive: true });
+
+  addEventListener("pagehide", teardown, { once: true });
+  addEventListener("beforeunload", teardown, { once: true });
+
+  async function initialize() {
+    try {
+      await request("ui/initialize", {
+        protocolVersion: APP_PROTOCOL,
+        appInfo: { name: "webcodex-acp-permission-app", title: "WebCodex ACP Permission", version: "1.0.0" },
+        appCapabilities: {},
+      });
+      if (tornDown) return;
+      notify("ui/notifications/initialized", {});
+      hostReady = true;
+      if (cachedEarlyResult) {
+        const early = cachedEarlyResult;
+        cachedEarlyResult = null;
+        acceptToolResult(early);
+      } else {
+        setBadge(L.ready);
+        setStatus("", false);
+      }
+    } catch (_) {
+      if (!tornDown) {
+        setBadge(L.connecting);
+        setStatus(L.initFail, true);
+      }
+    }
+  }
+
+  void initialize();
+})();
+</script>
+</body>
+</html>

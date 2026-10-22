@@ -18,6 +18,7 @@ pub(in crate::mcp) const MCP_AGENT_CONTINUATION_UI_RESOURCE_URI: &str =
     "ui://webcodex/agent-continuation/v22";
 pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI: &str =
     "ui://webcodex/job-terminal-continuation/v2";
+pub(in crate::mcp) const MCP_ACP_PERMISSION_UI_RESOURCE_URI: &str = "ui://webcodex/acp-permission/v1";
 
 pub(in crate::mcp) const MCP_COMPUTER_APP_HTML: &str = include_str!("../../mcp_computer_app.html");
 pub(in crate::mcp) const MCP_RESULT_APP_HTML: &str = include_str!("../../mcp_result_app.html");
@@ -31,6 +32,8 @@ pub(in crate::mcp) const MCP_AGENT_CONTINUATION_APP_HTML: &str =
     include_str!("../../mcp_agent_continuation_app.html");
 pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_APP_HTML: &str =
     include_str!("../../mcp_job_terminal_continuation_app.html");
+pub(in crate::mcp) const MCP_ACP_PERMISSION_APP_HTML: &str =
+    include_str!("../../mcp_acp_permission_app.html");
 
 pub(in crate::mcp) const MCP_PDF_UI_RESOURCE_URI: &str = "ui://webcodex/pdf/v7";
 
@@ -107,6 +110,15 @@ pub(super) static BUILTIN_MCP_APPS: &[BundledMcpApp] = &[
         }),
         tools: &["present_job_terminal_continuation"],
         ..BundledMcpApp::template(MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI, MCP_JOB_TERMINAL_CONTINUATION_APP_HTML)
+    },
+    BundledMcpApp {
+        listing: Some(AppListing {
+            name: "WebCodex ACP Permission",
+            description: "Compact interactive card for Cursor ACP permission callbacks observed through observe_coding_agent. Clickable choices use only provider-advertised option_id values via respond_coding_agent_permission; no auto-approval or background prompts.",
+        }),
+        tools: &["observe_coding_agent"],
+        read_display_modes: &["inline", "fullscreen"],
+        ..BundledMcpApp::template(MCP_ACP_PERMISSION_UI_RESOURCE_URI, MCP_ACP_PERMISSION_APP_HTML)
     },
     BundledMcpApp {
         listing: Some(AppListing { name: "WebCodex DOCX", description: "Dedicated read-only DOCX reader for one authorized Project file version. Displays common text, tables and images; no Word-equivalent pagination or editing." }),

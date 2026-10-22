@@ -5,6 +5,7 @@ use super::protocol::{
     AcpFailure, AcpOutboundWriter, OutboundInterruption, OutboundWriteOutcome, ReaderEvent,
 };
 use super::*;
+use webcodex_core::coding_agent::CodingAgentLiveConfirmedConfigEntry;
 
 fn unique_config_option<'a>(
     options: &'a [SessionConfigOption],
@@ -58,6 +59,129 @@ fn config_override_is_current(
         }
         _ => false,
     }
+}
+
+pub(super) fn acp_initialize_client_capabilities(config: &AcpAgentConfig) -> Value {
+    if config.parameterized_model_picker {
+        json!({"_meta": {"parameterizedModelPicker": true}})
+    } else {
+        json!({})
+    }
+}
+
+fn select_choice_count(option: &SessionConfigOption) -> usize {
+    match &option.kind {
+        SessionConfigKind::Select(select) => match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => options.len(),
+            SessionConfigSelectOptions::Grouped(groups) => {
+                groups.iter().map(|group| group.options.len()).sum()
+            }
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+fn config_kind_rank(option: Option<&SessionConfigOption>) -> u8 {
+    match option.map(|option| &option.kind) {
+        Some(SessionConfigKind::Select(_)) => 0,
+        Some(SessionConfigKind::Boolean(_)) => 1,
+        _ => 2,
+    }
+}
+
+/// Provider-agnostic apply order: high-choice `select` options before booleans
+/// so model-style pickers settle before dependent toggles. When two `select`
+/// options tie on choice count (for example Cursor `fast` before `model` under
+/// lexicographic key order), a single bounded re-pass plus final fail-closed
+/// current checks must converge or reject — never report success early.
+fn caller_config_application_order(
+    advertised: &[SessionConfigOption],
+    keys: &[String],
+) -> Vec<String> {
+    let mut ordered = keys.to_vec();
+    ordered.sort_by(|left, right| {
+        let left_option = unique_config_option(advertised, left);
+        let right_option = unique_config_option(advertised, right);
+        config_kind_rank(left_option)
+            .cmp(&config_kind_rank(right_option))
+            .then_with(|| {
+                let left_count = left_option.map(select_choice_count).unwrap_or(0);
+                let right_count = right_option.map(select_choice_count).unwrap_or(0);
+                right_count.cmp(&left_count)
+            })
+            .then_with(|| left.cmp(right))
+    });
+    ordered
+}
+
+/// Project only provider-reported currents that are legal advertised values,
+/// never arbitrary secret-like free text outside the option enum.
+fn config_current_advertised_identity(
+    advertised: &[SessionConfigOption],
+    key: &str,
+) -> Option<String> {
+    let option = unique_config_option(advertised, key)?;
+    match &option.kind {
+        SessionConfigKind::Boolean(boolean) => Some(boolean.current_value.to_string()),
+        SessionConfigKind::Select(select) => {
+            let current = select.current_value.to_string();
+            let advertised_current = match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .any(|option| option.value.to_string() == current),
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|group| group.options.iter())
+                    .any(|option| option.value.to_string() == current),
+                _ => false,
+            };
+            advertised_current.then_some(current)
+        }
+        _ => None,
+    }
+}
+
+fn build_live_confirmed_effective_config(
+    advertised: &[SessionConfigOption],
+    forced: &BTreeMap<String, CodingAgentConfigValue>,
+    caller: &BTreeMap<String, CodingAgentConfigValue>,
+) -> Vec<CodingAgentLiveConfirmedConfigEntry> {
+    let mut out = Vec::new();
+    for key in forced.keys() {
+        if let Some(current) = config_current_advertised_identity(advertised, key) {
+            out.push(CodingAgentLiveConfirmedConfigEntry {
+                id: key.clone(),
+                current,
+                source: "runner_forced".into(),
+            });
+        }
+    }
+    for key in caller.keys() {
+        if forced.contains_key(key) {
+            continue;
+        }
+        if let Some(current) = config_current_advertised_identity(advertised, key) {
+            out.push(CodingAgentLiveConfirmedConfigEntry {
+                id: key.clone(),
+                current,
+                source: "caller_requested".into(),
+            });
+        }
+    }
+    out
+}
+
+fn caller_config_is_fully_current(
+    advertised: &[SessionConfigOption],
+    caller: &BTreeMap<String, CodingAgentConfigValue>,
+    forced: &BTreeMap<String, CodingAgentConfigValue>,
+) -> bool {
+    caller.iter().all(|(key, value)| {
+        forced.contains_key(key)
+            || (config_override_is_valid(advertised, key, value)
+                && config_override_is_current(advertised, key, value))
+    })
 }
 
 fn config_params(session_id: &str, key: &str, value: &CodingAgentConfigValue) -> Option<Value> {
@@ -370,7 +494,7 @@ impl CodingAgentManager {
         outbound: &mut AcpOutboundWriter,
         rx: &Receiver<ReaderEvent>,
         run_deadline: Instant,
-    ) -> Option<(String, u64)> {
+    ) -> Option<(String, u64, Vec<CodingAgentLiveConfirmedConfigEntry>)> {
         let mut next_id = 1u64;
         if self.pre_prompt_should_stop(&request.run_id, entry, run_deadline, "initialize") {
             self.terminate_run_io(child, outbound);
@@ -388,7 +512,7 @@ impl CodingAgentManager {
                 "initialize",
                 json!({
                     "protocolVersion": 1,
-                    "clientCapabilities": {},
+                    "clientCapabilities": acp_initialize_client_capabilities(&provider.config),
                     "clientInfo": {"name":"webcodex-runner","version":env!("CARGO_PKG_VERSION")}
                 }),
             ),
@@ -549,12 +673,13 @@ impl CodingAgentManager {
             }
         }
 
-        for (key, value) in &request.config {
-            // Exact repetition of globally forced policy is accepted but is not
-            // a caller override and is already active.
-            if self.forced_config.contains_key(key) {
-                continue;
-            }
+        let caller_keys: Vec<String> = request
+            .config
+            .keys()
+            .filter(|key| !self.forced_config.contains_key(key.as_str()))
+            .cloned()
+            .collect();
+        for key in &caller_keys {
             if !provider
                 .config
                 .allowed_config_options
@@ -570,6 +695,11 @@ impl CodingAgentManager {
                 self.terminate_run_io(child, outbound);
                 return None;
             }
+        }
+        let caller_apply_order =
+            caller_config_application_order(&advertised, &caller_keys);
+        for key in &caller_apply_order {
+            let value = request.config.get(key).expect("caller key was enumerated");
             if !self.apply_pre_prompt_config_option(
                 &request.run_id,
                 entry,
@@ -585,6 +715,33 @@ impl CodingAgentManager {
                 false,
             ) {
                 return None;
+            }
+        }
+        if !caller_config_is_fully_current(&advertised, &request.config, &self.forced_config) {
+            for key in &caller_apply_order {
+                let value = request.config.get(key).expect("caller key was enumerated");
+                if self.forced_config.contains_key(key) {
+                    continue;
+                }
+                if config_override_is_current(&advertised, key, value) {
+                    continue;
+                }
+                if !self.apply_pre_prompt_config_option(
+                    &request.run_id,
+                    entry,
+                    child,
+                    outbound,
+                    rx,
+                    run_deadline,
+                    &session_id,
+                    &mut next_id,
+                    &mut advertised,
+                    key,
+                    value,
+                    false,
+                ) {
+                    return None;
+                }
             }
         }
 
@@ -628,7 +785,22 @@ impl CodingAgentManager {
             self.terminate_run_io(child, outbound);
             return None;
         }
+        if !caller_config_is_fully_current(&advertised, &request.config, &self.forced_config) {
+            self.setup_failure(
+                &request.run_id,
+                entry,
+                "coding_agent_config_not_applied",
+                "caller-requested ACP config was not active before prompt dispatch",
+            );
+            self.terminate_run_io(child, outbound);
+            return None;
+        }
 
-        Some((session_id, next_id))
+        let live_confirmed = build_live_confirmed_effective_config(
+            &advertised,
+            &self.forced_config,
+            &request.config,
+        );
+        Some((session_id, next_id, live_confirmed))
     }
 }

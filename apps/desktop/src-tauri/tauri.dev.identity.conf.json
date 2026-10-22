@@ -1,0 +1,13 @@
+{
+  "productName": "WebCodex Desktop Dev",
+  "mainBinaryName": "WebCodexDev",
+  "identifier": "dev.webcodex.desktop.dev",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "WebCodex Dev"
+      }
+    ]
+  }
+}

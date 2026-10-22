@@ -12,6 +12,7 @@ fn bundled_app_registry_has_unique_exact_identities_and_stable_discovery() {
         "ui://webcodex/goal-plan/v9",
         "ui://webcodex/agent-continuation/v22",
         "ui://webcodex/job-terminal-continuation/v2",
+        "ui://webcodex/acp-permission/v1",
         "ui://webcodex/docx/v2",
     ];
     let listed = resources_list(None);
@@ -37,7 +38,7 @@ fn bundled_app_registry_has_unique_exact_identities_and_stable_discovery() {
             assert!(for_uri(&format!("{}{extra}", app.uri)).is_none());
         }
     }
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 10);
     for retired in [
         "ui://webcodex/docx/v1",
         "ui://webcodex/spreadsheet/v1",
@@ -138,6 +139,7 @@ fn bundled_app_registry_preserves_read_only_cached_resource_without_new_bindings
             "present_job_terminal_continuation",
             MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI,
         ),
+        ("observe_coding_agent", MCP_ACP_PERMISSION_UI_RESOURCE_URI),
     ] {
         assert_eq!(for_tool(tool).unwrap().uri, uri);
     }
@@ -178,6 +180,7 @@ fn bundled_app_registry_keeps_resource_csp_display_modes_and_cache_policy_separa
                 MCP_WORK_RESULT_UI_RESOURCE_URI
                     | MCP_DOCX_UI_RESOURCE_URI
                     | MCP_SPREADSHEET_UI_RESOURCE_URI
+                    | MCP_ACP_PERMISSION_UI_RESOURCE_URI
             ) {
                 assert_eq!(
                     contents[0]["_meta"]["openai/ui"],
@@ -202,6 +205,29 @@ fn bundled_app_registry_keeps_resource_csp_display_modes_and_cache_policy_separa
             );
         }
     }
+}
+
+#[test]
+fn bundled_acp_permission_app_aligns_with_runner_permission_bounds() {
+    for required in [
+        "const MAX_OPTIONS = 16",
+        "MAX_IDENTITY_KEY_BYTES",
+        "ui/notifications/tool-input",
+        "ui/resource-teardown",
+        "pagehide",
+        "beforeunload",
+        "observe_coding_agent",
+        "Outcome unconfirmed; re-observe the same Run",
+    ] {
+        assert!(
+            MCP_ACP_PERMISSION_APP_HTML.contains(required),
+            "missing ACP permission App behavior: {required}"
+        );
+    }
+    assert!(
+        !MCP_ACP_PERMISSION_APP_HTML.contains("const MAX_OPTIONS = 8"),
+        "ACP permission App must not cap options below Runner limit"
+    );
 }
 
 #[test]

@@ -59,6 +59,13 @@ impl AppState {
         manual_version: Option<&str>,
         submit: impl FnOnce(&UpdateCache, bool, InstallationKind),
     ) -> DesktopResult<UpdateCache> {
+        if crate::desktop_edition::dev_edition_enabled() {
+            let slot = self.core.lock().await;
+            let core = slot
+                .as_ref()
+                .ok_or_else(|| runtime_selection::error("desktop_operation_busy"))?;
+            return Ok(core.config.update_cache.clone());
+        }
         let (revision, binaries, source, environment_id) = {
             let slot = self.core.lock().await;
             let core = slot
@@ -143,6 +150,9 @@ impl AppState {
     pub async fn check_for_updates(&self, manual: bool) -> DesktopResult<UpdateStatus> {
         let _guard = self.update_check.lock().await;
         let now = runtime_selection::now_ms();
+        if crate::desktop_edition::dev_edition_enabled() {
+            return Ok(crate::desktop_edition::dev_update_status(DESKTOP_VERSION, now));
+        }
         let cache = {
             let slot = self.core.lock().await;
             slot.as_ref()
@@ -209,6 +219,7 @@ impl AppState {
     }
 
     pub async fn download_update(&self, version: &str) -> DesktopResult<UpdateStatus> {
+        crate::desktop_edition::guard_production_update_action()?;
         let cache = self.request_update_download(Some(version)).await?;
         tokio::task::yield_now().await;
         Ok(self.update_status(&cache, runtime_selection::now_ms(), true, None))
@@ -223,6 +234,9 @@ impl AppState {
         &self,
         enabled: bool,
     ) -> DesktopResult<UpdateStatus> {
+        if enabled {
+            crate::desktop_edition::guard_production_update_action()?;
+        }
         let mut slot = self.core.lock().await;
         let core = slot
             .as_mut()
@@ -257,6 +271,7 @@ impl AppState {
         confirmed: bool,
         confirmation: UpdateConfirmation,
     ) -> DesktopResult<bool> {
+        crate::desktop_edition::guard_production_update_action()?;
         if !confirmed {
             return Err(action_error());
         }
@@ -326,6 +341,7 @@ impl AppState {
     }
 
     pub async fn open_latest_release(&self) -> DesktopResult<()> {
+        crate::desktop_edition::guard_production_update_action()?;
         let slot = self.core.lock().await;
         let core = slot
             .as_ref()

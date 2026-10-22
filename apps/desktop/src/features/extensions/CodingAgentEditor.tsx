@@ -25,6 +25,7 @@ export function CodingAgentEditor({ profile, revision, target, globals, onState,
   const [args, setArgs] = useState(JSON.stringify(profile?.args ?? []));
   const [enabled, setEnabled] = useState(profile?.enabled ?? true);
   const [options, setOptions] = useState(JSON.stringify(profile?.allowed_config_options ?? []));
+  const [parameterizedModelPicker, setParameterizedModelPicker] = useState(profile?.parameterized_model_picker ?? false);
   const [mapping, setMapping] = useState<Mapping[]>(() => Object.entries(profile?.env_from_env ?? {}).map(([child, runner], row) => ({ row, child, runner })));
   const [manageGlobals, setManageGlobals] = useState(globals !== null);
   const [concurrency, setConcurrency] = useState(globals?.max_concurrent_runs ?? 1);
@@ -60,7 +61,7 @@ export function CodingAgentEditor({ profile, revision, target, globals, onState,
         return [child, runner];
       });
       request = { target, expected_revision: revision, previous_id: profile?.provider_id ?? null,
-        profile: { provider_id: id.trim(), name: name.trim(), executable: executable.trim(), args: parsedArgs, enabled, env_from_env: Object.fromEntries(env), allowed_config_options: allowed },
+        profile: { provider_id: id.trim(), name: name.trim(), executable: executable.trim(), args: parsedArgs, enabled, env_from_env: Object.fromEntries(env), allowed_config_options: allowed, parameterized_model_picker: parameterizedModelPicker },
         global_settings: manageGlobals ? { max_concurrent_runs: concurrency, permission_timeout_secs: timeout } : null };
     } catch { setError("invalid_fields"); return; }
     submitting.current = true; setBusy(true); setError(null);
@@ -92,6 +93,8 @@ export function CodingAgentEditor({ profile, revision, target, globals, onState,
           <button type="button" className="secondary-button" aria-label="Add Environment Mapping" disabled={mapping.length >= 64} onClick={() => { const row = nextRow.current++; setMapping(fields => [...fields, { row, child: "", runner: "" }]); }}>{r("addMapping")}</button>
         </fieldset>
         <div className="field-group"><label htmlFor="coding-agent-options">{r("allowedOptions")}</label><textarea id="coding-agent-options" value={options} onChange={event => setOptions(event.target.value)} rows={2} maxLength={16384} required disabled={busy} spellCheck={false} /></div>
+        <label className="profile-checkbox" htmlFor="coding-parameterized-model-picker"><input id="coding-parameterized-model-picker" type="checkbox" checked={parameterizedModelPicker} onChange={event => setParameterizedModelPicker(event.target.checked)} disabled={busy} aria-describedby="coding-parameterized-model-picker-help" />{r("parameterizedModelPicker")}</label>
+        <p id="coding-parameterized-model-picker-help" className="workspace-notice">{r("parameterizedModelPickerHelp")}</p>
         <label className="profile-checkbox" htmlFor="coding-global-settings"><input id="coding-global-settings" type="checkbox" checked={manageGlobals} onChange={event => setManageGlobals(event.target.checked)} disabled={busy} />{r("globalSettings")}</label>
         <p>{r("preserveGlobals")}</p>
         {manageGlobals && <div className="mcp-environment-row"><div className="field-group"><label htmlFor="coding-concurrency">{r("maxConcurrent")}</label><input id="coding-concurrency" type="number" min={1} max={8} value={concurrency} onChange={event => setConcurrency(event.target.valueAsNumber)} required disabled={busy} /></div><div className="field-group"><label htmlFor="coding-timeout">{r("permissionTimeout")}</label><input id="coding-timeout" type="number" min={1} max={60} value={timeout} onChange={event => setTimeout(event.target.valueAsNumber)} required disabled={busy} /></div></div>}

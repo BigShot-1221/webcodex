@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use webcodex_core::coding_agent::CodingAgentConfigValue;
+use webcodex_core::coding_agent::{
+    CodingAgentConfigValue, CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES,
+};
 use webcodex_core::runner_protocol::{
     RunnerCapabilities, RunnerConfigAction, RunnerConfigErrorCode, RunnerConfigErrorField,
     RunnerConfigErrorReason, RunnerConfigExecutionState, RunnerConfigOperationResponse,
@@ -129,7 +131,7 @@ pub(crate) struct RunnerConfig {
     pub(crate) acp: AcpConfig,
 }
 
-const ACP_MAX_ENV_MAPPINGS: usize = 64;
+const ACP_MAX_ENV_MAPPINGS: usize = CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES;
 const ACP_MAX_ENV_NAME_BYTES: usize = 256;
 const ACP_MAX_ARGS: usize = 64;
 const ACP_MAX_ARG_BYTES: usize = 4096;
@@ -164,6 +166,11 @@ pub(crate) struct AcpAgentConfig {
     /// explicitly named here. The live advertised option still validates value.
     #[serde(default)]
     pub(crate) allowed_config_options: Vec<String>,
+    /// When true, ACP `initialize` advertises the provider-specific
+    /// `parameterizedModelPicker` client capability. Leave false unless the
+    /// configured provider documents that requirement.
+    #[serde(default)]
+    pub(crate) parameterized_model_picker: bool,
 }
 
 fn default_acp_max_concurrent_runs() -> usize {
@@ -1932,9 +1939,9 @@ fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
             }
             destinations.push(destination);
         }
-        if agent.allowed_config_options.len() > 64 {
+        if agent.allowed_config_options.len() > CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES {
             return Err(format!(
-                "ACP agent '{}' allowed_config_options may contain at most 64 entries",
+                "ACP agent '{}' allowed_config_options may contain at most {CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES} entries",
                 agent.id
             ));
         }
@@ -2190,6 +2197,7 @@ mod acp_config_tests {
             args: Vec::new(),
             env_from_env: BTreeMap::new(),
             allowed_config_options: Vec::new(),
+            parameterized_model_picker: false,
         }
     }
 

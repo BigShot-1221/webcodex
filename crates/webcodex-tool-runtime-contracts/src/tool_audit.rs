@@ -241,6 +241,24 @@ impl ToolCallAuditProjection for ToolCall {
             Self::CodingAgentCancel { run_id } => serde_json::json!({
                 "run_id": run_id,
             }),
+            Self::CodingAgentRespondPermission {
+                run_id,
+                permission_request_token,
+                option_id,
+            } => serde_json::json!({
+                "run_id": run_id,
+                "permission_request_token_present": !permission_request_token.is_empty(),
+                "option_id_bytes": option_id.len(),
+            }),
+            Self::CodingAgentInspectConfig {
+                project,
+                provider_id,
+                include_live_acp,
+            } => serde_json::json!({
+                "project": project,
+                "provider_id": provider_id,
+                "include_live_acp": include_live_acp,
+            }),
             Self::RunScript {
                 project,
                 language,

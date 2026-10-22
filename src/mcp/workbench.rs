@@ -13,6 +13,7 @@ pub(super) const CANONICAL_TOOLS: &[&str] = &[
     "read_agent_task",
     "observe_coding_agent",
     "cancel_coding_agent",
+    "respond_coding_agent_permission",
     "get_session_assignment",
     "complete_session_message",
     "reconcile_agent_task_coding_run",

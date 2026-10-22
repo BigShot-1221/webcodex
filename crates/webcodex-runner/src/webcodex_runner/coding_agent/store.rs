@@ -49,6 +49,8 @@ impl DurableRunRecord {
             created_at: self.created_at,
             updated_at: self.updated_at,
             terminal: self.terminal.clone(),
+            pending_permission: None,
+            live_confirmed_effective_config: None,
         }
     }
 }
@@ -211,7 +213,7 @@ impl DurableRunStore {
             if self
                 .test_control
                 .fail_next_terminal_writes
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     (remaining > 0).then(|| remaining - 1)
                 })
                 .is_ok()

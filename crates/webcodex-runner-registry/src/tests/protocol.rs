@@ -319,6 +319,8 @@ async fn coding_agent_run_lookup_is_exact_when_bound_and_ambiguous_when_unbound(
                             created_at: 1,
                             updated_at: 1,
                             terminal: None,
+                            pending_permission: None,
+                            live_confirmed_effective_config: None,
                         }],
                     },
                 ),
@@ -397,6 +399,8 @@ async fn coding_agent_registration_rejects_semantically_contradictory_snapshot()
         created_at: 1,
         updated_at: 1,
         terminal: None,
+        pending_permission: None,
+        live_confirmed_effective_config: None,
     };
     registry.register(register(base.clone())).await.unwrap();
 

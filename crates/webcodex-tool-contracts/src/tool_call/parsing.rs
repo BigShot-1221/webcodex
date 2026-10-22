@@ -475,6 +475,8 @@ impl ToolCall {
             Self::CodingAgentStart { .. } => "start_coding_agent",
             Self::CodingAgentObserve { .. } => "observe_coding_agent",
             Self::CodingAgentCancel { .. } => "cancel_coding_agent",
+            Self::CodingAgentRespondPermission { .. } => "respond_coding_agent_permission",
+            Self::CodingAgentInspectConfig { .. } => "inspect_coding_agent_config",
             Self::RunScript { .. } => "run_script",
             Self::RunShell { .. } => "run_shell",
             Self::OpenSessionShell { .. } => "open_session_shell",

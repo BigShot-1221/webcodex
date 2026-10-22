@@ -233,17 +233,25 @@ impl CodingAgentManager {
             }
         };
 
-        let Some((session_id, next_id)) = self.initialize_session(
-            &request,
-            &provider,
-            &entry,
-            &mut child,
-            &mut outbound,
-            &rx,
-            run_deadline,
-        ) else {
+        let Some((session_id, next_id, live_confirmed_effective_config)) =
+            self.initialize_session(
+                &request,
+                &provider,
+                &entry,
+                &mut child,
+                &mut outbound,
+                &rx,
+                run_deadline,
+            )
+        else {
             return;
         };
+        if !live_confirmed_effective_config.is_empty() {
+            entry.update_snapshot(|snapshot| {
+                snapshot.live_confirmed_effective_config =
+                    Some(live_confirmed_effective_config.clone());
+            });
+        }
 
         #[cfg(test)]
         {
@@ -465,42 +473,65 @@ impl CodingAgentManager {
                             return;
                         }
                         entry.push_event(permission_event(&params));
-                        entry.update_snapshot(|snapshot| {
-                            snapshot.state = CodingAgentRunState::WaitingPermission
-                        });
                         let permission_deadline =
                             (Instant::now() + self.permission_timeout).min(run_deadline);
-                        while Instant::now() < permission_deadline
-                            && !entry.cancel_requested.load(Ordering::Acquire)
-                            && self.accepting.load(Ordering::Acquire)
-                        {
-                            thread::sleep(ACP_POLL);
-                        }
+                        let pending = match entry.permission.open_from_acp(
+                            &params,
+                            id,
+                            &session_id,
+                            permission_deadline,
+                        ) {
+                            Ok(pending) => pending,
+                            Err(_) => {
+                                self.terminate_run_io(&mut child, &mut outbound);
+                                self.mark_lost(
+                                    &request.run_id,
+                                    &entry,
+                                    "coding_agent_permission_invalid",
+                                );
+                                return;
+                            }
+                        };
+                        entry.update_snapshot(|snapshot| {
+                            snapshot.state = CodingAgentRunState::WaitingPermission;
+                            snapshot.pending_permission = Some(pending.clone());
+                        });
+                        let outcome = entry.permission.wait_until(
+                            permission_deadline,
+                            &entry.cancel_requested,
+                            &self.accepting,
+                        );
                         let lifecycle_interrupted = entry.cancel_requested.load(Ordering::Acquire)
                             || Instant::now() >= run_deadline
                             || !self.accepting.load(Ordering::Acquire);
+                        let outcome_for_acp = permission_outcome_for_acp(
+                            outcome,
+                            lifecycle_interrupted,
+                            permission_deadline,
+                        );
                         let response_deadline = if lifecycle_interrupted {
                             *cancel_deadline
                                 .get_or_insert_with(|| Instant::now() + ACP_CANCEL_GRACE)
                         } else {
                             (Instant::now() + ACP_CANCEL_GRACE).min(run_deadline)
                         };
-                        // P1 never selects an allow/reject option. Cancelled is
-                        // the only fail-closed ACP outcome emitted by WebCodex.
                         if !self.write_post_prompt_frame(
                             &request.run_id,
                             &entry,
                             &mut child,
                             &mut outbound,
-                            result_frame(id, json!({"outcome":{"outcome":"cancelled"}})),
+                            result_frame(id, permission_result_json(&outcome_for_acp)),
                             response_deadline,
                             !lifecycle_interrupted,
                             "coding_agent_permission_response_uncertain",
                         ) {
+                            entry.permission.clear();
                             return;
                         }
+                        entry.permission.clear();
                         entry.update_snapshot(|snapshot| {
-                            snapshot.state = CodingAgentRunState::Running
+                            snapshot.state = CodingAgentRunState::Running;
+                            snapshot.pending_permission = None;
                         });
                         if (entry.cancel_requested.load(Ordering::Acquire)
                             || Instant::now() >= run_deadline

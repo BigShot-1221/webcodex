@@ -771,6 +771,14 @@ mod tests {
                 "cancel_coding_agent",
                 OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
             ),
+            (
+                "respond_coding_agent_permission",
+                OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE]),
+            ),
+            (
+                "inspect_coding_agent_config",
+                OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
+            ),
         ] {
             assert_eq!(oauth_scope_policy_for_runtime_tool(tool), policy, "{tool}");
         }

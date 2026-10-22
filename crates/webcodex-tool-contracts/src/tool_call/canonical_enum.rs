@@ -938,6 +938,34 @@ pub enum ToolCall {
         #[schemars(regex(pattern = "^wc_agent_run_[A-Za-z0-9_.-]+$"))]
         run_id: String,
     },
+    #[serde(rename = "respond_coding_agent_permission")]
+    CodingAgentRespondPermission {
+        /// Opaque CodingAgentRun id for the Run currently in waiting_permission.
+        #[schemars(regex(pattern = "^wc_agent_run_[A-Za-z0-9_.-]+$"))]
+        run_id: String,
+        /// Exact pending permission request token from observe_coding_agent pending_permission or the
+        /// permission_request event context. JSON-RPC ids are never valid here.
+        #[schemars(regex(pattern = "^wc_acp_perm_[A-Za-z0-9_.-]+$"))]
+        permission_request_token: String,
+        /// One option_id advertised for the active pending request. Callers cannot invent outcomes.
+        #[schemars(length(min = 1, max = 128))]
+        option_id: String,
+    },
+    #[serde(rename = "inspect_coding_agent_config")]
+    CodingAgentInspectConfig {
+        /// Exact registered Project id; resolves the Runner and authorized Project root fence.
+        #[schemars(length(min = 1))]
+        project: String,
+        /// Logical Runner-advertised ACP provider id from get_runtime_status or list_runners.
+        #[schemars(length(min = 1, max = 64))]
+        provider_id: String,
+        /// When true, authorizes one bounded ephemeral ACP child (`initialize` then `session/new`
+        /// only) to project live configOptions. This can spawn a provider process and trigger
+        /// provider-side effects such as an external login prompt; it never sends
+        /// session/set_config_option or session/prompt.
+        #[serde(default)]
+        include_live_acp: bool,
+    },
 
     /// Execute bounded script content transported as typed data and written to
     /// a Runner-owned temporary file. The selected language is explicit and

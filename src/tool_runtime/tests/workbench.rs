@@ -137,6 +137,8 @@ async fn workbench_runner_submission_is_durable_and_same_key_replay_never_starts
         created_at: now,
         updated_at: now,
         terminal: None,
+        pending_permission: None,
+        live_confirmed_effective_config: None,
     };
     runtime
         .runner_registry

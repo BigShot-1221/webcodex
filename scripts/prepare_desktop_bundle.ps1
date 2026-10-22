@@ -11,7 +11,8 @@ param(
     [Parameter(Mandatory = $true)][string]$SourceSha,
     [Parameter(Mandatory = $true)][Int64]$BuiltAt,
     [Parameter(Mandatory = $true)][string]$OutputDir,
-    [bool]$GitDirty = $false
+    [bool]$GitDirty = $false,
+    [bool]$DevEdition = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -110,6 +111,7 @@ try {
         version = $Version
         source_sha = $SourceSha.ToLowerInvariant()
         built_at = $BuiltAt
+        dev_edition = $DevEdition
         resource_dir = "resources/webcodex-runtime"
         files = $fileMetadata
     }

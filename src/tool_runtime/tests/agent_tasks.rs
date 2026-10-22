@@ -862,6 +862,8 @@ async fn coding_run_attempt_ref_executes_then_reconciles_from_reopened_db_and_fr
         created_at: run_now,
         updated_at: run_now,
         terminal: None,
+        pending_permission: None,
+        live_confirmed_effective_config: None,
     };
     runtime
         .runner_registry

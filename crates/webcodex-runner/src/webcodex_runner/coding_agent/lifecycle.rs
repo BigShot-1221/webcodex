@@ -17,6 +17,7 @@ impl CodingAgentManager {
         }
         entry.cancel_requested.store(true, Ordering::Release);
         entry.changed.notify_all();
+        entry.permission.wake_waiters();
         if *prompt_gate == PromptDispatchGateState::PrePrompt {
             self.finish_pre_prompt_cancelled(run_id, entry);
         }

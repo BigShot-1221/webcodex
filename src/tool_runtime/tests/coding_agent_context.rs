@@ -243,6 +243,8 @@ async fn coding_agent_context_is_frozen_in_dispatched_intent_and_changed_retry_c
         created_at: now,
         updated_at: now,
         terminal: None,
+        pending_permission: None,
+        live_confirmed_effective_config: None,
     };
     runtime
         .runner_registry

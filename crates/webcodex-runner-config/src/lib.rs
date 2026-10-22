@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use webcodex_core::runner_protocol::RunnerCapabilities;
 
+pub mod desktop_edition;
 pub mod paths;
 
 /// Desktop injects provider credentials under these private source names. Only

@@ -183,6 +183,11 @@ fn patch(
             .collect::<Array>()
             .into(),
     );
+    set(
+        table,
+        "parameterized_model_picker",
+        profile.parameterized_model_picker.into(),
+    );
     set(table, OWNER_KEY, owner.into());
     Ok(())
 }

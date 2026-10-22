@@ -479,6 +479,7 @@ fn declared_acp_environment_presence_only_returns_configured_boolean_destination
             ("CODEX_PATH".into(), "ACP_CONFIG_SOURCE".into()),
         ]),
         allowed_config_options: Vec::new(),
+        parameterized_model_picker: false,
     };
     let mut probed = Vec::new();
     let result = declared_env_source_presence(&provider, |source| {
@@ -510,6 +511,7 @@ fn acp_environment_presence_does_not_probe_unlisted_sources() {
         args: Vec::new(),
         env_from_env: BTreeMap::new(),
         allowed_config_options: Vec::new(),
+        parameterized_model_picker: false,
     };
     let result = declared_env_source_presence(&provider, |_| {
         panic!("unlisted environment sources must not be inspected")

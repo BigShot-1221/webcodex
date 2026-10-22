@@ -599,6 +599,7 @@ fn global_forced_config_is_multi_provider_admission_policy() {
         args: vec!["end".to_string()],
         env_from_env: BTreeMap::new(),
         allowed_config_options: vec!["mode".to_string()],
+        parameterized_model_picker: false,
     });
     let projects = project_fixture(&temp);
     let root = temp.path().join("repo");

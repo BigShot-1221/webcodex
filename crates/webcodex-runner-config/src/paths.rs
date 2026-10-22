@@ -25,6 +25,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::desktop_edition;
+
 /// Canonical Runner configuration filename.
 pub const RUNNER_CONFIG_FILE: &str = "runner.toml";
 /// Canonical directory name for Runner project registries.
@@ -115,11 +117,12 @@ pub fn default_client_config_base_dir() -> Result<PathBuf, String> {
         // together with `USERPROFILE`, but either may be absent or unusable in
         // stripped-down environments and the two must not depend on each
         // other).
+        let dir_name = desktop_edition::windows_client_config_dir_name();
         if let Some(appdata) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(appdata).join("webcodex"));
+            return Ok(PathBuf::from(appdata).join(dir_name));
         }
         if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(profile).join(".config/webcodex"));
+            return Ok(PathBuf::from(profile).join(format!(".config/{dir_name}")));
         }
         Err(
             "cannot determine the WebCodex config directory: set APPDATA or USERPROFILE"
@@ -156,15 +159,16 @@ pub fn default_client_state_base_dir() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
         // `LOCALAPPDATA` must work on its own, exactly like `APPDATA` above.
+        let dir_name = desktop_edition::windows_client_config_dir_name();
         if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
-            return Ok(PathBuf::from(local_appdata).join("webcodex"));
+            return Ok(PathBuf::from(local_appdata).join(dir_name));
         }
         if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(profile).join(".local/state/webcodex"));
+            return Ok(PathBuf::from(profile).join(format!(".local/state/{dir_name}")));
         }
         // A volatile temp location is better than a relative path for state
         // that can be regenerated.
-        Ok(std::env::temp_dir().join("webcodex"))
+        Ok(std::env::temp_dir().join(dir_name))
     }
     #[cfg(not(windows))]
     {

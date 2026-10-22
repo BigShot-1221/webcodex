@@ -170,7 +170,7 @@ impl State {
         if size > MAX_RESPONSE
             || self
                 .queued
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current
                         .checked_add(size)
                         .filter(|next| *next <= MAX_QUEUED_BYTES)
@@ -584,7 +584,7 @@ impl ExternalLease {
             .0
             .state
             .next_channel
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
             .map_err(|_| capacity())?;
         let (tx, rx) = mpsc::sync_channel(128);
         registry.routes.insert(

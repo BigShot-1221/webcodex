@@ -17,7 +17,12 @@ pub const CODING_AGENT_MAX_INTENT_FINGERPRINT_BYTES: usize = 96;
 pub const CODING_AGENT_MAX_PROJECT_ID_BYTES: usize = 512;
 pub const CODING_AGENT_MAX_PROJECT_ROOT_BYTES: usize = 4096;
 pub const CODING_AGENT_MAX_INSTRUCTION_BYTES: usize = 64 * 1024;
+/// Per-Run caller overrides, live ACP option projection, and Runner-global
+/// `forced_config` admission.
 pub const CODING_AGENT_MAX_CONFIG_OPTIONS: usize = 32;
+/// Operator allowlisted config option ids, forced-policy key ids, and declared
+/// `env_from_env` destination keys on Diagnose (matches Runner ACP admission).
+pub const CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES: usize = 64;
 pub const CODING_AGENT_MAX_CONFIG_KEY_BYTES: usize = 128;
 pub const CODING_AGENT_MAX_CONFIG_VALUE_BYTES: usize = 4096;
 pub const CODING_AGENT_MAX_CONFIG_SELECT_CHOICES: usize = 64;
@@ -33,6 +38,14 @@ pub const CODING_AGENT_MAX_INVENTORY_RUNS: usize = 128;
 pub const CODING_AGENT_TIMEOUT_MIN_SECS: u64 = 1;
 pub const CODING_AGENT_TIMEOUT_MAX_SECS: u64 = 3600;
 pub const CODING_AGENT_OBSERVE_WAIT_MAX_SECS: u64 = 60;
+pub const CODING_AGENT_MAX_PERMISSION_OPTIONS: usize = 16;
+pub const CODING_AGENT_MAX_PERMISSION_OPTION_ID_BYTES: usize = 128;
+pub const CODING_AGENT_MAX_PERMISSION_OPTION_NAME_BYTES: usize = 256;
+pub const CODING_AGENT_MAX_PERMISSION_OPTION_KIND_BYTES: usize = 64;
+pub const CODING_AGENT_MAX_PERMISSION_TOOL_CALL_ID_BYTES: usize = 128;
+pub const CODING_AGENT_MAX_PERMISSION_TITLE_BYTES: usize = 512;
+pub const CODING_AGENT_PERMISSION_REQUEST_TOKEN_PREFIX: &str = "wc_acp_perm_";
+pub const CODING_AGENT_MAX_PERMISSION_REQUEST_TOKEN_BYTES: usize = 96;
 
 pub const CODING_AGENT_STOP_REASON_END_TURN: &str = "end_turn";
 pub const CODING_AGENT_STOP_REASON_CANCELLED: &str = "cancelled";
@@ -257,6 +270,39 @@ pub struct CodingAgentRunSnapshot {
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<CodingAgentTerminal>,
+    /// Present only while the Run is in `waiting_permission` with an active ACP callback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_permission: Option<CodingAgentPendingPermission>,
+    /// Present only after live pre-prompt negotiation on the Runner; never
+    /// durably recovered after restart and never inferred from caller input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_confirmed_effective_config: Option<Vec<CodingAgentLiveConfirmedConfigEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentPermissionOptionSummary {
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_PERMISSION_OPTION_ID_BYTES))]
+    pub option_id: String,
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_PERMISSION_OPTION_NAME_BYTES))]
+    pub name: String,
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_PERMISSION_OPTION_KIND_BYTES))]
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentPendingPermission {
+    /// Opaque Run-bound token for exactly one in-flight ACP permission callback.
+    #[schemars(regex(pattern = "^wc_acp_perm_[A-Za-z0-9_.-]+$"))]
+    pub request_token: String,
+    /// Monotonic fence for this Run; must match the active callback generation.
+    pub generation: u64,
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_PERMISSION_TOOL_CALL_ID_BYTES))]
+    pub tool_call_id: String,
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_PERMISSION_TITLE_BYTES))]
+    pub title: String,
+    pub options: Vec<CodingAgentPermissionOptionSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +349,14 @@ pub struct CodingAgentObserveRequest {
 #[serde(deny_unknown_fields)]
 pub struct CodingAgentCancelRequest {
     pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentRespondPermissionRequest {
+    pub run_id: String,
+    pub permission_request_token: String,
+    pub option_id: String,
 }
 
 /// Identity-fenced diagnostic for one authorized Project/provider. Its run_id
@@ -386,6 +440,39 @@ pub struct CodingAgentLiveConfigOption {
     pub choices_truncated: bool,
 }
 
+/// One live-confirmed ACP config identity after pre-prompt negotiation.
+/// Values are provider-advertised selection ids only, never secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentLiveConfirmedConfigEntry {
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_CONFIG_KEY_BYTES))]
+    pub id: String,
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_CONFIG_VALUE_BYTES))]
+    pub current: String,
+    /// `caller_requested` or `runner_forced`.
+    #[schemars(length(min = 1, max = 32))]
+    pub source: String,
+}
+
+/// Runner-owned admission policy identities exposed without secret values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentConfigPolicyProjection {
+    #[schemars(length(max = CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES))]
+    pub caller_allowed_option_ids: Vec<String>,
+    #[schemars(length(max = CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES))]
+    pub forced_option_ids: Vec<String>,
+}
+
+impl Default for CodingAgentConfigPolicyProjection {
+    fn default() -> Self {
+        Self {
+            caller_allowed_option_ids: Vec::new(),
+            forced_option_ids: Vec::new(),
+        }
+    }
+}
+
 /// Bounded projection of one ephemeral ACP session. When `outcome` is not
 /// [`CodingAgentDiagnoseOutcome::Ok`], `options` is always empty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -394,6 +481,7 @@ pub struct CodingAgentLiveAcpDiagnostic {
     pub outcome: CodingAgentDiagnoseOutcome,
     pub phase: CodingAgentDiagnosePhase,
     pub protocol_version: Option<u64>,
+    #[schemars(length(max = CODING_AGENT_MAX_CONFIG_OPTIONS))]
     pub options: Vec<CodingAgentLiveConfigOption>,
     pub options_truncated: bool,
 }
@@ -404,6 +492,7 @@ pub enum CodingAgentRequest {
     Start(CodingAgentStartRequest),
     Observe(CodingAgentObserveRequest),
     Cancel(CodingAgentCancelRequest),
+    RespondPermission(CodingAgentRespondPermissionRequest),
     Diagnose(CodingAgentDiagnoseRequest),
 }
 
@@ -413,6 +502,7 @@ impl CodingAgentRequest {
             Self::Start(request) => &request.run_id,
             Self::Observe(request) => &request.run_id,
             Self::Cancel(request) => &request.run_id,
+            Self::RespondPermission(request) => &request.run_id,
             Self::Diagnose(request) => &request.run_id,
         }
     }
@@ -421,7 +511,7 @@ impl CodingAgentRequest {
         match self {
             Self::Start(request) => Some((&request.provider_id, &request.provider_instance_id)),
             Self::Diagnose(request) => Some((&request.provider_id, &request.provider_instance_id)),
-            Self::Observe(_) | Self::Cancel(_) => None,
+            Self::Observe(_) | Self::Cancel(_) | Self::RespondPermission(_) => None,
         }
     }
 }
@@ -449,11 +539,18 @@ pub enum CodingAgentResponsePayload {
     Cancel {
         run: CodingAgentRunSnapshot,
     },
+    RespondPermission {
+        run: CodingAgentRunSnapshot,
+        /// True when the Runner accepted the selection and will write it to the live ACP session.
+        applied: bool,
+    },
     Diagnose {
         provider_id: String,
         provider_instance_id: String,
         /// Configured destination environment names, mapped only to booleans.
         env_presence: BTreeMap<String, bool>,
+        /// Operator allowlist and Runner forced-policy key identities only.
+        config_policy: CodingAgentConfigPolicyProjection,
         /// Present only when the request explicitly authorized the live probe.
         live_acp: Option<CodingAgentLiveAcpDiagnostic>,
     },
@@ -602,6 +699,14 @@ pub fn validate_request(request: &CodingAgentRequest) -> Result<(), String> {
             }
         }
         CodingAgentRequest::Cancel(_) => {}
+        CodingAgentRequest::RespondPermission(request) => {
+            validate_permission_request_token(&request.permission_request_token)?;
+            if !diagnostic_identity_key_is_bounded(&request.option_id)
+                || request.option_id.len() > CODING_AGENT_MAX_PERMISSION_OPTION_ID_BYTES
+            {
+                return Err("permission option_id is invalid".to_string());
+            }
+        }
         CodingAgentRequest::Diagnose(request) => {
             validate_provider_id(&request.provider_id)?;
             validate_provider_instance_id(&request.provider_instance_id)?;
@@ -644,16 +749,18 @@ pub fn validate_response_for_request(
             provider_id,
             provider_instance_id,
             env_presence,
+            config_policy,
             live_acp,
         },
     ) = (request, payload)
     {
         if provider_id != &request.provider_id
             || provider_instance_id != &request.provider_instance_id
-            || env_presence.len() > CODING_AGENT_MAX_CONFIG_OPTIONS
+            || env_presence.len() > CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES
         {
             return Err("ACP diagnostic provider identity or size is invalid".into());
         }
+        validate_config_policy_projection(config_policy)?;
         for key in env_presence.keys() {
             if !diagnostic_identity_key_is_bounded(key) {
                 return Err("ACP diagnostic destination key is invalid".into());
@@ -722,6 +829,10 @@ pub fn validate_response_for_request(
             &observation.run
         }
         (CodingAgentRequest::Cancel(_), CodingAgentResponsePayload::Cancel { run }) => run,
+        (
+            CodingAgentRequest::RespondPermission(_),
+            CodingAgentResponsePayload::RespondPermission { run, .. },
+        ) => run,
         _ => {
             return Err("CodingAgentRun response kind does not match request operation".to_string())
         }
@@ -766,6 +877,44 @@ pub fn bounded_diagnostic_label(value: &str) -> String {
 /// truncated by the Runner before they can cross this validation.
 fn diagnostic_label_is_bounded(label: &str) -> bool {
     label.len() <= CODING_AGENT_MAX_CONFIG_LABEL_BYTES && !label.contains(['\0', '\r', '\n'])
+}
+
+pub fn validate_live_confirmed_config_entry(
+    entry: &CodingAgentLiveConfirmedConfigEntry,
+) -> Result<(), String> {
+    if !diagnostic_identity_key_is_bounded(&entry.id)
+        || entry.id.len() > CODING_AGENT_MAX_CONFIG_KEY_BYTES
+    {
+        return Err("live confirmed config id is invalid".into());
+    }
+    if entry.current.is_empty() || entry.current.len() > CODING_AGENT_MAX_CONFIG_VALUE_BYTES {
+        return Err("live confirmed config current is invalid".into());
+    }
+    if entry.source != "caller_requested" && entry.source != "runner_forced" {
+        return Err("live confirmed config source is invalid".into());
+    }
+    Ok(())
+}
+
+pub fn validate_config_policy_projection(
+    policy: &CodingAgentConfigPolicyProjection,
+) -> Result<(), String> {
+    if policy.caller_allowed_option_ids.len() > CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES
+        || policy.forced_option_ids.len() > CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES
+    {
+        return Err("ACP config policy projection is too large".into());
+    }
+    for key in policy
+        .caller_allowed_option_ids
+        .iter()
+        .chain(policy.forced_option_ids.iter())
+    {
+        if !diagnostic_identity_key_is_bounded(key) || key.len() > CODING_AGENT_MAX_CONFIG_KEY_BYTES
+        {
+            return Err("ACP config policy key is invalid".into());
+        }
+    }
+    Ok(())
 }
 
 /// Closed bounds for the live ACP projection. A failed probe must not carry
@@ -833,6 +982,50 @@ fn validate_live_acp_diagnostic(live: &CodingAgentLiveAcpDiagnostic) -> Result<(
     Ok(())
 }
 
+pub fn validate_permission_request_token(value: &str) -> Result<(), String> {
+    if !value.starts_with(CODING_AGENT_PERMISSION_REQUEST_TOKEN_PREFIX) {
+        return Err("permission_request_token must use the wc_acp_perm_ namespace".to_string());
+    }
+    validate_identifier(
+        value,
+        "permission_request_token",
+        CODING_AGENT_MAX_PERMISSION_REQUEST_TOKEN_BYTES,
+        false,
+    )
+}
+
+pub fn validate_pending_permission(
+    pending: &CodingAgentPendingPermission,
+) -> Result<(), String> {
+    validate_permission_request_token(&pending.request_token)?;
+    if pending.generation == 0 {
+        return Err("pending permission generation must be positive".to_string());
+    }
+    if !diagnostic_identity_key_is_bounded(&pending.tool_call_id)
+        || pending.tool_call_id.len() > CODING_AGENT_MAX_PERMISSION_TOOL_CALL_ID_BYTES
+    {
+        return Err("pending permission tool_call_id is invalid".to_string());
+    }
+    if pending.title.is_empty() || pending.title.len() > CODING_AGENT_MAX_PERMISSION_TITLE_BYTES {
+        return Err("pending permission title is invalid".to_string());
+    }
+    if pending.options.is_empty() || pending.options.len() > CODING_AGENT_MAX_PERMISSION_OPTIONS {
+        return Err("pending permission options are invalid".to_string());
+    }
+    for option in &pending.options {
+        if !diagnostic_identity_key_is_bounded(&option.option_id)
+            || option.option_id.len() > CODING_AGENT_MAX_PERMISSION_OPTION_ID_BYTES
+            || option.name.is_empty()
+            || option.name.len() > CODING_AGENT_MAX_PERMISSION_OPTION_NAME_BYTES
+            || option.kind.is_empty()
+            || option.kind.len() > CODING_AGENT_MAX_PERMISSION_OPTION_KIND_BYTES
+        {
+            return Err("pending permission option summary is invalid".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Validate the bounded identity and semantic state matrix of one Runner-owned
 /// CodingAgentRun snapshot. This is the canonical Server/Runner reconciliation
 /// contract: structurally decodable snapshots that contradict the closed ACP v1
@@ -847,6 +1040,26 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
         || run.runtime_project_id.len() > CODING_AGENT_MAX_PROJECT_ID_BYTES
     {
         return Err("CodingAgentRun snapshot project id is invalid".to_string());
+    }
+    if let Some(pending) = run.pending_permission.as_ref() {
+        validate_pending_permission(pending)?;
+    }
+    if let Some(entries) = run.live_confirmed_effective_config.as_ref() {
+        if entries.len() > CODING_AGENT_MAX_CONFIG_OPTIONS {
+            return Err(
+                "CodingAgentRun live_confirmed_effective_config is too large".to_string(),
+            );
+        }
+        for entry in entries {
+            validate_live_confirmed_config_entry(entry)?;
+        }
+    }
+    if run.pending_permission.is_some()
+        && run.state != CodingAgentRunState::WaitingPermission
+    {
+        return Err(
+            "pending permission is only valid while the Run is waiting_permission".to_string(),
+        );
     }
 
     if let Some(terminal) = run.terminal.as_ref() {
@@ -878,6 +1091,7 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
         CodingAgentRunState::Starting => {
             if run.execution_state != CodingAgentExecutionState::NotStarted
                 || run.terminal.is_some()
+                || run.pending_permission.is_some()
             {
                 return Err(
                     "starting CodingAgentRun snapshot is semantically inconsistent".to_string(),
@@ -889,6 +1103,7 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
                 run.execution_state,
                 CodingAgentExecutionState::OutcomeUnknown | CodingAgentExecutionState::Started
             ) || run.terminal.is_some()
+                || run.pending_permission.is_some()
             {
                 return Err(
                     "running CodingAgentRun snapshot is semantically inconsistent".to_string(),
@@ -896,7 +1111,10 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
             }
         }
         CodingAgentRunState::WaitingPermission => {
-            if run.execution_state != CodingAgentExecutionState::Started || run.terminal.is_some() {
+            if run.execution_state != CodingAgentExecutionState::Started
+                || run.terminal.is_some()
+                || run.pending_permission.is_none()
+            {
                 return Err(
                     "waiting_permission CodingAgentRun snapshot is semantically inconsistent"
                         .to_string(),
@@ -1323,6 +1541,8 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             terminal: None,
+            pending_permission: None,
+            live_confirmed_effective_config: None,
         };
         let response = CodingAgentResponse::success(CodingAgentResponsePayload::Observe {
             observation: CodingAgentObserveResult {
@@ -1374,6 +1594,8 @@ mod tests {
                 message: None,
                 completed_at: 1,
             }),
+            pending_permission: None,
+            live_confirmed_effective_config: None,
         }
     }
 
@@ -1707,6 +1929,7 @@ mod tests {
             provider_id: "codex".into(),
             provider_instance_id: "acp_current".into(),
             env_presence: BTreeMap::from([("API_KEY".into(), true)]),
+            config_policy: CodingAgentConfigPolicyProjection::default(),
             live_acp: None,
         });
         validate_response_for_request(&request, &response).unwrap();
@@ -1733,6 +1956,65 @@ mod tests {
             diag.project_root = String::new();
         }
         assert!(validate_request(&invalid).is_err());
+    }
+
+    #[test]
+    fn diagnose_config_policy_and_env_presence_use_runner_admission_budget() {
+        let request = CodingAgentRequest::Diagnose(CodingAgentDiagnoseRequest {
+            run_id: "wc_agent_run_diag_core_994".into(),
+            runtime_project_id: "agent:runner:demo".into(),
+            project_root: "/workspace/demo".into(),
+            provider_id: "codex".into(),
+            provider_instance_id: "acp_current".into(),
+            include_live_acp: false,
+        });
+        let allowed = (0..CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES)
+            .map(|index| format!("option_{index:02}"))
+            .collect::<Vec<_>>();
+        let env_presence = (0..CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES)
+            .map(|index| (format!("ENV_{index:02}"), index % 2 == 0))
+            .collect::<BTreeMap<_, _>>();
+        let response = CodingAgentResponse::success(CodingAgentResponsePayload::Diagnose {
+            provider_id: "codex".into(),
+            provider_instance_id: "acp_current".into(),
+            env_presence,
+            config_policy: CodingAgentConfigPolicyProjection {
+                caller_allowed_option_ids: allowed,
+                forced_option_ids: Vec::new(),
+            },
+            live_acp: None,
+        });
+        validate_response_for_request(&request, &response).unwrap();
+        if let Some(CodingAgentResponsePayload::Diagnose { config_policy, .. }) =
+            &response.payload
+        {
+            validate_config_policy_projection(config_policy).unwrap();
+        } else {
+            panic!("expected diagnose payload");
+        }
+
+        let mut too_many_allowed = response.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { config_policy, .. }) =
+            &mut too_many_allowed.payload
+        {
+            config_policy
+                .caller_allowed_option_ids
+                .push(format!("option_{}", CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES));
+        }
+        assert!(validate_response_for_request(&request, &too_many_allowed).is_err());
+
+        let mut too_many_env = response.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { env_presence, .. }) =
+            &mut too_many_env.payload
+        {
+            env_presence.insert(
+                format!("ENV_{}", CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES),
+                true,
+            );
+        }
+        assert!(validate_response_for_request(&request, &too_many_env).is_err());
+
+        assert!(CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES > CODING_AGENT_MAX_CONFIG_OPTIONS);
     }
 
     #[test]
@@ -1776,6 +2058,7 @@ mod tests {
             provider_id: "codex".into(),
             provider_instance_id: "acp_current".into(),
             env_presence: BTreeMap::new(),
+            config_policy: CodingAgentConfigPolicyProjection::default(),
             live_acp: Some(live.clone()),
         });
         assert!(validate_response_for_request(&presence_request, &unrequested).is_err());
@@ -1794,6 +2077,7 @@ mod tests {
             provider_id: "codex".into(),
             provider_instance_id: "acp_current".into(),
             env_presence: BTreeMap::new(),
+            config_policy: CodingAgentConfigPolicyProjection::default(),
             live_acp: Some(live.clone()),
         });
         validate_response_for_request(&authorized_request, &successful).unwrap();
@@ -1887,6 +2171,7 @@ mod tests {
                 provider_id: "codex".into(),
                 provider_instance_id: "acp_current".into(),
                 env_presence: BTreeMap::new(),
+                config_policy: CodingAgentConfigPolicyProjection::default(),
                 live_acp: Some(failed),
             });
         validate_response_for_request(&authorized_request, &validated_failure).unwrap();

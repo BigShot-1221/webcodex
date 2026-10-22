@@ -24,6 +24,8 @@ pub struct CodingAgentProfile {
     pub env_from_env: BTreeMap<String, String>,
     #[serde(default)]
     pub allowed_config_options: Vec<String>,
+    #[serde(default)]
+    pub parameterized_model_picker: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

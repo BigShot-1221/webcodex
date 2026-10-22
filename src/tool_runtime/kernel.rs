@@ -889,6 +889,8 @@ mod tests {
                 "start_coding_agent",
                 "observe_coding_agent",
                 "cancel_coding_agent",
+                "respond_coding_agent_permission",
+                "inspect_coding_agent_config",
             ] {
                 assert_eq!(
                     check_runtime_tool_scope(Some(&insufficient), tool),
@@ -908,13 +910,24 @@ mod tests {
                 description: "missing required scope: project:write".to_string(),
             })
         );
-        for tool in ["observe_coding_agent", "cancel_coding_agent"] {
+        for tool in [
+            "observe_coding_agent",
+            "cancel_coding_agent",
+            "inspect_coding_agent_config",
+        ] {
             assert_eq!(
                 check_runtime_tool_scope(Some(&run_only), tool),
                 Ok(()),
                 "{tool}"
             );
         }
+        assert_eq!(
+            check_runtime_tool_scope(Some(&run_only), "respond_coding_agent_permission"),
+            Err(ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_PROJECT_WRITE),
+                description: "missing required scope: project:write".to_string(),
+            }),
+        );
         let start_allowed = oauth(&["coding_agent:run", "project:write"]);
         assert_eq!(
             check_runtime_tool_scope(Some(&start_allowed), "start_coding_agent"),

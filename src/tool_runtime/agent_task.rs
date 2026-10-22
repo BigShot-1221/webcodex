@@ -107,6 +107,8 @@ mod observation_tests {
             created_at: 1,
             updated_at: 1,
             terminal: None,
+            pending_permission: None,
+            live_confirmed_effective_config: None,
         };
         let error = coding_run_observation(&run).unwrap_err();
         assert!(!error.success);

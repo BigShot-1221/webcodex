@@ -806,52 +806,16 @@ impl NativeEnvironment {
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
-        let mut response = request.send().await.map_err(|_| {
+        let response = request.send().await.map_err(|_| {
             diagnostic(
                 "server_unreachable",
                 "The Server request did not produce a verified response",
             )
         })?;
         let status = response.status();
+        let bytes = read_bounded_http_body(response).await?;
         if !status.is_success() {
-            return Err(match status.as_u16() {
-                401 => diagnostic(
-                    "authentication_required",
-                    "The user credential was not accepted",
-                ),
-                403 => diagnostic(
-                    "permission_denied",
-                    "The authenticated user is not authorized for this operation",
-                ),
-                409 => diagnostic(
-                    "server_conflict",
-                    "The Server reports an existing or conflicting resource",
-                ),
-                _ => diagnostic("server_request_failed", "The Server rejected the operation"),
-            });
-        }
-        if response
-            .content_length()
-            .is_some_and(|n| n > HTTP_LIMIT as u64)
-        {
-            return Err(diagnostic(
-                "response_limit",
-                "The Server response exceeded its bound",
-            ));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| diagnostic("response_uncertain", "The Server response was interrupted"))?
-        {
-            if bytes.len().saturating_add(chunk.len()) > HTTP_LIMIT {
-                return Err(diagnostic(
-                    "response_limit",
-                    "The Server response exceeded its bound",
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
+            return Err(server_http_error(status, &bytes));
         }
         serde_json::from_slice(&bytes)
             .map_err(|_| diagnostic("response_invalid", "The Server response was invalid"))
@@ -939,22 +903,23 @@ impl NativeEnvironment {
         record: &mut EnvironmentRecord,
     ) -> SetupResultValue<()> {
         let bootstrap = bootstrap_token(store)?;
-        let username = record
-            .username
-            .get_or_insert_with(|| account_username(&record.request.account.name))
-            .clone();
         let path = store.root().join("webcodex-user-token");
         if path.exists() {
             let token = read_secret(&path)?;
             match self.authenticated(record, token.expose()).await {
                 Ok(identity) => {
-                    ensure_username(record, &identity)?;
+                    bind_username_from_verified_identity(record, &identity)?;
                     return Ok(());
                 }
-                Err(error) if error.code == "authentication_required" => {}
+                Err(error) if error.code == "authentication_required" => {
+                    prepare_provisioning_username_after_rejected_token(record);
+                }
                 Err(error) => return Err(error),
             }
+        } else {
+            ensure_provisioning_username(record);
         }
+        let username = record.username.clone().expect("provisioning username");
         match self
             .post(
                 &record.request.server_url,
@@ -974,7 +939,18 @@ impl NativeEnvironment {
                     "Server did not confirm the created user identity",
                 ))
             }
-            Err(error) if error.code == "server_conflict" => {}
+            Err(error) if error.code == "server_conflict" => {
+                if path.exists() {
+                    let token = read_secret(&path)?;
+                    if let Ok(identity) = self.authenticated(record, token.expose()).await {
+                        if authenticated_username(&identity)? == username {
+                            bind_username_from_verified_identity(record, &identity)?;
+                            return Ok(());
+                        }
+                    }
+                }
+                return Err(error);
+            }
             Err(error) => return Err(error),
         }
         if !path.exists() {
@@ -983,7 +959,7 @@ impl NativeEnvironment {
         let token = read_secret(&path)?;
         match self.authenticated(record, token.expose()).await {
             Ok(identity) => {
-                ensure_username(record, &identity)?;
+                bind_username_from_verified_identity(record, &identity)?;
                 return Ok(());
             }
             Err(error) if error.code == "authentication_required" => {}
@@ -1001,7 +977,7 @@ impl NativeEnvironment {
             Err(error) => return Err(error),
         }
         let identity = self.authenticated(record, token.expose()).await?;
-        ensure_username(record, &identity)?;
+        bind_username_from_verified_identity(record, &identity)?;
         Ok(())
     }
 
@@ -1271,9 +1247,6 @@ impl EnvironmentBackend for NativeEnvironment {
                     return Ok(Missing);
                 }
                 let token = read_secret(&path)?;
-                if record.request.local_server() && record.username.is_none() {
-                    record.username = Some(account_username(&record.request.account.name));
-                }
                 match self.authenticated(record, token.expose()).await {
                     Ok(identity) => {
                         ensure_username(record, &identity)?;
@@ -1283,6 +1256,7 @@ impl EnvironmentBackend for NativeEnvironment {
                         if record.request.local_server()
                             && error.code == "authentication_required" =>
                     {
+                        ensure_provisioning_username(record);
                         Ok(Missing)
                     }
                     Err(error) => Err(error),
@@ -1454,10 +1428,17 @@ impl EnvironmentBackend for NativeEnvironment {
                     }
                     record.username = Some(username.to_owned());
                 }
+                if record.request.local_server() {
+                    ensure_provisioning_username(record);
+                }
                 if record.request.local_runner() && record.runner_client_id.is_none() {
+                    let base = record
+                        .username
+                        .clone()
+                        .unwrap_or_else(|| account_username(&record.request.account.name));
                     record.runner_client_id = Some(format!(
                         "{}-{}",
-                        account_username(&record.request.account.name),
+                        base,
                         &record.environment_id.replace('-', "")[..16]
                     ));
                 }
@@ -1793,6 +1774,32 @@ fn authenticated_username(value: &Value) -> SetupResultValue<&str> {
             )
         })
 }
+fn bind_username_from_verified_identity(
+    record: &mut EnvironmentRecord,
+    identity: &Value,
+) -> SetupResultValue<()> {
+    if record
+        .username
+        .as_deref()
+        .is_some_and(is_server_valid_username)
+    {
+        return ensure_username(record, identity);
+    }
+    record.username = Some(authenticated_username(identity)?.to_owned());
+    Ok(())
+}
+
+fn prepare_provisioning_username_after_rejected_token(record: &mut EnvironmentRecord) {
+    if record
+        .username
+        .as_deref()
+        .is_some_and(is_server_valid_username)
+    {
+        return;
+    }
+    ensure_provisioning_username(record);
+}
+
 fn ensure_username(record: &mut EnvironmentRecord, identity: &Value) -> SetupResultValue<()> {
     // Older Servers omit this additive overview field. A viewer may still
     // use their existing user token, but attaching a Runner requires the
@@ -2102,12 +2109,15 @@ pub fn service_spec(
     let scope = record.request.service_scope;
     let id = if cfg!(windows) {
         match component {
-            Component::Server => "WebCodexServer".into(),
+            Component::Server => webcodex_runner_config::desktop_edition::windows_server_service_id()
+                .into(),
             Component::Runner => format!(
-                "WebCodexRunner-{}",
+                "{}{}",
+                webcodex_runner_config::desktop_edition::windows_runner_service_id_prefix(),
                 &format!("{:x}", Sha256::digest(account.identity.as_bytes()))[..12]
             ),
-            Component::Tunnel => "WebCodexTunnel".into(),
+            Component::Tunnel => webcodex_runner_config::desktop_edition::windows_tunnel_service_id()
+                .into(),
         }
     } else {
         match component {
@@ -2242,19 +2252,124 @@ fn generate_token(prefix: &str) -> String {
         uuid::Uuid::new_v4().simple()
     )
 }
+fn is_username_character(character: char) -> bool {
+    character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '_' | '-')
+}
+
+fn is_server_valid_username(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 64
+        && value.chars().all(is_username_character)
+}
+
+/// Derive a Server-valid bootstrap username from the local account label. Does
+/// not preserve invalid journal values; call `ensure_provisioning_username`
+/// before first user creation when a saved username may predate validation.
 fn account_username(name: &str) -> String {
-    let value: String = name
+    let trimmed = name
         .rsplit(['\\', '/'])
         .next()
-        .unwrap_or("user")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        .take(48)
+        .unwrap_or(name)
+        .trim();
+    if is_server_valid_username(trimmed) {
+        return trimmed.to_string();
+    }
+    #[derive(PartialEq)]
+    enum Part {
+        Kept(char),
+        GeneratedSeparator,
+    }
+    let mut parts: Vec<Part> = Vec::with_capacity(trimmed.len().min(64));
+    for character in trimmed.chars() {
+        let lowered = character.to_ascii_lowercase();
+        if is_username_character(lowered) {
+            parts.push(Part::Kept(lowered));
+        } else if parts.last() != Some(&Part::GeneratedSeparator) {
+            parts.push(Part::GeneratedSeparator);
+        }
+    }
+    while parts.first() == Some(&Part::GeneratedSeparator) {
+        parts.remove(0);
+    }
+    while parts.last() == Some(&Part::GeneratedSeparator) {
+        parts.pop();
+    }
+    let mut normalized: Vec<Part> = parts.into_iter().take(64).collect();
+    while normalized.last() == Some(&Part::GeneratedSeparator) {
+        normalized.pop();
+    }
+    let normalized: String = normalized
+        .into_iter()
+        .map(|part| match part {
+            Part::Kept(character) => character,
+            Part::GeneratedSeparator => '-',
+        })
         .collect();
-    if value.is_empty() {
+    if normalized.is_empty() {
         "user".into()
     } else {
-        value
+        normalized
+    }
+}
+
+fn ensure_provisioning_username(record: &mut EnvironmentRecord) {
+    if record
+        .username
+        .as_deref()
+        .is_some_and(is_server_valid_username)
+    {
+        return;
+    }
+    record.username = Some(account_username(&record.request.account.name));
+}
+
+async fn read_bounded_http_body(response: reqwest::Response) -> SetupResultValue<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > HTTP_LIMIT as u64)
+    {
+        return Err(diagnostic(
+            "response_limit",
+            "The Server response exceeded its bound",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| diagnostic("response_uncertain", "The Server response was interrupted"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > HTTP_LIMIT {
+            return Err(diagnostic(
+                "response_limit",
+                "The Server response exceeded its bound",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn server_http_error(status: reqwest::StatusCode, _bytes: &[u8]) -> SetupDiagnostic {
+    match status.as_u16() {
+        401 => diagnostic(
+            "authentication_required",
+            "The user credential was not accepted",
+        ),
+        403 => diagnostic(
+            "permission_denied",
+            "The authenticated user is not authorized for this operation",
+        ),
+        409 => diagnostic(
+            "server_conflict",
+            "The Server reports an existing or conflicting resource",
+        ),
+        400 => diagnostic(
+            "request_validation_failed",
+            "The Server rejected the request parameters (HTTP 400)",
+        ),
+        _ => diagnostic("server_request_failed", "The Server rejected the operation"),
     }
 }
 fn project_record(path: &Path) -> ProjectRecord {

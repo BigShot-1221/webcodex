@@ -55,6 +55,27 @@ impl ToolRuntime {
                     .await
             }
             ToolCall::CodingAgentCancel { run_id } => self.coding_agent_cancel(run_id, auth).await,
+            ToolCall::CodingAgentRespondPermission {
+                run_id,
+                permission_request_token,
+                option_id,
+            } => {
+                self.coding_agent_respond_permission(
+                    run_id,
+                    permission_request_token,
+                    option_id,
+                    auth,
+                )
+                .await
+            }
+            ToolCall::CodingAgentInspectConfig {
+                project,
+                provider_id,
+                include_live_acp,
+            } => {
+                self.coding_agent_inspect_config(project, provider_id, include_live_acp, auth)
+                    .await
+            }
 
             call @ (ToolCall::RunProcess { .. }
             | ToolCall::RunDetachedProcess { .. }

@@ -367,7 +367,7 @@ impl CodingAgentManager {
             "initialize",
             json!({
                 "protocolVersion": 1,
-                "clientCapabilities": {},
+                "clientCapabilities": super::setup::acp_initialize_client_capabilities(&provider.config),
                 "clientInfo": {"name":"webcodex-runner","version":env!("CARGO_PKG_VERSION")}
             }),
         ) {

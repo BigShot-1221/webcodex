@@ -522,6 +522,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("consume_agent_deliveries", PERMISSION_RISK_WRITE),
         ("consume_agent_wake", PERMISSION_RISK_WRITE),
         ("cancel_coding_agent", PERMISSION_RISK_WRITE),
+        ("inspect_coding_agent_config", PERMISSION_RISK_JOB),
         ("control_computer", PERMISSION_RISK_WRITE),
         ("computer_key_input", PERMISSION_RISK_WRITE),
         ("update_session_context", PERMISSION_RISK_WRITE),

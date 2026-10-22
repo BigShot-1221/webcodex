@@ -5,6 +5,7 @@ mod connection_id;
 mod connections;
 mod deadline;
 mod desktop_data_dir;
+mod desktop_edition;
 mod desktop_locale;
 mod desktop_shell;
 mod diagnostics;
@@ -58,6 +59,9 @@ fn desktop_builder() -> tauri::Builder<tauri::Wry> {
         .setup(|app| {
             let logical_data_dir = app.path().app_local_data_dir()?;
             let data_dir = desktop_data_dir::resolve(logical_data_dir)?;
+            if let Some(label) = desktop_edition::dev_edition_label() {
+                eprintln!("WebCodex Desktop edition={label}");
+            }
             eprintln!(
                 "WebCodex Desktop data root source={} physical_resolution={}",
                 data_dir.source.label(),

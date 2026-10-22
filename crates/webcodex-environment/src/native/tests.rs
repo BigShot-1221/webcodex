@@ -813,6 +813,58 @@ async fn a_generic_http_200_does_not_satisfy_server_reachability() {
 }
 
 #[tokio::test]
+async fn user_create_conflict_fails_closed_without_token_registration() {
+    let (url, requests, server) = fixture(2, |request| match request.path.as_str() {
+        "/api/runtime-console/overview" => (401, vec![], json!({"error":"unauthorized"})),
+        "/api/users/create" => (409, vec![], json!({"error":"username taken"})),
+        other => panic!("unexpected user provisioning route: {other}"),
+    });
+    let temp = crate::test_tempdir().unwrap();
+    let store = EnvironmentStore::open(temp.path().join("environment")).unwrap();
+    ensure_private_directory(&store.root().join("server")).unwrap();
+    atomic_private_write(
+        &store.root().join("server/webcodex.env"),
+        b"WEBCODEX_TOKEN=wc_boot_fixture\n",
+    )
+    .unwrap();
+    atomic_private_write(
+        &store.root().join("webcodex-user-token"),
+        b"wc_pat_unregistered",
+    )
+    .unwrap();
+    let mut environment = record(
+        url,
+        None,
+        EnvironmentMode::Create {
+            listen: "127.0.0.1:8080".into(),
+        },
+    );
+    environment.username = Some("fixture".into());
+    let error = NativeEnvironment::new()
+        .unwrap()
+        .create_user(&store, &mut environment)
+        .await
+        .unwrap_err();
+    server.join().unwrap();
+    assert_eq!(error.code, "server_conflict");
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/api/runtime-console/overview", "/api/users/create"]
+    );
+    assert_eq!(
+        read_secret(&store.root().join("webcodex-user-token"))
+            .unwrap()
+            .expose(),
+        "wc_pat_unregistered"
+    );
+}
+
+#[tokio::test]
 async fn uncertain_user_auth_does_not_reregister_saved_credential() {
     let (url, requests, server) = fixture(1, |request| match request.path.as_str() {
         "/api/runtime-console/overview" => (503, vec![], json!({"error":"unavailable"})),
@@ -1174,6 +1226,69 @@ fn runner_name_requires_the_runner_role() {
     );
     request.runner = Some(true);
     assert!(validate_request(&request).is_ok());
+}
+
+#[test]
+fn account_username_matches_server_username_validation() {
+    for name in ["alice", "bob_123", "valid_name-2"] {
+        let derived = account_username(name);
+        assert_eq!(derived, name);
+        assert!(is_server_valid_username(&derived));
+    }
+    assert_eq!(account_username("Administrator"), "administrator");
+    assert_eq!(account_username("Alice Smith"), "alice-smith");
+    assert_eq!(account_username("alice.smith"), "alice-smith");
+    assert_eq!(account_username("DOMAIN\\Jane Doe"), "jane-doe");
+    assert_eq!(account_username(""), "user");
+    assert_eq!(account_username(&"A".repeat(65)), "a".repeat(64));
+}
+
+#[test]
+fn ensure_provisioning_username_preserves_valid_journal_and_repairs_invalid() {
+    let mut saved = record(
+        "http://127.0.0.1:8080".into(),
+        None,
+        EnvironmentMode::Create {
+            listen: "127.0.0.1:8080".into(),
+        },
+    );
+    saved.username = Some("alice".into());
+    ensure_provisioning_username(&mut saved);
+    assert_eq!(saved.username.as_deref(), Some("alice"));
+
+    saved.username = Some("InvalidUser".into());
+    ensure_provisioning_username(&mut saved);
+    assert!(is_server_valid_username(saved.username.as_deref().unwrap()));
+    assert_ne!(saved.username.as_deref(), Some("InvalidUser"));
+}
+
+#[test]
+fn bind_username_from_verified_identity_repairs_untrusted_journal_username() {
+    let mut saved = record(
+        "http://127.0.0.1:8080".into(),
+        None,
+        EnvironmentMode::Create {
+            listen: "127.0.0.1:8080".into(),
+        },
+    );
+    saved.username = Some("InvalidUser".into());
+    let identity = json!({"service":"webcodex","authenticated_user":"fixture"});
+    bind_username_from_verified_identity(&mut saved, &identity).unwrap();
+    assert_eq!(saved.username.as_deref(), Some("fixture"));
+}
+
+#[test]
+fn server_http_error_400_uses_static_message_without_backend_echo() {
+    let error = server_http_error(
+        reqwest::StatusCode::BAD_REQUEST,
+        br#"{"error":"wc_pat_leaked_secret_from_server"}"#,
+    );
+    assert_eq!(error.code, "request_validation_failed");
+    assert_eq!(
+        error.message,
+        "The Server rejected the request parameters (HTTP 400)"
+    );
+    assert!(!error.message.contains("wc_pat_"));
 }
 
 #[test]

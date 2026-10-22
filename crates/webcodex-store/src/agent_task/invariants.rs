@@ -77,6 +77,8 @@ fn canonical_coding_run_snapshot(
         created_at: 0,
         updated_at: 0,
         terminal,
+        pending_permission: None,
+        live_confirmed_effective_config: None,
     };
     validate_coding_agent_run_snapshot(&snapshot)?;
     Ok(snapshot)

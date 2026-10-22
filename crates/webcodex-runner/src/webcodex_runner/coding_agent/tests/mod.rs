@@ -71,6 +71,7 @@ fn fake_config(executable: String, args: Vec<String>) -> AcpConfig {
             args,
             env_from_env: BTreeMap::new(),
             allowed_config_options: vec!["mode".to_string()],
+            parameterized_model_picker: false,
         }],
     }
 }

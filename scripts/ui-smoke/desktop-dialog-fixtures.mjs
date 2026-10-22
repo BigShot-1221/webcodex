@@ -7,7 +7,7 @@ export function dialogFixture(source, locale) {
 state.workspace_runner=structuredClone(settings.target);settings.max_concurrent_jobs=4;
 state.connections={profiles:[{id:'fixture-connection',name:'Fixture connection',tunnel_id:'fixture-tunnel',credential_present:true,enabled:false,autostart:false,revision:1,source:'file',lifecycle:'stopped',health:'unknown',logs:[]},{id:'fixture-cloudflare',name:'Fixture Cloudflare',provider:{kind:'cloudflare_named'},revision:1,enabled:true,lifecycle:'running',health:'healthy',logs:[]}],config_error:false,running:1,needs_attention:0};
 state.mcp_providers={revision:1,profiles:[{id:'fixture-mcp',name:'Fixture MCP',command:'fixture-mcp',args:[],env_keys:[],enabled:true}],config_error:false,max_enabled:8,restart_required:false};
-state.coding_agents={revision:1,profiles:[{provider_id:'fixture-agent',name:'Fixture agent',executable:'fixture-agent',args:[],enabled:true,env_from_env:{},allowed_config_options:[]}],global_settings:null,restart_required:false,config_error:false,max_enabled:8};
+state.coding_agents={revision:1,profiles:[{provider_id:'fixture-agent',name:'Fixture agent',executable:'fixture-agent',args:[],enabled:true,env_from_env:{},allowed_config_options:[],parameterized_model_picker:false}],global_settings:null,restart_required:false,config_error:false,max_enabled:8};
 runtime.active_jobs=2;runtime.candidate=structuredClone(runtime.selected);
 diagnostic.trace={...diagnostic.trace,can_edit:true,configured_mode:'off'};diagnostic.configuration={reason_code:'fixture_migration_failure',backup_available:true,primary_fingerprint:'fixture-fingerprint'};diagnostic.can_copy_console_credential=true;diagnostic.credential_copy_fence='fixture-fence';
 `;

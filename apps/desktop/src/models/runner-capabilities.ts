@@ -12,6 +12,8 @@ export interface CodingAgentProfile extends CodingAgentProvider {
   enabled: boolean;
   env_from_env: Record<string, string>;
   allowed_config_options: string[];
+  /** Opt in to ACP initialize parameterizedModelPicker for providers that require it. */
+  parameterized_model_picker: boolean;
 }
 export interface AcpGlobalSettings { max_concurrent_runs: number; permission_timeout_secs: number }
 export interface CodingAgentsSnapshot {

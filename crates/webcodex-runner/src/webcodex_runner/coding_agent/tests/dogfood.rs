@@ -109,6 +109,7 @@ fn real_codex_config() -> AcpConfig {
             args,
             env_from_env,
             allowed_config_options: Vec::new(),
+            parameterized_model_picker: false,
         }],
     }
 }

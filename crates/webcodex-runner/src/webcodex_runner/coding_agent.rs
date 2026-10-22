@@ -81,6 +81,7 @@ struct RunEntry {
     cancel_requested: AtomicBool,
     prompt_dispatch: Mutex<PromptDispatchGateState>,
     terminal_transition: Mutex<()>,
+    permission: PermissionSlot,
 }
 
 impl RunEntry {
@@ -96,6 +97,7 @@ impl RunEntry {
             cancel_requested: AtomicBool::new(false),
             prompt_dispatch: Mutex::new(PromptDispatchGateState::PrePrompt),
             terminal_transition: Mutex::new(()),
+            permission: PermissionSlot::default(),
         }
     }
 
@@ -577,12 +579,21 @@ impl CodingAgentManager {
                 let live_acp = request
                     .include_live_acp
                     .then(|| self.run_live_acp_probe(&request, provider));
+                let forced_option_ids = self
+                    .forced_config
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 CodingAgentResponse::success(CodingAgentResponsePayload::Diagnose {
                     provider_id: request.provider_id.clone(),
                     provider_instance_id: provider.instance_id.clone(),
                     env_presence: self
                         .declared_provider_env_presence(&request.provider_id)
                         .expect("selected configured provider was checked above"),
+                    config_policy: webcodex_core::coding_agent::CodingAgentConfigPolicyProjection {
+                        caller_allowed_option_ids: provider.config.allowed_config_options.clone(),
+                        forced_option_ids,
+                    },
                     live_acp,
                 })
             }
@@ -623,6 +634,50 @@ impl CodingAgentManager {
                         CodingAgentResponse::success(CodingAgentResponsePayload::Cancel {
                             run: self.request_cancel(&request.run_id, &entry),
                         })
+                    }
+                    None => response_error(
+                        CodingAgentDispatchState::NotStarted,
+                        "unknown_coding_agent_run",
+                        "CodingAgentRun is not retained by this Runner",
+                        "not_found",
+                        "reobserve",
+                    ),
+                }
+            }
+            CodingAgentRequest::RespondPermission(request) => {
+                let entry = self.runs.lock().unwrap().get(&request.run_id).cloned();
+                match entry {
+                    Some(entry) => {
+                        let snapshot = entry.snapshot();
+                        if snapshot.state != CodingAgentRunState::WaitingPermission {
+                            return response_error(
+                                CodingAgentDispatchState::NotStarted,
+                                "coding_agent_permission_not_pending",
+                                "CodingAgentRun is not waiting for an ACP permission response",
+                                "invalid_input",
+                                "reobserve",
+                            );
+                        }
+                        match entry.permission.try_respond(
+                            &request.permission_request_token,
+                            &request.option_id,
+                            &entry.cancel_requested,
+                            &self.accepting,
+                        ) {
+                            Ok(()) => CodingAgentResponse::success(
+                                CodingAgentResponsePayload::RespondPermission {
+                                    run: entry.snapshot(),
+                                    applied: true,
+                                },
+                            ),
+                            Err(code) => response_error(
+                                CodingAgentDispatchState::NotStarted,
+                                code,
+                                "ACP permission response was rejected",
+                                "invalid_input",
+                                "reobserve",
+                            ),
+                        }
                     }
                     None => response_error(
                         CodingAgentDispatchState::NotStarted,
@@ -862,10 +917,14 @@ impl CodingAgentManager {
 
 mod diagnose;
 mod lifecycle;
+mod permission;
 mod protocol;
 mod run;
 mod setup;
 mod store;
+
+use permission::permission_outcome_for_acp;
+use permission::{permission_result_json, PermissionSlot};
 
 use store::{DurableDispatchPhase, DurableRunRecord, DurableRunStore, STORE_SCHEMA_VERSION};
 

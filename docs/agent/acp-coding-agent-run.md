@@ -32,8 +32,12 @@ no production `codex-acp` default. The provider child is always spawned after
 `env_clear()` and receives only configured mappings. Missing source variables
 fail before provider process start.
 
-The P1 Run primitive exposes three model tools: `start_coding_agent`,
-`observe_coding_agent`, and `cancel_coding_agent`. The managed AgentTask entry
+The P1 Run primitive exposes five model tools: `start_coding_agent`,
+`observe_coding_agent`, `cancel_coding_agent`, `respond_coding_agent_permission`,
+and `inspect_coding_agent_config` (bounded config discovery; conservative
+Execute/JobRun + Standard `PermissionEvaluator` for the whole tool because
+`include_live_acp=true` spawns a bounded ephemeral provider probe; live probe
+is opt-in via `include_live_acp`). The managed AgentTask entry
 below adds durable attempt ownership over this same primitive. These Run tools
 require the independent
 `coding_agent:run` OAuth scope. Direct shared-key, open-anonymous, project
@@ -505,6 +509,31 @@ independent and takes precedence. P1 must perform this order:
 An invalid override is `not_started` with `recovery_kind=fix_input`; it must not
 partially begin the coding prompt.
 
+Caller overrides are applied in a provider-agnostic stable order (high-choice
+`select` options before booleans, then one dependency re-pass) with a final
+fail-closed check that every explicit caller key is live-current before
+`session/prompt`. After negotiation, `live_confirmed_effective_config` on
+`observe_coding_agent` (and when already present at start acknowledgment)
+reports only forced and caller-requested keys confirmed by the live session,
+never inferred defaults, and only when the provider-reported current is a legal
+advertised enum value (never arbitrary secret-like free text). Confirmed values
+reflect what ACP reported for that negotiation instant only; they do not prove
+billing tier, quota, or off-session provider policy.
+
+`inspect_coding_agent_config` reuses the typed Runner `Diagnose` operation:
+without `include_live_acp` it returns env presence plus operator allowlist and
+forced-policy **key identities only** (no provider child); with
+`include_live_acp=true` it performs the same bounded `initialize` +
+`session/new` probe as diagnostics and projects live `configOptions` (still no
+`set_config_option` or prompt). Either path uses the same Execute/JobRun tool
+contract and may have provider-side side effects when a child is spawned; live
+currents are labeled as ephemeral-probe defaults only. Timeouts and rejections
+are not auto-retried.
+
+Per-agent `parameterized_model_picker = true` opts in to advertising
+`clientCapabilities._meta.parameterizedModelPicker` on `initialize` when a
+provider documents that requirement; default remains empty capabilities.
+
 The initial P1 operator policy is an explicit allowlist of option ids rather than
 a generic policy language. Permitting one id delegates selection among that
 session's currently advertised legal values; unknown newly advertised option ids
@@ -664,23 +693,65 @@ An ACP `session/request_permission` callback is not fed back through the normal
 WebCodex `PermissionEvaluator`, because that would create a second per-action
 policy layer over the agent's own approval system.
 
-P1 nevertheless must implement the callback. The minimum safe behavior is:
+P1 must implement the callback without auto-allowing:
 
 - emit a bounded sanitized `permission_request` Run event;
 - enter `waiting_permission` while a bounded response deadline is active;
-- never choose an allow option automatically;
-- if `cancel_coding_agent` cancels the prompt while a permission request is
-  outstanding, answer that request with ACP `Cancelled` as required by v1 and
-  then continue the cancel path;
-- if only the permission-response deadline expires, answer ACP `Cancelled`.
-  Do not synthesize an option selection or mutate the Agent's persistent policy;
+- expose a compact `pending_permission` summary on observation with an opaque
+  Run-bound `permission_request_token`, bounded `tool_call_id`, title, and
+  provider-advertised `option_id` values only (never raw ACP JSON-RPC ids,
+  params, or credential material);
+- never choose an allow option automatically and never infer approval from
+  WebCodex `trusted_agent` authority mode or request titles;
+- accept exactly one explicit `respond_coding_agent_permission` call per active
+  pending token, with `coding_agent:run` plus `project:write` and the same Run
+  ownership fences as start; validate `option_id` against the live advertised
+  option set and write ACP `selected` or fail closed;
+- if `cancel_coding_agent`, shutdown, or the permission deadline fires first,
+  answer ACP `Cancelled`, then continue the same prompt observation path;
 - then continue observing the same prompt until it reaches a terminal result or
   becomes lost.
 
-This makes P1 safe but intentionally incomplete for providers/configurations that
-frequently require interactive approval. A later operator UI or model-visible
-permission-response capability requires separate evidence and authority design;
-it is not part of P0/P1 by implication.
+### MCP Apps Host permission card (limited)
+
+When the connected client advertises MCP Apps (`io.modelcontextprotocol/ui`) and
+binds `observe_coding_agent` to `ui://webcodex/acp-permission/v1`, a Host may
+mount a compact interactive card on **that direct tool result only**. The card is
+not a system notification, push channel, or background poller: it appears when
+the model or user flow actually calls `observe_coding_agent` **as a direct MCP
+tool** and the Host chooses to render the App. The Adaptive Runtime
+`call_runtime_tool` gateway does not attach MCP Apps presentation metadata;
+WebCodex does not promise that observing through the gateway will mount
+`ui://webcodex/acp-permission/v1` or auto-open the iframe.
+
+The bundled App:
+
+- reads the sanitized `pending_permission` summary from the `observe_coding_agent`
+  tool result (`request_token`, `generation`, bounded `title`, and
+  provider-advertised `options[{option_id,name,kind}]`);
+- renders **Allow once** only when an option with `kind=allow_once` is present;
+  **Always allow** only when `kind=allow_always` is present (Cursor Provider
+  owns persistence and scope—WebCodex does not store a global whitelist);
+- renders **Reject** only when `kind=reject_once` or `kind=reject_always` is
+  advertised (never inferred from titles or tool names);
+- binds the card to the Host `ui/notifications/tool-input` `arguments.run_id`
+  when present, otherwise to the first valid `observe_coding_agent` result for
+  that mount, and ignores tool results for other Runs;
+- on explicit click, calls `respond_coding_agent_permission` through the Host
+  `tools/call` bridge with the exact `run_id`, `permission_request_token`, and
+  `option_id`, then performs one read-only `observe_coding_agent` refresh
+  (`wait_secs=0`) before showing that the choice was submitted; if that submit or
+  refresh is uncertain, it reconciles with one more read-only observe and does
+  not auto-resubmit or blindly re-enable buttons.
+
+`respond_coding_agent_permission` remains the authoritative backend approval
+tool (`coding_agent:run` plus `project:write`, Run ownership, token/generation
+validation). The App cannot bypass ToolRuntime scopes or permission risk.
+
+Clients **without** MCP Apps support should keep using conversational approval
+followed by a direct `respond_coding_agent_permission` call; WebCodex does not
+claim that ChatGPT or other Hosts will auto-open the iframe without an
+`observe_coding_agent` invocation in that turn.
 
 ## 9. Minimal CodingAgentRun lifecycle
 
@@ -813,6 +884,7 @@ The planned model surface is:
 start_coding_agent
 observe_coding_agent
 cancel_coding_agent
+respond_coding_agent_permission
 ```
 
 P0 does not implement these tools.
@@ -1035,6 +1107,7 @@ Only after the internal vertical slice is typed and tested, add exactly:
 start_coding_agent
 observe_coding_agent
 cancel_coding_agent
+respond_coding_agent_permission
 ```
 
 `start_coding_agent` inputs should be limited to Project, logical provider id,
@@ -1122,8 +1195,7 @@ P0/P1 do not imply:
 - Claude as a second ACP provider;
 - browser-hosted ACP sessions;
 - raw ACP JSON-RPC tools;
-- model-visible permission-response tooling;
-- automatic permission allow;
+- automatic permission allow without an explicit respond call;
 - hot ACP provider reload/generic provider framework;
 - ACP v2 or experimental extensions;
 - scheduler, worker pool, automatic worker spawning, or orchestration;
@@ -1168,7 +1240,7 @@ The P0 architecture baseline is therefore:
     the child environment before explicit `env_from_env` injection, and keeps
     prompt/reasoning/tool bodies out of ordinary durable telemetry/audit.
 14. P1 is one exact Codex vertical slice with typed closed Server<->Runner
-    protocol and three eventual model tools, not a generic agent framework.
+    protocol and four model tools, not a generic agent framework.
 
 
 ## Runner-global forced ACP configuration

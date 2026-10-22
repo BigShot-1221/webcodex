@@ -310,6 +310,8 @@ async fn managed_user_coding_agent_inventory_does_not_cross_owner() {
                             created_at: 1,
                             updated_at: 1,
                             terminal: None,
+                            pending_permission: None,
+                            live_confirmed_effective_config: None,
                         }],
                     },
                 ),

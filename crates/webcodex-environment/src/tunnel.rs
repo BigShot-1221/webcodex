@@ -184,7 +184,7 @@ fn tunnel_service_spec_for_provider(
         ));
     }
     let id = if cfg!(windows) {
-        format!("WebCodexTunnel-{profile_id}")
+        webcodex_runner_config::desktop_edition::windows_profile_tunnel_service_id(profile_id)
     } else {
         format!("webcodex-tunnel-{profile_id}")
     };

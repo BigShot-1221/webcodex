@@ -17,9 +17,12 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use webcodex_core::coding_agent::{
     merge_coding_agent_run_snapshot, validate_coding_agent_run_snapshot, CodingAgentCancelRequest,
+    CodingAgentRespondPermissionRequest,
     CodingAgentConfigValue, CodingAgentDispatchState, CodingAgentEvent, CodingAgentExecutionState,
     CodingAgentObservationMerge, CodingAgentObserveRequest, CodingAgentObserveResult,
+    CodingAgentConfigPolicyProjection, CodingAgentDiagnoseRequest, CodingAgentLiveAcpDiagnostic,
     CodingAgentRequest, CodingAgentResponse, CodingAgentResponsePayload, CodingAgentRunSnapshot,
+    validate_provider_id,
     CodingAgentRunState, CodingAgentStartRequest, CodingAgentTerminal,
     CODING_AGENT_MAX_CONFIG_OPTIONS, CODING_AGENT_MAX_EVENTS_PER_RESPONSE,
     CODING_AGENT_MAX_INVENTORY_RUNS, CODING_AGENT_OBSERVE_WAIT_MAX_SECS,
@@ -29,6 +32,7 @@ use webcodex_core::coding_agent::{
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
 const START_RESPONSE_WAIT_SECS: u64 = 32;
 const CONTROL_RESPONSE_WAIT_SECS: u64 = 65;
+const INSPECT_LIVE_PROBE_WAIT_SECS: u64 = 35;
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 300;
 const PUBLIC_TOKEN_PREFIX: &str = "wcar3_";
 const PUBLIC_TOKEN_MAX_BYTES: usize = 54;
@@ -1032,6 +1036,139 @@ impl ToolRuntime {
         }
     }
 
+    pub(crate) async fn coding_agent_respond_permission(
+        &self,
+        run_id: String,
+        permission_request_token: String,
+        option_id: String,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        let authority = match stable_principal(auth) {
+            Ok(principal) => authority_fingerprint(&principal),
+            Err(error) => {
+                return coding_agent_error(
+                    "coding_agent_identity_unavailable",
+                    error,
+                    "not_started",
+                    RecoveryKind::FixInput,
+                    Some(&run_id),
+                )
+            }
+        };
+        let binding = match self.reconcile_run(&run_id, &authority, auth).await {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                return coding_agent_error(
+                    "unknown_coding_agent_run",
+                    "CodingAgentRun is not visible to this caller",
+                    "not_started",
+                    RecoveryKind::Reobserve,
+                    Some(&run_id),
+                )
+            }
+            Err(error) => {
+                return coding_agent_error(
+                    "coding_agent_observation_conflict",
+                    error,
+                    "outcome_unknown",
+                    RecoveryKind::Reconcile,
+                    Some(&run_id),
+                )
+            }
+        };
+        if binding.snapshot.state != CodingAgentRunState::WaitingPermission {
+            return coding_agent_error(
+                "coding_agent_permission_not_pending",
+                "CodingAgentRun is not waiting for an ACP permission response",
+                self.current_retained_execution_state(&binding).await,
+                RecoveryKind::Reobserve,
+                Some(&run_id),
+            );
+        }
+        let operation = CodingAgentRequest::RespondPermission(CodingAgentRespondPermissionRequest {
+            run_id: run_id.clone(),
+            permission_request_token,
+            option_id,
+        });
+        let (request_id, receiver) = match self
+            .runner_registry
+            .enqueue_coding_agent(
+                &binding.client_id,
+                &binding.runner_instance_id,
+                &binding.provider_id,
+                &binding.provider_instance_id,
+                operation,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                authority.clone(),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return coding_agent_error(
+                    "coding_agent_permission_unavailable",
+                    error,
+                    self.current_retained_execution_state(&binding).await,
+                    RecoveryKind::Reobserve,
+                    Some(&run_id),
+                )
+            }
+        };
+        let response =
+            match tokio::time::timeout(Duration::from_secs(CONTROL_RESPONSE_WAIT_SECS), receiver)
+                .await
+            {
+                Ok(Ok(response)) => response,
+                _ => {
+                    let _ = self
+                        .runner_registry
+                        .cancel_request_dispatch_state(&request_id)
+                        .await;
+                    return coding_agent_error(
+                        "coding_agent_permission_timeout",
+                        "permission response outcome is not yet authoritative; observe the same Run",
+                        self.current_retained_execution_state(&binding).await,
+                        RecoveryKind::Reobserve,
+                        Some(&run_id),
+                    );
+                }
+            };
+        match response.payload {
+            Some(CodingAgentResponsePayload::RespondPermission { run, applied }) => {
+                if !run_matches_binding_identity(&binding, &run) {
+                    return coding_agent_error(
+                        "invalid_runner_response",
+                        "Runner returned mismatched CodingAgentRun identity",
+                        self.current_retained_execution_state(&binding).await,
+                        RecoveryKind::Reconcile,
+                        Some(&run_id),
+                    );
+                }
+                let merged = match self
+                    .coding_agent_runs
+                    .merge_bound_snapshot(&binding, run)
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        return coding_agent_error(
+                            "coding_agent_observation_conflict",
+                            error,
+                            self.current_retained_execution_state(&binding).await,
+                            RecoveryKind::Reconcile,
+                            Some(&run_id),
+                        )
+                    }
+                };
+                ToolResult::ok(respond_permission_projection(&merged.snapshot, applied))
+            }
+            _ => {
+                let retained = self.current_retained_binding(&binding).await;
+                response_to_tool_error(response, Some(&run_id), &retained.snapshot)
+            }
+        }
+    }
+
     pub(crate) async fn coding_agent_cancel(
         &self,
         run_id: String,
@@ -1172,6 +1309,169 @@ impl ToolRuntime {
                 let retained = self.current_retained_binding(&binding).await;
                 response_to_tool_error(response, Some(&run_id), &retained.snapshot)
             }
+        }
+    }
+
+    pub(crate) async fn coding_agent_inspect_config(
+        &self,
+        project: String,
+        provider_id: String,
+        include_live_acp: bool,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        if validate_provider_id(&provider_id).is_err() {
+            return coding_agent_error(
+                "invalid_coding_agent_inspect",
+                "provider_id is invalid",
+                "not_started",
+                RecoveryKind::FixInput,
+                None,
+            );
+        }
+        let principal = match stable_principal(auth) {
+            Ok(principal) => principal,
+            Err(error) => {
+                return coding_agent_error(
+                    "coding_agent_identity_unavailable",
+                    error,
+                    "not_started",
+                    RecoveryKind::FixInput,
+                    None,
+                )
+            }
+        };
+        let authority_fingerprint = authority_fingerprint(&principal);
+        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error.into_tool_result(),
+        };
+        let client_id = resolved.config.client_id.as_str();
+        let client = match self
+            .runner_registry
+            .get_runner_semantic_view_for_auth(
+                client_id,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+            )
+            .await
+        {
+            Some(client) if client.view.connected => client,
+            _ => {
+                return coding_agent_error(
+                    "coding_agent_runner_unavailable",
+                    "exact Project Runner is offline or unauthorized",
+                    "not_started",
+                    RecoveryKind::Wait,
+                    None,
+                )
+            }
+        };
+        if !client.supports(RunnerFeature::CodingAgentRuns) {
+            return coding_agent_error(
+                "coding_agent_unsupported",
+                "exact Project Runner does not advertise CodingAgentRun",
+                "not_started",
+                RecoveryKind::Reobserve,
+                None,
+            );
+        }
+        let client = client.view;
+        let provider_instance_id = match client
+            .coding_agent_providers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find(|provider| provider.provider_id == provider_id)
+        {
+            Some(provider) => provider.provider_instance_id.clone(),
+            None => {
+                let mut error = coding_agent_error(
+                    "coding_agent_provider_unavailable",
+                    "Logical ACP provider is not advertised by the exact Project Runner",
+                    "not_started",
+                    RecoveryKind::Reobserve,
+                    None,
+                );
+                error.output["available_providers"] =
+                    json!(webcodex_core::coding_agent::safe_provider_inventory(
+                        client.coding_agent_providers.as_deref()
+                    ));
+                return error;
+            }
+        };
+        let correlation_run_id = format!(
+            "wc_agent_run_inspect_{}",
+            Uuid::new_v4().simple().to_string()
+        );
+        let operation = CodingAgentRequest::Diagnose(CodingAgentDiagnoseRequest {
+            run_id: correlation_run_id,
+            runtime_project_id: resolved.resolved_id.clone(),
+            project_root: resolved.config.path.clone(),
+            provider_id: provider_id.clone(),
+            provider_instance_id: provider_instance_id.clone(),
+            include_live_acp,
+        });
+        let wait_secs = if include_live_acp {
+            INSPECT_LIVE_PROBE_WAIT_SECS
+        } else {
+            START_RESPONSE_WAIT_SECS
+        };
+        let (request_id, receiver) = match self
+            .runner_registry
+            .enqueue_coding_agent(
+                &client.client_id,
+                &client.runner_instance_id,
+                &provider_id,
+                &provider_instance_id,
+                operation,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                authority_fingerprint,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return coding_agent_error(
+                    "coding_agent_inspect_rejected",
+                    error,
+                    "not_started",
+                    RecoveryKind::Reobserve,
+                    None,
+                )
+            }
+        };
+        let response = match tokio::time::timeout(Duration::from_secs(wait_secs), receiver).await {
+            Ok(Ok(response)) => response,
+            _ => {
+                let _ = self
+                    .runner_registry
+                    .cancel_request_dispatch_state(&request_id)
+                    .await;
+                return coding_agent_error(
+                    "coding_agent_inspect_timeout",
+                    "ACP config inspection did not complete within the bounded wait",
+                    "not_started",
+                    RecoveryKind::Reobserve,
+                    None,
+                );
+            }
+        };
+        match response.payload {
+            Some(CodingAgentResponsePayload::Diagnose {
+                provider_id: actual_provider_id,
+                provider_instance_id: actual_instance_id,
+                env_presence,
+                config_policy,
+                live_acp,
+            }) => ToolResult::ok(inspect_config_projection(
+                &resolved.resolved_id,
+                &actual_provider_id,
+                &actual_instance_id,
+                include_live_acp,
+                env_presence,
+                config_policy,
+                live_acp,
+            )),
+            _ => coding_agent_start_failure_from_response(response, "").into_tool_result(),
         }
     }
 
@@ -1741,13 +2041,55 @@ fn parse_observation_token(
 }
 
 fn start_projection(run: &CodingAgentRunSnapshot, token: String) -> Value {
-    json!({
+    let mut output = json!({
         "run_id": run.run_id,
         "project": run.runtime_project_id,
         "provider_id": run.provider_id,
         "state": run.state.as_str(),
         "execution_state": run.execution_state.as_str(),
         "observation_token": token,
+        "terminal": terminal_projection(run),
+    });
+    if let Some(config) = &run.live_confirmed_effective_config {
+        output["live_confirmed_effective_config"] = json!(config);
+    }
+    output
+}
+
+fn inspect_config_projection(
+    project: &str,
+    provider_id: &str,
+    _provider_instance_id: &str,
+    include_live_acp: bool,
+    env_presence: BTreeMap<String, bool>,
+    config_policy: CodingAgentConfigPolicyProjection,
+    live_acp: Option<CodingAgentLiveAcpDiagnostic>,
+) -> Value {
+    let live_scope = if include_live_acp {
+        "ephemeral_probe_defaults_only"
+    } else {
+        "not_requested"
+    };
+    json!({
+        "project": project,
+        "provider_id": provider_id,
+        "include_live_acp": include_live_acp,
+        "live_probe_scope": live_scope,
+        "live_probe_disclaimer": "Live option currents reflect only the authorized ephemeral initialize+session/new probe when include_live_acp=true; they are not a future Run guarantee, billing tier, or persisted default.",
+        "env_presence": env_presence,
+        "config_policy": config_policy,
+        "live_acp": live_acp,
+    })
+}
+
+fn respond_permission_projection(run: &CodingAgentRunSnapshot, applied: bool) -> Value {
+    json!({
+        "run_id": run.run_id,
+        "project": run.runtime_project_id,
+        "provider_id": run.provider_id,
+        "state": run.state.as_str(),
+        "execution_state": run.execution_state.as_str(),
+        "applied": applied,
         "terminal": terminal_projection(run),
     })
 }
@@ -1776,7 +2118,7 @@ fn observe_projection(
         .iter()
         .map(event_projection)
         .collect::<Vec<_>>();
-    json!({
+    let mut projection = json!({
         "run_id": run.run_id,
         "project": run.runtime_project_id,
         "provider_id": run.provider_id,
@@ -1787,8 +2129,13 @@ fn observe_projection(
         "has_more": observation.has_more,
         "history_lost": observation.history_lost || reset,
         "first_retained_sequence": observation.first_retained_sequence,
+        "pending_permission": run.pending_permission,
         "terminal": terminal_projection(run),
-    })
+    });
+    if let Some(config) = &run.live_confirmed_effective_config {
+        projection["live_confirmed_effective_config"] = json!(config);
+    }
+    projection
 }
 
 fn event_projection(event: &CodingAgentEvent) -> Value {
@@ -1972,6 +2319,8 @@ mod tests {
                 created_at: updated_at,
                 updated_at,
                 terminal,
+                pending_permission: None,
+                live_confirmed_effective_config: None,
             },
         }
     }

@@ -34,6 +34,7 @@ pub(crate) fn request(id: &str, revision: u64) -> CodingAgentUpdate {
             enabled: true,
             env_from_env: BTreeMap::from([("OPENAI_API_KEY".into(), "SUB2API_API_KEY".into())]),
             allowed_config_options: vec!["mode".into()],
+            parameterized_model_picker: false,
         },
         global_settings: None,
     }

@@ -30,6 +30,7 @@ pub struct DesktopDataDir {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopDataDirError {
     RelativeOverride,
+    DevEditionEnvOverrideForbidden,
     Unavailable {
         reason: DesktopDataDirFailureReason,
         path_kind: DesktopDataDirPathKind,
@@ -101,6 +102,11 @@ pub fn resolve_with_override_detailed(
     default: PathBuf,
     override_value: Option<std::ffi::OsString>,
 ) -> Result<DesktopDataDir, DesktopDataDirError> {
+    if webcodex_runner_config::desktop_edition::desktop_dev_edition_enabled()
+        && override_value.is_some()
+    {
+        return Err(DesktopDataDirError::DevEditionEnvOverrideForbidden);
+    }
     let (logical, source) = match override_value {
         Some(value) => {
             let path = PathBuf::from(value);
@@ -257,7 +263,7 @@ fn invalid_data_dir(path: &Path, reason: DesktopDataDirFailureReason) -> Desktop
 pub fn default_desktop_data_dir() -> UpdateResult<PathBuf> {
     let default = dirs::data_local_dir()
         .ok_or(UpdateError::CacheUnavailable)?
-        .join("dev.webcodex.desktop");
+        .join(webcodex_runner_config::desktop_edition::desktop_app_local_data_component());
     resolve(default).map(|dir| dir.effective)
 }
 

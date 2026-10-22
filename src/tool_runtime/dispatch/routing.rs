@@ -172,6 +172,8 @@ impl ToolRuntime {
             call @ (ToolCall::CodingAgentStart { .. }
             | ToolCall::CodingAgentObserve { .. }
             | ToolCall::CodingAgentCancel { .. }
+            | ToolCall::CodingAgentRespondPermission { .. }
+            | ToolCall::CodingAgentInspectConfig { .. }
             | ToolCall::RunProcess { .. }
             | ToolCall::JobWriteInput { .. }
             | ToolCall::RunDetachedProcess { .. }

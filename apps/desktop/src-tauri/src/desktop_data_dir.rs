@@ -56,6 +56,11 @@ fn project_data_dir_error(
 ) -> DesktopError {
     use webcodex_environment::unified_update::desktop_data_dir::DesktopDataDirError;
     match error {
+        DesktopDataDirError::DevEditionEnvOverrideForbidden => DesktopError::new(
+            "desktop_data_dir_dev_override_forbidden",
+            "WebCodex Desktop Dev ignores WEBCODEX_DESKTOP_DATA_DIR so it cannot share production app data",
+            "Unset WEBCODEX_DESKTOP_DATA_DIR or use the production Desktop build for that data root.",
+        ),
         DesktopDataDirError::RelativeOverride => DesktopError::new(
             "desktop_data_dir_invalid",
             format!("{DESKTOP_DATA_DIR_ENV} must be an absolute path"),

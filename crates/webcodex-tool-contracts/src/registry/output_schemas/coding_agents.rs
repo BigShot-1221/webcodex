@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use webcodex_core::coding_agent::{
-    CodingAgentEventKind, CodingAgentExecutionState, CodingAgentProviderSummary,
-    CodingAgentRunState,
+    CodingAgentEventKind, CodingAgentExecutionState, CodingAgentPendingPermission,
+    CodingAgentProviderSummary, CodingAgentRunState,
 };
 
 use crate::schema_generation::typed_host_schema;
@@ -51,6 +51,15 @@ fn usage_schema() -> Value {
     })
 }
 
+fn pending_permission_schema() -> Value {
+    json!({
+        "anyOf": [
+            typed_host_schema::<CodingAgentPendingPermission>(),
+            {"type": "null"}
+        ]
+    })
+}
+
 fn event_schema() -> Value {
     json!({
         "type":"object",
@@ -95,6 +104,26 @@ fn common_run_fields() -> Vec<(&'static str, Value)> {
 }
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
+    if name == "inspect_coding_agent_config" {
+        let fields = vec![
+            ("project", schema_type("string", "Exact registered runtime Project id.")),
+            ("provider_id", schema_type("string", "Logical operator-configured provider id.")),
+            ("include_live_acp", schema_type("boolean", "Whether the ephemeral live probe was authorized.")),
+            ("live_probe_scope", schema_type("string", "Whether live currents are from an ephemeral probe or absent.")),
+            ("live_probe_disclaimer", schema_type("string", "Clarifies probe-only currents vs future Runs.")),
+            (
+                "env_presence",
+                json!({
+                    "type":"object",
+                    "maxProperties": webcodex_core::coding_agent::CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES,
+                    "additionalProperties":{"type":"boolean"}
+                }),
+            ),
+            ("config_policy", typed_host_schema::<webcodex_core::coding_agent::CodingAgentConfigPolicyProjection>()),
+            ("live_acp", json!({"anyOf":[typed_host_schema::<webcodex_core::coding_agent::CodingAgentLiveAcpDiagnostic>(), {"type":"null"}]})),
+        ];
+        return Some(wrapped_output_schema(fields));
+    }
     let mut fields = common_run_fields();
     match name {
         "start_coding_agent" => {
@@ -120,6 +149,18 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "observation_token",
                 schema_type("string", "Opaque Run-bound observation token."),
             ));
+            fields.push((
+                "live_confirmed_effective_config",
+                json!({
+                    "anyOf": [
+                        {
+                            "type": "array",
+                            "items": typed_host_schema::<webcodex_core::coding_agent::CodingAgentLiveConfirmedConfigEntry>(),
+                        },
+                        {"type": "null"}
+                    ]
+                }),
+            ));
             Some(wrapped_output_schema(fields))
         }
         "observe_coding_agent" => {
@@ -129,6 +170,22 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ("has_more", schema_type("boolean", "True when retained newer events remain after this page.")),
                 ("history_lost", schema_type("boolean", "True when the requested cursor predates retained history or the Server epoch rebaselined.")),
                 ("first_retained_sequence", schema_type("integer", "First currently retained Runner event sequence.")),
+                (
+                    "pending_permission",
+                    pending_permission_schema(),
+                ),
+                (
+                    "live_confirmed_effective_config",
+                    json!({
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "items": typed_host_schema::<webcodex_core::coding_agent::CodingAgentLiveConfirmedConfigEntry>(),
+                            },
+                            {"type": "null"}
+                        ]
+                    }),
+                ),
             ]);
             Some(wrapped_output_schema(fields))
         }
@@ -138,6 +195,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type(
                     "boolean",
                     "True when cancellation was requested for a nonterminal Run.",
+                ),
+            ));
+            Some(wrapped_output_schema(fields))
+        }
+        "respond_coding_agent_permission" => {
+            fields.push((
+                "applied",
+                schema_type(
+                    "boolean",
+                    "True when the Runner accepted the permission choice for the active callback.",
                 ),
             ));
             Some(wrapped_output_schema(fields))
@@ -157,6 +224,7 @@ mod tests {
             "start_coding_agent",
             "observe_coding_agent",
             "cancel_coding_agent",
+            "respond_coding_agent_permission",
         ] {
             let schema = output_schema_for_tool(tool).unwrap();
             let fields = &schema["properties"]["output"]["properties"];
@@ -264,5 +332,23 @@ mod tests {
         let serialized = serde_json::to_string(&observe).unwrap();
         assert!(serialized.contains("agent_message"));
         assert!(!serialized.contains("agentmessage"));
+    }
+
+    #[test]
+    fn inspect_coding_agent_config_output_schema_matches_diagnose_budgets() {
+        use webcodex_core::coding_agent::{
+            CODING_AGENT_MAX_CONFIG_OPTIONS, CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES,
+        };
+
+        let schema = output_schema_for_tool("inspect_coding_agent_config").unwrap();
+        let fields = &schema["properties"]["output"]["properties"];
+        assert_eq!(
+            fields["env_presence"]["maxProperties"],
+            json!(CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES)
+        );
+        let policy = &fields["config_policy"]["properties"]["caller_allowed_option_ids"];
+        assert_eq!(policy["maxItems"], json!(CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES));
+        let live_options = &fields["live_acp"]["anyOf"][0]["properties"]["options"];
+        assert_eq!(live_options["maxItems"], json!(CODING_AGENT_MAX_CONFIG_OPTIONS));
     }
 }

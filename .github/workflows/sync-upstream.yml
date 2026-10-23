@@ -1,0 +1,79 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 09:00 China Standard Time (UTC+8)
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge official main into fork main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch and merge upstream
+        shell: bash
+        env:
+          UPSTREAM_REPOSITORY: yyjeqhc/webcodex
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Refresh both refs so we never push from a stale checkout.
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags origin main
+          git fetch --no-tags upstream main
+
+          git checkout main
+          git reset --hard origin/main
+
+          if git merge-base --is-ancestor upstream/main main; then
+            echo "Fork main already contains upstream main; no sync needed."
+            {
+              echo "## Upstream sync"
+              echo "No changes needed: `main` already contains `yyjeqhc/webcodex:main`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! git merge --no-edit --no-ff upstream/main; then
+            git merge --abort || true
+            {
+              echo "## Upstream sync needs manual conflict resolution"
+              echo "The merge from `yyjeqhc/webcodex:main` conflicted. Nothing was pushed to the fork."
+              echo "Resolve the conflicts locally, then rerun this workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Upstream merge conflict. No changes were pushed."
+            exit 1
+          fi
+
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            echo "No new commit to push."
+            exit 0
+          fi
+
+          git push origin HEAD:refs/heads/main
+
+          {
+            echo "## Upstream sync succeeded"
+            echo "Merged `yyjeqhc/webcodex:main` into `BigShot-1221/webcodex:main`."
+            echo "Upstream HEAD: `$(git rev-parse upstream/main)`"
+            echo "Fork HEAD: `$(git rev-parse HEAD)`"
+          } >> "$GITHUB_STEP_SUMMARY"

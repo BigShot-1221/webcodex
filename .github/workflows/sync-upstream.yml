@@ -28,13 +28,12 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Fetch and merge upstream
+      - name: Fetch, merge, and preserve the fork ACP App
         shell: bash
         env:
           UPSTREAM_REPOSITORY: yyjeqhc/webcodex
         run: |
           set -euo pipefail
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -46,7 +45,7 @@ jobs:
 
           if git merge-base --is-ancestor upstream/main main; then
             printf 'Fork main already contains upstream main; no sync needed.\n'
-            printf '## Upstream sync\n\nNo changes needed: main already contains yyjeqhc/webcodex:main.\n' >> "$GITHUB_STEP_SUMMARY"
+            printf '## Upstream sync\n\nNo changes needed.\n' >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
@@ -55,63 +54,76 @@ jobs:
             expected="$(printf '%s\n%s' \
               'src/mcp/app_registry/builtin.rs' \
               'src/mcp/app_registry/tests.rs')"
-
             git merge --abort || true
 
             if [ "$conflicts" != "$expected" ]; then
-              printf '## Upstream sync needs manual conflict resolution\n\n' >> "$GITHUB_STEP_SUMMARY"
-              printf 'Unexpected conflicting files:\n\n%s\n\nNo changes were pushed.\n' "$conflicts" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::Unexpected upstream conflicts. No changes were pushed."
+              printf '## Upstream sync stopped: unexpected conflicts\n\n%s\n' "$conflicts" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Unexpected upstream conflicts. Nothing was pushed."
               exit 1
             fi
 
-            echo "Only the known MCP App registry files conflict; retrying with upstream-preferred conflict hunks."
+            echo "Resolving the two known registry conflicts using upstream code, then restoring the fork ACP App."
             if ! git merge --no-edit --no-ff -X theirs upstream/main; then
               git merge --abort || true
-              echo "::error::Targeted conflict resolution failed. No changes were pushed."
+              echo "::error::The known registry conflicts could not be resolved. Nothing was pushed."
               exit 1
             fi
 
-            # Restore the fork-specific ACP permission App and update its
-            # registry tests on top of the official versions. Fail closed if
-            # the upstream layout changes unexpectedly.
             python3 - <<'PY'
           from pathlib import Path
 
           builtin_path = Path("src/mcp/app_registry/builtin.rs")
           tests_path = Path("src/mcp/app_registry/tests.rs")
+          html_path = Path("src/mcp_acp_permission_app.html")
+
           builtin = builtin_path.read_text(encoding="utf-8")
           tests = tests_path.read_text(encoding="utf-8")
+          html = html_path.read_text(encoding="utf-8")
 
-          def insert_after(text, anchor, addition, label):
-              if addition.strip() in text:
+          required_html = [
+              "const MAX_OPTIONS = 16",
+              "MAX_IDENTITY_KEY_BYTES",
+              "ui/notifications/tool-input",
+              "ui/resource-teardown",
+              "pagehide",
+              "beforeunload",
+              "observe_coding_agent",
+              "Outcome unconfirmed; re-observe the same Run",
+          ]
+          for marker in required_html:
+              if marker not in html:
+                  raise SystemExit(f"ACP App source check failed: missing {marker!r}")
+          if "const MAX_OPTIONS = 8" in html:
+              raise SystemExit("ACP App source check failed: outdated option limit")
+
+          def replace_once(text, old, new, label):
+              if new in text:
                   return text
-              if anchor not in text:
-                  raise SystemExit(f"Cannot safely restore {label}: anchor not found")
-              return text.replace(anchor, anchor + addition, 1)
+              if old not in text:
+                  raise SystemExit(f"Cannot safely restore {label}: expected upstream anchor not found")
+              return text.replace(old, new, 1)
 
-          uri_anchor = (
+          builtin = replace_once(
+              builtin,
               'pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI: &str =\n'
-              '    "ui://webcodex/job-terminal-continuation/v3";'
-          )
-          builtin = insert_after(
-              builtin, uri_anchor,
-              '\npub(in crate::mcp) const MCP_ACP_PERMISSION_UI_RESOURCE_URI: &str = "ui://webcodex/acp-permission/v1";',
+              '    "ui://webcodex/job-terminal-continuation/v3";',
+              'pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI: &str =\n'
+              '    "ui://webcodex/job-terminal-continuation/v3";\n'
+              'pub(in crate::mcp) const MCP_ACP_PERMISSION_UI_RESOURCE_URI: &str = "ui://webcodex/acp-permission/v1";',
               "ACP resource URI",
           )
-
-          html_anchor = (
+          builtin = replace_once(
+              builtin,
               'pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_APP_HTML: &str =\n'
-              '    include_str!("../../mcp_job_terminal_continuation_app.html");'
-          )
-          builtin = insert_after(
-              builtin, html_anchor,
-              '\npub(in crate::mcp) const MCP_ACP_PERMISSION_APP_HTML: &str =\n'
+              '    include_str!("../../mcp_job_terminal_continuation_app.html");',
+              'pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_APP_HTML: &str =\n'
+              '    include_str!("../../mcp_job_terminal_continuation_app.html");\n'
+              'pub(in crate::mcp) const MCP_ACP_PERMISSION_APP_HTML: &str =\n'
               '    include_str!("../../mcp_acp_permission_app.html");',
               "ACP HTML binding",
           )
 
-          acp_app = (
+          acp_entry = (
               '    BundledMcpApp {\n'
               '        listing: Some(AppListing {\n'
               '            name: "WebCodex ACP Permission",\n'
@@ -129,22 +141,15 @@ jobs:
           if 'name: "WebCodex ACP Permission"' not in builtin:
               if docx_anchor not in builtin:
                   raise SystemExit("Cannot safely restore ACP registry entry: DOCX anchor not found")
-              builtin = builtin.replace(docx_anchor, acp_app + docx_anchor, 1)
+              builtin = builtin.replace(docx_anchor, acp_entry + docx_anchor, 1)
 
-          if "MCP_ACP_PERMISSION_APP_HTML" not in builtin or "observe_coding_agent" not in builtin:
-              raise SystemExit("ACP registry restoration verification failed")
-          builtin_path.write_text(builtin, encoding="utf-8")
-
-          expected_anchor = '        "ui://webcodex/job-terminal-continuation/v3",\n'
-          if '"ui://webcodex/acp-permission/v1"' not in tests:
-              if expected_anchor not in tests:
-                  raise SystemExit("Cannot safely update registry test URI list")
-              tests = tests.replace(
-                  expected_anchor,
-                  expected_anchor + '        "ui://webcodex/acp-permission/v1",\n',
-                  1,
-              )
-
+          tests = replace_once(
+              tests,
+              '        "ui://webcodex/job-terminal-continuation/v3",\n',
+              '        "ui://webcodex/job-terminal-continuation/v3",\n'
+              '        "ui://webcodex/acp-permission/v1",\n',
+              "ACP URI test",
+          )
           tests = tests.replace("assert_eq!(tools.len(), 9);", "assert_eq!(tools.len(), 10);", 1)
 
           mapping_anchor = (
@@ -160,20 +165,15 @@ jobs:
               '        ),\n'
           )
           if acp_mapping not in tests:
-              if mapping_anchor not in tests:
-                  raise SystemExit("Cannot safely update registry tool mapping test")
-              tests = tests.replace(mapping_anchor, mapping_anchor + acp_mapping, 1)
+              tests = replace_once(tests, mapping_anchor, mapping_anchor + acp_mapping, "ACP tool mapping")
 
           display_anchor = '                    | MCP_SPREADSHEET_UI_RESOURCE_URI\n            ) {'
+          display_replacement = (
+              '                    | MCP_SPREADSHEET_UI_RESOURCE_URI\n'
+              '                    | MCP_ACP_PERMISSION_UI_RESOURCE_URI\n            ) {'
+          )
           if '                    | MCP_ACP_PERMISSION_UI_RESOURCE_URI' not in tests:
-              if display_anchor not in tests:
-                  raise SystemExit("Cannot safely update ACP display-mode assertion")
-              tests = tests.replace(
-                  display_anchor,
-                  '                    | MCP_SPREADSHEET_UI_RESOURCE_URI\n'
-                  '                    | MCP_ACP_PERMISSION_UI_RESOURCE_URI\n            ) {',
-                  1,
-              )
+              tests = replace_once(tests, display_anchor, display_replacement, "ACP display-mode assertion")
 
           acp_test = (
               '#[test]\n'
@@ -188,32 +188,23 @@ jobs:
               '        "observe_coding_agent",\n'
               '        "Outcome unconfirmed; re-observe the same Run",\n'
               '    ] {\n'
-              '        assert!(\n'
-              '            MCP_ACP_PERMISSION_APP_HTML.contains(required),\n'
-              '            "missing ACP permission App behavior: {required}"\n'
-              '        );\n'
+              '        assert!(MCP_ACP_PERMISSION_APP_HTML.contains(required), "missing ACP App behavior: {required}");\n'
               '    }\n'
-              '    assert!(\n'
-              '        !MCP_ACP_PERMISSION_APP_HTML.contains("const MAX_OPTIONS = 8"),\n'
-              '        "ACP permission App must not cap options below Runner limit"\n'
-              '    );\n'
+              '    assert!(!MCP_ACP_PERMISSION_APP_HTML.contains("const MAX_OPTIONS = 8"));\n'
               '}\n\n'
           )
-          metadata_anchor = (
-              '#[test]\n'
-              'fn bundled_app_registry_metadata_preserves_existing_descriptor_fields()'
-          )
+          test_anchor = '#[test]\nfn bundled_app_registry_metadata_preserves_existing_descriptor_fields()'
           if "fn bundled_acp_permission_app_aligns_with_runner_permission_bounds()" not in tests:
-              if metadata_anchor not in tests:
-                  raise SystemExit("Cannot safely restore ACP permission test")
-              tests = tests.replace(metadata_anchor, acp_test + metadata_anchor, 1)
+              tests = replace_once(tests, test_anchor, acp_test + test_anchor, "ACP source test")
 
           if tests.count('"ui://webcodex/acp-permission/v1"') != 1:
               raise SystemExit("ACP URI test verification failed")
           if "assert_eq!(tools.len(), 10);" not in tests:
-              raise SystemExit("ACP tool-count test verification failed")
+              raise SystemExit("ACP tool-count verification failed")
           if "fn bundled_acp_permission_app_aligns_with_runner_permission_bounds()" not in tests:
-              raise SystemExit("ACP permission test verification failed")
+              raise SystemExit("ACP test verification failed")
+
+          builtin_path.write_text(builtin, encoding="utf-8")
           tests_path.write_text(tests, encoding="utf-8")
           PY
 
@@ -224,12 +215,6 @@ jobs:
             cargo test --lib bundled_acp_permission_app_aligns_with_runner_permission_bounds
           fi
 
-          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
-            echo "No new commit to push."
-            exit 0
-          fi
-
           git push origin HEAD:refs/heads/main
-
-          printf '## Upstream sync succeeded\n\nMerged yyjeqhc/webcodex:main into BigShot-1221/webcodex:main.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '## Upstream sync succeeded\n\nMerged official main and preserved the ACP permission App.\n' >> "$GITHUB_STEP_SUMMARY"
           printf 'Upstream HEAD: %s\nFork HEAD: %s\n' "$(git rev-parse upstream/main)" "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

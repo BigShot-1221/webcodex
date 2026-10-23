@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-upstream-main
@@ -16,6 +16,8 @@ concurrency:
 jobs:
   sync:
     name: Merge official main into fork main
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -40,6 +42,7 @@ jobs:
           git fetch --no-tags origin main
           git fetch --no-tags upstream main
           git checkout main
+          git reset --hard origin/main
 
           if git merge-base --is-ancestor upstream/main main; then
             printf 'Fork main already contains upstream main; no sync needed.\n'

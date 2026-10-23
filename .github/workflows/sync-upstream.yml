@@ -17,7 +17,7 @@ jobs:
   sync:
     name: Merge official main into fork main
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - name: Checkout fork main
@@ -36,32 +36,189 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Refresh both refs so we never push from a stale checkout.
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch --no-tags origin main
           git fetch --no-tags upstream main
-
           git checkout main
-          git reset --hard origin/main
 
           if git merge-base --is-ancestor upstream/main main; then
-            echo "Fork main already contains upstream main; no sync needed."
-            {
-              echo "## Upstream sync"
-              echo "No changes needed: `main` already contains `yyjeqhc/webcodex:main`."
-            } >> "$GITHUB_STEP_SUMMARY"
+            printf 'Fork main already contains upstream main; no sync needed.\n'
+            printf '## Upstream sync\n\nNo changes needed: main already contains yyjeqhc/webcodex:main.\n' >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           if ! git merge --no-edit --no-ff upstream/main; then
+            conflicts="$(git diff --name-only --diff-filter=U | sort)"
+            expected="$(printf '%s\n%s' \
+              'src/mcp/app_registry/builtin.rs' \
+              'src/mcp/app_registry/tests.rs')"
+
             git merge --abort || true
-            {
-              echo "## Upstream sync needs manual conflict resolution"
-              echo "The merge from `yyjeqhc/webcodex:main` conflicted. Nothing was pushed to the fork."
-              echo "Resolve the conflicts locally, then rerun this workflow."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Upstream merge conflict. No changes were pushed."
-            exit 1
+
+            if [ "$conflicts" != "$expected" ]; then
+              printf '## Upstream sync needs manual conflict resolution\n\n' >> "$GITHUB_STEP_SUMMARY"
+              printf 'Unexpected conflicting files:\n\n%s\n\nNo changes were pushed.\n' "$conflicts" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::Unexpected upstream conflicts. No changes were pushed."
+              exit 1
+            fi
+
+            echo "Only the known MCP App registry files conflict; retrying with upstream-preferred conflict hunks."
+            if ! git merge --no-edit --no-ff -X theirs upstream/main; then
+              git merge --abort || true
+              echo "::error::Targeted conflict resolution failed. No changes were pushed."
+              exit 1
+            fi
+
+            # Restore the fork-specific ACP permission App and update its
+            # registry tests on top of the official versions. Fail closed if
+            # the upstream layout changes unexpectedly.
+            python3 - <<'PY'
+          from pathlib import Path
+
+          builtin_path = Path("src/mcp/app_registry/builtin.rs")
+          tests_path = Path("src/mcp/app_registry/tests.rs")
+          builtin = builtin_path.read_text(encoding="utf-8")
+          tests = tests_path.read_text(encoding="utf-8")
+
+          def insert_after(text, anchor, addition, label):
+              if addition.strip() in text:
+                  return text
+              if anchor not in text:
+                  raise SystemExit(f"Cannot safely restore {label}: anchor not found")
+              return text.replace(anchor, anchor + addition, 1)
+
+          uri_anchor = (
+              'pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI: &str =\n'
+              '    "ui://webcodex/job-terminal-continuation/v3";'
+          )
+          builtin = insert_after(
+              builtin, uri_anchor,
+              '\npub(in crate::mcp) const MCP_ACP_PERMISSION_UI_RESOURCE_URI: &str = "ui://webcodex/acp-permission/v1";',
+              "ACP resource URI",
+          )
+
+          html_anchor = (
+              'pub(in crate::mcp) const MCP_JOB_TERMINAL_CONTINUATION_APP_HTML: &str =\n'
+              '    include_str!("../../mcp_job_terminal_continuation_app.html");'
+          )
+          builtin = insert_after(
+              builtin, html_anchor,
+              '\npub(in crate::mcp) const MCP_ACP_PERMISSION_APP_HTML: &str =\n'
+              '    include_str!("../../mcp_acp_permission_app.html");',
+              "ACP HTML binding",
+          )
+
+          acp_app = (
+              '    BundledMcpApp {\n'
+              '        listing: Some(AppListing {\n'
+              '            name: "WebCodex ACP Permission",\n'
+              '            description: "Compact interactive card for Cursor ACP permission callbacks observed through observe_coding_agent. Clickable choices use only provider-advertised option_id values via respond_coding_agent_permission; no auto-approval or background prompts.",\n'
+              '        }),\n'
+              '        tools: &["observe_coding_agent"],\n'
+              '        read_display_modes: &["inline", "fullscreen"],\n'
+              '        ..BundledMcpApp::template(MCP_ACP_PERMISSION_UI_RESOURCE_URI, MCP_ACP_PERMISSION_APP_HTML)\n'
+              '    },\n'
+          )
+          docx_anchor = (
+              '    BundledMcpApp {\n'
+              '        listing: Some(AppListing { name: "WebCodex DOCX",'
+          )
+          if 'name: "WebCodex ACP Permission"' not in builtin:
+              if docx_anchor not in builtin:
+                  raise SystemExit("Cannot safely restore ACP registry entry: DOCX anchor not found")
+              builtin = builtin.replace(docx_anchor, acp_app + docx_anchor, 1)
+
+          if "MCP_ACP_PERMISSION_APP_HTML" not in builtin or "observe_coding_agent" not in builtin:
+              raise SystemExit("ACP registry restoration verification failed")
+          builtin_path.write_text(builtin, encoding="utf-8")
+
+          expected_anchor = '        "ui://webcodex/job-terminal-continuation/v3",\n'
+          if '"ui://webcodex/acp-permission/v1"' not in tests:
+              if expected_anchor not in tests:
+                  raise SystemExit("Cannot safely update registry test URI list")
+              tests = tests.replace(
+                  expected_anchor,
+                  expected_anchor + '        "ui://webcodex/acp-permission/v1",\n',
+                  1,
+              )
+
+          tests = tests.replace("assert_eq!(tools.len(), 9);", "assert_eq!(tools.len(), 10);", 1)
+
+          mapping_anchor = (
+              '        (\n'
+              '            "present_job_terminal_continuation",\n'
+              '            MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI,\n'
+              '        ),\n'
+          )
+          acp_mapping = (
+              '        (\n'
+              '            "observe_coding_agent",\n'
+              '            MCP_ACP_PERMISSION_UI_RESOURCE_URI,\n'
+              '        ),\n'
+          )
+          if acp_mapping not in tests:
+              if mapping_anchor not in tests:
+                  raise SystemExit("Cannot safely update registry tool mapping test")
+              tests = tests.replace(mapping_anchor, mapping_anchor + acp_mapping, 1)
+
+          display_anchor = '                    | MCP_SPREADSHEET_UI_RESOURCE_URI\n            ) {'
+          if '                    | MCP_ACP_PERMISSION_UI_RESOURCE_URI' not in tests:
+              if display_anchor not in tests:
+                  raise SystemExit("Cannot safely update ACP display-mode assertion")
+              tests = tests.replace(
+                  display_anchor,
+                  '                    | MCP_SPREADSHEET_UI_RESOURCE_URI\n'
+                  '                    | MCP_ACP_PERMISSION_UI_RESOURCE_URI\n            ) {',
+                  1,
+              )
+
+          acp_test = (
+              '#[test]\n'
+              'fn bundled_acp_permission_app_aligns_with_runner_permission_bounds() {\n'
+              '    for required in [\n'
+              '        "const MAX_OPTIONS = 16",\n'
+              '        "MAX_IDENTITY_KEY_BYTES",\n'
+              '        "ui/notifications/tool-input",\n'
+              '        "ui/resource-teardown",\n'
+              '        "pagehide",\n'
+              '        "beforeunload",\n'
+              '        "observe_coding_agent",\n'
+              '        "Outcome unconfirmed; re-observe the same Run",\n'
+              '    ] {\n'
+              '        assert!(\n'
+              '            MCP_ACP_PERMISSION_APP_HTML.contains(required),\n'
+              '            "missing ACP permission App behavior: {required}"\n'
+              '        );\n'
+              '    }\n'
+              '    assert!(\n'
+              '        !MCP_ACP_PERMISSION_APP_HTML.contains("const MAX_OPTIONS = 8"),\n'
+              '        "ACP permission App must not cap options below Runner limit"\n'
+              '    );\n'
+              '}\n\n'
+          )
+          metadata_anchor = (
+              '#[test]\n'
+              'fn bundled_app_registry_metadata_preserves_existing_descriptor_fields()'
+          )
+          if "fn bundled_acp_permission_app_aligns_with_runner_permission_bounds()" not in tests:
+              if metadata_anchor not in tests:
+                  raise SystemExit("Cannot safely restore ACP permission test")
+              tests = tests.replace(metadata_anchor, acp_test + metadata_anchor, 1)
+
+          if tests.count('"ui://webcodex/acp-permission/v1"') != 1:
+              raise SystemExit("ACP URI test verification failed")
+          if "assert_eq!(tools.len(), 10);" not in tests:
+              raise SystemExit("ACP tool-count test verification failed")
+          if "fn bundled_acp_permission_app_aligns_with_runner_permission_bounds()" not in tests:
+              raise SystemExit("ACP permission test verification failed")
+          tests_path.write_text(tests, encoding="utf-8")
+          PY
+
+            git add src/mcp/app_registry/builtin.rs src/mcp/app_registry/tests.rs
+            git commit -m "fix: preserve ACP permission app during upstream sync"
+
+            cargo test --lib bundled_app_registry
+            cargo test --lib bundled_acp_permission_app_aligns_with_runner_permission_bounds
           fi
 
           if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
@@ -71,9 +228,5 @@ jobs:
 
           git push origin HEAD:refs/heads/main
 
-          {
-            echo "## Upstream sync succeeded"
-            echo "Merged `yyjeqhc/webcodex:main` into `BigShot-1221/webcodex:main`."
-            echo "Upstream HEAD: `$(git rev-parse upstream/main)`"
-            echo "Fork HEAD: `$(git rev-parse HEAD)`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          printf '## Upstream sync succeeded\n\nMerged yyjeqhc/webcodex:main into BigShot-1221/webcodex:main.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf 'Upstream HEAD: %s\nFork HEAD: %s\n' "$(git rev-parse upstream/main)" "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"

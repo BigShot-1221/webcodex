@@ -1,8 +1,83 @@
 //! Cancellation, restart recovery, and durable-before-live terminal transitions.
 
 use super::protocol::bounded_text;
-use super::store::{durable_record_from_snapshot, DurableDispatchPhase, STORE_RETENTION_SECS};
+use super::store::{durable_record_from_snapshot, DurableDispatchPhase, DurableRunRecord, STORE_RETENTION_SECS};
 use super::*;
+
+pub(super) fn coding_agent_run_retention_evictable(snapshot: &CodingAgentRunSnapshot) -> bool {
+    if !snapshot.state.terminal() {
+        return false;
+    }
+    if snapshot.state == CodingAgentRunState::Lost {
+        return false;
+    }
+    if snapshot.execution_state == CodingAgentExecutionState::OutcomeUnknown {
+        return false;
+    }
+    if snapshot
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.error_code.as_deref())
+        == Some(CODING_AGENT_TERMINAL_PERSISTENCE_UNCERTAIN)
+    {
+        return false;
+    }
+    true
+}
+
+pub(super) fn select_bounded_inventory_runs(
+    mut runs: Vec<CodingAgentRunSnapshot>,
+) -> Vec<CodingAgentRunSnapshot> {
+    runs.sort_by(|left, right| {
+        let left_active = !left.state.terminal();
+        let right_active = !right.state.terminal();
+        left_active
+            .cmp(&right_active)
+            .reverse()
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.run_id.cmp(&right.run_id))
+    });
+    runs.truncate(CODING_AGENT_MAX_INVENTORY_RUNS);
+    runs
+}
+
+fn durable_live_retention_aligned(
+    record: &DurableRunRecord,
+    snapshot: &CodingAgentRunSnapshot,
+) -> bool {
+    record.run_id == snapshot.run_id
+        && record.intent_fingerprint == snapshot.intent_fingerprint
+        && record.authority_fingerprint == snapshot.authority_fingerprint
+        && record.runtime_project_id == snapshot.runtime_project_id
+        && record.provider_id == snapshot.provider_id
+        && record.provider_instance_id == snapshot.provider_instance_id
+        && record.created_at == snapshot.created_at
+        && snapshot.state == record.state
+        && snapshot.execution_state == record.execution_state
+        && snapshot.updated_at == record.updated_at
+        && snapshot.terminal == record.terminal
+}
+
+fn oldest_evictable_durable_run_id<'a>(
+    records: &'a [DurableRunRecord],
+    protected_run_id: Option<&str>,
+    skip_run_ids: &[&str],
+) -> Option<&'a DurableRunRecord> {
+    records
+        .iter()
+        .filter(|record| protected_run_id.is_none_or(|run_id| record.run_id != run_id))
+        .filter(|record| {
+            !skip_run_ids
+                .iter()
+                .any(|skipped| *skipped == record.run_id.as_str())
+        })
+        .filter(|record| coding_agent_run_retention_evictable(&record.snapshot(0)))
+        .min_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.run_id.cmp(&right.run_id))
+        })
+}
 
 impl CodingAgentManager {
     pub(super) fn request_cancel(
@@ -69,6 +144,7 @@ impl CodingAgentManager {
     }
 
     pub(super) fn recover(&self) -> Result<(), String> {
+        self.enforce_durable_capacity_before_scan()?;
         let mut map = self.runs.lock().unwrap();
         for mut record in self.store.scan()? {
             if record.dispatch_phase != DurableDispatchPhase::Terminal {
@@ -125,19 +201,149 @@ impl CodingAgentManager {
             map.iter()
                 .filter(|(_, entry)| {
                     let snapshot = entry.snapshot();
-                    snapshot.state.terminal() && snapshot.updated_at < cutoff
+                    coding_agent_run_retention_evictable(&snapshot) && snapshot.updated_at < cutoff
                 })
                 .map(|(run_id, _)| run_id.clone())
                 .collect::<Vec<_>>()
         };
-        if expired.is_empty() {
-            return;
+        self.cleanup_expired_stale_candidates(cutoff, expired);
+    }
+
+    fn cleanup_expired_stale_candidates(&self, cutoff: i64, stale_candidate_run_ids: Vec<String>) {
+        for run_id in stale_candidate_run_ids {
+            let entry = {
+                let map = self.runs.lock().unwrap();
+                map.get(&run_id).cloned()
+            };
+            let Some(entry) = entry else {
+                continue;
+            };
+            let _terminal_transition = entry.terminal_transition.lock().unwrap();
+            let snapshot = entry.snapshot();
+            if !coding_agent_run_retention_evictable(&snapshot) || snapshot.updated_at >= cutoff {
+                continue;
+            }
+            let durable = match self.store.read(&run_id) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    self.runs.lock().unwrap().remove(&run_id);
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if !durable_live_retention_aligned(&durable, &snapshot) {
+                continue;
+            }
+            match self.store.remove_checked(&run_id) {
+                Ok(()) => {
+                    self.runs.lock().unwrap().remove(&run_id);
+                }
+                Err(error) => {
+                    tracing::error!(
+                        run_id = %run_id,
+                        error = %error,
+                        "ACP expired Run durable removal failed; retaining in-memory Run"
+                    );
+                }
+            }
         }
-        let mut map = self.runs.lock().unwrap();
-        for run_id in expired {
-            map.remove(&run_id);
-            self.store.remove(&run_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_expired_for_test(&self) {
+        self.cleanup_expired();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_expired_stale_candidates_for_test(
+        &self,
+        stale_candidate_run_ids: Vec<String>,
+    ) {
+        let cutoff = now().saturating_sub(STORE_RETENTION_SECS);
+        self.cleanup_expired_stale_candidates(cutoff, stale_candidate_run_ids);
+    }
+
+    pub(super) fn enforce_durable_capacity_for_admission(
+        &self,
+        protected_run_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.enforce_durable_capacity(protected_run_id, |count| {
+            count >= CODING_AGENT_MAX_INVENTORY_RUNS
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enforce_durable_capacity_for_admission_for_test(
+        &self,
+        protected_run_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.enforce_durable_capacity_for_admission(protected_run_id)
+    }
+
+    fn enforce_durable_capacity_before_scan(&self) -> Result<(), String> {
+        self.enforce_durable_capacity(None, |count| count > CODING_AGENT_MAX_INVENTORY_RUNS)
+    }
+
+    fn enforce_durable_capacity(
+        &self,
+        protected_run_id: Option<&str>,
+        mut should_evict: impl FnMut(usize) -> bool,
+    ) -> Result<(), String> {
+        let mut skip_eviction = Vec::new();
+        loop {
+            let listing = self.store.list_records_for_retention()?;
+            if !should_evict(listing.entry_count) {
+                return Ok(());
+            }
+            let skip_refs = skip_eviction
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let Some(record) =
+                oldest_evictable_durable_run_id(&listing.records, protected_run_id, &skip_refs)
+            else {
+                return Err(
+                    "ACP Run durable retention cannot reclaim space without evicting active or uncertain Runs"
+                        .to_string(),
+                );
+            };
+            let run_id = record.run_id.as_str();
+            match self.try_evict_retained_durable_run(run_id, record)? {
+                true => {}
+                false => {
+                    skip_eviction.push(record.run_id.clone());
+                }
+            }
         }
+    }
+
+    fn try_evict_retained_durable_run(
+        &self,
+        run_id: &str,
+        record: &DurableRunRecord,
+    ) -> Result<bool, String> {
+        let entry = {
+            let map = self.runs.lock().unwrap();
+            map.get(run_id).cloned()
+        };
+        let Some(entry) = entry else {
+            let snapshot = record.snapshot(0);
+            if !coding_agent_run_retention_evictable(&snapshot) {
+                return Ok(false);
+            }
+            self.store.remove_checked(run_id)?;
+            return Ok(true);
+        };
+        let _terminal_transition = entry.terminal_transition.lock().unwrap();
+        let snapshot = entry.snapshot();
+        if !coding_agent_run_retention_evictable(&snapshot)
+            || !durable_live_retention_aligned(record, &snapshot)
+        {
+            return Ok(false);
+        }
+        self.store.remove_checked(run_id)?;
+        self.runs.lock().unwrap().remove(run_id);
+        Ok(true)
     }
 
     pub(super) fn setup_failure(

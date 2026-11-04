@@ -49,6 +49,12 @@ async fn mcp_route_recovery_rejects_unavailable_tools_without_gateway_retry() {
         for name in [
             "tool_manifest",
             "runtime_status",
+            "show_changes",
+            "git_diff_hunks",
+            "git_status",
+            "git_log",
+            "project_overview",
+            "search_and_read",
             "unknown_tool_name",
             "get_work_result_state",
         ] {
@@ -66,10 +72,143 @@ async fn mcp_route_recovery_rejects_unavailable_tools_without_gateway_retry() {
             };
             assert_eq!(value["error"]["code"], -32602);
             let message = value["error"]["message"].as_str().unwrap();
-            assert!(message.contains("unavailable"), "{name}: {message}");
+            assert!(
+                message.contains("unavailable")
+                    || message.contains("not exposed")
+                    || message.contains("not as a direct MCP callable"),
+                "{name}: {message}"
+            );
             assert!(message.contains("tools/list"), "{name}: {message}");
-            assert!(!message.contains("call_runtime_tool"), "{name}: {message}");
+            let data = &value["error"]["data"];
+            assert_eq!(data["execution_state"], "not_started");
+            assert_eq!(data["state_changed"], false);
+            assert_eq!(data["target_tool"], name);
+            let error_kind = data["error_kind"].as_str().expect("error_kind");
+            assert!(
+                matches!(error_kind, "direct_route_denied" | "gateway_route_required"),
+                "{name}: {error_kind}"
+            );
+            if error_kind == "gateway_route_required" {
+                let suggested = &data["suggested_call"];
+                assert_eq!(
+                    suggested["tool"],
+                    crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+                );
+                assert_eq!(suggested["arguments"]["tool"], "read_tool_manifest");
+                assert_eq!(suggested["arguments"]["arguments"]["tool_name"], name);
+            } else {
+                assert_eq!(data["error_kind"], "direct_route_denied");
+                assert_eq!(data["discovery_tool"], "read_tool_manifest");
+                let suggested = &data["suggested_call"];
+                assert_eq!(
+                    suggested["tool"],
+                    crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+                );
+                assert_eq!(suggested["arguments"]["tool"], "read_tool_manifest");
+                assert_eq!(suggested["arguments"]["arguments"]["query"], name);
+                assert!(suggested["arguments"]["arguments"]
+                    .get("tool_name")
+                    .is_none());
+            }
+            if let Some(suggested) = data.get("suggested_call") {
+                assert_ne!(
+                    suggested["arguments"]["tool"].as_str(),
+                    Some(name),
+                    "{name}: must not gateway-execute the denied target"
+                );
+            }
         }
+    }
+}
+
+#[tokio::test]
+async fn stale_tool_contract_fields_return_manifest_recovery_without_execution() {
+    let runtime = test_runtime_with_mcp_settings(true, false);
+    for (id, tool, field, value, via_gateway) in [
+        (
+            8110,
+            "work_on_project",
+            "include_project_instructions",
+            json!(false),
+            false,
+        ),
+        (
+            8111,
+            "work_on_project",
+            "include_workflow_guidance",
+            json!(false),
+            false,
+        ),
+        (
+            8112,
+            "work_on_project",
+            "context_request",
+            json!(["project.instructions"]),
+            false,
+        ),
+        (
+            8113,
+            "get_runtime_status",
+            "recording_session_id",
+            json!("~s12"),
+            false,
+        ),
+        (
+            8114,
+            "work_on_project",
+            "include_project_instructions",
+            json!(false),
+            true,
+        ),
+    ] {
+        let mut business_arguments = json!({
+            "project": "agent:missing:contract-probe",
+            "instruction": "contract probe",
+        });
+        if tool == "get_runtime_status" {
+            business_arguments["compact"] = json!(true);
+        }
+        business_arguments[field] = value;
+        let call = if via_gateway {
+            json!({
+                "name": crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "arguments": {
+                    "tool": tool,
+                    "arguments": business_arguments,
+                }
+            })
+        } else {
+            json!({"name": tool, "arguments": business_arguments})
+        };
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc("tools/call", Some(json!(id)), mcp_2026_params(call)),
+            None,
+        )
+        .await;
+        let McpOutcome::BadRequest(value) = outcome else {
+            panic!("stale contract field must be rejected before execution: {tool}.{field}");
+        };
+        assert_eq!(value["error"]["code"], -32602);
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Refresh tools/list"), "{message}");
+        assert!(message.contains("read_tool_manifest"), "{message}");
+        let data = &value["error"]["data"];
+        assert_eq!(data["error_kind"], "stale_tool_contract");
+        assert_eq!(data["execution_state"], "not_started");
+        assert_eq!(data["state_changed"], false);
+        assert_eq!(data["target_tool"], tool);
+        assert!(data["retired_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(field)));
+        let suggested = &data["suggested_call"];
+        assert_eq!(
+            suggested["tool"],
+            crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+        );
+        assert_eq!(suggested["arguments"]["tool"], "read_tool_manifest");
+        assert_eq!(suggested["arguments"]["arguments"]["tool_name"], tool);
     }
 }
 
@@ -102,8 +241,54 @@ async fn mcp_route_recovery_suggests_gateway_only_with_current_scope() {
             if auth.is_some() {
                 assert!(message.contains("authorization"), "{message}");
             }
+            let data = &value["error"]["data"];
+            assert_eq!(data["execution_state"], "not_started");
+            assert_eq!(data["state_changed"], false);
+            if auth.is_some() {
+                assert_eq!(data["error_kind"], "insufficient_scope");
+                assert!(data.get("suggested_call").is_none());
+            } else {
+                assert_eq!(data["error_kind"], "gateway_route_required");
+                let suggested = &data["suggested_call"];
+                assert_eq!(
+                    suggested["tool"],
+                    crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+                );
+                assert_eq!(suggested["arguments"]["tool"], "read_tool_manifest");
+                assert_eq!(
+                    suggested["arguments"]["arguments"]["tool_name"],
+                    "list_projects"
+                );
+            }
         }
     }
+}
+
+#[tokio::test]
+async fn adaptive_runtime_gateway_unknown_target_returns_discovery_guidance() {
+    let runtime = test_runtime_with_mcp_settings(true, false);
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(8104)),
+            mcp_2026_params(adaptive_runtime_gateway_params("unknown_target", json!({}))),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("unknown gateway target must return structured tool failure: {outcome:?}");
+    };
+    let output = &value["result"]["structuredContent"]["output"];
+    assert_eq!(output["error_kind"], "unknown_tool");
+    assert_eq!(output["execution_state"], "not_started");
+    assert_eq!(output["state_changed"], false);
+    assert_eq!(output["discovery_tool"], "read_tool_manifest");
+    assert_eq!(
+        output["suggested_call"]["arguments"]["arguments"]["query"],
+        "unknown_target"
+    );
 }
 
 #[tokio::test]
@@ -122,6 +307,12 @@ async fn mcp_route_recovery_current_discovery_matches_callable_contracts() {
     for retired in [
         "tool_manifest",
         "runtime_status",
+        "show_changes",
+        "git_diff_hunks",
+        "git_status",
+        "git_log",
+        "project_overview",
+        "search_and_read",
         "apply_text_edits",
         "session_handoff_summary",
     ] {
@@ -2319,6 +2510,36 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
     let tools = compact["tools"].as_array().unwrap();
     for (name, phrases) in [
         (
+            "search_file_context",
+            vec![
+                "Search project text",
+                "max_reads is shared",
+                "revision-fenced ranges",
+                "reads.suggested_call",
+            ],
+        ),
+        (
+            "search_project_texts",
+            vec![
+                "1..8 independent queries",
+                "regex by default",
+                "literal for exact text",
+                "search_file_context",
+                "narrow truncated queries",
+            ],
+        ),
+        (
+            "present_pdf",
+            vec![
+                "authorized project PDF",
+                "present_work_result",
+                "unchanged/untracked files",
+                "20 MiB max",
+                "version changes",
+                "Requires MCP Apps Host",
+            ],
+        ),
+        (
             "project_build",
             vec![
                 "Build Rust/Go/Python/Node via Runner argv",
@@ -2613,6 +2834,27 @@ fn mcp_compact_work_result_files_preserves_content_constraints() {
         "256 KiB/file",
     ] {
         assert!(description.contains(phrase), "{description}");
+    }
+}
+
+#[test]
+fn mcp_compact_workbench_descriptions_keep_retry_and_fence_semantics() {
+    use crate::mcp::discovery::compact_tool;
+    for (name, required) in [
+        ("create_goal", "same key and unchanged input"),
+        ("update_goal", "same keyed input"),
+        ("complete_session_message", "stale fences fail closed"),
+    ] {
+        let mut tool = json!({
+            "name": name,
+            "description": "canonical full description",
+            "_meta": {"ui": {"visibility": ["app"]}},
+            "inputSchema": {"type": "object"}
+        });
+        compact_tool(&mut tool);
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains(required), "{name}: {description}");
+        assert!(description.chars().count() <= crate::mcp::discovery::TOOL_DESCRIPTION_MAX_CHARS);
     }
 }
 
@@ -3125,7 +3367,10 @@ async fn mcp_tools_call_rejects_legacy_reserved_session_id_before_dispatch() {
     };
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.contains("_session_id"));
-    assert!(message.contains("unknown field"));
+    assert!(message.contains("current contract"));
+    assert_eq!(value["error"]["data"]["error_kind"], "stale_tool_contract");
+    assert_eq!(value["error"]["data"]["execution_state"], "not_started");
+    assert_eq!(value["error"]["data"]["state_changed"], false);
     assert_eq!(
         runtime
             .sessions
@@ -3359,7 +3604,7 @@ async fn stateless_mcp_ack_wrapper_is_removed_before_concrete_dispatch_and_is_re
 }
 
 #[tokio::test]
-async fn mcp_tools_call_rejects_legacy_session_alias_even_with_canonical_recorder() {
+async fn mcp_tools_call_rejects_legacy_session_alias_before_recording_or_dispatch() {
     let runtime = test_runtime();
     let canonical = runtime
         .sessions
@@ -3386,13 +3631,14 @@ async fn mcp_tools_call_rejects_legacy_session_alias_even_with_canonical_recorde
         McpOutcome::BadRequest(value) => value,
         other => panic!("expected invalid-params BadRequest, got {other:?}"),
     };
-    assert!(value["error"]["message"]
-        .as_str()
-        .is_some_and(
-            |message| message.contains("_session_id") && message.contains("unknown field")
-        ));
-    // Explicit recorder provenance still records the rejected canonical tool
-    // attempt; the retired business alias is rejected before any main effect.
+    assert!(value["error"]["message"].as_str().is_some_and(|message| {
+        message.contains("_session_id") && message.contains("current contract")
+    }));
+    assert_eq!(value["error"]["data"]["error_kind"], "stale_tool_contract");
+    assert_eq!(value["error"]["data"]["execution_state"], "not_started");
+    assert_eq!(value["error"]["data"]["state_changed"], false);
+    // The stale business field is rejected before runtime dispatch. A recorder
+    // sidecar must not fabricate a Session tool-call record for an unexecuted target.
     assert_eq!(
         runtime
             .sessions
@@ -3400,12 +3646,12 @@ async fn mcp_tools_call_rejects_legacy_session_alias_even_with_canonical_recorde
             .unwrap()
             .counts
             .tool_calls,
-        1
+        0
     );
 }
 
 #[tokio::test]
-async fn mcp_tools_call_records_event_with_recording_session_id() {
+async fn mcp_tools_call_records_event_with_wc_record_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
         crate::Database::open(&tmp.path().join("recorder-refs.db")).unwrap(),

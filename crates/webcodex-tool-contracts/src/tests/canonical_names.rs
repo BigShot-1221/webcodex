@@ -116,6 +116,7 @@ fn canonical_operation_names_are_unique_verb_first_and_route_independent() {
         "purge_",
         "record_",
         "resolve_",
+        "respond_",
         "send_",
         "load_",
         "install_",

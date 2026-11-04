@@ -691,7 +691,7 @@ async fn long_tail_direct_call_is_rejected_with_gateway_guidance() {
     let message = value["error"]["message"].as_str().unwrap();
     assert!(message.contains("call_runtime_tool"), "{message}");
     assert!(
-        message.contains("not directly callable on Adaptive Runtime"),
+        message.contains("not as a direct MCP callable"),
         "{message}"
     );
 }

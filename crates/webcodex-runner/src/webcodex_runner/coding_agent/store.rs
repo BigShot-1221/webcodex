@@ -5,7 +5,10 @@ use super::*;
 pub(super) const STORE_SCHEMA_VERSION: u32 = 1;
 const STORE_FILE: &str = "state.json";
 const STORE_MAX_BYTES: usize = 64 * 1024;
-pub(super) const STORE_RETENTION_SECS: i64 = 15 * 60;
+/// One recoverable overflow directory above the normal inventory bound.
+const STORE_MAX_RUN_DIR_SCAN: usize = CODING_AGENT_MAX_INVENTORY_RUNS + 1;
+/// Must match `SERVER_TERMINAL_RETENTION_SECS` in `src/tool_runtime/coding_agent.rs`.
+pub(super) const STORE_RETENTION_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,7 +110,14 @@ impl TerminalWriteGate {
 #[derive(Debug, Default)]
 struct DurableRunStoreTestControl {
     fail_next_terminal_writes: std::sync::atomic::AtomicUsize,
+    fail_next_removes: std::sync::atomic::AtomicUsize,
     terminal_write_gate: Mutex<Option<Arc<TerminalWriteGate>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DurableRetentionListing {
+    pub(super) records: Vec<DurableRunRecord>,
+    pub(super) entry_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -247,9 +257,22 @@ impl DurableRunStore {
     }
 
     pub(super) fn scan(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let listing = self.list_records_for_retention()?;
+        if listing.entry_count > CODING_AGENT_MAX_INVENTORY_RUNS {
+            return Err("ACP Run durable state exceeds bounded record count".to_string());
+        }
+        Ok(listing.records)
+    }
+
+    pub(super) fn list_records_for_retention(&self) -> Result<DurableRetentionListing, String> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DurableRetentionListing {
+                    records: Vec::new(),
+                    entry_count: 0,
+                });
+            }
             Err(error) => return Err(format!("failed to list ACP Run state: {error}")),
         };
         let mut records = Vec::new();
@@ -263,20 +286,38 @@ impl DurableRunStore {
             if !ty.is_dir() || ty.is_symlink() {
                 return Err("ACP Run state root contains an unexpected entry".to_string());
             }
-            entry_count = entry_count.saturating_add(1);
-            if entry_count > CODING_AGENT_MAX_INVENTORY_RUNS {
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| "ACP Run durable state exceeds bounded record count".to_string())?;
+            if entry_count > STORE_MAX_RUN_DIR_SCAN {
                 return Err("ACP Run durable state exceeds bounded record count".to_string());
             }
             let path = entry.path().join(STORE_FILE);
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
+            let len = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata.len() as usize,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::error!(state_path = %path.display(), "ACP Run durable state is missing from an existing Run state directory; preserving tombstone");
+                    continue;
+                }
                 Err(error) => {
                     tracing::error!(state_path = %path.display(), error = %error, "ACP Run durable state unavailable during recovery; preserving tombstone");
                     continue;
                 }
             };
-            if bytes.is_empty() || bytes.len() > STORE_MAX_BYTES {
+            if len == 0 || len > STORE_MAX_BYTES {
                 tracing::error!(state_path = %path.display(), "ACP Run durable state has invalid bounded size; preserving tombstone");
+                continue;
+            }
+            let mut file = match File::open(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    tracing::error!(state_path = %path.display(), error = %error, "ACP Run durable state unavailable during recovery; preserving tombstone");
+                    continue;
+                }
+            };
+            let mut bytes = Vec::with_capacity(len);
+            if let Err(error) = file.read_to_end(&mut bytes) {
+                tracing::error!(state_path = %path.display(), error = %error, "ACP Run durable state unavailable during recovery; preserving tombstone");
                 continue;
             }
             let record: DurableRunRecord = match serde_json::from_slice(&bytes) {
@@ -297,11 +338,33 @@ impl DurableRunStore {
             records.push(record);
         }
         records.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-        Ok(records)
+        Ok(DurableRetentionListing {
+            records,
+            entry_count,
+        })
     }
 
     pub(super) fn remove(&self, run_id: &str) {
         let _ = fs::remove_dir_all(self.run_dir(run_id));
+    }
+
+    pub(super) fn remove_checked(&self, run_id: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if self
+            .test_control
+            .fail_next_removes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                (remaining > 0).then(|| remaining - 1)
+            })
+            .is_ok()
+        {
+            return Err("injected ACP durable run removal failure".to_string());
+        }
+        match fs::remove_dir_all(self.run_dir(run_id)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("failed to remove ACP Run state dir: {error}")),
+        }
     }
 
     #[cfg(test)]
@@ -314,6 +377,13 @@ impl DurableRunStore {
     #[cfg(all(test, unix))]
     pub(super) fn set_terminal_write_gate(&self, gate: Option<Arc<TerminalWriteGate>>) {
         *self.test_control.terminal_write_gate.lock().unwrap() = gate;
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_removes(&self, count: usize) {
+        self.test_control
+            .fail_next_removes
+            .store(count, Ordering::SeqCst);
     }
 }
 

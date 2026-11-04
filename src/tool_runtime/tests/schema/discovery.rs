@@ -371,6 +371,18 @@ fn discovery_output_schemas_cover_runtime_payload_keys() {
         &list_tools_payload,
         output_schema_properties(list_tools_spec),
     );
+    let hint = list_tools_payload["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("category") && hint.contains("features"),
+        "{hint}"
+    );
+    assert!(hint.contains("summary_only=true"), "{hint}");
+    assert!(hint.contains("read_tool_manifest"), "{hint}");
+    assert!(!hint.contains("tool_name:"), "{hint}");
+    assert!(
+        !hint.contains("query/category/intent/limit: bounded search"),
+        "{hint}"
+    );
 
     let tool_manifest_spec = spec_named(&specs, "read_tool_manifest");
     let tool_manifest_payload = runtime

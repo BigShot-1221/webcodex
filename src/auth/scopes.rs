@@ -777,7 +777,7 @@ mod tests {
             ),
             (
                 "inspect_coding_agent_config",
-                OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
+                OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN]),
             ),
         ] {
             assert_eq!(oauth_scope_policy_for_runtime_tool(tool), policy, "{tool}");

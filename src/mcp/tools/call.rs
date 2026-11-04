@@ -178,6 +178,65 @@ impl ParsedCall {
         // their existing bounded audit projections below.
         let raw_mcp_arguments = params.arguments.clone();
         let via_adaptive_runtime_gateway = params.name == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
+        let stale_contract_target = if via_adaptive_runtime_gateway {
+            params
+                .arguments
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or(&params.name)
+        } else {
+            params.name.as_str()
+        };
+        let stale_contract_fields =
+            mcp_legacy_invocation_contract_fields(stale_contract_target, &params.arguments);
+        let stale_contract_target_admitted = matches!(
+            mcp_adaptive_runtime_gateway_target_route(stale_contract_target, stateless_2026),
+            crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
+                | crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Direct
+        )
+            && crate::tool_runtime::kernel::runtime_tool_scope_allows_discovery(
+                context.auth,
+                stale_contract_target,
+            );
+        if !stale_contract_fields.is_empty() && stale_contract_target_admitted {
+            if let Some(lc) = lifecycle.as_deref_mut() {
+                lc.set_tool_name(Some(stale_contract_target.to_string()));
+                lc.dispatch_failed("stale_tool_contract");
+                lc.dispatch_finished(false, Some(false), "stale_tool_contract");
+            }
+            let invocation_facts = crate::tool_runtime::model_ergonomics_telemetry::invocation::InvocationFacts::from_arguments(&raw_mcp_arguments);
+            let mut pre_kernel_model_ergonomics = ModelErgonomicsTimer::start_with_arguments(
+                stale_contract_target,
+                &params.arguments,
+            );
+            if stateless_2026 {
+                if let Some(timer) = pre_kernel_model_ergonomics.as_mut() {
+                    timer.invocation = invocation_facts;
+                }
+            }
+            if let (Some(slot), Some(timer)) = (
+                diagnostics.model_ergonomics_out.as_deref_mut(),
+                pre_kernel_model_ergonomics,
+            ) {
+                *slot = Some(
+                    timer
+                        .finish()
+                        .record_for_pre_result_failure("invalid_arguments"),
+                );
+            }
+            let diagnostic = mcp_stale_tool_contract_diagnostic(
+                stale_contract_target,
+                &stale_contract_fields,
+                context.auth,
+                stateless_2026,
+            );
+            return Err(McpOutcome::BadRequest(rpc_error_with_data(
+                id,
+                -32602,
+                diagnostic.message,
+                diagnostic.diagnostics,
+            )));
+        }
         let invocation = match parse_mcp_invocation_envelope(
             &params.name,
             &mut params.arguments,
@@ -334,6 +393,45 @@ impl PreparedRuntimeCall {
         // tool identity. A few MCP-only validations still happen before the
         // shared ToolRuntime kernel; preserve those failed attempts in generic
         // telemetry without creating a second record for normal kernel calls.
+        let stale_contract_fields = mcp_stale_tool_contract_fields(&params.name, &params.arguments);
+        let stale_contract_target_admitted =
+            crate::tool_runtime::kernel::runtime_tool_scope_allows_discovery(auth, &params.name);
+        if !stale_contract_fields.is_empty() && stale_contract_target_admitted {
+            if let Some(lc) = lifecycle.as_deref() {
+                lc.dispatch_failed("stale_tool_contract");
+                lc.dispatch_finished(false, Some(false), "stale_tool_contract");
+            }
+            let invocation_facts = crate::tool_runtime::model_ergonomics_telemetry::invocation::InvocationFacts::from_arguments(&raw_mcp_arguments);
+            let mut pre_kernel_model_ergonomics =
+                ModelErgonomicsTimer::start_with_arguments(&params.name, &params.arguments);
+            if stateless_2026 {
+                if let Some(timer) = pre_kernel_model_ergonomics.as_mut() {
+                    timer.invocation = invocation_facts;
+                }
+            }
+            if let (Some(slot), Some(timer)) = (
+                model_ergonomics_out.as_deref_mut(),
+                pre_kernel_model_ergonomics,
+            ) {
+                *slot = Some(
+                    timer
+                        .finish()
+                        .record_for_pre_result_failure("invalid_arguments"),
+                );
+            }
+            let diagnostic = mcp_stale_tool_contract_diagnostic(
+                &params.name,
+                &stale_contract_fields,
+                auth,
+                stateless_2026,
+            );
+            return Err(McpOutcome::BadRequest(rpc_error_with_data(
+                id,
+                -32602,
+                diagnostic.message,
+                diagnostic.diagnostics,
+            )));
+        }
         // Preserve omission versus explicit false before canonical bool parsing.
         project_mcp_model_argument_defaults(&params.name, &mut params.arguments);
         let invocation_facts = crate::tool_runtime::model_ergonomics_telemetry::invocation::InvocationFacts::from_arguments(&raw_mcp_arguments);

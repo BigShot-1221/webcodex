@@ -258,6 +258,19 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         ],
     },
     ToolRecommendedFlow {
+        name: "delegated_acp_coding",
+        summary: "ACP coding: provider from current Runner inventory only; start_coding_agent/observe_coding_agent manage Run lifecycle; required after uncertain start; default omit config overrides; live probe may side effect; no automatic fallback; no provider/model fallback.",
+        manifest_purpose:
+            "Delegated ACP coding when the current Runner advertises a provider: choose provider_id only from that exact inventory, not a guarantee on every Runner. Omit config overrides by default; call inspect_coding_agent_config only when needed and accept that include_live_acp probing may have provider-side side effects. start_coding_agent starts one Run; observe_coding_agent follows the same Run to a terminal state and is required after any uncertain start instead of starting a replacement. respond_coding_agent_permission only with the exact live pending permission_request_token and an advertised option id from that request. cancel_coding_agent stops an active Run when needed. WebCodex does not automatically fall back to another provider or model.",
+        tools: &[
+            "inspect_coding_agent_config",
+            "start_coding_agent",
+            "observe_coding_agent",
+            "respond_coding_agent_permission",
+            "cancel_coding_agent",
+        ],
+    },
+    ToolRecommendedFlow {
         name: "handoff",
         summary: "Handoff/recovery only: list_sessions(project) -> choose exact Session. read_session_summary reads ledger; read_session_handoff only for missing task context or transfer, never routine progress polling. Save decisions/progress. get_session_assignment -> complete_session_message with fence.",
         manifest_purpose: "Recover missing Session identity with caller-authorized list_sessions(project), explicitly choose a returned identity, then read read_session_handoff; discovery never resumes work. Save explicit decisions/progress with post_session_message. Coordinate independent Workflow Sessions through atomic assignment snapshots, required assignment-fenced completions, and explicit generic message-state delta observation without sharing execution history, authority, subscriptions, or automatic wake-up.",
@@ -320,6 +333,12 @@ pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     // Primary ordinary review plus authoritative hygiene/closeout.
     "review_changes",
     "check_workspace_hygiene",
+    // Delegated ACP lifecycle when the current Runner advertises a provider.
+    "inspect_coding_agent_config",
+    "start_coding_agent",
+    "observe_coding_agent",
+    "respond_coding_agent_permission",
+    "cancel_coding_agent",
     "finish_coding_task",
 ];
 
@@ -344,7 +363,7 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
 
     ToolManifestIntent {
         name: "coding",
-        purpose: "Default coding loop: start, inspect, make reliable scoped changes, validate, review, report.",
+        purpose: "Default coding loop: start, inspect, make reliable scoped changes, validate, review, report. When the current Runner advertises an ACP provider, delegated ACP coding via the lifecycle tools is an available option—not guaranteed on every Runner.",
         tools: CODING_INTENT_TOOL_NAMES,
     },
     ToolManifestIntent {

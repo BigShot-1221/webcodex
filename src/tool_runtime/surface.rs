@@ -621,8 +621,8 @@ impl ToolRuntime {
                 registered_tool_categories()
             },
             "recommended_flows": recommended_flows(),
-            "recommended_next": "Use read_tool_manifest directly for focused discovery; long-tail Adaptive Runtime tools are invoked through call_runtime_tool.",
-            "hint": "Prefer exact tool_name or category/intent filters for compact discovery; availability describes routing only and grants no authority.",
+            "recommended_next": "Use read_tool_manifest for discovery, then invoke the selected tool through route.primary or route.fallback from the manifest (call_runtime_tool only when the fallback is admitted and authorized).",
+            "hint": "Use category and features to filter the list, limit to bound results, and summary_only=true for compact summaries. For exact tool contracts, intent/query discovery, and route.primary versus route.fallback, use read_tool_manifest. Discovery describes routing only and grants no authority.",
         });
         if !bounded_request {
             output["filtered_count"] = json!(total_count);
@@ -748,7 +748,7 @@ impl ToolRuntime {
             "requested_limit": Value::Null,
             "categories": Value::Object(exact_categories),
             "tools": [compact_manifest_tool_entry(spec)],
-            "routing_note": "read_tool_manifest only describes an existing route; it never dynamically registers a new Host tool. Follow route.primary, or route.fallback when the direct callable is unavailable and the fallback is not blocked by MCP App presentation requirements.",
+            "routing_note": "read_tool_manifest only describes an existing route; it never dynamically registers a new Host tool. Follow route.primary when this MCP surface exposes that direct callable; otherwise use route.fallback (typically call_runtime_tool) only when admitted, authorized, and not blocked by MCP App direct-presentation requirements.",
         });
         if let Some(execution) = runtime_tool_execution_contract(spec.name.as_str()) {
             output["contract"]["execution"] = manifest_execution_projection(execution);

@@ -15,8 +15,9 @@ import { ConnectionEditor } from "./ConnectionEditor";
 import { CloudflareConnectionCard } from "./CloudflareConnectionCard";
 import { ConnectionCard } from "./ConnectionCard";
 
-export function ConnectionPanel({ state, onState, onSettings }: {
+export function ConnectionPanel({ state, operationPending = false, onState, onSettings }: {
   state: DesktopState;
+  operationPending?: boolean;
   onState: (state: DesktopState) => void;
   onSettings: (section: "network" | "runtime" | "diagnostics") => void;
 }) {
@@ -32,7 +33,7 @@ export function ConnectionPanel({ state, onState, onSettings }: {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const submitting = useRef(false);
-  const disabled = busyId !== null || Boolean(state.current_operation);
+  const disabled = operationPending || busyId !== null || Boolean(state.current_operation);
   const local = state.topology?.server.kind === "local" && state.topology.experience === "full";
   const environmentId = state.persistent_environment?.trim() || null;
   const persistentLocal = Boolean(environmentId && local);
@@ -85,7 +86,17 @@ export function ConnectionPanel({ state, onState, onSettings }: {
     try {
       onState(await desktopApi.environmentServiceAction({ environmentId, component: "server", action }));
     } catch (value) {
-      setFailed(normalizeDesktopError(value));
+      const failure = normalizeDesktopError(value);
+      if (failure.code === "desktop_operation_busy") {
+        try {
+          const observed = await desktopApi.getState();
+          onState(observed);
+          if (observed.current_operation) return;
+        } catch {
+          // Keep the original failure if the best-effort state read also fails.
+        }
+      }
+      setFailed(failure);
     } finally {
       submitting.current = false;
       setBusyId(null);

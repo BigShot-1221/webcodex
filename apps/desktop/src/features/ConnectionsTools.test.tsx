@@ -11,7 +11,7 @@ import { connectionFixture, connectionSnapshot } from "../test/connections-fixtu
 import { ConnectionPanel } from "./connection/ConnectionPanel";
 import { McpProvidersPanel } from "./extensions/McpProvidersPanel";
 
-const api = vi.hoisted(() => ({ saveTunnelProfile: vi.fn(), tunnelProfileAction: vi.fn(), cloudflareConnection: vi.fn(), environmentServiceAction: vi.fn(), saveMcpProvider: vi.fn(), removeMcpProvider: vi.fn(), runnerSettings: vi.fn(), restartOwnedRunner: vi.fn(), stopQuickShare: vi.fn() }));
+const api = vi.hoisted(() => ({ getState: vi.fn(), saveTunnelProfile: vi.fn(), tunnelProfileAction: vi.fn(), cloudflareConnection: vi.fn(), environmentServiceAction: vi.fn(), saveMcpProvider: vi.fn(), removeMcpProvider: vi.fn(), runnerSettings: vi.fn(), restartOwnedRunner: vi.fn(), stopQuickShare: vi.fn() }));
 vi.mock("../lib/desktop-api", () => ({ desktopApi: api }));
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeText: vi.fn() }));
 const onSettings = vi.fn();
@@ -29,12 +29,13 @@ function state(): DesktopState {
     mcp_providers: { ...EMPTY_MCP_PROVIDERS, profiles: [] },
   };
 }
-function Harness({ mode, initial = state() }: { mode: "connections" | "mcp"; initial?: DesktopState }) {
+function Harness({ mode, initial = state(), operationPending = false }: { mode: "connections" | "mcp"; initial?: DesktopState; operationPending?: boolean }) {
   const [snapshot, setSnapshot] = useState(initial);
-  return <MantineProvider><LocaleProvider>{mode === "connections" ? <ConnectionPanel state={snapshot} onState={setSnapshot} onSettings={onSettings} /> : <McpProvidersPanel state={snapshot} onState={setSnapshot} settings={settings} onRestarted={() => undefined} />}</LocaleProvider></MantineProvider>;
+  return <MantineProvider><LocaleProvider>{mode === "connections" ? <ConnectionPanel state={snapshot} operationPending={operationPending} onState={setSnapshot} onSettings={onSettings} /> : <McpProvidersPanel state={snapshot} onState={setSnapshot} settings={settings} onRestarted={() => undefined} />}</LocaleProvider></MantineProvider>;
 }
 beforeEach(() => {
   vi.resetAllMocks(); localStorage.setItem("webcodex.desktop.locale", "en-US");
+  api.getState.mockResolvedValue(state());
   api.tunnelProfileAction.mockResolvedValue(state());
   api.environmentServiceAction.mockResolvedValue(state());
   api.runnerSettings.mockResolvedValue(settings);
@@ -234,6 +235,48 @@ describe("Connections + Tools control surfaces", () => {
     }));
     expect(api.tunnelProfileAction).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByRole("button", { name: "Restart Server" })).not.toBeInTheDocument());
+  });
+
+  it("disables Server restart while startup or a status refresh is pending", () => {
+    const initial = state();
+    initial.persistent_environment = "server-environment";
+    const connections = connectionSnapshot(...(initial.connections?.profiles ?? []));
+    connections.server_restart_required = true;
+    initial.connections = connections;
+    render(<Harness mode="connections" initial={initial} operationPending />);
+
+    expect(screen.getByRole("button", { name: "Restart Server" })).toBeDisabled();
+    expect(api.environmentServiceAction).not.toHaveBeenCalled();
+  });
+
+  it("refreshes Desktop state instead of surfacing a stale busy error when Server restart races another operation", async () => {
+    const initial = state();
+    initial.persistent_environment = "server-environment";
+    const connections = connectionSnapshot(...(initial.connections?.profiles ?? []));
+    connections.server_restart_required = true;
+    initial.connections = connections;
+    api.environmentServiceAction.mockRejectedValue({
+      code: "desktop_operation_busy",
+      message: "Another Desktop operation is still running",
+      next_action: "Wait for the current operation to finish or stop it before starting another one.",
+    });
+    api.getState.mockResolvedValue({
+      ...initial,
+      current_operation: {
+        id: "desktop-operation-1",
+        kind: "runtime_refresh",
+        phase: "running",
+        started_at_ms: 1,
+        cancellable: true,
+      },
+    });
+    render(<Harness mode="connections" initial={initial} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Restart Server" }));
+
+    await waitFor(() => expect(api.getState).toHaveBeenCalledOnce());
+    expect(screen.getByRole("button", { name: "Restart Server" })).toBeDisabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("starts the owner explicitly when saved Server-owned profiles have no running Server", async () => {

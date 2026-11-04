@@ -2,11 +2,12 @@ use super::app_registry;
 use super::presentation;
 use super::resources;
 use super::response::{
-    mcp_runtime_tool_result_fallback, mcp_stateless_result, rpc_error, rpc_result,
-    McpToolResultPresentation,
+    mcp_runtime_tool_result_fallback, mcp_stateless_result, rpc_error, rpc_error_with_data,
+    rpc_result, McpToolResultPresentation,
 };
 use super::{require_mcp_scope, scope_forbidden, McpOutcome};
 use crate::auth::AuthContext;
+use crate::model_surface::AdaptiveRuntimeGatewayTargetRoute;
 pub(super) use crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
 use crate::model_surface::{
     project_suggested_tool_call_schema, project_tool_result_suggested_calls, SuggestedToolCallRoute,
@@ -25,7 +26,7 @@ use crate::tool_runtime::tool_definition::{
     is_adaptive_runtime_direct_tool, is_model_visible_tool_name,
     runtime_tool_operator_extension_family, ToolOperatorExtensionFamily,
 };
-use crate::tool_runtime::{ToolCall, ToolResult, ToolRuntime, ToolSpec};
+use crate::tool_runtime::{SuggestedToolCall, ToolCall, ToolResult, ToolRuntime, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use webcodex_tool_contracts::registry::{self as tool_registry, ToolDescriptor};
@@ -115,7 +116,7 @@ fn stateless_advertised_operator_extension_descriptors_for_auth(
 fn adaptive_runtime_gateway_tool_json(compact: bool) -> Value {
     mcp_tool_parts_json(
         ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME.to_string(),
-        "Call one runtime tool admitted by Adaptive Runtime through the generic gateway. A tool with availability=direct should still be invoked through its direct callable when available; ordinary direct tools may fall back here when that callable is unavailable or not loaded. Explicit MCP App presentation tools are the exception: when MCP Apps are enabled they must use their direct callable because only that tool descriptor carries the Host App resource metadata. Directness otherwise changes preferred model exposure only: canonical runtime argument validation, OAuth scope, Project authority, permission gates, Runner capability, Session/context policy, host-file-import trust, protocol capability admission, and tool effects remain unchanged.".to_string(),
+        "Invoke one admitted runtime tool when its direct callable is unavailable. Use read_tool_manifest for exact contracts/routes; if it is not directly callable, invoke this gateway with tool='read_tool_manifest'. Follow route.primary, or route.fallback only when authorized. Never guess names/fields or bypass OAuth/permission gates. With MCP Apps enabled, call App presentation tools directly for Host metadata. Retired wrapper failures do not imply ACP is absent.".to_string(),
         json!({
             "type": "object",
             "properties": {
@@ -123,11 +124,11 @@ fn adaptive_runtime_gateway_tool_json(compact: bool) -> Value {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
-                    "description": "Exact runtime tool name admitted by Adaptive Runtime. availability=direct is normally preferred with gateway fallback when unavailable; explicit MCP App presentation tools remain direct-only while MCP Apps are enabled."
+                    "description": "Exact runtime tool name already admitted by Adaptive Runtime. Discover the contract with read_tool_manifest before calling when it is not already known."
                 },
                 "arguments": {
                     "type": "object",
-                    "description": "Arguments for the selected runtime tool. Discover its contract before calling when it is not already known.",
+                    "description": "Canonical business arguments for the selected runtime tool after read_tool_manifest (or another authoritative contract source) confirms the admitted name and input schema.",
                     "additionalProperties": true
                 }
             },
@@ -253,17 +254,220 @@ fn unwrap_adaptive_runtime_gateway_arguments(arguments: Value) -> Result<(String
     }
     Ok((target, target_arguments))
 }
+fn adaptive_runtime_read_tool_manifest_gateway_arguments(arguments: Value) -> Value {
+    json!({
+        "tool": "read_tool_manifest",
+        "arguments": arguments,
+    })
+}
+
+/// Legacy invocation metadata used to appear beside business arguments. Keep
+/// rejecting it, but report the current `_wc` contract so stale Hosts can recover.
+const LEGACY_MCP_INVOCATION_FIELDS: &[&str] = &[
+    "_session_id",
+    crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+    crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD,
+    crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+    crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD,
+    crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
+    crate::tool_runtime::control_sidecar::CONTROL_FIELD,
+];
+
+pub(crate) fn mcp_legacy_invocation_contract_fields(
+    tool_name: &str,
+    arguments: &Value,
+) -> Vec<&'static str> {
+    if !is_model_visible_tool_name(tool_name) {
+        return Vec::new();
+    }
+    let Some(object) = arguments.as_object() else {
+        return Vec::new();
+    };
+    LEGACY_MCP_INVOCATION_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| object.contains_key(*field))
+        .collect()
+}
+
+/// Known retired fields are reported before ToolRuntime executes a call so a Host
+/// with cached MCP metadata can recover from the current canonical contract. This
+/// is diagnostic only: no aliases are accepted and authority is unchanged.
+pub(crate) fn mcp_stale_tool_contract_fields(
+    tool_name: &str,
+    arguments: &Value,
+) -> Vec<&'static str> {
+    let mut fields = mcp_legacy_invocation_contract_fields(tool_name, arguments);
+    if tool_name == "work_on_project" {
+        if let Some(object) = arguments.as_object() {
+            for field in ["include_project_instructions", "include_workflow_guidance"] {
+                if object.contains_key(field) {
+                    fields.push(field);
+                }
+            }
+        }
+    }
+    fields
+}
+
+pub(crate) struct McpStaleToolContractDiagnostic {
+    pub message: String,
+    pub diagnostics: Value,
+}
+
+pub(crate) fn mcp_stale_tool_contract_diagnostic(
+    tool_name: &str,
+    fields: &[&str],
+    auth: Option<&AuthContext>,
+    stateless_2026: bool,
+) -> McpStaleToolContractDiagnostic {
+    let field_list = fields.join(", ");
+    let message = format!(
+        "tool '{tool_name}' received field(s) not accepted by the current contract: {field_list}. No execution occurred. Refresh tools/list or reconnect the MCP Host, then discover the canonical contract with read_tool_manifest and retry using only current fields. Legacy invocation metadata belongs in the outer '_wc' object (for example '_wc.context' for context requests), not in business arguments."
+    );
+    let discovery_admitted = is_model_visible_tool_name(tool_name)
+        && matches!(
+            mcp_adaptive_runtime_gateway_target_route("read_tool_manifest", stateless_2026),
+            AdaptiveRuntimeGatewayTargetRoute::Gateway | AdaptiveRuntimeGatewayTargetRoute::Direct
+        )
+        && crate::tool_runtime::kernel::runtime_tool_scope_allows_discovery(
+            auth,
+            "read_tool_manifest",
+        );
+    let mut diagnostics = json!({
+        "error_kind": "stale_tool_contract",
+        "execution_state": "not_started",
+        "state_changed": false,
+        "target_tool": tool_name,
+        "recovery_kind": "fix_input",
+        "retired_fields": fields,
+        "discovery_tool": "read_tool_manifest",
+    });
+    if discovery_admitted {
+        diagnostics["suggested_call"] = SuggestedToolCall::fallback_recovery(
+            ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            adaptive_runtime_read_tool_manifest_gateway_arguments(json!({
+                "tool_name": tool_name,
+            })),
+        )
+        .to_value();
+    }
+    McpStaleToolContractDiagnostic {
+        message,
+        diagnostics,
+    }
+}
+
 fn adaptive_runtime_gateway_unknown_target(target: &str) -> ToolResult {
+    let discovery_arguments = json!({ "query": target, "limit": 10 });
+    let suggested_call = SuggestedToolCall::fallback_recovery(
+        ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        adaptive_runtime_read_tool_manifest_gateway_arguments(discovery_arguments),
+    )
+    .to_value();
     ToolResult::err_with_output(
-        format!("unknown adaptive runtime tool '{target}'"),
+        format!(
+            "unknown adaptive runtime tool '{target}'. No target execution occurred and WebCodex does not auto-correct or dispatch guessed tool names. Refresh tools/list when supported, then discover admitted tools with read_tool_manifest using query, category, or intent (do not assume tool_name='{target}' is valid). When read_tool_manifest is not directly callable on this MCP surface, invoke call_runtime_tool with tool='read_tool_manifest' and arguments such as intent='coding' or tool_name='start_coding_agent', then follow the returned route; stale retired direct-wrapper failures are not proof ACP is absent."
+        ),
         json!({
             "error_kind": "unknown_tool",
             "execution_state": "not_started",
             "state_changed": false,
             "target_tool": target,
-            "recovery_kind": "fix_input"
+            "recovery_kind": "fix_input",
+            "discovery_tool": "read_tool_manifest",
+            "suggested_call": suggested_call,
         }),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpAdaptiveRuntimeDirectRouteDenialKind {
+    NotOnSurface,
+    GatewayRouteRequired,
+    InsufficientScope,
+}
+
+pub(crate) struct McpAdaptiveRuntimeDirectRouteDenial {
+    #[cfg(test)]
+    pub kind: McpAdaptiveRuntimeDirectRouteDenialKind,
+    pub message: String,
+    pub diagnostics: Value,
+}
+
+pub(crate) fn mcp_adaptive_runtime_direct_route_denial(
+    tool_name: &str,
+    auth: Option<&AuthContext>,
+    stateless_2026: bool,
+) -> McpAdaptiveRuntimeDirectRouteDenial {
+    let route = mcp_adaptive_runtime_gateway_target_route(tool_name, stateless_2026);
+    let admitted = matches!(
+        route,
+        AdaptiveRuntimeGatewayTargetRoute::Gateway | AdaptiveRuntimeGatewayTargetRoute::Direct
+    );
+    let scope_allows =
+        crate::tool_runtime::kernel::runtime_tool_scope_allows_discovery(auth, tool_name);
+
+    let kind = if admitted && !scope_allows {
+        McpAdaptiveRuntimeDirectRouteDenialKind::InsufficientScope
+    } else if admitted && route == AdaptiveRuntimeGatewayTargetRoute::Gateway {
+        McpAdaptiveRuntimeDirectRouteDenialKind::GatewayRouteRequired
+    } else {
+        McpAdaptiveRuntimeDirectRouteDenialKind::NotOnSurface
+    };
+
+    let message = match kind {
+        McpAdaptiveRuntimeDirectRouteDenialKind::InsufficientScope => format!(
+            "tool '{tool_name}' is not callable on this MCP surface under the current authorization; refresh tools/list for admitted callables and check granted OAuth scopes"
+        ),
+        McpAdaptiveRuntimeDirectRouteDenialKind::GatewayRouteRequired => format!(
+            "tool '{tool_name}' is admitted on Adaptive Runtime but not as a direct MCP callable; invoke it with call_runtime_tool using its exact canonical arguments and normal authorization. Load the contract first by calling call_runtime_tool with tool='read_tool_manifest' and arguments containing tool_name='{tool_name}', then follow the returned route"
+        ),
+        McpAdaptiveRuntimeDirectRouteDenialKind::NotOnSurface => format!(
+            "tool '{tool_name}' is not exposed as a direct MCP callable on this surface. Refresh tools/list when supported, then discover admitted canonical tool names with read_tool_manifest via query, category, or intent, or invoke call_runtime_tool with tool='read_tool_manifest' and arguments containing intent='coding' or tool_name='start_coding_agent', then follow the returned route. Do not retry stale retired direct wrappers such as tool_manifest; their not-on-surface failure is not proof ACP is absent. WebCodex does not auto-correct unknown tool names"
+        ),
+    };
+
+    let error_kind = match kind {
+        McpAdaptiveRuntimeDirectRouteDenialKind::InsufficientScope => "insufficient_scope",
+        McpAdaptiveRuntimeDirectRouteDenialKind::GatewayRouteRequired => "gateway_route_required",
+        McpAdaptiveRuntimeDirectRouteDenialKind::NotOnSurface => "direct_route_denied",
+    };
+
+    let mut diagnostics = json!({
+        "error_kind": error_kind,
+        "execution_state": "not_started",
+        "state_changed": false,
+        "target_tool": tool_name,
+        "recovery_kind": "fix_input",
+    });
+    if kind == McpAdaptiveRuntimeDirectRouteDenialKind::GatewayRouteRequired {
+        diagnostics["suggested_call"] = SuggestedToolCall::fallback_recovery(
+            ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            adaptive_runtime_read_tool_manifest_gateway_arguments(
+                json!({ "tool_name": tool_name }),
+            ),
+        )
+        .to_value();
+    } else if kind == McpAdaptiveRuntimeDirectRouteDenialKind::NotOnSurface {
+        diagnostics["suggested_call"] = SuggestedToolCall::fallback_recovery(
+            ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            adaptive_runtime_read_tool_manifest_gateway_arguments(json!({
+                "query": tool_name,
+                "limit": 10,
+            })),
+        )
+        .to_value();
+        diagnostics["discovery_tool"] = json!("read_tool_manifest");
+    }
+
+    McpAdaptiveRuntimeDirectRouteDenial {
+        #[cfg(test)]
+        kind,
+        message,
+        diagnostics,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1967,4 +2171,88 @@ fn canonicalize_recording_session_id(
             .map_err(|err| err.to_string())
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod adaptive_runtime_route_guidance_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_gateway_target_points_at_query_discovery_not_exact_name() {
+        let result = adaptive_runtime_gateway_unknown_target("definitely_unknown_tool");
+        assert!(!result.success);
+        let output = &result.output;
+        assert_eq!(output["error_kind"], "unknown_tool");
+        assert_eq!(output["execution_state"], "not_started");
+        assert_eq!(output["state_changed"], false);
+        assert_eq!(output["discovery_tool"], "read_tool_manifest");
+        let suggested = &output["suggested_call"];
+        assert_eq!(suggested["tool"], ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME);
+        assert_eq!(suggested["arguments"]["tool"], "read_tool_manifest");
+        assert_eq!(
+            suggested["arguments"]["arguments"]["query"],
+            "definitely_unknown_tool"
+        );
+        assert!(suggested["arguments"]["arguments"]
+            .get("tool_name")
+            .is_none());
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("read_tool_manifest"));
+        assert!(result.error.as_deref().unwrap().contains("query"));
+    }
+
+    #[test]
+    fn direct_route_denial_classifies_gateway_scope_and_surface_cases() {
+        let gateway = mcp_adaptive_runtime_direct_route_denial("apply_patch", None, true);
+        assert_eq!(
+            gateway.kind,
+            McpAdaptiveRuntimeDirectRouteDenialKind::GatewayRouteRequired
+        );
+        assert_eq!(gateway.diagnostics["error_kind"], "gateway_route_required");
+        assert_eq!(
+            gateway.diagnostics["suggested_call"]["arguments"]["tool"],
+            "read_tool_manifest"
+        );
+        assert_eq!(
+            gateway.diagnostics["suggested_call"]["arguments"]["arguments"]["tool_name"],
+            "apply_patch"
+        );
+        assert!(gateway.message.contains("call_runtime_tool"));
+        assert!(gateway.message.contains("tool='read_tool_manifest'"));
+        assert!(gateway.message.contains("tool_name='apply_patch'"));
+        assert!(!gateway
+            .message
+            .contains("directly or via call_runtime_tool"));
+
+        let mut restricted = AuthContext::new(crate::auth::AuthKind::OAuth2Token);
+        restricted.scopes = vec!["runtime:read".to_string()];
+        let scope =
+            mcp_adaptive_runtime_direct_route_denial("list_projects", Some(&restricted), true);
+        assert_eq!(
+            scope.kind,
+            McpAdaptiveRuntimeDirectRouteDenialKind::InsufficientScope
+        );
+        assert_eq!(scope.diagnostics["error_kind"], "insufficient_scope");
+        assert!(scope.diagnostics.get("suggested_call").is_none());
+        assert!(scope.message.contains("authorization"));
+
+        let hidden = mcp_adaptive_runtime_direct_route_denial("list_skills", None, false);
+        assert_eq!(
+            hidden.kind,
+            McpAdaptiveRuntimeDirectRouteDenialKind::NotOnSurface
+        );
+        assert_eq!(hidden.diagnostics["error_kind"], "direct_route_denied");
+        assert_eq!(hidden.diagnostics["discovery_tool"], "read_tool_manifest");
+        assert!(!hidden
+            .message
+            .contains("call_runtime_tool with tool='list_skills'"));
+        let suggested = &hidden.diagnostics["suggested_call"];
+        assert_eq!(suggested["tool"], ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME);
+        assert_eq!(suggested["arguments"]["tool"], "read_tool_manifest");
+        assert_eq!(suggested["arguments"]["arguments"]["query"], "list_skills");
+        assert_ne!(suggested["arguments"]["tool"].as_str(), Some("list_skills"));
+    }
 }

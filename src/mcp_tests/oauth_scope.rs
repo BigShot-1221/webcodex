@@ -858,9 +858,27 @@ async fn oauth2_mcp_unknown_tool_fails_closed() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body:?}");
     assert_eq!(body["error"]["code"], -32602);
     let message = body["error"]["message"].as_str().unwrap_or("");
-    assert!(message.contains("unavailable"), "{message}");
+    assert!(
+        message.contains("not exposed as a direct MCP callable"),
+        "{message}"
+    );
     assert!(message.contains("tools/list"), "{message}");
-    assert!(!message.contains("call_runtime_tool"), "{message}");
+    let data = &body["error"]["data"];
+    assert_eq!(data["execution_state"], "not_started");
+    assert_eq!(data["state_changed"], false);
+    assert_eq!(data["target_tool"], "no_such_tool");
+    assert_eq!(data["error_kind"], "direct_route_denied");
+    let suggested = &data["suggested_call"];
+    assert_eq!(
+        suggested["tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(suggested["arguments"]["tool"], "read_tool_manifest");
+    assert_eq!(suggested["arguments"]["arguments"]["query"], "no_such_tool");
+    assert_ne!(
+        suggested["arguments"]["tool"].as_str(),
+        Some("no_such_tool")
+    );
     assert!(challenge.is_none());
 }
 

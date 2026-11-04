@@ -54,22 +54,51 @@ fn list_tools_schema_exposes_bounded_discovery_fields() {
         output,
         "list_tools output schema",
         present: [
-            "category", "features", "limit", "returned_count", "total_count",
-            "filtered_count", "limit_applied", "requested_limit", "truncation_reason",
-            "truncated", "categories", "recommended_flows",
+            "tools", "names", "count", "category", "features", "limit", "returned_count",
+            "total_count", "filtered_count", "limit_applied", "requested_limit", "truncation_reason",
+            "truncated", "categories", "recommended_flows", "hint", "recommended_next",
         ]
     );
+    let hint_description = output["hint"]["description"].as_str().unwrap();
+    assert!(hint_description.contains("list_tools"));
+    assert!(hint_description.contains("read_tool_manifest"));
+    assert!(!hint_description.contains("tool_name lookup"));
 }
 
 #[test]
 fn tool_manifest_schema_exposes_compact_discovery_fields() {
     let specs = registered_tool_specs();
+    let names = registered_tool_names();
+    assert!(
+        names.iter().any(|name| name == "read_tool_manifest"),
+        "canonical discovery tool must be registered"
+    );
+    assert!(
+        !names.iter().any(|name| name == "tool_manifest"),
+        "retired tool_manifest must not remain registered"
+    );
+    assert!(lookup_tool_definition("read_tool_manifest").is_some());
+    assert!(lookup_tool_definition("tool_manifest").is_none());
+    assert!(
+        ToolCall::from_tool_name("tool_manifest", json!({})).is_err(),
+        "retired tool_manifest must not parse"
+    );
+
     let spec = spec_named(&specs, "read_tool_manifest");
+    assert_eq!(spec.name, "read_tool_manifest");
     let props = spec.input_schema["properties"].as_object().unwrap();
     assert_schema_fields!(
         props,
         "read_tool_manifest input schema",
-        present: ["category", "intent", "include_recommended_flows", "include_risk_summary"]
+        present: [
+            "tool_name",
+            "query",
+            "limit",
+            "category",
+            "intent",
+            "include_recommended_flows",
+            "include_risk_summary",
+        ]
     );
     let flow_description = props["include_recommended_flows"]["description"]
         .as_str()
@@ -96,7 +125,8 @@ fn tool_manifest_schema_exposes_compact_discovery_fields() {
             "schema_version", "count", "tool_count", "filtered_count", "category", "intent",
             "available_intents", "filtered", "categories_requested", "limit", "returned_count",
             "total_count", "limit_applied", "requested_limit", "truncation_reason", "truncated",
-            "categories", "tools", "risk_summary", "recommended_flows",
+            "categories", "tools", "contract", "route", "routing_note", "input_schema",
+            "risk_summary", "recommended_flows",
         ]
     );
 }
@@ -527,6 +557,8 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         "old review tools remain specialists",        "handoff/recovery only",
         "read_session_handoff only for missing task context",
         "never routine progress polling",
+        "acp coding: provider from current runner inventory only",
+        "no provider/model fallback",
     ] {
         assert!(
             joined_flows.contains(phrase),
@@ -893,6 +925,11 @@ fn coding_intent_has_independent_ordered_canonical_selection_surface() {
         "project_validate",
         "review_changes",
         "check_workspace_hygiene",
+        "inspect_coding_agent_config",
+        "start_coding_agent",
+        "observe_coding_agent",
+        "respond_coding_agent_permission",
+        "cancel_coding_agent",
         "finish_coding_task",
         "run_script",
         "cargo_fmt",
@@ -918,9 +955,6 @@ fn coding_intent_has_independent_ordered_canonical_selection_surface() {
         "apply_patch",
         "apply_unified_diff",
         "write_project_file",
-        "start_coding_agent",
-        "observe_coding_agent",
-        "cancel_coding_agent",
         "get_session_assignment",
         "complete_session_message",
     ] {
@@ -940,6 +974,79 @@ fn coding_intent_has_independent_ordered_canonical_selection_surface() {
         .position(|tool| *tool == "edit_project_files")
         .unwrap();
     assert!(read_files_position < edit_project_files_position);
+    let purpose = coding.purpose.to_ascii_lowercase();
+    assert!(purpose.contains("advertises an acp provider"));
+    assert!(purpose.contains("available option"));
+    assert!(purpose.contains("not guaranteed"));
+}
+
+#[test]
+fn delegated_acp_coding_flow_exposes_lifecycle_tools_and_safe_continuation() {
+    let flow = TOOL_RECOMMENDED_FLOWS
+        .iter()
+        .find(|flow| flow.name == "delegated_acp_coding")
+        .expect("delegated_acp_coding recommended flow");
+    assert_eq!(
+        flow.tools,
+        &[
+            "inspect_coding_agent_config",
+            "start_coding_agent",
+            "observe_coding_agent",
+            "respond_coding_agent_permission",
+            "cancel_coding_agent",
+        ]
+    );
+    assert!(flow.summary.chars().count() <= 300);
+    for tool in flow.tools {
+        let definition = lookup_tool_definition(tool)
+            .unwrap_or_else(|| panic!("delegated_acp_coding references unknown tool {tool}"));
+        assert!(
+            definition.visibility.is_model_visible(),
+            "delegated_acp_coding: {tool}"
+        );
+        assert!(
+            is_model_visible_tool_name(tool),
+            "delegated_acp_coding: {tool}"
+        );
+    }
+    let guidance = format!("{}\n{}", flow.summary, flow.manifest_purpose).to_lowercase();
+    for phrase in [
+        "current runner inventory",
+        "start_coding_agent",
+        "observe_coding_agent",
+        "uncertain start",
+        "omit config overrides",
+        "inspect_coding_agent_config",
+        "side effect",
+        "respond_coding_agent_permission",
+        "permission_request_token",
+        "option id",
+        "no automatic",
+        "provider",
+        "model",
+        "fallback",
+    ] {
+        assert!(
+            guidance.contains(phrase),
+            "delegated_acp_coding flow should mention {phrase}: {guidance}"
+        );
+    }
+    let coding = TOOL_MANIFEST_INTENTS
+        .iter()
+        .find(|intent| intent.name == "coding")
+        .expect("coding intent");
+    for acp_tool in [
+        "inspect_coding_agent_config",
+        "start_coding_agent",
+        "observe_coding_agent",
+        "respond_coding_agent_permission",
+        "cancel_coding_agent",
+    ] {
+        assert!(
+            coding.tools.contains(&acp_tool),
+            "coding intent must expose {acp_tool}"
+        );
+    }
 }
 
 #[test]

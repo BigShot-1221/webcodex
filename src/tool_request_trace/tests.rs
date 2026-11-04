@@ -1323,3 +1323,337 @@ fn continuation_timing_ids_are_bounded_and_exclude_payloads() {
         json!({"event_id": "wc_attention_event_CCCCCCCCCCCCCCCC", "wake_id": wake_id})
     );
 }
+
+#[test]
+fn metadata_mode_coding_agent_diagnostics_correlate_run_id_without_secrets() {
+    const RUN_ID: &str = "wc_agent_run_metadata_trace_aa";
+    const INSTRUCTION: &str = "PRIVATE_ACP_INSTRUCTION_BODY";
+    const IDEMPOTENCY: &str = "PRIVATE_IDEMPOTENCY_KEY_VALUE";
+    const OBS_TOKEN: &str = "wc_acp_obs_PRIVATE_OBSERVATION_TOKEN";
+    const PERM_TOKEN: &str = "wc_acp_perm_PRIVATE_PERMISSION_TOKEN";
+    const EVENT_TEXT: &str = "PRIVATE_ACP_EVENT_TEXT_BODY";
+    const EVENT_LABEL: &str = "PRIVATE_ACP_EVENT_LABEL_/secret/path/cmd --token=leak";
+    const PERM_TITLE: &str = "PRIVATE_PERMISSION_TITLE_BODY";
+
+    let start_request = json!({
+        "project": "agent:test:demo",
+        "provider_id": "cursor",
+        "instruction": INSTRUCTION,
+        "idempotency_key": IDEMPOTENCY,
+    });
+    let observe_request = json!({
+        "run_id": RUN_ID,
+        "after_observation_token": OBS_TOKEN,
+        "limit": 8,
+        "wait_secs": 0,
+    });
+    let respond_request = json!({
+        "run_id": RUN_ID,
+        "permission_request_token": PERM_TOKEN,
+        "option_id": "allow-once",
+    });
+
+    let start_response = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "run_id": RUN_ID,
+                    "project": "agent:test:demo",
+                    "provider_id": "cursor",
+                    "state": "running",
+                    "execution_state": "started",
+                    "observation_token": OBS_TOKEN,
+                    "terminal": null,
+                }
+            }
+        }
+    });
+    let observe_response = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "run_id": RUN_ID,
+                    "project": "agent:test:demo",
+                    "provider_id": "cursor",
+                    "state": "failed",
+                    "execution_state": "completed",
+                    "observation_token": OBS_TOKEN,
+                    "has_more": false,
+                    "history_lost": false,
+                    "first_retained_sequence": 1,
+                    "terminal": {
+                        "stop_reason": "error",
+                        "error_code": "provider_exit",
+                        "message": "PRIVATE_TERMINAL_MESSAGE_BODY",
+                        "completed_at": 1_700_000_000,
+                    },
+                    "events": [{
+                        "sequence": 1,
+                        "kind": "agent_message",
+                        "text": EVENT_TEXT,
+                        "label": EVENT_LABEL,
+                        "status": "running",
+                        "usage": {"used_tokens": 999, "context_window_tokens": 128000},
+                    }],
+                    "pending_permission": {
+                        "request_token": PERM_TOKEN,
+                        "generation": 1,
+                        "tool_call_id": "call-1",
+                        "title": PERM_TITLE,
+                        "options": [{"option_id": "allow-once", "name": "Allow once", "kind": "allow"}],
+                    },
+                }
+            }
+        }
+    });
+
+    let start_req_diag = diagnostics::test_api::request("start_coding_agent", &start_request)
+        .expect("start_coding_agent must be metadata-selected");
+    assert_eq!(start_req_diag["value"]["tool"], "start_coding_agent");
+    assert_eq!(start_req_diag["value"]["arguments"]["provider_id"], "cursor");
+    assert_eq!(
+        start_req_diag["value"]["arguments"]["instruction"]["omitted"],
+        "body"
+    );
+    assert_eq!(
+        start_req_diag["value"]["arguments"]["idempotency_key"]["omitted"],
+        "credential_field"
+    );
+
+    let start_res_diag =
+        diagnostics::test_api::result("start_coding_agent", &start_response).unwrap();
+    assert_eq!(start_res_diag["value"]["output"]["run_id"], RUN_ID);
+    assert_eq!(start_res_diag["value"]["output"]["state"], "running");
+
+    let observe_req_diag = diagnostics::test_api::request("observe_coding_agent", &observe_request)
+        .expect("observe_coding_agent must be metadata-selected");
+    assert_eq!(observe_req_diag["value"]["arguments"]["run_id"], RUN_ID);
+    assert_eq!(
+        observe_req_diag["value"]["arguments"]["after_observation_token"]["omitted"],
+        "credential_field"
+    );
+
+    let observe_res_diag =
+        diagnostics::test_api::result("observe_coding_agent", &observe_response).unwrap();
+    assert_eq!(observe_res_diag["value"]["output"]["run_id"], RUN_ID);
+    assert_eq!(observe_res_diag["value"]["output"]["state"], "failed");
+    assert_eq!(
+        observe_res_diag["value"]["output"]["terminal"]["error_code"],
+        "provider_exit"
+    );
+    let summarized_events = &observe_res_diag["value"]["output"]["events"];
+    assert_eq!(summarized_events["count"], 1);
+    assert_eq!(summarized_events["items"][0]["sequence"], 1);
+    assert_eq!(summarized_events["items"][0]["kind"], "agent_message");
+    assert!(summarized_events["items"][0].get("text").is_none());
+    assert!(summarized_events["items"][0].get("label").is_none());
+    assert!(summarized_events["items"][0].get("status").is_none());
+    assert!(summarized_events["items"][0].get("usage").is_none());
+    assert!(
+        observe_res_diag
+            .get("pending_permission")
+            .is_none()
+            && observe_res_diag["value"]["output"].get("pending_permission").is_none()
+    );
+
+    let respond_req_diag =
+        diagnostics::test_api::request("respond_coding_agent_permission", &respond_request)
+            .expect("respond_coding_agent_permission must be metadata-selected");
+    assert_eq!(
+        respond_req_diag["value"]["arguments"]["permission_request_token"]["omitted"],
+        "credential_field"
+    );
+
+    let unit_blob = serde_json::to_string(&json!([
+        &start_req_diag,
+        &start_res_diag,
+        &observe_req_diag,
+        &observe_res_diag,
+        &respond_req_diag,
+    ]))
+    .unwrap();
+    for secret in [
+        INSTRUCTION,
+        IDEMPOTENCY,
+        OBS_TOKEN,
+        PERM_TOKEN,
+        EVENT_TEXT,
+        EVENT_LABEL,
+        PERM_TITLE,
+        "PRIVATE_TERMINAL_MESSAGE_BODY",
+    ] {
+        assert!(
+            !unit_blob.contains(secret),
+            "metadata diagnostic must not retain {secret}"
+        );
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE", "metadata");
+    env.set(
+        "WEBCODEX_TOOL_REQUEST_TRACE_DIR",
+        temp.path().to_string_lossy().as_ref(),
+    );
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES", "8388608");
+    reset_trace_store_accounting();
+
+    let start_trace = "trace-acp-start-metadata";
+    let observe_trace = "trace-acp-observe-metadata";
+    let start_guard = ToolRequestLifecycle::new(
+        "mcp",
+        start_trace.into(),
+        "1",
+        "tools/call",
+        Some("start_coding_agent".into()),
+    );
+    start_guard.capture_request_diagnostic("start_coding_agent", &start_request);
+    start_guard.capture_payload("final_response", &start_response);
+    drop(start_guard);
+
+    let observe_guard = ToolRequestLifecycle::new(
+        "mcp",
+        observe_trace.into(),
+        "2",
+        "tools/call",
+        Some("observe_coding_agent".into()),
+    );
+    observe_guard.capture_request_diagnostic("observe_coding_agent", &observe_request);
+    observe_guard.capture_payload("final_response", &observe_response);
+    drop(observe_guard);
+    flush_full_trace_writer();
+
+    assert!(payload_files(temp.path(), start_trace).is_empty());
+    assert!(payload_files(temp.path(), observe_trace).is_empty());
+
+    let read_run_id = |trace_id: &str| -> String {
+        let events =
+            fs::read_to_string(temp.path().join(trace_id).join("events.jsonl")).unwrap();
+        let summary = events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["phase"] == "response_summary")
+            .expect("response_summary diagnostic");
+        summary["diagnostic"]["value"]["output"]["run_id"]
+            .as_str()
+            .expect("run_id in response summary")
+            .to_string()
+    };
+    assert_eq!(read_run_id(start_trace), RUN_ID);
+    assert_eq!(read_run_id(observe_trace), RUN_ID);
+
+    let persisted = fs::read_to_string(temp.path().join(observe_trace).join("events.jsonl")).unwrap();
+    assert!(persisted.contains("provider_exit"));
+    assert!(!persisted.contains(EVENT_TEXT));
+    assert!(!persisted.contains(EVENT_LABEL));
+    assert!(!persisted.contains(OBS_TOKEN));
+}
+
+#[test]
+fn metadata_mode_coding_agent_diagnostics_omit_provider_error_messages() {
+    const RUN_ID: &str = "wc_agent_run_error_redact_bb";
+    const STRING_SECRET: &str = "PRIVATE_PROVIDER_STRING_ERROR_cc77";
+    const STRUCTURED_SECRET: &str = "PRIVATE_PROVIDER_STRUCT_MESSAGE_dd88";
+
+    for tool in [
+        "start_coding_agent",
+        "observe_coding_agent",
+        "cancel_coding_agent",
+        "respond_coding_agent_permission",
+    ] {
+        let string_response = json!({
+            "result": {
+                "isError": true,
+                "structuredContent": {
+                    "success": false,
+                    "error": STRING_SECRET,
+                    "output": {
+                        "run_id": RUN_ID,
+                        "error_kind": "provider_failed",
+                        "recovery_kind": "retry_observe",
+                        "execution_state": "failed",
+                    }
+                }
+            }
+        });
+        let string_diag = diagnostics::test_api::result(tool, &string_response).unwrap();
+        assert_eq!(string_diag["value"]["is_error"], true);
+        assert_eq!(
+            string_diag["value"]["output"]["error_kind"],
+            "provider_failed"
+        );
+        assert_eq!(
+            string_diag["value"]["output"]["recovery_kind"],
+            "retry_observe"
+        );
+        assert_eq!(string_diag["value"]["output"]["run_id"], RUN_ID);
+        assert_eq!(
+            string_diag["value"]["error"]["omitted"],
+            "provider_error_message"
+        );
+        assert!(
+            !string_diag.to_string().contains(STRING_SECRET),
+            "{tool} string error must not appear in metadata diagnostic"
+        );
+
+        let structured_response = json!({
+            "result": {
+                "isError": true,
+                "structuredContent": {
+                    "success": false,
+                    "error": {
+                        "code": "acp_provider_exit",
+                        "message": format!("stderr and paths leak: {STRUCTURED_SECRET}"),
+                    },
+                    "output": {
+                        "run_id": RUN_ID,
+                        "error_kind": "provider_exit",
+                        "recovery_kind": "none",
+                        "execution_state": "completed",
+                    }
+                }
+            }
+        });
+        let structured_diag =
+            diagnostics::test_api::result(tool, &structured_response).unwrap();
+        assert_eq!(structured_diag["value"]["is_error"], true);
+        assert_eq!(
+            structured_diag["value"]["output"]["error_kind"],
+            "provider_exit"
+        );
+        assert_eq!(structured_diag["value"]["output"]["recovery_kind"], "none");
+        assert_eq!(structured_diag["value"]["output"]["run_id"], RUN_ID);
+        assert_eq!(
+            structured_diag["value"]["error"]["code"],
+            "acp_provider_exit"
+        );
+        assert_eq!(
+            structured_diag["value"]["error"]["message"]["omitted"],
+            "provider_error_message"
+        );
+        assert!(
+            !structured_diag.to_string().contains(STRUCTURED_SECRET),
+            "{tool} structured error message must not appear in metadata diagnostic"
+        );
+    }
+
+    let legacy = diagnostics::test_api::result(
+        "run_process",
+        &json!({
+            "result": {
+                "structuredContent": {
+                    "success": false,
+                    "error": "legacy-error-preview-sentinel",
+                    "output": {"error_kind": "process_failed"}
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy["value"]["error"],
+        "legacy-error-preview-sentinel"
+    );
+}

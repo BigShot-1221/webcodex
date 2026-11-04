@@ -209,7 +209,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolActivityPresentation::Support,
                 super::ToolActivityInteraction::NonMeaningful,
             ),
-            "Find tools by query/category/intent and limit. Exact tool_name returns one contract and route. Discovery never executes work, registers Host tools or grants authority.",
+            "Exact tool_name returns an admitted contract/route; query/category/intent/limit search without execution. Prefer route.primary; use route.fallback only when authorized. Discovery grants no authority or Host registration. Retired tool_manifest failures do not imply ACP is absent; call call_runtime_tool with tool='read_tool_manifest' and canonical args.",
         ),
         30,
         super::ToolDirectReason::CoreWorkflow,

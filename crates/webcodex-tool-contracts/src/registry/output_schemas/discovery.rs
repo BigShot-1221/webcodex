@@ -273,7 +273,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "Short GPT-facing recommended flow summaries.",
                 ),
             ),
-            ("hint", schema_type("string", "Focused discovery guidance.")),
+            ("hint", schema_type("string", "How list_tools category/features/limit filters work, when summary_only returns compact summaries, and when to use read_tool_manifest for exact contracts and routes.")),
             (
                 "recommended_next",
                 schema_type("string", "Recommended next discovery action."),

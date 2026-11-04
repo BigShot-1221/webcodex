@@ -300,7 +300,7 @@ pub(super) fn dacl_sddl(path: &Path, directory: bool) -> Result<String, String> 
             LocalFree(text as _);
             value
         };
-        Ok(value)
+        Ok(value.trim_end_matches('\0').to_string())
     })();
     unsafe { LocalFree(descriptor as _) };
     result

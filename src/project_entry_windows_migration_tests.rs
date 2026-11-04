@@ -42,11 +42,20 @@ fn legacy_paths(name: &str) -> (tempfile::TempDir, ProjectPaths) {
     (temp, paths)
 }
 
+fn current_user_ace_present(sddl: &str, current_user_sid: &str) -> bool {
+    sddl.contains(&format!(";;;{current_user_sid})"))
+        // Windows renders the local Administrator SID (RID 500) as the SDDL
+        // alias LA rather than its literal SID string.
+        || (current_user_sid.starts_with("S-1-5-21-")
+            && current_user_sid.ends_with("-500")
+            && sddl.contains(";;;LA)"))
+}
+
 fn assert_hardened(path: &Path, current_user_sid: &str) {
     let sddl = dacl_sddl(path, false).unwrap();
     assert!(sddl.starts_with("D:P"), "DACL must be protected: {sddl}");
     assert!(
-        sddl.contains(&format!(";;;{current_user_sid})")),
+        current_user_ace_present(&sddl, current_user_sid),
         "current user ACE must remain: {sddl}"
     );
     assert!(sddl.contains(";;;SY)"), "SYSTEM ACE must remain: {sddl}");
@@ -66,7 +75,7 @@ fn assert_hardened_directory(path: &Path, current_user_sid: &str) {
 
 fn assert_narrow_acl(sddl: &str, current_user_sid: &str) {
     assert!(
-        sddl.contains(&format!(";;;{current_user_sid})")),
+        current_user_ace_present(sddl, current_user_sid),
         "current user ACE must remain: {sddl}"
     );
     assert!(sddl.contains(";;;SY)"), "SYSTEM ACE must remain: {sddl}");

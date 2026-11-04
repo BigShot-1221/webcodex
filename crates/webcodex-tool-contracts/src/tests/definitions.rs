@@ -667,6 +667,52 @@ fn every_runtime_tool_has_an_explicit_fail_closed_audit_contract() {
 }
 
 #[test]
+fn start_coding_agent_description_covers_lost_response_and_same_key_recovery() {
+    let definition =
+        lookup_tool_definition("start_coding_agent").expect("start_coding_agent definition");
+    let description = definition
+        .model_spec
+        .expect("start_coding_agent model spec")
+        .description;
+    for phrase in [
+        "start response was lost",
+        "no run_id",
+        "exact same idempotency_key",
+        "exact same intent",
+        "without redispatching session/prompt",
+        "not a new prompt",
+        "Do not mint a new idempotency_key",
+        "128-record store bound",
+        "up to 24h",
+        "capacity pressure can evict them earlier",
+        "Protected Lost/OutcomeUnknown may persist longer",
+        "new starts fail closed",
+        "do not retry start",
+        "missing record does not prove the prompt never ran",
+        "operator reconciliation",
+        "JSON-RPC ids",
+        "app_call_id",
+        "observe_coding_agent(run_id)",
+        "lost/outcome_unknown",
+        "do not start a replacement Run",
+    ] {
+        assert!(
+            description.contains(phrase),
+            "start_coding_agent: missing {phrase:?}: {description}"
+        );
+    }
+    assert!(
+        description.chars().count() <= MODEL_TOOL_DESCRIPTION_MAX_CHARS,
+        "start_coding_agent canonical description budget"
+    );
+    let spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "start_coding_agent")
+        .expect("start_coding_agent ToolSpec");
+    assert_eq!(spec.description, description);
+}
+
+#[test]
 fn stop_job_preserves_one_canonical_effect() {
     let definition = lookup_tool_definition("stop_job").unwrap();
     assert_eq!(

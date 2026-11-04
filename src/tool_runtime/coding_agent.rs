@@ -41,7 +41,8 @@ const PUBLIC_TOKEN_SEQUENCE_BYTES: usize = 8;
 const PUBLIC_TOKEN_TAG_BYTES: usize = 16;
 const PUBLIC_TOKEN_PAYLOAD_BYTES: usize =
     PUBLIC_TOKEN_EPOCH_BYTES + PUBLIC_TOKEN_SEQUENCE_BYTES + PUBLIC_TOKEN_TAG_BYTES;
-const SERVER_TERMINAL_RETENTION_SECS: i64 = 15 * 60;
+/// Must match `STORE_RETENTION_SECS` in the Runner durable store.
+const SERVER_TERMINAL_RETENTION_SECS: i64 = 24 * 60 * 60;
 const SERVER_MAX_TERMINAL_RUNS: usize = CODING_AGENT_MAX_INVENTORY_RUNS;
 const OBSERVATION_MAC_KEY_DIR: &str = "private";
 const OBSERVATION_MAC_KEY_FILE: &str = "coding-agent-observation-mac-key-v2";
@@ -117,20 +118,55 @@ pub(crate) enum CodingAgentTypedStartOutcome {
     Failure(CodingAgentStartFailure),
 }
 
+fn coding_agent_run_retention_evictable(snapshot: &CodingAgentRunSnapshot) -> bool {
+    if !snapshot.state.terminal() {
+        return false;
+    }
+    if snapshot.state == CodingAgentRunState::Lost {
+        return false;
+    }
+    if snapshot.execution_state == CodingAgentExecutionState::OutcomeUnknown {
+        return false;
+    }
+    if snapshot
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.error_code.as_deref())
+        == Some("coding_agent_terminal_persistence_uncertain")
+    {
+        return false;
+    }
+    true
+}
+
 fn prune_server_runs_locked(runs: &mut HashMap<String, ServerRunBinding>, now: i64) {
     let cutoff = now.saturating_sub(SERVER_TERMINAL_RETENTION_SECS);
     runs.retain(|_, binding| {
-        !binding.snapshot.state.terminal() || binding.snapshot.updated_at >= cutoff
+        let snapshot = &binding.snapshot;
+        if !snapshot.state.terminal() {
+            return true;
+        }
+        if !coding_agent_run_retention_evictable(snapshot) {
+            return true;
+        }
+        snapshot.updated_at >= cutoff
     });
     let mut terminals = runs
         .iter()
-        .filter(|(_, binding)| binding.snapshot.state.terminal())
+        .filter(|(_, binding)| {
+            binding.snapshot.state.terminal()
+                && coding_agent_run_retention_evictable(&binding.snapshot)
+        })
         .map(|(run_id, binding)| (run_id.clone(), binding.snapshot.updated_at))
         .collect::<Vec<_>>();
     if terminals.len() <= SERVER_MAX_TERMINAL_RUNS {
         return;
     }
-    terminals.sort_by_key(|(_, updated_at)| *updated_at);
+    terminals.sort_by(|(left_id, left_at), (right_id, right_at)| {
+        left_at
+            .cmp(right_at)
+            .then_with(|| left_id.cmp(right_id))
+    });
     let remove_count = terminals.len().saturating_sub(SERVER_MAX_TERMINAL_RUNS);
     for (run_id, _) in terminals.into_iter().take(remove_count) {
         runs.remove(&run_id);
@@ -2457,6 +2493,97 @@ mod tests {
                 .filter(|binding| binding.snapshot.state.terminal())
                 .count(),
             SERVER_MAX_TERMINAL_RUNS
+        );
+    }
+
+    #[test]
+    fn server_run_registry_retains_terminal_within_twenty_four_hour_window() {
+        let now = 100_000;
+        let mut runs = HashMap::new();
+        runs.insert(
+            "wc_agent_run_midretention".to_string(),
+            test_server_binding(
+                "wc_agent_run_midretention".to_string(),
+                CodingAgentRunState::Completed,
+                now - (16 * 60),
+            ),
+        );
+        prune_server_runs_locked(&mut runs, now);
+        assert!(runs.contains_key("wc_agent_run_midretention"));
+        runs.get_mut("wc_agent_run_midretention").unwrap().snapshot.updated_at =
+            now - SERVER_TERMINAL_RETENTION_SECS - 1;
+        prune_server_runs_locked(&mut runs, now);
+        assert!(!runs.contains_key("wc_agent_run_midretention"));
+    }
+
+    #[test]
+    fn server_run_registry_retains_protected_terminal_past_twenty_four_hours() {
+        let now = 100_000;
+        let old_ts = now - SERVER_TERMINAL_RETENTION_SECS - 1;
+        let mut runs = HashMap::new();
+        let mut lost = test_server_binding(
+            "wc_agent_run_old_lost".to_string(),
+            CodingAgentRunState::Lost,
+            old_ts,
+        );
+        lost.snapshot.execution_state = CodingAgentExecutionState::OutcomeUnknown;
+        runs.insert("wc_agent_run_old_lost".to_string(), lost);
+        let mut uncertain = test_server_binding(
+            "wc_agent_run_old_uncertain".to_string(),
+            CodingAgentRunState::Failed,
+            old_ts,
+        );
+        uncertain.snapshot.execution_state = CodingAgentExecutionState::NotStarted;
+        uncertain.snapshot.terminal = Some(CodingAgentTerminal {
+            stop_reason: None,
+            error_code: Some("coding_agent_terminal_persistence_uncertain".to_string()),
+            message: Some("uncertain".to_string()),
+            completed_at: old_ts,
+        });
+        runs.insert("wc_agent_run_old_uncertain".to_string(), uncertain);
+        prune_server_runs_locked(&mut runs, now);
+        assert!(runs.contains_key("wc_agent_run_old_lost"));
+        assert!(runs.contains_key("wc_agent_run_old_uncertain"));
+    }
+
+    #[test]
+    fn server_run_registry_capacity_skips_active_and_uncertain_terminals() {
+        let now = 10_000;
+        let mut runs = HashMap::new();
+        runs.insert(
+            "wc_agent_run_active".to_string(),
+            test_server_binding(
+                "wc_agent_run_active".to_string(),
+                CodingAgentRunState::Running,
+                1,
+            ),
+        );
+        let mut lost = test_server_binding(
+            "wc_agent_run_lost_retained".to_string(),
+            CodingAgentRunState::Lost,
+            1,
+        );
+        lost.snapshot.execution_state = CodingAgentExecutionState::OutcomeUnknown;
+        lost.snapshot.terminal = Some(CodingAgentTerminal {
+            stop_reason: None,
+            error_code: Some("runner_restart_uncertain".to_string()),
+            message: Some("uncertain".to_string()),
+            completed_at: 1,
+        });
+        runs.insert("wc_agent_run_lost_retained".to_string(), lost);
+        for index in 0..=SERVER_MAX_TERMINAL_RUNS {
+            let run_id = format!("wc_agent_run_evictable_{index:03}");
+            runs.insert(
+                run_id.clone(),
+                test_server_binding(run_id, CodingAgentRunState::Completed, index as i64 + 10),
+            );
+        }
+        prune_server_runs_locked(&mut runs, now);
+        assert!(runs.contains_key("wc_agent_run_active"));
+        assert!(runs.contains_key("wc_agent_run_lost_retained"));
+        assert!(
+            !runs.contains_key("wc_agent_run_evictable_000"),
+            "oldest evictable terminal should be dropped first"
         );
     }
 

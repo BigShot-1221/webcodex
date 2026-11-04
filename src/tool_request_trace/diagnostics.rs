@@ -37,6 +37,10 @@ pub(super) fn selected(tool: &str) -> bool {
             | "list_projects"
             | "list_project_files"
             | "list_project_tracked_files"
+            | "start_coding_agent"
+            | "observe_coding_agent"
+            | "cancel_coding_agent"
+            | "respond_coding_agent_permission"
     )
 }
 
@@ -249,6 +253,50 @@ fn context_receipt(output: &Value) -> Value {
         "evidence_boundary": "included_in_server_response_not_proof_of_client_receipt_or_model_reading"})
 }
 
+const CODING_AGENT_EVENT_KINDS: &[&str] = &[
+    "agent_message",
+    "reasoning",
+    "plan",
+    "tool_activity",
+    "file_change",
+    "terminal_activity",
+    "usage",
+    "permission_request",
+    "terminal",
+];
+
+fn summarize_coding_agent_events(budget: &mut Budget, value: &Value) -> Value {
+    let Some(events) = value.as_array() else {
+        return Value::Null;
+    };
+    let count = events.len();
+    let mut items = Vec::new();
+    for event in events.iter().take(MAX_ITEMS) {
+        budget.nodes += 1;
+        if budget.nodes > MAX_NODES || budget.bytes >= 6000 {
+            budget.truncated = true;
+            break;
+        }
+        let sequence = event.get("sequence").cloned().unwrap_or(Value::Null);
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|kind| CODING_AGENT_EVENT_KINDS.contains(kind))
+            .map(|kind| Value::String(kind.to_owned()))
+            .unwrap_or(Value::Null);
+        budget.bytes += 48;
+        items.push(json!({"sequence": sequence, "kind": kind}));
+    }
+    if items.len() != count {
+        budget.truncated = true;
+    }
+    json!({
+        "count": count,
+        "items": items,
+        "truncated": items.len() != count,
+    })
+}
+
 pub(super) fn result(tool: &str, response: &Value) -> Option<Value> {
     if super::tool_suppresses_payload_capture(Some(tool)) {
         return None;
@@ -275,6 +323,9 @@ pub(super) fn result(tool: &str, response: &Value) -> Option<Value> {
         "instructions",
         "semantic_navigation",
         "input_normalization",
+        "run_id",
+        "state",
+        "provider_id",
         "execution_state",
         "command_execution_state",
         "command_started",
@@ -288,6 +339,7 @@ pub(super) fn result(tool: &str, response: &Value) -> Option<Value> {
         "job_id",
         "failure_kind",
         "error_kind",
+        "recovery_kind",
         "reason_code",
         "passed",
         "tests_run_count",
@@ -305,22 +357,75 @@ pub(super) fn result(tool: &str, response: &Value) -> Option<Value> {
         "output_truncated",
         "truncation_reason",
         "items",
+        "terminal",
+        "has_more",
+        "history_lost",
+        "first_retained_sequence",
+        "events",
+        "cancel_requested",
+        "applied",
     ] {
         if let Some(value) = output.get(name) {
-            fields.insert(name.into(), budget.copy(value, 0, name));
+            let diagnostic = if name == "events" && omits_provider_error_message(tool) {
+                summarize_coding_agent_events(&mut budget, value)
+            } else {
+                budget.copy(value, 0, name)
+            };
+            fields.insert(name.into(), diagnostic);
         }
     }
     Some(budget.finish(json!({"tool": prefix(tool,128), "success": result.get("success"),
-        "is_error": protocol.get("isError"), "error": budgeted_error(response, result), "output": fields})))
+        "is_error": protocol.get("isError"), "error": budgeted_error(tool, response, result), "output": fields})))
 }
 
-fn budgeted_error(response: &Value, result: &Value) -> Value {
+fn omits_provider_error_message(tool: &str) -> bool {
+    matches!(
+        tool,
+        "start_coding_agent"
+            | "observe_coding_agent"
+            | "cancel_coding_agent"
+            | "respond_coding_agent_permission"
+    )
+}
+
+fn budgeted_error(tool: &str, response: &Value, result: &Value) -> Value {
     let error = result.get("error").or_else(|| response.get("error"));
+    let omit_message = omits_provider_error_message(tool);
     match error {
+        Some(Value::String(_)) if omit_message => json!({"omitted": "provider_error_message"}),
         Some(Value::String(text)) => Value::String(prefix(text, 256).to_owned()),
-        Some(value) if value.is_object() => json!({"code": value.get("code"),
-            "message": value.get("message").and_then(Value::as_str).map(|s| prefix(s, 256))}),
+        Some(value) if value.is_object() => {
+            if omit_message {
+                let mut object = Map::new();
+                if let Some(code) = value.get("code") {
+                    object.insert("code".into(), code.clone());
+                }
+                if value.get("message").is_some() {
+                    object.insert(
+                        "message".into(),
+                        json!({"omitted": "provider_error_message"}),
+                    );
+                }
+                Value::Object(object)
+            } else {
+                json!({"code": value.get("code"),
+                    "message": value.get("message").and_then(Value::as_str).map(|s| prefix(s, 256))})
+            }
+        }
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_api {
+    use super::Value;
+
+    pub(crate) fn request(entry_tool: &str, arguments: &Value) -> Option<Value> {
+        super::request(entry_tool, arguments)
+    }
+
+    pub(crate) fn result(tool: &str, response: &Value) -> Option<Value> {
+        super::result(tool, response)
     }
 }
 

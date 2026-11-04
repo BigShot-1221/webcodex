@@ -802,6 +802,7 @@ impl ToolCall {
             Self::RunProcess { project, .. }
             | Self::RunDetachedProcess { project, .. }
             | Self::CodingAgentStart { project, .. }
+            | Self::CodingAgentInspectConfig { project, .. }
             | Self::StartAgentTaskCodingRun { project, .. }
             | Self::RunScript { project, .. }
             | Self::RunShell { project, .. }

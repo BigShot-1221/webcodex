@@ -468,16 +468,16 @@ impl CodingAgentManager {
 
     pub(crate) fn inventory(&self) -> CodingAgentRunInventory {
         self.cleanup_expired();
-        let mut runs = self
+        let runs = self
             .runs
             .lock()
             .unwrap()
             .values()
             .map(|entry| entry.snapshot())
             .collect::<Vec<_>>();
-        runs.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-        runs.truncate(CODING_AGENT_MAX_INVENTORY_RUNS);
-        CodingAgentRunInventory { runs }
+        CodingAgentRunInventory {
+            runs: select_bounded_inventory_runs(runs),
+        }
     }
 
     pub(crate) fn stop_accepting(&self) {
@@ -838,6 +838,15 @@ impl CodingAgentManager {
                 );
             }
         }
+        if let Err(error) = self.enforce_durable_capacity_for_admission(Some(&request.run_id)) {
+            return response_error(
+                CodingAgentDispatchState::NotStarted,
+                "coding_agent_retention_capacity_exhausted",
+                error,
+                "capacity",
+                "wait",
+            );
+        }
 
         let timestamp = now();
         let record = DurableRunRecord {
@@ -927,6 +936,16 @@ use permission::permission_outcome_for_acp;
 use permission::{permission_result_json, PermissionSlot};
 
 use store::{DurableDispatchPhase, DurableRunRecord, DurableRunStore, STORE_SCHEMA_VERSION};
+
+use lifecycle::select_bounded_inventory_runs;
+
+#[cfg(test)]
+pub(crate) use lifecycle::{
+    coding_agent_run_retention_evictable as test_coding_agent_run_retention_evictable,
+    select_bounded_inventory_runs as test_select_bounded_inventory_runs,
+};
+#[cfg(test)]
+pub(crate) use store::STORE_RETENTION_SECS;
 
 #[cfg(test)]
 mod tests;

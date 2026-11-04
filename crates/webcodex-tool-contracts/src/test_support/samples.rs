@@ -22,7 +22,7 @@ fn generate(
     let object = schema
         .as_object()
         .ok_or("sample requires an object schema")?;
-    check_keywords(object, false)?;
+    check_keywords(object, fixtures)?;
     let valid = |value: &Value| validate_candidate(value, schema, fixtures).is_ok();
     for key in ["const", "default"] {
         if let Some(value) = schema.get(key) {
@@ -244,6 +244,7 @@ fn generate_field(
             "wake_id" => Some(json!("wc_wake_7u7u7u7u7u7u7u7u")),
             "consume_token" => Some(json!("wc_wake_consume______________________w")),
             "run_id" => Some(json!("wc_agent_run_sample_1234")),
+            "permission_request_token" => Some(json!("wc_acp_perm_sample_1234")),
             "skill_id" => Some(json!("wc_skill_EREREREREREREREREREREQ")),
             // App-only and operator-only identities need fixtures too. These
             // values are test data, not live bindings or an admission registry.

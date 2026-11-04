@@ -1,6 +1,8 @@
 //! MCP surface admission and exact Work Result Window selection.
 //! This supplies capabilities only; canonical runtime authorization still follows.
+use super::super::mcp_adaptive_runtime_direct_route_denial;
 use super::*;
+use crate::mcp::response::rpc_error_with_data;
 
 pub(super) struct RuntimeSurface {
     pub(super) capabilities: ToolProtocolCapabilities,
@@ -154,28 +156,14 @@ impl RuntimeSurface {
             }
             // A recovery hint must name a real, currently admitted route. Retired
             // names and unavailable App tools cannot become valid through a gateway.
-            let message = if mcp_adaptive_runtime_gateway_target_route(&params.name, stateless_2026)
-                != crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
-            {
-                format!(
-                    "tool '{}' is unavailable on the current MCP surface; refresh tools/list and select a current callable",
-                    params.name
-                )
-            } else if !crate::tool_runtime::kernel::runtime_tool_scope_allows_discovery(
-                auth,
-                &params.name,
-            ) {
-                format!(
-                    "tool '{}' is unavailable under the current authorization; check granted scopes and current tools/list",
-                    params.name
-                )
-            } else {
-                format!(
-                    "tool '{}' is not directly callable on Adaptive Runtime; use call_runtime_tool with its current canonical arguments and normal authorization",
-                    params.name
-                )
-            };
-            return Err(McpOutcome::BadRequest(rpc_error(id, -32602, message)));
+            let denial =
+                mcp_adaptive_runtime_direct_route_denial(&params.name, auth, stateless_2026);
+            return Err(McpOutcome::BadRequest(rpc_error_with_data(
+                id,
+                -32602,
+                denial.message,
+                denial.diagnostics,
+            )));
         }
 
         Ok(Self {

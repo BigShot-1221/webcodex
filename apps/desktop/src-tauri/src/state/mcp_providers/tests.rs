@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp_providers::ProviderTransport;
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -23,12 +24,16 @@ fn request(revision: u64) -> McpProviderRequest {
         id: None,
         expected_revision: revision,
         name: "Local MCP".into(),
+        transport: ProviderTransport::Stdio,
         command: std::env::current_exe()
             .unwrap()
             .to_string_lossy()
             .into_owned(),
         args: Vec::new(),
         cwd: None,
+        url: None,
+        http_headers: BTreeMap::new(),
+        http_query_params: BTreeMap::new(),
         enabled: true,
         env: BTreeMap::from([("PASSWORD".into(), Some("appstate-fixture-secret".into()))]),
     }

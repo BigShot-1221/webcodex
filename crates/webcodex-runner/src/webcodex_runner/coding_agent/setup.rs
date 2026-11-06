@@ -1,8 +1,8 @@
 //! Pre-prompt ACP negotiation and Runner-enforced configuration.
 
 use super::protocol::{
-    bounded_setup_wait, remaining_run_budget, request_frame, wait_outbound_write, wait_response,
     AcpFailure, AcpOutboundWriter, OutboundInterruption, OutboundWriteOutcome, ReaderEvent,
+    bounded_setup_wait, remaining_run_budget, request_frame, wait_outbound_write, wait_response,
 };
 use super::*;
 use webcodex_core::coding_agent::CodingAgentLiveConfirmedConfigEntry;
@@ -696,8 +696,7 @@ impl CodingAgentManager {
                 return None;
             }
         }
-        let caller_apply_order =
-            caller_config_application_order(&advertised, &caller_keys);
+        let caller_apply_order = caller_config_application_order(&advertised, &caller_keys);
         for key in &caller_apply_order {
             let value = request.config.get(key).expect("caller key was enumerated");
             if !self.apply_pre_prompt_config_option(

@@ -11,7 +11,7 @@ use agent_client_protocol_schema::v1::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
@@ -29,21 +29,21 @@ use uuid::Uuid;
 #[cfg(all(test, unix))]
 use webcodex_core::coding_agent::CodingAgentCancelRequest;
 use webcodex_core::coding_agent::{
-    validate_coding_agent_run_snapshot, validate_request, CodingAgentConfigValue,
-    CodingAgentDispatchState, CodingAgentEvent, CodingAgentEventKind, CodingAgentExecutionState,
-    CodingAgentObserveResult, CodingAgentProvider, CodingAgentRequest, CodingAgentResponse,
-    CodingAgentResponsePayload, CodingAgentRunInventory, CodingAgentRunSnapshot,
-    CodingAgentRunState, CodingAgentTerminal, CodingAgentUsage,
     CODING_AGENT_MAX_EVENTS_PER_RESPONSE, CODING_AGENT_MAX_INVENTORY_RUNS,
     CODING_AGENT_MAX_RETAINED_EVENTS, CODING_AGENT_STOP_REASON_CANCELLED,
     CODING_AGENT_STOP_REASON_END_TURN, CODING_AGENT_STOP_REASON_MAX_TOKENS,
     CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS, CODING_AGENT_STOP_REASON_REFUSAL,
+    CodingAgentConfigValue, CodingAgentDispatchState, CodingAgentEvent, CodingAgentEventKind,
+    CodingAgentExecutionState, CodingAgentObserveResult, CodingAgentProvider, CodingAgentRequest,
+    CodingAgentResponse, CodingAgentResponsePayload, CodingAgentRunInventory,
+    CodingAgentRunSnapshot, CodingAgentRunState, CodingAgentTerminal, CodingAgentUsage,
+    validate_coding_agent_run_snapshot, validate_request,
 };
 use webcodex_process::ManagedChild;
 use webcodex_runner_config::paths::paths_equal;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 const ACP_MESSAGE_MAX_BYTES: usize = 1024 * 1024;
 const ACP_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -579,11 +579,7 @@ impl CodingAgentManager {
                 let live_acp = request
                     .include_live_acp
                     .then(|| self.run_live_acp_probe(&request, provider));
-                let forced_option_ids = self
-                    .forced_config
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let forced_option_ids = self.forced_config.keys().cloned().collect::<Vec<_>>();
                 CodingAgentResponse::success(CodingAgentResponsePayload::Diagnose {
                     provider_id: request.provider_id.clone(),
                     provider_instance_id: provider.instance_id.clone(),
@@ -803,7 +799,7 @@ impl CodingAgentManager {
                     error,
                     "configuration",
                     "retry_same",
-                )
+                );
             }
         };
         match self.store.read(&request.run_id) {
@@ -933,19 +929,19 @@ mod setup;
 mod store;
 
 use permission::permission_outcome_for_acp;
-use permission::{permission_result_json, PermissionSlot};
+use permission::{PermissionSlot, permission_result_json};
 
 use store::{DurableDispatchPhase, DurableRunRecord, DurableRunStore, STORE_SCHEMA_VERSION};
 
 use lifecycle::select_bounded_inventory_runs;
 
 #[cfg(test)]
-pub(crate) use lifecycle::{
+use lifecycle::{
     coding_agent_run_retention_evictable as test_coding_agent_run_retention_evictable,
     select_bounded_inventory_runs as test_select_bounded_inventory_runs,
 };
 #[cfg(test)]
-pub(crate) use store::STORE_RETENTION_SECS;
+use store::STORE_RETENTION_SECS;
 
 #[cfg(test)]
 mod tests;

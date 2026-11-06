@@ -22,12 +22,16 @@ fn request(revision: u64) -> McpProviderRequest {
         id: None,
         expected_revision: revision,
         name: "Local test MCP".into(),
+        transport: ProviderTransport::Stdio,
         command: std::env::current_exe()
             .unwrap()
             .to_string_lossy()
             .into_owned(),
         args: vec!["--stdio".into()],
         cwd: None,
+        url: None,
+        http_headers: BTreeMap::new(),
+        http_query_params: BTreeMap::new(),
         enabled: true,
         env: BTreeMap::from([
             (
@@ -60,7 +64,9 @@ fn desired_profiles_and_private_credentials_survive_desktop_restart() {
     restarted.apply_to_command(&mut command).unwrap();
     let injected = command
         .get_envs()
-        .filter(|(key, _)| key.to_string_lossy().starts_with(PRIVATE_ENV_PREFIX))
+        .filter(|(key, value)| {
+            key.to_string_lossy().starts_with(PRIVATE_ENV_PREFIX) && value.is_some()
+        })
         .collect::<Vec<_>>();
     assert_eq!(injected.len(), 2);
     assert!(injected
@@ -253,6 +259,218 @@ fn enabled_capacity_matches_runner_and_rejects_without_partial_commit() {
         .update(request(MCP_GATEWAY_MAX_PROVIDERS as u64))
         .is_err());
     assert_eq!(fs::read(store.manifest_path()).unwrap(), before);
+}
+
+#[test]
+fn legacy_manifest_without_transport_deserializes_as_stdio() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let id = store.update(request(0)).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.manifest_path()).unwrap()).unwrap();
+    manifest["profiles"][0]["profile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("transport");
+    fs::write(
+        store.manifest_path(),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let restarted = fixture.store();
+    assert!(!restarted.invalid);
+    assert_eq!(
+        restarted.profiles().unwrap()[0].transport,
+        ProviderTransport::Stdio
+    );
+    assert_eq!(restarted.profiles().unwrap()[0].id, id);
+}
+
+#[test]
+fn streamable_http_profile_rejects_secrets_in_url_and_forbidden_headers() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let mut remote = request(0);
+    remote.transport = ProviderTransport::StreamableHttp;
+    remote.command.clear();
+    remote.args.clear();
+    remote.url = Some("https://design.example/mcp".into());
+    remote.http_query_params = BTreeMap::from([("userToken".into(), "API_KEY".into())]);
+    store.update(remote).unwrap();
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("https://user:secret@design.example/mcp".into());
+    bad.http_query_params = BTreeMap::from([("userToken".into(), "API_KEY".into())]);
+    assert!(store.update(bad).is_err());
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("https://design.example/mcp?token=leak".into());
+    bad.http_query_params = BTreeMap::from([("userToken".into(), "API_KEY".into())]);
+    assert!(store.update(bad).is_err());
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("http://example.com/mcp".into());
+    bad.http_query_params = BTreeMap::from([("userToken".into(), "API_KEY".into())]);
+    assert!(store.update(bad).is_err());
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("https://design.example/mcp".into());
+    bad.http_headers = BTreeMap::from([("Proxy-Authorization".into(), "API_KEY".into())]);
+    assert!(store.update(bad).is_err());
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("https://design.example/mcp".into());
+    bad.http_headers = BTreeMap::from([("Host".into(), "API_KEY".into())]);
+    assert!(store.update(bad).is_err());
+    assert!(validate_streamable_http_url("http://127.0.0.1/mcp").is_ok());
+}
+
+#[test]
+fn streamable_http_url_rejects_empty_query_delimiter_and_port_zero() {
+    assert!(validate_streamable_http_url("https://design.example/mcp?").is_err());
+    assert!(validate_streamable_http_url("https://design.example/mcp#").is_err());
+    assert!(validate_streamable_http_url("https://design.example/mcp?token=leak").is_err());
+    assert!(validate_streamable_http_url("http://127.0.0.1:0/mcp").is_err());
+    assert!(validate_streamable_http_url("https://design.example/mcp").is_ok());
+}
+
+#[test]
+fn streamable_http_url_rejects_empty_userinfo_delimiter() {
+    assert!(validate_streamable_http_url("https://@design.example/mcp").is_err());
+    assert!(validate_streamable_http_url("https://design.example/mcp").is_ok());
+}
+
+#[test]
+fn streamable_http_url_accepts_localhost_subdomains_and_rejects_plain_http_elsewhere() {
+    assert!(validate_streamable_http_url("http://app.localhost/mcp").is_ok());
+    assert!(validate_streamable_http_url("http://app.localhost./mcp").is_ok());
+    assert!(validate_streamable_http_url("http://localhost./mcp").is_ok());
+    assert!(validate_streamable_http_url("http://example.com/mcp").is_err());
+    assert!(validate_streamable_http_url("http://notlocal.host/mcp").is_err());
+}
+
+#[test]
+fn streamable_http_rejects_aligned_forbidden_header_names() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    store.update(request(0)).unwrap();
+    let base = || {
+        let mut remote = request(1);
+        remote.transport = ProviderTransport::StreamableHttp;
+        remote.command.clear();
+        remote.args.clear();
+        remote.url = Some("https://design.example/mcp".into());
+        remote.env = BTreeMap::from([("API_KEY".into(), Some("fixture-only-api-key".into()))]);
+        remote
+    };
+    for header in [
+        "proxy-connection",
+        "trailer",
+        "Trailers",
+        "Proxy-Connection",
+    ] {
+        let mut bad = base();
+        bad.http_headers = BTreeMap::from([(header.into(), "API_KEY".into())]);
+        assert!(
+            store.update(bad).is_err(),
+            "expected {header} to be forbidden"
+        );
+    }
+    let mut ok = base();
+    ok.http_headers = BTreeMap::from([
+        ("Authorization".into(), "API_KEY".into()),
+        ("Cookie".into(), "API_KEY".into()),
+    ]);
+    store.update(ok).unwrap();
+}
+
+#[test]
+fn streamable_http_accepts_mapped_auth_headers_and_rejects_transport_owned() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let mut remote = request(0);
+    remote.transport = ProviderTransport::StreamableHttp;
+    remote.command.clear();
+    remote.args.clear();
+    remote.url = Some("https://design.example/mcp".into());
+    remote.env = BTreeMap::from([
+        (
+            "MCP_ACCESS_TOKEN".into(),
+            Some("fixture-bearer-token".into()),
+        ),
+        (
+            "SESSION_COOKIE".into(),
+            Some("fixture-session-cookie".into()),
+        ),
+    ]);
+    remote.http_headers = BTreeMap::from([
+        ("Authorization".into(), "MCP_ACCESS_TOKEN".into()),
+        ("Cookie".into(), "SESSION_COOKIE".into()),
+    ]);
+    store.update(remote).unwrap();
+    assert_eq!(
+        store.snapshot(None).profiles[0].http_headers,
+        BTreeMap::from([
+            ("Authorization".into(), "MCP_ACCESS_TOKEN".into()),
+            ("Cookie".into(), "SESSION_COOKIE".into()),
+        ])
+    );
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("https://design.example/mcp".into());
+    bad.env = BTreeMap::from([(
+        "MCP_ACCESS_TOKEN".into(),
+        Some("fixture-bearer-token".into()),
+    )]);
+    bad.http_headers = BTreeMap::from([("Proxy-Authorization".into(), "MCP_ACCESS_TOKEN".into())]);
+    assert!(store.update(bad).is_err());
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("https://design.example/mcp".into());
+    bad.env = BTreeMap::from([(
+        "MCP_ACCESS_TOKEN".into(),
+        Some("fixture-bearer-token".into()),
+    )]);
+    bad.http_headers = BTreeMap::from([("mcp-session-id".into(), "MCP_ACCESS_TOKEN".into())]);
+    assert!(store.update(bad).is_err());
+    let mut bad = request(1);
+    bad.transport = ProviderTransport::StreamableHttp;
+    bad.command.clear();
+    bad.args.clear();
+    bad.url = Some("https://design.example/mcp".into());
+    bad.env
+        .insert("AUTHORIZATION".into(), Some("forbidden-env-key".into()));
+    assert!(store.update(bad).is_err());
+}
+
+#[test]
+fn streamable_http_requires_nonempty_control_free_mapped_credentials() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    for secret in ["", "Bearer token\r\nX-Injected: yes"] {
+        let mut remote = request(0);
+        remote.transport = ProviderTransport::StreamableHttp;
+        remote.command.clear();
+        remote.args.clear();
+        remote.url = Some("https://design.example/mcp".into());
+        remote.env = BTreeMap::from([("MCP_ACCESS_TOKEN".into(), Some(secret.to_string()))]);
+        remote.http_headers = BTreeMap::from([("Authorization".into(), "MCP_ACCESS_TOKEN".into())]);
+        assert!(store.update(remote).is_err());
+    }
 }
 
 #[cfg(unix)]

@@ -23,14 +23,38 @@ pub enum ProviderScope {
     Runner,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+impl ProviderTransport {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Stdio)
+    }
+}
+
+const MAX_HTTP_MAPPINGS: usize = 32;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct McpProviderProfile {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "ProviderTransport::is_default")]
+    pub transport: ProviderTransport,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub http_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub http_query_params: BTreeMap<String, String>,
     pub enabled: bool,
     pub scope: ProviderScope,
     pub env_keys: Vec<String>,
@@ -77,9 +101,17 @@ pub struct McpProviderRequest {
     pub id: Option<String>,
     pub expected_revision: u64,
     pub name: String,
+    #[serde(default)]
+    pub transport: ProviderTransport,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub http_headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub http_query_params: BTreeMap<String, String>,
     pub enabled: bool,
     /// Values are write-only; null retains the selected provider's existing value.
     /// Omitted keys remove the credential. Empty strings are intentional values.
@@ -177,12 +209,19 @@ impl McpProviderStore {
         let profile = McpProviderProfile {
             id: id.clone(),
             name: request.name.trim().into(),
+            transport: request.transport,
             command: request.command.trim().into(),
             args: request.args,
             cwd: request
                 .cwd
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            url: request
+                .url
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            http_headers: request.http_headers,
+            http_query_params: request.http_query_params,
             enabled: request.enabled,
             scope: ProviderScope::Runner,
             env_keys: request.env.keys().cloned().collect(),
@@ -190,7 +229,7 @@ impl McpProviderStore {
         validate_profile(&profile)?;
         // Resolve executables without running them. Names such as npx are allowed in
         // desired state; the Runner contract receives an absolute host-local path.
-        if profile.enabled {
+        if profile.enabled && profile.transport == ProviderTransport::Stdio {
             resolve_executable(&profile.command)?;
         }
         let old_values = previous
@@ -207,6 +246,7 @@ impl McpProviderStore {
             }
             values.insert(key, value);
         }
+        validate_mapped_credentials(&profile, &values)?;
         let secret_ref = (!values.is_empty()).then(|| uuid::Uuid::new_v4().to_string());
         let next_provider = StoredProvider {
             profile,
@@ -287,6 +327,7 @@ impl McpProviderStore {
         {
             return Err(invalid());
         }
+        validate_mapped_credentials(&provider.profile, &values)?;
         Ok(values)
     }
     fn write_credentials(
@@ -494,27 +535,25 @@ fn validate_profile(p: &McpProviderProfile) -> DesktopResult<()> {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         || validate_provider_name(&p.name).is_err()
-        || p.command.is_empty()
         || p.command.len() > 1024
         || p.command.contains(['\0', '\n', '\r'])
-        || p.args.len() > 64
-        || p.args.iter().any(|s| s.len() > 4096 || s.contains('\0'))
-        || p.args.iter().map(|s| s.len() + 1).sum::<usize>() > 16 * 1024
         || p.env_keys.len() > 64
     {
         return Err(invalid());
     }
-    if let Some(cwd) = &p.cwd {
-        if cwd.len() > 4096
-            || !Path::new(cwd).is_absolute()
-            || cwd.contains(['\0', '\n', '\r'])
-            || webcodex_runner_config::paths::validate_project_path_ingress(Path::new(cwd)).is_err()
-        {
-            return Err(invalid());
-        }
+    if !validate_env_keys(&p.env_keys)? {
+        return Err(invalid());
     }
+    match p.transport {
+        ProviderTransport::Stdio => validate_stdio_profile(p)?,
+        ProviderTransport::StreamableHttp => validate_streamable_http_profile(p)?,
+    }
+    Ok(())
+}
+
+fn validate_env_keys(env_keys: &[String]) -> DesktopResult<bool> {
     let mut keys = BTreeSet::new();
-    for key in &p.env_keys {
+    for key in env_keys {
         let normalized = key.to_ascii_uppercase();
         if key.is_empty()
             || key.len() > 128
@@ -528,16 +567,210 @@ fn validate_profile(p: &McpProviderProfile) -> DesktopResult<()> {
                 key.clone()
             })
         {
-            return Err(invalid());
+            return Ok(false);
         }
     }
-    if p.env_keys.windows(2).any(|pair| pair[0] >= pair[1])
-        || p.env_keys.len() + bootstrap_environment(&p.env_keys).len()
-            > MCP_GATEWAY_MAX_ENV_MAPPINGS
+    Ok(!(env_keys.windows(2).any(|pair| pair[0] >= pair[1])
+        || env_keys.len() + bootstrap_environment(env_keys).len() > MCP_GATEWAY_MAX_ENV_MAPPINGS))
+}
+
+fn validate_stdio_profile(p: &McpProviderProfile) -> DesktopResult<()> {
+    if p.command.is_empty()
+        || p.args.len() > 64
+        || p.args.iter().any(|s| s.len() > 4096 || s.contains('\0'))
+        || p.args.iter().map(|s| s.len() + 1).sum::<usize>() > 16 * 1024
+        || p.url.is_some()
+        || !p.http_headers.is_empty()
+        || !p.http_query_params.is_empty()
     {
         return Err(invalid());
     }
+    if let Some(cwd) = &p.cwd {
+        if cwd.len() > 4096
+            || !Path::new(cwd).is_absolute()
+            || cwd.contains(['\0', '\n', '\r'])
+            || webcodex_runner_config::paths::validate_project_path_ingress(Path::new(cwd)).is_err()
+        {
+            return Err(invalid());
+        }
+    }
     Ok(())
+}
+
+fn validate_streamable_http_profile(p: &McpProviderProfile) -> DesktopResult<()> {
+    if !p.args.is_empty() || p.cwd.is_some() {
+        return Err(invalid());
+    }
+    let url = p.url.as_deref().ok_or_else(invalid)?;
+    validate_streamable_http_url(url)?;
+    validate_http_mappings(p, &p.http_headers, true)?;
+    validate_http_mappings(p, &p.http_query_params, false)?;
+    Ok(())
+}
+
+fn streamable_http_url_authority_has_userinfo(value: &str) -> bool {
+    let Some(scheme_end) = value.find("://") else {
+        return false;
+    };
+    let rest = &value[scheme_end + 3..];
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .unwrap_or(rest.len());
+    rest[..authority_end].contains('@')
+}
+
+pub fn validate_streamable_http_url(value: &str) -> DesktopResult<()> {
+    if value.len() > 4096 || value.contains(['\0', '\n', '\r']) {
+        return Err(invalid());
+    }
+    if value.contains('#') {
+        return Err(invalid());
+    }
+    let parsed = url::Url::parse(value).map_err(|_| invalid())?;
+    if !parsed.has_host() {
+        return Err(invalid());
+    }
+    if parsed.username() != ""
+        || parsed.password().is_some()
+        || streamable_http_url_authority_has_userinfo(value)
+    {
+        return Err(invalid());
+    }
+    if parsed.port() == Some(0) {
+        return Err(invalid());
+    }
+    if parsed.query().is_some() {
+        return Err(invalid());
+    }
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            if !url_host_is_loopback(&parsed) {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    if !parsed.path().starts_with('/') {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn url_host_is_loopback(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            let host = host.trim_end_matches('.');
+            host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+fn validate_http_mappings(
+    profile: &McpProviderProfile,
+    mappings: &BTreeMap<String, String>,
+    headers: bool,
+) -> DesktopResult<()> {
+    if mappings.len() > MAX_HTTP_MAPPINGS {
+        return Err(invalid());
+    }
+    let env_keys: BTreeSet<&str> = profile.env_keys.iter().map(String::as_str).collect();
+    let mut seen = BTreeSet::new();
+    for (target, source) in mappings {
+        if headers {
+            validate_http_header_target(target)?;
+        } else if !validate_http_query_target(target) {
+            return Err(invalid());
+        }
+        if !env_keys.contains(source.as_str()) {
+            return Err(invalid());
+        }
+        let normalized = if headers {
+            target.to_ascii_lowercase()
+        } else if cfg!(windows) {
+            target.to_ascii_lowercase()
+        } else {
+            target.clone()
+        };
+        if !seen.insert(normalized) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn validate_mapped_credentials(
+    profile: &McpProviderProfile,
+    values: &BTreeMap<String, String>,
+) -> DesktopResult<()> {
+    if profile.transport != ProviderTransport::StreamableHttp {
+        return Ok(());
+    }
+    for source in profile
+        .http_headers
+        .values()
+        .chain(profile.http_query_params.values())
+    {
+        let value = values.get(source).ok_or_else(invalid)?;
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn validate_http_header_target(name: &str) -> DesktopResult<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || name.contains(['\0', '\n', '\r'])
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'))
+    {
+        return Err(invalid());
+    }
+    if forbidden_http_header(name) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_http_query_target(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains(['\0', '\n', '\r', '=', '&'])
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
+        })
+}
+
+fn forbidden_http_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "proxy-authorization"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "proxy-authenticate"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+            | "content-length"
+            | "content-type"
+            | "accept"
+            | "expect"
+            | "mcp-session-id"
+            | "mcp-protocol-version"
+            | "last-event-id"
+            | "mcp-method"
+            | "mcp-name"
+    )
 }
 fn validate_manifest(manifest: &Manifest) -> DesktopResult<()> {
     if manifest.schema_version != 1
@@ -603,7 +836,7 @@ fn read_optional(path: &Path) -> DesktopResult<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 pub fn invalid() -> DesktopError {
-    DesktopError::new("mcp_provider_invalid", "MCP Provider settings are invalid or unavailable", "Check the name, command, arguments and environment fields. Saved private values are never returned.")
+    DesktopError::new("mcp_provider_invalid", "MCP Provider settings are invalid or unavailable", "Check the name, transport, command or endpoint URL, HTTP mappings, arguments and environment fields. Saved private values are never returned.")
 }
 fn changed() -> DesktopError {
     DesktopError::new("mcp_provider_changed", "MCP Provider settings changed or could not be saved", "Refresh MCP Providers before saving again; the previous valid configuration is retained on an interrupted write.")

@@ -1,5 +1,5 @@
 use super::*;
-use crate::mcp_providers::McpProviderRequest;
+use crate::mcp_providers::{env_source, McpProviderRequest, McpProviderStore, ProviderTransport};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -35,12 +35,16 @@ fn request(revision: u64) -> McpProviderRequest {
         id: None,
         expected_revision: revision,
         name: "Browser automation".into(),
+        transport: ProviderTransport::Stdio,
         command: std::env::current_exe()
             .unwrap()
             .to_string_lossy()
             .into_owned(),
         args: vec!["--stdio".into()],
         cwd: None,
+        url: None,
+        http_headers: BTreeMap::new(),
+        http_query_params: BTreeMap::new(),
         enabled: true,
         env: BTreeMap::from([("API_KEY".into(), Some("mcp-fixture-secret".into()))]),
     }
@@ -208,4 +212,51 @@ fn wrong_identity_duplicate_ids_and_capacity_never_rewrite_runner_config() {
         "mcp_provider_capacity"
     );
     assert_eq!(text(&runtime), original);
+}
+
+#[test]
+fn streamable_http_reconciliation_materializes_remote_fields_and_omits_stdio() {
+    let fixture = Fixture::new();
+    let runtime = fixture.runtime("remote", "remote-client");
+    let mut store = McpProviderStore::load(&fixture.0);
+    let mut remote = request(0);
+    remote.transport = ProviderTransport::StreamableHttp;
+    remote.command.clear();
+    remote.args.clear();
+    remote.url = Some("https://design.penpot.app/mcp/stream".into());
+    remote.http_query_params =
+        BTreeMap::from([("userToken".into(), "PENPOT_USER_TOKEN".into())]);
+    remote.env = BTreeMap::from([(
+        "PENPOT_USER_TOKEN".into(),
+        Some("mcp-fixture-secret".into()),
+    )]);
+    let id = store.update(remote).unwrap();
+    reconcile_mcp(&runtime, &store).unwrap();
+    let doc = text(&runtime).parse::<DocumentMut>().unwrap();
+    let provider = doc["mcp"]["providers"]
+        .as_array_of_tables()
+        .unwrap()
+        .iter()
+        .find(|table| table.get("id").and_then(|item| item.as_str()) == Some(id.as_str()))
+        .unwrap();
+    assert_eq!(
+        provider.get("transport").and_then(|item| item.as_str()),
+        Some("streamable_http")
+    );
+    assert_eq!(
+        provider.get("url").and_then(|item| item.as_str()),
+        Some("https://design.penpot.app/mcp/stream")
+    );
+    assert!(provider.get("executable").is_none());
+    assert!(provider.get("args").is_none());
+    assert!(provider.get("cwd").is_none());
+    assert_eq!(
+        provider["http_query_from_env"]["userToken"].as_str(),
+        Some("PENPOT_USER_TOKEN")
+    );
+    assert_eq!(
+        provider["env_from_env"]["PENPOT_USER_TOKEN"].as_str(),
+        Some(env_source(&id, 0).as_str())
+    );
+    assert!(!text(&runtime).contains("mcp-fixture-secret"));
 }

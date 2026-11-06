@@ -128,10 +128,12 @@ fn completed_terminal_is_persisted_before_live_publication_and_restart() {
     let before = entry.observe(None, 64, 0).unwrap();
     assert!(!before.run.state.terminal());
     assert_ne!(before.run.state, CodingAgentRunState::Completed);
-    assert!(before
-        .events
-        .iter()
-        .all(|event| event.kind != CodingAgentEventKind::Terminal));
+    assert!(
+        before
+            .events
+            .iter()
+            .all(|event| event.kind != CodingAgentEventKind::Terminal)
+    );
     let durable_before = manager.store.read(run).unwrap().unwrap();
     assert_eq!(
         durable_before.dispatch_phase,
@@ -203,10 +205,12 @@ fn completion_persistence_failure_publishes_only_lost_and_never_redispatches() {
     let before = entry.observe(None, 64, 0).unwrap();
     assert!(!before.run.state.terminal());
     assert_ne!(before.run.state, CodingAgentRunState::Completed);
-    assert!(before
-        .events
-        .iter()
-        .all(|event| event.kind != CodingAgentEventKind::Terminal));
+    assert!(
+        before
+            .events
+            .iter()
+            .all(|event| event.kind != CodingAgentEventKind::Terminal)
+    );
     gate.release();
     manager.store.set_terminal_write_gate(None);
 

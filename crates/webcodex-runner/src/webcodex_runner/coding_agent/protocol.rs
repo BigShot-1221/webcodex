@@ -181,13 +181,19 @@ impl AcpFailure {
 
     pub(super) fn safe_message(self) -> &'static str {
         match self {
-            Self::ProcessExited => "ACP process exited before responding; check the executable and explicit Runner environment mappings",
-            Self::OutputClosed => "ACP stdout closed before responding; check the executable and explicit Runner environment mappings",
+            Self::ProcessExited => {
+                "ACP process exited before responding; check the executable and explicit Runner environment mappings"
+            }
+            Self::OutputClosed => {
+                "ACP stdout closed before responding; check the executable and explicit Runner environment mappings"
+            }
             Self::Malformed => "ACP returned malformed JSON",
             Self::TooLarge => "ACP message exceeded the size limit",
             Self::ReadIo(_) => "ACP stdout read failed",
             Self::WriteIo(_) => "ACP stdin write failed",
-            Self::SpawnIo(_) => "ACP process could not start; check the executable and explicit Runner environment mappings",
+            Self::SpawnIo(_) => {
+                "ACP process could not start; check the executable and explicit Runner environment mappings"
+            }
             Self::WorkerIo(_) => "ACP I/O worker could not start",
             Self::WriterUnavailable => "ACP stdin writer is unavailable",
             Self::WriterBusy => "ACP stdin writer is busy",

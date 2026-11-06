@@ -1,5 +1,5 @@
 use super::super::diagnose::{project_live_options, read_bounded_diagnostic_frame};
-use super::super::protocol::{wait_response, AcpFailure, ReaderEvent};
+use super::super::protocol::{AcpFailure, ReaderEvent, wait_response};
 use super::*;
 
 const PRIVATE_DIAGNOSTIC: &str = "synthetic-secret-/private/operator/auth-session";
@@ -199,23 +199,51 @@ fn setup_stages_preserve_fault_class_and_never_dispatch_prompt() {
             ("malformed", "ACP returned malformed JSON"),
             ("oversized", "ACP message exceeded the size limit"),
             ("read_io", "ACP stdout read failed"),
-            ("eof", "ACP stdout closed before responding; check the executable and explicit Runner environment mappings"),
+            (
+                "eof",
+                "ACP stdout closed before responding; check the executable and explicit Runner environment mappings",
+            ),
         ] {
             let temp = crate::tests::executable_tempdir();
-            let (exe,args) = diagnostic_agent(&temp, stage, fault);
-            let manager = CodingAgentManager::with_store(&fake_config(exe,args), temp.path().join("store")).unwrap();
+            let (exe, args) = diagnostic_agent(&temp, stage, fault);
+            let manager =
+                CodingAgentManager::with_store(&fake_config(exe, args), temp.path().join("store"))
+                    .unwrap();
             let projects = project_fixture(&temp);
             let run = "wc_agent_run_diagnosticstage01";
-            let config = BTreeMap::from([("mode".into(), CodingAgentConfigValue::String("read-only".into()))]);
-            assert!(manager.handle(start_request(&manager, &temp.path().join("repo"), run, config), &projects).error.is_none());
+            let config = BTreeMap::from([(
+                "mode".into(),
+                CodingAgentConfigValue::String("read-only".into()),
+            )]);
+            assert!(
+                manager
+                    .handle(
+                        start_request(&manager, &temp.path().join("repo"), run, config),
+                        &projects
+                    )
+                    .error
+                    .is_none()
+            );
             let snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
-            assert_eq!(snapshot.state, CodingAgentRunState::Failed, "{stage}/{fault}");
-            assert_eq!(snapshot.execution_state, CodingAgentExecutionState::NotStarted);
+            assert_eq!(
+                snapshot.state,
+                CodingAgentRunState::Failed,
+                "{stage}/{fault}"
+            );
+            assert_eq!(
+                snapshot.execution_state,
+                CodingAgentExecutionState::NotStarted
+            );
             let terminal = snapshot.terminal.unwrap();
             assert_eq!(terminal.error_code.as_deref(), Some(code));
             assert_eq!(terminal.message.as_deref(), Some(expected));
             assert!(!temp.path().join("prompt-dispatched").exists());
-            assert_eq!(manager.drain_workers_until(Instant::now()+Duration::from_secs(3)).timed_out, 0);
+            assert_eq!(
+                manager
+                    .drain_workers_until(Instant::now() + Duration::from_secs(3))
+                    .timed_out,
+                0
+            );
         }
     }
 }
@@ -240,13 +268,15 @@ fn rpc_and_stderr_secrets_never_reach_observations_inventory_or_durable_state() 
             "mode".into(),
             CodingAgentConfigValue::String("read-only".into()),
         )]);
-        assert!(manager
-            .handle(
-                start_request(&manager, &temp.path().join("repo"), run, config),
-                &projects
-            )
-            .error
-            .is_none());
+        assert!(
+            manager
+                .handle(
+                    start_request(&manager, &temp.path().join("repo"), run, config),
+                    &projects
+                )
+                .error
+                .is_none()
+        );
         let snapshot = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
         assert_eq!(
             snapshot.terminal.as_ref().unwrap().error_code.as_deref(),
@@ -321,13 +351,15 @@ fn explicit_path_mapping_restores_an_interpreter_outside_default_search_paths() 
             let manager =
                 CodingAgentManager::with_store(&cfg, temp.path().join("unmapped-store")).unwrap();
             let run = "wc_agent_run_unmappedruntime01";
-            assert!(manager
-                .handle(
-                    start_request(&manager, &root, run, BTreeMap::new()),
-                    &projects
-                )
-                .error
-                .is_none());
+            assert!(
+                manager
+                    .handle(
+                        start_request(&manager, &root, run, BTreeMap::new()),
+                        &projects
+                    )
+                    .error
+                    .is_none()
+            );
             let failed = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
             assert_eq!(failed.state, CodingAgentRunState::Failed);
             assert_eq!(
@@ -346,13 +378,15 @@ fn explicit_path_mapping_restores_an_interpreter_outside_default_search_paths() 
             let manager =
                 CodingAgentManager::with_store(&cfg, temp.path().join("mapped-store")).unwrap();
             let run = "wc_agent_run_mappedruntime01";
-            assert!(manager
-                .handle(
-                    start_request(&manager, &root, run, BTreeMap::new()),
-                    &projects
-                )
-                .error
-                .is_none());
+            assert!(
+                manager
+                    .handle(
+                        start_request(&manager, &root, run, BTreeMap::new()),
+                        &projects
+                    )
+                    .error
+                    .is_none()
+            );
             let completed = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
             assert_eq!(completed.state, CodingAgentRunState::Completed);
             assert_eq!(prompt_count(&temp), 1);
@@ -382,19 +416,21 @@ fn each_setup_stage_cancels_and_reports_its_deadline_without_prompt_dispatch() {
                 CodingAgentConfigValue::String("read-only".into()),
             )]);
             let budget = if cancel { 10 } else { 1 };
-            assert!(manager
-                .handle(
-                    start_request_with_timeout(
-                        &manager,
-                        &temp.path().join("repo"),
-                        run,
-                        config,
-                        budget
-                    ),
-                    &projects
-                )
-                .error
-                .is_none());
+            assert!(
+                manager
+                    .handle(
+                        start_request_with_timeout(
+                            &manager,
+                            &temp.path().join("repo"),
+                            run,
+                            config,
+                            budget
+                        ),
+                        &projects
+                    )
+                    .error
+                    .is_none()
+            );
             let deadline = Instant::now() + Duration::from_secs(3);
             while !temp.path().join("setup-blocked").exists() {
                 assert!(
@@ -404,13 +440,17 @@ fn each_setup_stage_cancels_and_reports_its_deadline_without_prompt_dispatch() {
                 thread::sleep(Duration::from_millis(10));
             }
             if cancel {
-                assert!(manager
-                    .handle(
-                        CodingAgentRequest::Cancel(CodingAgentCancelRequest { run_id: run.into() }),
-                        &projects
-                    )
-                    .error
-                    .is_none());
+                assert!(
+                    manager
+                        .handle(
+                            CodingAgentRequest::Cancel(CodingAgentCancelRequest {
+                                run_id: run.into()
+                            }),
+                            &projects
+                        )
+                        .error
+                        .is_none()
+                );
             }
             let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
             assert_eq!(
@@ -427,10 +467,12 @@ fn each_setup_stage_cancels_and_reports_its_deadline_without_prompt_dispatch() {
                     error.error_code.as_deref(),
                     Some("coding_agent_setup_timeout")
                 );
-                assert!(error
-                    .message
-                    .unwrap()
-                    .contains(&format!("during ACP {stage} before prompt dispatch")));
+                assert!(
+                    error
+                        .message
+                        .unwrap()
+                        .contains(&format!("during ACP {stage} before prompt dispatch"))
+                );
             }
             assert!(!temp.path().join("prompt-dispatched").exists());
             assert_eq!(
@@ -545,7 +587,7 @@ fn provider_env_presence_uses_explicit_provider_id_and_omits_values() {
 #[test]
 #[cfg(unix)]
 fn acp_diagnose_runner_request_is_identity_fenced_read_only_and_no_spawn() {
-    use webcodex_core::coding_agent::{validate_response_for_request, CodingAgentDiagnoseRequest};
+    use webcodex_core::coding_agent::{CodingAgentDiagnoseRequest, validate_response_for_request};
     let temp = crate::tests::executable_tempdir();
     let projects = project_fixture(&temp);
     let project_root = temp.path().join("repo");
@@ -709,7 +751,7 @@ fn concurrent_live_probe_is_rejected_without_unbounded_mutex_wait() {
 #[cfg(unix)]
 fn acp_diagnose_live_probe_reports_live_options_with_only_initialize_and_session_new() {
     use webcodex_core::coding_agent::{
-        validate_response_for_request, CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase,
+        CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase, validate_response_for_request,
     };
     let temp = crate::tests::executable_tempdir();
     let (exe, args) = fake_agent(&temp, "end");
@@ -778,7 +820,7 @@ fn acp_diagnose_live_probe_reports_live_options_with_only_initialize_and_session
 #[cfg(unix)]
 fn acp_diagnose_live_probe_missing_env_source_fails_closed_without_spawn() {
     use webcodex_core::coding_agent::{
-        validate_response_for_request, CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase,
+        CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase, validate_response_for_request,
     };
     let temp = crate::tests::executable_tempdir();
     let mut config = fake_config("never-launch-this-acp-binary".into(), Vec::new());
@@ -817,7 +859,7 @@ fn acp_diagnose_live_probe_missing_env_source_fails_closed_without_spawn() {
 #[cfg(unix)]
 fn acp_diagnose_live_probe_faults_stay_classified_bounded_and_prompt_free() {
     use webcodex_core::coding_agent::{
-        validate_response_for_request, CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase,
+        CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase, validate_response_for_request,
     };
     let transport = CodingAgentDiagnoseOutcome::TransportFailed;
     let cases = [
@@ -920,7 +962,7 @@ fn acp_diagnose_live_probe_faults_stay_classified_bounded_and_prompt_free() {
 #[cfg(unix)]
 fn acp_diagnose_live_probe_timeout_terminates_the_whole_provider_tree() {
     use webcodex_core::coding_agent::{
-        validate_response_for_request, CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase,
+        CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase, validate_response_for_request,
     };
     let temp = crate::tests::executable_tempdir();
     let (exe, args) = fake_agent(&temp, "block_initialize_tree");
@@ -983,7 +1025,7 @@ fn acp_diagnose_live_probe_timeout_terminates_the_whole_provider_tree() {
 #[cfg(unix)]
 fn acp_diagnose_live_probe_provider_exit_is_classified_without_status_leak() {
     use webcodex_core::coding_agent::{
-        validate_response_for_request, CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase,
+        CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase, validate_response_for_request,
     };
     let temp = crate::tests::executable_tempdir();
     let (exe, args) = fake_agent(&temp, "crash_before_prompt");
@@ -1032,9 +1074,9 @@ fn acp_diagnose_live_probe_provider_exit_is_classified_without_status_leak() {
 #[cfg(unix)]
 fn acp_diagnose_live_probe_projects_advertised_options_within_closed_bounds() {
     use webcodex_core::coding_agent::{
-        validate_response_for_request, CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase,
         CODING_AGENT_MAX_CONFIG_LABEL_BYTES, CODING_AGENT_MAX_CONFIG_OPTIONS,
-        CODING_AGENT_MAX_CONFIG_SELECT_CHOICES,
+        CODING_AGENT_MAX_CONFIG_SELECT_CHOICES, CodingAgentDiagnoseOutcome,
+        CodingAgentDiagnosePhase, validate_response_for_request,
     };
     let temp = crate::tests::executable_tempdir();
     let (exe, args) = fake_agent(&temp, "diag_oversized");
@@ -1064,17 +1106,21 @@ fn acp_diagnose_live_probe_projects_advertised_options_within_closed_bounds() {
     let option = &live.options[0];
     assert_eq!(option.id, "opt_0");
     assert_eq!(option.kind, "select");
-    assert!(option
-        .label
-        .as_ref()
-        .is_some_and(|label| label.len() <= CODING_AGENT_MAX_CONFIG_LABEL_BYTES));
+    assert!(
+        option
+            .label
+            .as_ref()
+            .is_some_and(|label| label.len() <= CODING_AGENT_MAX_CONFIG_LABEL_BYTES)
+    );
     assert_eq!(option.choices.len(), CODING_AGENT_MAX_CONFIG_SELECT_CHOICES);
     assert!(option.choices_truncated);
     assert_eq!(option.choices[0].value, "v0_0");
-    assert!(option.choices[0]
-        .label
-        .as_ref()
-        .is_some_and(|label| label.len() <= CODING_AGENT_MAX_CONFIG_LABEL_BYTES));
+    assert!(
+        option.choices[0]
+            .label
+            .as_ref()
+            .is_some_and(|label| label.len() <= CODING_AGENT_MAX_CONFIG_LABEL_BYTES)
+    );
     assert_eq!(
         received_methods(&wire_log(&temp)),
         vec!["initialize".to_string(), "session/new".to_string()]

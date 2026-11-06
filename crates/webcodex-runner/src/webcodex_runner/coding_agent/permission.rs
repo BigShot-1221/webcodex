@@ -6,8 +6,8 @@ use agent_client_protocol_schema::v1::RequestPermissionRequest;
 use serde_json::Value;
 use uuid::Uuid;
 use webcodex_core::coding_agent::{
-    validate_pending_permission, CodingAgentPendingPermission, CodingAgentPermissionOptionSummary,
     CODING_AGENT_MAX_PERMISSION_OPTIONS, CODING_AGENT_PERMISSION_REQUEST_TOKEN_PREFIX,
+    CodingAgentPendingPermission, CodingAgentPermissionOptionSummary, validate_pending_permission,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +75,10 @@ impl PermissionSlot {
             .get("options")
             .and_then(Value::as_array)
             .ok_or_else(|| "ACP permission options are invalid".to_string())?;
-        for option in option_values.iter().take(CODING_AGENT_MAX_PERMISSION_OPTIONS + 1) {
+        for option in option_values
+            .iter()
+            .take(CODING_AGENT_MAX_PERMISSION_OPTIONS + 1)
+        {
             let option_id = option
                 .get("optionId")
                 .and_then(Value::as_str)

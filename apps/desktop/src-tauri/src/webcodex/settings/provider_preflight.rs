@@ -1,6 +1,9 @@
 //! Availability checks never launch arbitrary providers or mutate user configuration.
 use super::*;
-use crate::{coding_agents::CodingAgentStore, mcp_providers::McpProviderStore};
+use crate::{
+    coding_agents::CodingAgentStore,
+    mcp_providers::{McpProviderStore, ProviderTransport},
+};
 use toml_edit::TableLike;
 
 fn check(
@@ -29,7 +32,9 @@ pub fn preflight_providers(
     acp: &CodingAgentStore,
 ) -> DesktopResult<()> {
     for provider in mcp.profiles()?.iter().filter(|p| p.enabled) {
-        check("mcp", &provider.id, &provider.name, &provider.command, None)?;
+        if provider.transport == ProviderTransport::Stdio {
+            check("mcp", &provider.id, &provider.name, &provider.command, None)?;
+        }
     }
     for provider in acp.profiles()?.iter().filter(|p| p.enabled) {
         check(
@@ -56,7 +61,10 @@ pub fn preflight_providers(
         };
         let check_table = |table: &dyn TableLike| -> DesktopResult<()> {
             let id = table.get("id").and_then(Item::as_str).ok_or_else(error)?;
-            if managed.contains(id) {
+            if managed.contains(id)
+                || (kind == "mcp"
+                    && table.get("transport").and_then(Item::as_str) == Some("streamable_http"))
+            {
                 return Ok(());
             }
             let name = table.get("name").and_then(Item::as_str).unwrap_or(id);

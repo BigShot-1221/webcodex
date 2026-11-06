@@ -1,7 +1,9 @@
 //! Cancellation, restart recovery, and durable-before-live terminal transitions.
 
 use super::protocol::bounded_text;
-use super::store::{durable_record_from_snapshot, DurableDispatchPhase, DurableRunRecord, STORE_RETENTION_SECS};
+use super::store::{
+    DurableDispatchPhase, DurableRunRecord, STORE_RETENTION_SECS, durable_record_from_snapshot,
+};
 use super::*;
 
 pub(super) fn coding_agent_run_retention_evictable(snapshot: &CodingAgentRunSnapshot) -> bool {
@@ -295,10 +297,7 @@ impl CodingAgentManager {
             if !should_evict(listing.entry_count) {
                 return Ok(());
             }
-            let skip_refs = skip_eviction
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
+            let skip_refs = skip_eviction.iter().map(String::as_str).collect::<Vec<_>>();
             let Some(record) =
                 oldest_evictable_durable_run_id(&listing.records, protected_run_id, &skip_refs)
             else {

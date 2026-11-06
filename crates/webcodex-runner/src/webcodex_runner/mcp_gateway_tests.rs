@@ -1,8 +1,12 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tempfile::TempDir;
 use webcodex_core::mcp_gateway::{
@@ -115,6 +119,10 @@ impl Fixture {
                 id: "fake".to_string(),
                 name: "Fake provider".to_string(),
                 executable: fake.path.to_string_lossy().to_string(),
+                transport: Default::default(),
+                url: None,
+                http_headers_from_env: BTreeMap::new(),
+                http_query_from_env: BTreeMap::new(),
                 args,
                 cwd,
                 env_from_env,
@@ -195,7 +203,10 @@ fn request_id_exhaustion_retires_connection_without_dispatch_or_replay() {
         let state = fixture.manager.state.read().unwrap();
         Arc::clone(state.providers.get("fake").unwrap())
     };
-    entry.session.lock().unwrap().as_mut().unwrap().next_id = u64::MAX;
+    match entry.session.lock().unwrap().as_mut().unwrap() {
+        ProviderConnection::Stdio(stdio) => stdio.next_id = u64::MAX,
+        ProviderConnection::Http(_) => panic!("stdio fixture must not use HTTP transport"),
+    }
 
     let failed = fixture.call(&provider);
     assert_eq!(failed.dispatch_state, McpGatewayDispatchState::NotStarted);
@@ -454,6 +465,10 @@ fn replacement_config(
             id: id.to_string(),
             name: name.to_string(),
             executable: fixture._fake.path.to_string_lossy().into_owned(),
+            transport: Default::default(),
+            url: None,
+            http_headers_from_env: BTreeMap::new(),
+            http_query_from_env: BTreeMap::new(),
             args: vec![
                 scenario.to_string(),
                 fixture.marker.to_string_lossy().into_owned(),
@@ -1548,4 +1563,1116 @@ fn stale_provider_instance_fails_without_starting_child() {
     assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
     assert_eq!(response.error.as_ref().unwrap().code, "stale_provider");
     assert_eq!(fixture.marker_count("start"), 0);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MockHttpScenario {
+    Json,
+    SseToolsList,
+    MalformedJson,
+    OversizedBody,
+    FailToolsCallTransport,
+    Notification200ChunkedBody,
+    JsonWrongContentType,
+    SseCommentFlood,
+    StatelessSession,
+    InitRedirect302,
+    InitCloudflare1010,
+    InitUnauthorized,
+    EmptySessionId,
+    Notification202,
+    Notification200EmptyBody,
+    Init2025_03_26,
+    Init2025_11_25,
+    InitLegacy2024,
+    InitUnsupportedProtocol,
+}
+
+const MOCK_HTTP_MAX_REQUEST_BODY_BYTES: usize = MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES + 64 * 1024;
+
+#[derive(Default)]
+struct MockHttpLog {
+    posts: usize,
+    deletes: usize,
+    delete_paths: Vec<String>,
+    delete_query_user_tokens: Vec<Option<String>>,
+    delete_authorization_header_values: Vec<Option<String>>,
+    session_header_values: Vec<Option<String>>,
+    query_user_tokens: Vec<Option<String>>,
+    authorization_header_values: Vec<Option<String>>,
+    protocol_header_values: Vec<Option<String>>,
+    initialize_body_versions: Vec<Option<String>>,
+    delete_protocol_header_values: Vec<Option<String>>,
+    initialized_notifications: usize,
+    tools_call_posts: usize,
+    tools_list_posts: usize,
+}
+
+struct MockHttpMcpServer {
+    url: String,
+    log: Arc<Mutex<MockHttpLog>>,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for MockHttpMcpServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl MockHttpMcpServer {
+    fn start(scenario: MockHttpScenario) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/mcp/stream");
+        let log = Arc::new(Mutex::new(MockHttpLog::default()));
+        let thread_log = Arc::clone(&log);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_thread = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || loop {
+            if shutdown_thread.load(Ordering::SeqCst) {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let mut stream = stream;
+                    let request = read_mock_http_request(&mut stream);
+                    match request.method.as_str() {
+                        "DELETE" => {
+                            let mut state = mock_http_log(&thread_log);
+                            state.deletes += 1;
+                            state.delete_paths.push(request.path.clone());
+                            state
+                                .delete_query_user_tokens
+                                .push(parse_query_param(&request.path, "userToken"));
+                            state.delete_authorization_header_values.push(
+                                request
+                                    .headers
+                                    .get("authorization")
+                                    .cloned()
+                                    .filter(|value| !value.is_empty()),
+                            );
+                            state.delete_protocol_header_values.push(
+                                request
+                                    .headers
+                                    .get("mcp-protocol-version")
+                                    .cloned()
+                                    .filter(|value| !value.is_empty()),
+                            );
+                            write_http_response(&mut stream, 204, &[], b"");
+                        }
+                        "POST" => {
+                            handle_mock_mcp_post(&mut stream, &request, scenario, &thread_log)
+                        }
+                        _ => write_http_response(&mut stream, 405, &[], b""),
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        });
+        Self {
+            url,
+            log,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+}
+
+fn mock_http_log(log: &Arc<Mutex<MockHttpLog>>) -> std::sync::MutexGuard<'_, MockHttpLog> {
+    log.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct MockHttpRequest {
+    method: String,
+    path: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn read_mock_http_request(stream: &mut TcpStream) -> MockHttpRequest {
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if buffer.len() > 64 * 1024 {
+            break;
+        }
+    }
+    let header_end = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .unwrap_or(buffer.len());
+    let header_text = String::from_utf8_lossy(&buffer[..header_end.saturating_sub(4)]);
+    let mut lines = header_text.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MOCK_HTTP_MAX_REQUEST_BODY_BYTES);
+    let mut body = buffer[header_end..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+        if body.len() > MOCK_HTTP_MAX_REQUEST_BODY_BYTES {
+            body.truncate(MOCK_HTTP_MAX_REQUEST_BODY_BYTES);
+            break;
+        }
+    }
+    body.truncate(content_length);
+    MockHttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    }
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) {
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        302 => "Found",
+        405 => "Method Not Allowed",
+        _ => "Fixture",
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in extra_headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str("\r\n");
+    stream.write_all(response.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+}
+
+fn write_http_chunked_response(
+    stream: &mut TcpStream,
+    status: u16,
+    extra_headers: &[(&str, &str)],
+    chunks: &[&[u8]],
+) {
+    let mut response =
+        format!("HTTP/1.1 {status} OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n");
+    for (name, value) in extra_headers {
+        response.push_str(&format!("{name}: {value}\r\n"));
+    }
+    response.push_str("\r\n");
+    stream.write_all(response.as_bytes()).unwrap();
+    for chunk in chunks {
+        stream
+            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .unwrap();
+        stream.write_all(chunk).unwrap();
+        stream.write_all(b"\r\n").unwrap();
+    }
+    stream.write_all(b"0\r\n\r\n").unwrap();
+}
+
+fn write_mock_tools_list_json(stream: &mut TcpStream, id: u64) {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "tools": [{
+                "name": "echo",
+                "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}}
+            }]
+        }
+    });
+    let encoded = serde_json::to_vec(&body).unwrap();
+    write_http_response(
+        stream,
+        200,
+        &[("content-type", "application/json")],
+        &encoded,
+    );
+}
+
+fn handle_mock_mcp_post(
+    stream: &mut TcpStream,
+    request: &MockHttpRequest,
+    scenario: MockHttpScenario,
+    log: &Arc<Mutex<MockHttpLog>>,
+) {
+    {
+        let mut state = mock_http_log(log);
+        state.posts += 1;
+        state.session_header_values.push(
+            request
+                .headers
+                .get("mcp-session-id")
+                .cloned()
+                .filter(|value| !value.is_empty()),
+        );
+        state
+            .query_user_tokens
+            .push(parse_query_param(&request.path, "userToken"));
+        state.authorization_header_values.push(
+            request
+                .headers
+                .get("authorization")
+                .cloned()
+                .filter(|value| !value.is_empty()),
+        );
+        state.protocol_header_values.push(
+            request
+                .headers
+                .get("mcp-protocol-version")
+                .cloned()
+                .filter(|value| !value.is_empty()),
+        );
+    }
+    let message: Value = match serde_json::from_slice(&request.body) {
+        Ok(value) => value,
+        Err(_) => {
+            write_http_response(stream, 400, &[], b"");
+            return;
+        }
+    };
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if method == "initialize" {
+        mock_http_log(log).initialize_body_versions.push(
+            message
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    if message.get("id").is_none() && !method.is_empty() {
+        if method == "notifications/initialized" {
+            mock_http_log(log).initialized_notifications += 1;
+            if matches!(scenario, MockHttpScenario::Notification202) {
+                write_http_response(stream, 202, &[], b"");
+                return;
+            }
+            if matches!(scenario, MockHttpScenario::Notification200EmptyBody) {
+                write_http_response(stream, 200, &[("content-type", "application/json")], b"");
+                return;
+            }
+            if matches!(scenario, MockHttpScenario::Notification200ChunkedBody) {
+                write_http_chunked_response(stream, 200, &[], &[b"not-empty"]);
+                return;
+            }
+            write_http_response(stream, 204, &[], b"");
+            return;
+        }
+        write_http_response(stream, 202, &[], b"");
+        return;
+    }
+    let id = message.get("id").and_then(Value::as_u64).unwrap_or(0);
+    match method {
+        "initialize" => {
+            if matches!(scenario, MockHttpScenario::InitCloudflare1010) {
+                write_http_response(
+                    stream,
+                    403,
+                    &[
+                        ("server", "cloudflare"),
+                        ("cf-ray", "test-ray-1010"),
+                        ("content-type", "text/html"),
+                    ],
+                    b"<!doctype html><title>Access denied</title>Cloudflare Error 1010 browser_signature_banned body-canary",
+                );
+                return;
+            }
+            if matches!(scenario, MockHttpScenario::InitUnauthorized) {
+                write_http_response(
+                    stream,
+                    401,
+                    &[("content-type", "application/json")],
+                    br#"{"error":"invalid token body-canary"}"#,
+                );
+                return;
+            }
+            if matches!(scenario, MockHttpScenario::InitRedirect302) {
+                write_http_response(stream, 302, &[("location", "/redirect-target")], b"");
+                return;
+            }
+            let negotiated_version = match scenario {
+                MockHttpScenario::Init2025_03_26 => "2025-03-26",
+                MockHttpScenario::Init2025_11_25 => "2025-11-25",
+                MockHttpScenario::InitLegacy2024 => "2024-11-05",
+                MockHttpScenario::InitUnsupportedProtocol => "2024-01-01",
+                _ => MCP_PROTOCOL_VERSION,
+            };
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": negotiated_version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "mock-http-mcp", "version": "1"}
+                }
+            });
+            let encoded = serde_json::to_vec(&body).unwrap();
+            if matches!(scenario, MockHttpScenario::EmptySessionId) {
+                write_http_response(
+                    stream,
+                    200,
+                    &[("content-type", "application/json"), ("mcp-session-id", "")],
+                    &encoded,
+                );
+                return;
+            }
+            if matches!(scenario, MockHttpScenario::StatelessSession) {
+                write_http_response(
+                    stream,
+                    200,
+                    &[("content-type", "application/json")],
+                    &encoded,
+                );
+            } else {
+                write_http_response(
+                    stream,
+                    200,
+                    &[
+                        ("content-type", "application/json"),
+                        ("mcp-session-id", "mock-session-alpha"),
+                    ],
+                    &encoded,
+                );
+            }
+        }
+        "tools/list" if matches!(scenario, MockHttpScenario::SseToolsList) => {
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [{
+                        "name": "echo",
+                        "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}}
+                    }]
+                }
+            });
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {"message": "mock provider notification"}
+            });
+            let data = format!(
+                "data: {}\n\ndata: {}\n\n",
+                serde_json::to_string(&notification).unwrap(),
+                serde_json::to_string(&payload).unwrap()
+            );
+            write_http_response(
+                stream,
+                200,
+                &[("content-type", "text/event-stream")],
+                data.as_bytes(),
+            );
+        }
+        "tools/list" if matches!(scenario, MockHttpScenario::JsonWrongContentType) => {
+            let fail_first = {
+                let mut state = mock_http_log(log);
+                state.tools_list_posts += 1;
+                state.tools_list_posts == 1
+            };
+            if fail_first {
+                write_http_response(stream, 200, &[("content-type", "text/plain")], b"not-json");
+            } else {
+                write_mock_tools_list_json(stream, id);
+            }
+        }
+        "tools/list" if matches!(scenario, MockHttpScenario::SseCommentFlood) => {
+            let comment_line = b": fixture-comment\n";
+            let repeats = MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES / comment_line.len() + 4;
+            let flood = comment_line.repeat(repeats);
+            write_http_response(
+                stream,
+                200,
+                &[("content-type", "text/event-stream")],
+                &flood,
+            );
+        }
+        "tools/list"
+            if matches!(
+                scenario,
+                MockHttpScenario::MalformedJson | MockHttpScenario::OversizedBody
+            ) =>
+        {
+            let fail_first = {
+                let mut state = mock_http_log(log);
+                state.tools_list_posts += 1;
+                state.tools_list_posts == 1
+            };
+            if fail_first {
+                match scenario {
+                    MockHttpScenario::MalformedJson => {
+                        write_http_response(
+                            stream,
+                            200,
+                            &[("content-type", "application/json")],
+                            b"{",
+                        );
+                    }
+                    MockHttpScenario::OversizedBody => {
+                        let oversized = vec![b'x'; MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES + 8];
+                        write_http_response(
+                            stream,
+                            200,
+                            &[("content-type", "application/json")],
+                            &oversized,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                write_mock_tools_list_json(stream, id);
+            }
+        }
+        "tools/list" => write_mock_tools_list_json(stream, id),
+        "tools/call" if matches!(scenario, MockHttpScenario::FailToolsCallTransport) => {
+            mock_http_log(log).tools_call_posts += 1;
+            drop(stream);
+        }
+        "tools/call" => {
+            mock_http_log(log).tools_call_posts += 1;
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{"type": "text", "text": "call-1"}],
+                    "isError": false
+                }
+            });
+            let encoded = serde_json::to_vec(&body).unwrap();
+            write_http_response(
+                stream,
+                200,
+                &[("content-type", "application/json")],
+                &encoded,
+            );
+        }
+        _ => write_http_response(stream, 400, &[], b""),
+    }
+}
+
+fn parse_query_param(path: &str, key: &str) -> Option<String> {
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=')?;
+        if name == key {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+struct HttpFixture {
+    provider: McpGatewayProvider,
+    // Struct fields drop in declaration order. manager must drop before server so
+    // best-effort session DELETE can reach the mock while it is still listening.
+    manager: McpGatewayManager,
+    server: MockHttpMcpServer,
+}
+
+impl HttpFixture {
+    fn new(scenario: MockHttpScenario, env_from_env: BTreeMap<String, String>) -> Self {
+        Self::with_mappings(scenario, env_from_env, BTreeMap::new(), BTreeMap::new())
+    }
+
+    fn with_mappings(
+        scenario: MockHttpScenario,
+        env_from_env: BTreeMap<String, String>,
+        http_headers_from_env: BTreeMap<String, String>,
+        http_query_from_env: BTreeMap<String, String>,
+    ) -> Self {
+        let server = MockHttpMcpServer::start(scenario);
+        let manager = McpGatewayManager::new(&McpGatewayConfig {
+            request_timeout_secs: 10,
+            max_tool_description_bytes: 64 * 1024,
+            providers: vec![McpGatewayProviderConfig {
+                id: "http".to_string(),
+                name: "HTTP MCP".to_string(),
+                executable: String::new(),
+                transport: McpGatewayProviderTransport::StreamableHttp,
+                url: Some(server.url.clone()),
+                http_headers_from_env,
+                http_query_from_env,
+                args: Vec::new(),
+                cwd: None,
+                env_from_env,
+                timeout_secs: None,
+            }],
+        });
+        let provider = manager.provider_inventory().into_iter().next().unwrap();
+        Self {
+            manager,
+            server,
+            provider,
+        }
+    }
+
+    fn list(&self) -> McpGatewayResponse {
+        self.manager.handle(McpGatewayRequest::ToolsList {
+            provider_id: self.provider.provider_id.clone(),
+            provider_instance_id: self.provider.provider_instance_id.clone(),
+        })
+    }
+
+    fn call(&self) -> McpGatewayResponse {
+        self.manager.handle(McpGatewayRequest::ToolsCall {
+            provider_id: self.provider.provider_id.clone(),
+            provider_instance_id: self.provider.provider_instance_id.clone(),
+            name: "echo".to_string(),
+            arguments: json!({"value": "hello"}),
+            expected_schema: McpGatewaySchemaObservation {
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}}
+                }),
+                output_schema: None,
+                annotations: None,
+            },
+            allow_resource_links: true,
+        })
+    }
+}
+
+#[test]
+fn streamable_http_initialize_propagates_session_and_acknowledges_initialized() {
+    let fixture = HttpFixture::new(MockHttpScenario::Json, BTreeMap::new());
+    assert!(fixture.list().error.is_none());
+    let log = fixture.server.log.lock().unwrap();
+    assert!(log.posts >= 2, "initialize and tools/list expected");
+    assert_eq!(log.initialized_notifications, 1);
+    assert_eq!(log.session_header_values.first(), Some(&None));
+    assert!(
+        log.session_header_values
+            .iter()
+            .skip(1)
+            .all(|session| session.as_deref() == Some("mock-session-alpha")),
+        "follow-up requests must reuse mcp-session-id"
+    );
+    assert_eq!(
+        log.initialize_body_versions,
+        vec![Some(MCP_PROTOCOL_VERSION.to_string())],
+        "client should request its preferred protocol version"
+    );
+    assert_eq!(log.protocol_header_values.first(), Some(&None));
+    assert!(log
+        .protocol_header_values
+        .iter()
+        .skip(1)
+        .all(|version| version.as_deref() == Some(MCP_PROTOCOL_VERSION)));
+}
+
+#[test]
+fn streamable_http_accepts_2025_03_26_negotiation_without_newer_version_header() {
+    let fixture = HttpFixture::new(MockHttpScenario::Init2025_03_26, BTreeMap::new());
+    assert!(fixture.list().error.is_none());
+    let log = Arc::clone(&fixture.server.log);
+    {
+        let state = log.lock().unwrap();
+        assert_eq!(
+            state.initialize_body_versions,
+            vec![Some(MCP_PROTOCOL_VERSION.to_string())]
+        );
+        assert_eq!(state.protocol_header_values.first(), Some(&None));
+        assert!(state.protocol_header_values.iter().all(Option::is_none));
+    }
+    drop(fixture);
+    assert_eq!(
+        log.lock().unwrap().delete_protocol_header_values,
+        vec![None]
+    );
+}
+
+#[test]
+fn streamable_http_accepts_penpot_legacy_2024_protocol_without_version_header() {
+    let fixture = HttpFixture::new(MockHttpScenario::InitLegacy2024, BTreeMap::new());
+    assert!(fixture.list().error.is_none());
+    let log = Arc::clone(&fixture.server.log);
+    {
+        let state = log.lock().unwrap();
+        assert_eq!(
+            state.initialize_body_versions,
+            vec![Some(MCP_PROTOCOL_VERSION.to_string())]
+        );
+        assert!(state.protocol_header_values.iter().all(Option::is_none));
+    }
+    drop(fixture);
+    assert_eq!(
+        log.lock().unwrap().delete_protocol_header_values,
+        vec![None]
+    );
+}
+
+#[test]
+fn streamable_http_reports_unsupported_negotiated_protocol_version() {
+    let fixture = HttpFixture::new(MockHttpScenario::InitUnsupportedProtocol, BTreeMap::new());
+    let response = fixture.list();
+    assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+    let error = response.error.unwrap();
+    assert_eq!(error.code, "provider_protocol_version_unsupported");
+    assert!(error.message.contains("2024-01-01"));
+    assert!(error.message.contains("2024-11-05"));
+    assert!(error
+        .message
+        .contains("provider error code: provider_protocol_version_unsupported"));
+    let log = fixture.server.log.lock().unwrap();
+    assert_eq!(
+        log.posts, 1,
+        "tools/list must not run after unsupported negotiation"
+    );
+}
+
+#[test]
+fn streamable_http_accepts_2025_11_25_negotiation_and_uses_selected_version() {
+    let fixture = HttpFixture::new(MockHttpScenario::Init2025_11_25, BTreeMap::new());
+    assert!(fixture.list().error.is_none());
+    let log = Arc::clone(&fixture.server.log);
+    {
+        let state = log.lock().unwrap();
+        assert_eq!(
+            state.initialize_body_versions,
+            vec![Some(MCP_PROTOCOL_VERSION.to_string())]
+        );
+        assert_eq!(state.protocol_header_values.first(), Some(&None));
+        assert!(state
+            .protocol_header_values
+            .iter()
+            .skip(1)
+            .all(|version| version.as_deref() == Some("2025-11-25")));
+    }
+    drop(fixture);
+    assert_eq!(
+        log.lock().unwrap().delete_protocol_header_values,
+        vec![Some("2025-11-25".to_string())]
+    );
+}
+
+#[test]
+fn streamable_http_session_delete_uses_negotiated_2025_06_18_header() {
+    let fixture = HttpFixture::new(MockHttpScenario::Json, BTreeMap::new());
+    assert!(fixture.list().error.is_none());
+    let log = Arc::clone(&fixture.server.log);
+    drop(fixture);
+    assert_eq!(
+        log.lock().unwrap().delete_protocol_header_values,
+        vec![Some(MCP_PROTOCOL_VERSION.to_string())]
+    );
+}
+
+#[test]
+fn streamable_http_cloudflare_1010_reports_safe_status_and_ray_id() {
+    let fixture = HttpFixture::new(MockHttpScenario::InitCloudflare1010, BTreeMap::new());
+    let response = fixture.list();
+    assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+    let error = response.error.unwrap();
+    assert_eq!(error.code, "provider_http_failed");
+    assert!(error.message.contains("HTTP 403"), "{}", error.message);
+    assert!(error.message.contains("test-ray-1010"), "{}", error.message);
+    assert!(
+        error.message.contains("Cloudflare Error 1010"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains("browser_signature_banned"));
+    assert!(!error.message.contains("body-canary"));
+}
+
+#[test]
+fn streamable_http_unauthorized_reports_status_without_cloudflare_classification() {
+    let fixture = HttpFixture::new(MockHttpScenario::InitUnauthorized, BTreeMap::new());
+    let response = fixture.list();
+    assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+    let error = response.error.unwrap();
+    assert_eq!(error.code, "provider_http_failed");
+    assert!(error.message.contains("HTTP 401"), "{}", error.message);
+    assert!(!error.message.contains("Cloudflare Error 1010"));
+    assert!(!error.message.contains("invalid token"));
+    assert!(!error.message.contains("body-canary"));
+}
+
+#[test]
+fn streamable_http_initialized_accepts_202_and_empty_200_acknowledgements() {
+    for scenario in [
+        MockHttpScenario::Notification202,
+        MockHttpScenario::Notification200EmptyBody,
+    ] {
+        let fixture = HttpFixture::new(scenario, BTreeMap::new());
+        let response = fixture.list();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(
+            fixture.server.log.lock().unwrap().initialized_notifications,
+            1
+        );
+    }
+}
+
+#[test]
+fn streamable_http_sse_tools_list_is_parsed() {
+    let fixture = HttpFixture::new(MockHttpScenario::SseToolsList, BTreeMap::new());
+    let response = fixture.list();
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let log = fixture.server.log.lock().unwrap();
+    assert_eq!(log.protocol_header_values.first(), Some(&None));
+    assert!(log
+        .protocol_header_values
+        .iter()
+        .skip(1)
+        .all(|version| version.as_deref() == Some(MCP_PROTOCOL_VERSION)));
+}
+
+#[test]
+fn streamable_http_query_env_mapping_uses_env_from_env_keys_not_values() {
+    crate::tests::IsolatedEnv::new()
+        .set("WEBCODEX_HTTP_QUERY_SOURCE", "resolved-query-token")
+        .set("PENPOT_USER_TOKEN", "direct-env-value-must-not-appear")
+        .run("inherited", || {
+            let fixture = HttpFixture::with_mappings(
+                MockHttpScenario::Json,
+                BTreeMap::from([(
+                    "PENPOT_USER_TOKEN".to_string(),
+                    "WEBCODEX_HTTP_QUERY_SOURCE".to_string(),
+                )]),
+                BTreeMap::new(),
+                BTreeMap::from([("userToken".to_string(), "PENPOT_USER_TOKEN".to_string())]),
+            );
+            let response = fixture.list();
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let log = fixture.server.log.lock().unwrap();
+            let tokens: Vec<_> = log.query_user_tokens.iter().flatten().cloned().collect();
+            assert!(
+                tokens.iter().any(|value| value == "resolved-query-token"),
+                "expected mapped Runner source value in query, got {tokens:?}"
+            );
+            assert!(!tokens
+                .iter()
+                .any(|value| value == "direct-env-value-must-not-appear"),);
+            drop(log);
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains("resolved-query-token"));
+            assert!(!encoded.contains("direct-env-value-must-not-appear"));
+        });
+}
+
+#[test]
+fn streamable_http_header_env_mapping_resolves_authorization_without_leaking() {
+    crate::tests::IsolatedEnv::new()
+        .set("WEBCODEX_HTTP_AUTH_SOURCE", "Bearer resolved-auth-secret")
+        .set(
+            "PENPOT_API_AUTH",
+            "Bearer direct-header-value-must-not-appear",
+        )
+        .run("inherited", || {
+            let fixture = HttpFixture::with_mappings(
+                MockHttpScenario::Json,
+                BTreeMap::from([(
+                    "PENPOT_API_AUTH".to_string(),
+                    "WEBCODEX_HTTP_AUTH_SOURCE".to_string(),
+                )]),
+                BTreeMap::from([("Authorization".to_string(), "PENPOT_API_AUTH".to_string())]),
+                BTreeMap::new(),
+            );
+            let response = fixture.list();
+            assert!(response.error.is_none(), "{:?}", response.error);
+            let log = fixture.server.log.lock().unwrap();
+            let auth_values: Vec<_> = log
+                .authorization_header_values
+                .iter()
+                .flatten()
+                .cloned()
+                .collect();
+            assert!(
+                auth_values
+                    .iter()
+                    .any(|value| value == "Bearer resolved-auth-secret"),
+                "expected mapped Authorization on mock requests, got {auth_values:?}"
+            );
+            assert!(!auth_values
+                .iter()
+                .any(|value| value == "Bearer direct-header-value-must-not-appear"),);
+            drop(log);
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains("resolved-auth-secret"));
+            assert!(!encoded.contains("direct-header-value-must-not-appear"));
+            assert!(!encoded.contains("PENPOT_API_AUTH"));
+        });
+}
+
+#[test]
+fn streamable_http_malformed_and_oversized_responses_fail_without_replay() {
+    for (scenario, code, state) in [
+        (
+            MockHttpScenario::MalformedJson,
+            "provider_malformed_json",
+            McpGatewayDispatchState::OutcomeUnknown,
+        ),
+        (
+            MockHttpScenario::OversizedBody,
+            "provider_message_too_large",
+            McpGatewayDispatchState::OutcomeUnknown,
+        ),
+    ] {
+        let fixture = HttpFixture::new(scenario, BTreeMap::new());
+        let response = fixture.list();
+        assert_eq!(response.error.as_ref().unwrap().code, code, "{scenario:?}");
+        assert_eq!(response.dispatch_state, state, "{scenario:?}");
+        let posts_before = fixture.server.log.lock().unwrap().posts;
+        let retry = fixture.list();
+        assert!(retry.error.is_none(), "{scenario:?}");
+        assert!(
+            fixture.server.log.lock().unwrap().posts > posts_before,
+            "explicit retry must establish a fresh connection"
+        );
+    }
+}
+
+#[test]
+fn streamable_http_failed_tools_call_is_not_replayed_and_retires_with_delete() {
+    let fixture = HttpFixture::new(MockHttpScenario::FailToolsCallTransport, BTreeMap::new());
+    assert!(fixture.list().error.is_none());
+    let failed = fixture.call();
+    assert_eq!(
+        failed.dispatch_state,
+        McpGatewayDispatchState::OutcomeUnknown
+    );
+    assert_eq!(failed.error.as_ref().unwrap().code, "provider_http_failed");
+    assert_eq!(fixture.server.log.lock().unwrap().tools_call_posts, 1);
+    assert!(
+        fixture.server.log.lock().unwrap().deletes >= 1,
+        "retired HTTP connection should best-effort DELETE the session"
+    );
+    assert!(fixture.list().error.is_none());
+    assert_eq!(
+        fixture.server.log.lock().unwrap().tools_call_posts,
+        1,
+        "later explicit list must not replay the failed tools/call"
+    );
+}
+
+#[test]
+fn streamable_http_notification_200_with_chunked_body_is_rejected() {
+    let fixture = HttpFixture::new(
+        MockHttpScenario::Notification200ChunkedBody,
+        BTreeMap::new(),
+    );
+    let response = fixture.list();
+    assert_eq!(
+        response.dispatch_state,
+        McpGatewayDispatchState::NotStarted,
+        "connection setup must fail before tools/list when initialized ack is invalid"
+    );
+    assert_eq!(
+        response.error.as_ref().unwrap().code,
+        "provider_protocol_error"
+    );
+    let log = fixture.server.log.lock().unwrap();
+    assert_eq!(log.initialized_notifications, 1);
+    assert_eq!(log.tools_list_posts, 0);
+}
+
+#[test]
+fn streamable_http_json_wrong_content_type_is_rejected_without_replay() {
+    let fixture = HttpFixture::new(MockHttpScenario::JsonWrongContentType, BTreeMap::new());
+    let response = fixture.list();
+    assert_eq!(
+        response.dispatch_state,
+        McpGatewayDispatchState::OutcomeUnknown
+    );
+    assert_eq!(
+        response.error.as_ref().unwrap().code,
+        "provider_protocol_error"
+    );
+    let posts_before = fixture.server.log.lock().unwrap().posts;
+    let retry = fixture.list();
+    assert!(retry.error.is_none());
+    assert!(fixture.server.log.lock().unwrap().posts > posts_before);
+}
+
+#[test]
+fn streamable_http_sse_comment_flood_hits_stream_byte_cap() {
+    let fixture = HttpFixture::new(MockHttpScenario::SseCommentFlood, BTreeMap::new());
+    let response = fixture.list();
+    assert_eq!(
+        response.dispatch_state,
+        McpGatewayDispatchState::OutcomeUnknown
+    );
+    assert_eq!(
+        response.error.as_ref().unwrap().code,
+        "provider_message_too_large"
+    );
+}
+
+#[test]
+fn streamable_http_delete_includes_dynamic_query_and_auth() {
+    crate::tests::IsolatedEnv::new()
+        .set("WEBCODEX_HTTP_DELETE_QUERY", "delete-query-token")
+        .set("WEBCODEX_HTTP_DELETE_AUTH", "Bearer delete-auth-secret")
+        .run("inherited", || {
+            let fixture = HttpFixture::with_mappings(
+                MockHttpScenario::Json,
+                BTreeMap::from([
+                    (
+                        "PENPOT_USER_TOKEN".to_string(),
+                        "WEBCODEX_HTTP_DELETE_QUERY".to_string(),
+                    ),
+                    (
+                        "PENPOT_API_AUTH".to_string(),
+                        "WEBCODEX_HTTP_DELETE_AUTH".to_string(),
+                    ),
+                ]),
+                BTreeMap::from([("Authorization".to_string(), "PENPOT_API_AUTH".to_string())]),
+                BTreeMap::from([("userToken".to_string(), "PENPOT_USER_TOKEN".to_string())]),
+            );
+            assert!(fixture.list().error.is_none());
+            let log = Arc::clone(&fixture.server.log);
+            drop(fixture);
+            let log = log.lock().unwrap();
+            assert!(log.deletes >= 1, "expected best-effort DELETE on drop");
+            assert!(
+                log.delete_query_user_tokens
+                    .iter()
+                    .flatten()
+                    .any(|value| value == "delete-query-token"),
+                "DELETE must include mapped query parameter"
+            );
+            assert!(
+                log.delete_authorization_header_values
+                    .iter()
+                    .flatten()
+                    .any(|value| value == "Bearer delete-auth-secret"),
+                "DELETE must include mapped Authorization header"
+            );
+        });
+}
+
+#[test]
+fn streamable_http_oversized_mapped_env_value_is_rejected_without_leaking() {
+    let oversized =
+        "x".repeat(crate::webcodex_runner::config::MCP_GATEWAY_HTTP_MAPPED_VALUE_MAX_BYTES + 1);
+    crate::tests::IsolatedEnv::new()
+        .set("WEBCODEX_HTTP_OVERSIZED", &oversized)
+        .run("inherited", || {
+            let fixture = HttpFixture::with_mappings(
+                MockHttpScenario::Json,
+                BTreeMap::from([(
+                    "PENPOT_USER_TOKEN".to_string(),
+                    "WEBCODEX_HTTP_OVERSIZED".to_string(),
+                )]),
+                BTreeMap::new(),
+                BTreeMap::from([("userToken".to_string(), "PENPOT_USER_TOKEN".to_string())]),
+            );
+            let response = fixture.list();
+            assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+            assert_eq!(
+                response.error.as_ref().unwrap().code,
+                "provider_env_invalid"
+            );
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains(&oversized));
+        });
+}
+
+#[test]
+fn streamable_http_stateless_server_omits_session_without_delete() {
+    let fixture = HttpFixture::new(MockHttpScenario::StatelessSession, BTreeMap::new());
+    assert!(fixture.list().error.is_none());
+    let log = Arc::clone(&fixture.server.log);
+    {
+        let state = log.lock().unwrap();
+        assert!(
+            state
+                .session_header_values
+                .iter()
+                .all(|session| session.is_none()),
+            "stateless server must not receive mcp-session-id"
+        );
+        assert_eq!(state.deletes, 0);
+    }
+    drop(fixture);
+    assert_eq!(
+        log.lock().unwrap().deletes,
+        0,
+        "stateless connection must not issue DELETE"
+    );
+}
+
+#[test]
+fn streamable_http_initialize_redirect_fails_without_following() {
+    let fixture = HttpFixture::new(MockHttpScenario::InitRedirect302, BTreeMap::new());
+    let response = fixture.list();
+    assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+    assert_eq!(
+        response.error.as_ref().unwrap().code,
+        "provider_http_redirect"
+    );
+    let log = fixture.server.log.lock().unwrap();
+    assert_eq!(
+        log.posts, 1,
+        "redirect must abort before follow-up requests"
+    );
+    assert_eq!(log.deletes, 0);
+}
+
+#[test]
+fn streamable_http_rejects_present_but_empty_session_id() {
+    let fixture = HttpFixture::new(MockHttpScenario::EmptySessionId, BTreeMap::new());
+    let response = fixture.list();
+    assert_eq!(
+        response.error.as_ref().map(|error| error.code.as_str()),
+        Some("provider_protocol_error")
+    );
+    let log = fixture.server.log.lock().unwrap();
+    assert_eq!(
+        log.posts, 1,
+        "tools/list must not run after invalid initialize"
+    );
+    assert_eq!(log.deletes, 0, "an invalid session ID must not be deleted");
+}
+
+#[test]
+fn streamable_http_mapped_values_reject_controls_and_oversized_secrets() {
+    assert!(validate_http_mapped_value("Bearer valid-token").is_ok());
+    assert!(validate_http_mapped_value("Bearer token\r\nX-Injected: yes").is_err());
+    assert!(
+        validate_http_mapped_value(&"x".repeat(MCP_GATEWAY_HTTP_MAPPED_VALUE_MAX_BYTES + 1))
+            .is_err()
+    );
 }

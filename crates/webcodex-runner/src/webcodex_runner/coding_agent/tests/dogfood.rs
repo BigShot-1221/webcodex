@@ -57,10 +57,12 @@ fn real_codex_config() -> AcpConfig {
                 .unwrap_or_else(|_| "node".to_string());
             (
                 node,
-                vec![script
-                    .to_str()
-                    .expect("ACP SCRIPT must be UTF-8")
-                    .to_string()],
+                vec![
+                    script
+                        .to_str()
+                        .expect("ACP SCRIPT must be UTF-8")
+                        .to_string(),
+                ],
             )
         }
         None => (

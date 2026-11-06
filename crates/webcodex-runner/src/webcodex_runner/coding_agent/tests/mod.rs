@@ -1,6 +1,6 @@
 use super::protocol::{
-    bounded_text, wait_outbound_write, AcpOutboundWriter, OutboundInterruption,
-    OutboundWriteOutcome,
+    AcpOutboundWriter, OutboundInterruption, OutboundWriteOutcome, bounded_text,
+    wait_outbound_write,
 };
 #[cfg(unix)]
 use super::protocol::{notification_frame, request_frame};

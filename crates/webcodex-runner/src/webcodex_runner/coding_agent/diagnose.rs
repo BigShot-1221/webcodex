@@ -7,15 +7,15 @@
 //! as an external login prompt only as a closed failure classification.
 
 use super::protocol::{
-    bounded_setup_wait, request_frame, wait_outbound_write, wait_response, AcpFailure,
-    AcpOutboundWriter, OutboundWriteOutcome, ReaderEvent,
+    AcpFailure, AcpOutboundWriter, OutboundWriteOutcome, ReaderEvent, bounded_setup_wait,
+    request_frame, wait_outbound_write, wait_response,
 };
 use super::*;
 use webcodex_core::coding_agent::{
-    bounded_diagnostic_label, diagnostic_identity_key_is_bounded, CodingAgentDiagnoseOutcome,
-    CodingAgentDiagnosePhase, CodingAgentDiagnoseRequest, CodingAgentLiveAcpDiagnostic,
-    CodingAgentLiveConfigChoice, CodingAgentLiveConfigOption, CODING_AGENT_MAX_CONFIG_OPTIONS,
-    CODING_AGENT_MAX_CONFIG_SELECT_CHOICES,
+    CODING_AGENT_MAX_CONFIG_OPTIONS, CODING_AGENT_MAX_CONFIG_SELECT_CHOICES,
+    CodingAgentDiagnoseOutcome, CodingAgentDiagnosePhase, CodingAgentDiagnoseRequest,
+    CodingAgentLiveAcpDiagnostic, CodingAgentLiveConfigChoice, CodingAgentLiveConfigOption,
+    bounded_diagnostic_label, diagnostic_identity_key_is_bounded,
 };
 
 /// Read at most one bounded ACP frame. `read_line` would only check the

@@ -3,6 +3,7 @@
 use super::*;
 use crate::mcp_providers::{
     bootstrap_environment, env_source, resolve_executable, McpProviderProfile, McpProviderStore,
+    ProviderTransport,
 };
 use std::collections::BTreeSet;
 use toml_edit::{InlineTable, TableLike, Value};
@@ -132,23 +133,52 @@ fn reconcile_document(
 fn patch(table: &mut dyn TableLike, profile: &McpProviderProfile) -> DesktopResult<()> {
     set(table, "id", profile.id.clone().into());
     set(table, "name", profile.name.clone().into());
-    set(
-        table,
-        "executable",
-        resolve_executable(&profile.command)?
-            .to_string_lossy()
-            .into_owned()
-            .into(),
-    );
-    set(
-        table,
-        "args",
-        profile.args.iter().cloned().collect::<Array>().into(),
-    );
-    if let Some(cwd) = &profile.cwd {
-        set(table, "cwd", cwd.clone().into());
-    } else {
-        table.remove("cwd");
+    match profile.transport {
+        ProviderTransport::Stdio => {
+            table.remove("transport");
+            table.remove("url");
+            table.remove("http_headers_from_env");
+            table.remove("http_query_from_env");
+            set(
+                table,
+                "executable",
+                resolve_executable(&profile.command)?
+                    .to_string_lossy()
+                    .into_owned()
+                    .into(),
+            );
+            set(
+                table,
+                "args",
+                profile.args.iter().cloned().collect::<Array>().into(),
+            );
+            if let Some(cwd) = &profile.cwd {
+                set(table, "cwd", cwd.clone().into());
+            } else {
+                table.remove("cwd");
+            }
+        }
+        ProviderTransport::StreamableHttp => {
+            set(table, "transport", "streamable_http".into());
+            set(
+                table,
+                "url",
+                profile.url.clone().ok_or_else(error)?.into(),
+            );
+            table.remove("executable");
+            table.remove("args");
+            table.remove("cwd");
+            set(
+                table,
+                "http_headers_from_env",
+                http_env_mapping(profile, &profile.http_headers)?.into(),
+            );
+            set(
+                table,
+                "http_query_from_env",
+                http_env_mapping(profile, &profile.http_query_params)?.into(),
+            );
+        }
     }
     let mut env = InlineTable::new();
     // The MCP gateway clears its child environment. Supply only these explicit
@@ -161,6 +191,20 @@ fn patch(table: &mut dyn TableLike, profile: &McpProviderProfile) -> DesktopResu
     }
     set(table, "env_from_env", env.into());
     Ok(())
+}
+
+fn http_env_mapping(
+    profile: &McpProviderProfile,
+    mappings: &std::collections::BTreeMap<String, String>,
+) -> DesktopResult<InlineTable> {
+    let mut table = InlineTable::new();
+    for (target, source) in mappings {
+        if !profile.env_keys.iter().any(|key| key == source) {
+            return Err(error());
+        }
+        table.insert(target, Value::from(source.as_str()));
+    }
+    Ok(table)
 }
 fn set(table: &mut dyn TableLike, key: &str, mut value: Value) {
     if let Some(previous) = table.get(key).and_then(Item::as_value) {

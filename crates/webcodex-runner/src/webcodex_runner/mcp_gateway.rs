@@ -1,12 +1,17 @@
-//! Persistent Runner-owned stdio MCP providers for the built-in MCP gateway.
+//! Persistent Runner-owned MCP providers for the built-in MCP gateway.
 //!
 //! Each configured provider has one process-lifetime logical identity. Its stdio
-//! connection is initialized lazily and reused while healthy. A fatal protocol/
-//! transport failure retires only that connection: the failed request is never
-//! replayed, while a later explicit request may establish a fresh connection
-//! under the same provider identity and revalidate tool schema before dispatch.
+//! or Streamable HTTP connection is initialized lazily and reused while healthy.
+//! A fatal protocol/transport failure retires only that connection: the failed
+//! request is never replayed, while a later explicit request may establish a
+//! fresh connection under the same provider identity and revalidate tool schema
+//! before dispatch.
 
-use super::config::{McpGatewayConfig, McpGatewayProviderConfig, MCP_GATEWAY_MAX_CWD_BYTES};
+use super::config::{
+    validate_mcp_gateway_http_url, McpGatewayConfig, McpGatewayProviderConfig,
+    McpGatewayProviderTransport, MCP_GATEWAY_HTTP_MAPPED_VALUE_MAX_BYTES,
+    MCP_GATEWAY_MAX_CWD_BYTES,
+};
 #[cfg(windows)]
 use super::shell::env_keys_equal;
 use super::shell::is_sensitive_env_key;
@@ -28,6 +33,18 @@ use webcodex_core::mcp_gateway::{
 use webcodex_process::ManagedChild;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 4] = [
+    MCP_PROTOCOL_VERSION,
+    "2025-11-25",
+    "2025-03-26",
+    "2024-11-05",
+];
+
+fn protocol_version_requires_http_header(version: &str) -> bool {
+    // The HTTP protocol-version header is required for negotiated versions
+    // from 2025-06-18 onward; earlier handshake versions do not define it.
+    matches!(version, "2025-06-18" | "2025-11-25")
+}
 const MCP_GATEWAY_MAX_IGNORED_NOTIFICATIONS: usize = 32;
 // Limit bursts, not lifetime totals: an idle provider may ping indefinitely.
 const MCP_GATEWAY_UNSOLICITED_WINDOW: Duration = Duration::from_secs(5);
@@ -63,7 +80,12 @@ struct ProviderEntry {
     session: Mutex<Option<ProviderConnection>>,
 }
 
-struct ProviderConnection {
+enum ProviderConnection {
+    Stdio(StdioProviderConnection),
+    Http(HttpProviderConnection),
+}
+
+struct StdioProviderConnection {
     child: ManagedChild,
     stdin: Arc<Mutex<ChildStdin>>,
     incoming: mpsc::Receiver<ReaderEvent>,
@@ -123,7 +145,8 @@ impl ProviderFailure {
         }
     }
 
-    fn with_detail(mut self, mut detail: String) -> Self {
+    fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        let mut detail = detail.into();
         if detail.len() > 512 {
             let mut end = 512;
             while !detail.is_char_boundary(end) {
@@ -493,18 +516,22 @@ impl ProviderEntry {
             Err(TryLockError::Poisoned(_)) => return McpGatewayProviderState::ConnectionRetired,
         };
         if let Some(connection) = session.as_mut() {
-            match connection.child.try_wait() {
-                Ok(None) => {
+            match connection {
+                ProviderConnection::Stdio(stdio) => match stdio.child.try_wait() {
+                    Ok(None) => {
+                        self.lifecycle.store(PROVIDER_HEALTHY, Ordering::SeqCst);
+                        return McpGatewayProviderState::Healthy;
+                    }
+                    Ok(Some(_)) | Err(_) => {
+                        drop(session.take());
+                        self.lifecycle
+                            .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
+                        return McpGatewayProviderState::ConnectionRetired;
+                    }
+                },
+                ProviderConnection::Http(_) => {
                     self.lifecycle.store(PROVIDER_HEALTHY, Ordering::SeqCst);
                     return McpGatewayProviderState::Healthy;
-                }
-                Ok(Some(_)) | Err(_) => {
-                    // Reap/drop the dead owned connection without starting a
-                    // replacement. A later explicit interaction owns reconnect.
-                    drop(session.take());
-                    self.lifecycle
-                        .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
-                    return McpGatewayProviderState::ConnectionRetired;
                 }
             }
         }
@@ -549,7 +576,7 @@ impl ProviderEntry {
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| ProviderFailure::not_started("provider_busy"))?;
         if session.is_none() {
-            match ProviderConnection::spawn(&self.config, remaining) {
+            match ProviderConnection::connect(&self.config, remaining) {
                 Ok(connection) => {
                     self.lifecycle.store(PROVIDER_HEALTHY, Ordering::SeqCst);
                     *session = Some(connection);
@@ -573,7 +600,7 @@ impl ProviderEntry {
             self.lifecycle
                 .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
             if let Some(mut connection) = session.take() {
-                connection.terminate();
+                connection.retire();
             }
             return Err(ProviderFailure::before_send("provider_timeout"));
         };
@@ -589,10 +616,61 @@ impl ProviderEntry {
             // failed request here; a later explicit request may spawn a fresh
             // connection under the same logical provider identity.
             if let Some(mut connection) = session.take() {
-                connection.terminate();
+                connection.retire();
             }
         }
         result
+    }
+}
+
+impl ProviderConnection {
+    fn connect(
+        config: &McpGatewayProviderConfig,
+        timeout: Duration,
+    ) -> Result<Self, ProviderFailure> {
+        match config.transport {
+            McpGatewayProviderTransport::Stdio => {
+                StdioProviderConnection::spawn(config, timeout).map(ProviderConnection::Stdio)
+            }
+            McpGatewayProviderTransport::StreamableHttp => {
+                HttpProviderConnection::connect(config, timeout).map(ProviderConnection::Http)
+            }
+        }
+    }
+
+    fn tools_list(
+        &mut self,
+        timeout: Duration,
+        max_description_bytes: usize,
+    ) -> Result<Vec<McpGatewayTool>, ProviderFailure> {
+        match self {
+            Self::Stdio(connection) => connection.tools_list(timeout, max_description_bytes),
+            Self::Http(connection) => connection.tools_list(timeout, max_description_bytes),
+        }
+    }
+
+    fn tools_call(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        timeout: Duration,
+        allow_resource_links: bool,
+    ) -> Result<McpGatewayToolResult, ProviderFailure> {
+        match self {
+            Self::Stdio(connection) => {
+                connection.tools_call(name, arguments, timeout, allow_resource_links)
+            }
+            Self::Http(connection) => {
+                connection.tools_call(name, arguments, timeout, allow_resource_links)
+            }
+        }
+    }
+
+    fn retire(&mut self) {
+        match self {
+            Self::Stdio(connection) => connection.terminate(),
+            Self::Http(connection) => connection.retire(),
+        }
     }
 }
 
@@ -676,7 +754,173 @@ fn validate_provider_tool_result_structure(result: &Value) -> Result<(), Provide
     .map_err(|_| ProviderFailure::completed("invalid_provider_result"))
 }
 
-impl ProviderConnection {
+fn parse_tools_list_result(
+    result: Value,
+    max_description_bytes: usize,
+) -> Result<Vec<McpGatewayTool>, ProviderFailure> {
+    let encoded = serde_json::to_vec(&result)
+        .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
+    if encoded.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
+        return Err(ProviderFailure::completed("invalid_provider_tools"));
+    }
+    let object = result
+        .as_object()
+        .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
+    if object
+        .get("nextCursor")
+        .is_some_and(|cursor| !cursor.is_null())
+    {
+        return Err(ProviderFailure::completed(
+            "provider_pagination_unsupported",
+        ));
+    }
+    let raw_tools = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
+    if raw_tools.len() > MCP_GATEWAY_MAX_TOOL_COUNT {
+        return Err(ProviderFailure::completed("invalid_provider_tools"));
+    }
+    let mut envelope = object.clone();
+    envelope.insert("tools".to_string(), json!([]));
+    validate_json_value(
+        &Value::Object(envelope),
+        MCP_GATEWAY_MAX_MESSAGE_BYTES,
+        "provider tools response",
+    )
+    .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
+    let mut tools = Vec::with_capacity(raw_tools.len());
+    for raw in raw_tools {
+        validate_json_value(
+            &json!({"tools": [raw]}),
+            MCP_GATEWAY_MAX_MESSAGE_BYTES,
+            "provider tool",
+        )
+        .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
+        let object = raw
+            .as_object()
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
+        let title = object
+            .get("title")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))
+            })
+            .transpose()?;
+        let description = object
+            .get("description")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))
+            })
+            .transpose()?;
+        let input_schema = object
+            .get("inputSchema")
+            .cloned()
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
+        let output_schema = object.get("outputSchema").cloned();
+        let annotations = object.get("annotations").cloned();
+        let meta = object.get("_meta").cloned();
+        tools.push(McpGatewayTool {
+            name: name.to_string(),
+            title,
+            description,
+            input_schema,
+            output_schema,
+            annotations,
+            meta,
+        });
+    }
+    validate_tools_with_description_limit(&tools, max_description_bytes)
+        .map_err(|error| ProviderFailure::completed("invalid_provider_tools").with_detail(error))?;
+    Ok(tools)
+}
+
+fn parse_tools_call_result(
+    result: Value,
+    allow_resource_links: bool,
+) -> Result<McpGatewayToolResult, ProviderFailure> {
+    validate_provider_tool_result_structure(&result)?;
+    let object = result
+        .as_object()
+        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+    let raw_content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+    let mut content = Vec::with_capacity(raw_content.len());
+    for item in raw_content {
+        let item = item
+            .as_object()
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+        let content_type = item
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+        match content_type {
+            "text" => {
+                let text = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                content.push(McpGatewayContent::Text {
+                    text: text.to_string(),
+                });
+            }
+            "image" => {
+                let data = item
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                let mime_type = item
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                content.push(McpGatewayContent::Image {
+                    data: data.to_string(),
+                    mime_type: mime_type.to_string(),
+                });
+            }
+            "resource_link" => {
+                if !allow_resource_links {
+                    return Err(ProviderFailure::completed("unsupported_provider_content"));
+                }
+                let link = serde_json::from_value(Value::Object(item.clone()))
+                    .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
+                content.push(link);
+            }
+            _ => {
+                return Err(ProviderFailure::completed("unsupported_provider_content"));
+            }
+        }
+    }
+    let result = McpGatewayToolResult {
+        content,
+        structured_content: object.get("structuredContent").cloned(),
+        is_error: object
+            .get("isError")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))
+            })
+            .transpose()?
+            .unwrap_or(false),
+    };
+    validate_tool_result(&result)
+        .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
+    Ok(result)
+}
+
+impl StdioProviderConnection {
     fn spawn(
         config: &McpGatewayProviderConfig,
         timeout: Duration,
@@ -765,94 +1009,7 @@ impl ProviderConnection {
         max_description_bytes: usize,
     ) -> Result<Vec<McpGatewayTool>, ProviderFailure> {
         let result = self.request("tools/list", json!({}), timeout)?;
-        let encoded = serde_json::to_vec(&result)
-            .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
-        if encoded.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
-            return Err(ProviderFailure::completed("invalid_provider_tools"));
-        }
-        let object = result
-            .as_object()
-            .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
-        if object
-            .get("nextCursor")
-            .is_some_and(|cursor| !cursor.is_null())
-        {
-            return Err(ProviderFailure::completed(
-                "provider_pagination_unsupported",
-            ));
-        }
-        let raw_tools = object
-            .get("tools")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
-        if raw_tools.len() > MCP_GATEWAY_MAX_TOOL_COUNT {
-            return Err(ProviderFailure::completed("invalid_provider_tools"));
-        }
-        // The catalog has an aggregate byte/count bound; each tool gets its own
-        // JSON node budget. Validate other response fields independently too.
-        let mut envelope = object.clone();
-        envelope.insert("tools".to_string(), json!([]));
-        validate_json_value(
-            &Value::Object(envelope),
-            MCP_GATEWAY_MAX_MESSAGE_BYTES,
-            "provider tools response",
-        )
-        .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
-        let mut tools = Vec::with_capacity(raw_tools.len());
-        for raw in raw_tools {
-            // Keep the tools/list wrapper so the existing depth bound is unchanged.
-            validate_json_value(
-                &json!({"tools": [raw]}),
-                MCP_GATEWAY_MAX_MESSAGE_BYTES,
-                "provider tool",
-            )
-            .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
-            let object = raw
-                .as_object()
-                .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
-            let name = object
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
-            let title = object
-                .get("title")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))
-                })
-                .transpose()?;
-            let description = object
-                .get("description")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_string)
-                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))
-                })
-                .transpose()?;
-            let input_schema = object
-                .get("inputSchema")
-                .cloned()
-                .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
-            let output_schema = object.get("outputSchema").cloned();
-            let annotations = object.get("annotations").cloned();
-            let meta = object.get("_meta").cloned();
-            tools.push(McpGatewayTool {
-                name: name.to_string(),
-                title,
-                description,
-                input_schema,
-                output_schema,
-                annotations,
-                meta,
-            });
-        }
-        validate_tools_with_description_limit(&tools, max_description_bytes).map_err(|error| {
-            ProviderFailure::completed("invalid_provider_tools").with_detail(error)
-        })?;
-        Ok(tools)
+        parse_tools_list_result(result, max_description_bytes)
     }
 
     fn tools_call(
@@ -862,82 +1019,9 @@ impl ProviderConnection {
         timeout: Duration,
         allow_resource_links: bool,
     ) -> Result<McpGatewayToolResult, ProviderFailure> {
-        // Outer MCP caller metadata deliberately stops at the WebCodex trust
-        // boundary. Provider tools/call receives only gateway-owned fields.
         let params = json!({"name": name, "arguments": arguments});
         let result = self.request("tools/call", params, timeout)?;
-        validate_provider_tool_result_structure(&result)?;
-        let object = result
-            .as_object()
-            .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-        let raw_content = object
-            .get("content")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-        let mut content = Vec::with_capacity(raw_content.len());
-        for item in raw_content {
-            let item = item
-                .as_object()
-                .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-            let content_type = item
-                .get("type")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-            match content_type {
-                "text" => {
-                    let text = item
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-                    content.push(McpGatewayContent::Text {
-                        text: text.to_string(),
-                    });
-                }
-                "image" => {
-                    let data = item
-                        .get("data")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-                    let mime_type = item
-                        .get("mimeType")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-                    content.push(McpGatewayContent::Image {
-                        data: data.to_string(),
-                        mime_type: mime_type.to_string(),
-                    });
-                }
-                "resource_link" => {
-                    if !allow_resource_links {
-                        // An old Server cannot decode this result variant. Since
-                        // tools/call completed, send a deterministic completed error.
-                        return Err(ProviderFailure::completed("unsupported_provider_content"));
-                    }
-                    let link = serde_json::from_value(Value::Object(item.clone()))
-                        .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
-                    content.push(link);
-                }
-                _ => {
-                    return Err(ProviderFailure::completed("unsupported_provider_content"));
-                }
-            }
-        }
-        let result = McpGatewayToolResult {
-            content,
-            structured_content: object.get("structuredContent").cloned(),
-            is_error: object
-                .get("isError")
-                .map(|value| {
-                    value
-                        .as_bool()
-                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))
-                })
-                .transpose()?
-                .unwrap_or(false),
-        };
-        validate_tool_result(&result)
-            .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
-        Ok(result)
+        parse_tools_call_result(result, allow_resource_links)
     }
 
     fn request(
@@ -1114,7 +1198,7 @@ impl ProviderConnection {
     }
 }
 
-impl Drop for ProviderConnection {
+impl Drop for StdioProviderConnection {
     fn drop(&mut self) {
         self.terminate();
     }
@@ -1290,28 +1374,35 @@ fn is_provider_notification(message: &Value) -> bool {
 }
 
 fn validate_rpc_response(response: Value, expected_id: u64) -> Result<Value, ProviderFailure> {
-    let object = response
-        .as_object()
-        .ok_or_else(|| ProviderFailure::after_send("provider_protocol_error"))?;
+    let object = response.as_object().ok_or_else(|| {
+        ProviderFailure::after_send("provider_protocol_error")
+            .with_detail("JSON-RPC response must be an object")
+    })?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(ProviderFailure::after_send("provider_protocol_error"));
+        return Err(
+            ProviderFailure::after_send("provider_protocol_error").with_detail(format!(
+                "JSON-RPC response for request id {expected_id} did not declare version 2.0"
+            )),
+        );
     }
     if object.contains_key("method") {
         return Err(ProviderFailure::after_send(
             "provider_callbacks_unsupported",
         ));
     }
-    let response_id = object
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| ProviderFailure::after_send("provider_response_id_invalid"))?;
+    let response_id = object.get("id").and_then(Value::as_u64).ok_or_else(|| {
+        ProviderFailure::after_send("provider_response_id_invalid")
+            .with_detail("JSON-RPC response omitted a valid integer id")
+    })?;
     if response_id < expected_id {
-        return Err(ProviderFailure::after_send(
-            "provider_duplicate_response_id",
-        ));
+        return Err(
+            ProviderFailure::after_send("provider_duplicate_response_id")
+                .with_detail("JSON-RPC response id was older than the outstanding request"),
+        );
     }
     if response_id != expected_id {
-        return Err(ProviderFailure::after_send("provider_unknown_response_id"));
+        return Err(ProviderFailure::after_send("provider_unknown_response_id")
+            .with_detail("JSON-RPC response id did not match the outstanding request"));
     }
     match (object.get("result"), object.get("error")) {
         (Some(result), None) => Ok(result.clone()),
@@ -1330,20 +1421,46 @@ fn validate_rpc_response(response: Value, expected_id: u64) -> Result<Value, Pro
         {
             Err(ProviderFailure::rpc_error())
         }
-        _ => Err(ProviderFailure::after_send("provider_protocol_error")),
+        _ => Err(ProviderFailure::after_send("provider_protocol_error")
+            .with_detail("JSON-RPC response must contain exactly one of result or error")),
     }
 }
 
-fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
+fn validate_initialize_result(result: &Value) -> Result<String, ProviderFailure> {
     validate_json_value(
         result,
         MCP_GATEWAY_MAX_MESSAGE_BYTES,
         "provider initialize response",
     )
-    .map_err(|_| ProviderFailure::after_send("provider_initialize_invalid"))?;
-    let object = result
-        .as_object()
-        .ok_or_else(|| ProviderFailure::after_send("provider_initialize_invalid"))?;
+    .map_err(|_| {
+        ProviderFailure::after_send("provider_initialize_invalid")
+            .with_detail("MCP initialize response exceeded validation limits")
+    })?;
+    let object = result.as_object().ok_or_else(|| {
+        ProviderFailure::after_send("provider_initialize_invalid")
+            .with_detail("MCP initialize response must be a JSON object")
+    })?;
+    let protocol_version = object
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ProviderFailure::after_send("provider_initialize_invalid")
+                .with_detail("MCP initialize response omitted protocolVersion")
+        })?;
+    if protocol_version.is_empty()
+        || protocol_version.len() > 64
+        || protocol_version.chars().any(char::is_control)
+    {
+        return Err(ProviderFailure::after_send("provider_initialize_invalid")
+            .with_detail("MCP initialize response contains an invalid protocolVersion"));
+    }
+    if !SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&protocol_version) {
+        return Err(ProviderFailure::after_send("provider_protocol_version_unsupported")
+            .with_detail(format!(
+                "MCP server negotiated unsupported protocol version '{protocol_version}'; supported versions are {}",
+                SUPPORTED_MCP_PROTOCOL_VERSIONS.join(", ")
+            )));
+    }
     let server_info = object.get("serverInfo").and_then(Value::as_object);
     let implementation_field_valid = |field: &str| {
         server_info
@@ -1353,8 +1470,7 @@ fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
                 !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
             })
     };
-    if object.get("protocolVersion").and_then(Value::as_str) != Some(MCP_PROTOCOL_VERSION)
-        || !object.get("capabilities").is_some_and(Value::is_object)
+    if !object.get("capabilities").is_some_and(Value::is_object)
         || !object
             .get("capabilities")
             .and_then(|capabilities| capabilities.get("tools"))
@@ -1362,9 +1478,13 @@ fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
         || !implementation_field_valid("name")
         || !implementation_field_valid("version")
     {
-        return Err(ProviderFailure::after_send("provider_initialize_invalid"));
+        return Err(
+            ProviderFailure::after_send("provider_initialize_invalid").with_detail(
+                "MCP initialize response omitted required tools capability or valid serverInfo",
+            ),
+        );
     }
-    Ok(())
+    Ok(protocol_version.to_string())
 }
 
 fn provider_failure_response(error: ProviderFailure) -> McpGatewayResponse {
@@ -1383,6 +1503,7 @@ fn provider_failure_response(error: ProviderFailure) -> McpGatewayResponse {
         }
         .to_string()
     });
+    let message = format!("{message} (provider error code: {})", error.code);
     McpGatewayResponse::error(state, error.code, message)
 }
 
@@ -1400,6 +1521,639 @@ fn stale_provider() -> McpGatewayResponse {
         "stale_provider",
         "Exact provider instance is unavailable; request was not routed elsewhere",
     )
+}
+
+const MCP_SESSION_HEADER: &str = "mcp-session-id";
+const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const MCP_HTTP_BEST_EFFORT_DELETE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn remaining_connect_budget(
+    started: Instant,
+    budget: Duration,
+) -> Result<Duration, ProviderFailure> {
+    budget
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| ProviderFailure::before_send("provider_timeout"))
+}
+
+fn validate_http_mapped_value(value: &str) -> Result<(), ProviderFailure> {
+    if value.is_empty()
+        || value.len() > MCP_GATEWAY_HTTP_MAPPED_VALUE_MAX_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ProviderFailure::before_send("provider_env_invalid"));
+    }
+    Ok(())
+}
+
+const MCP_GATEWAY_HTTP_ERROR_BODY_PREFIX_BYTES: u64 = 8 * 1024;
+const MCP_GATEWAY_HTTP_CF_RAY_MAX_BYTES: usize = 64;
+
+fn provider_http_response_failure(
+    response: reqwest::blocking::Response,
+    code: &'static str,
+    after_send: bool,
+) -> ProviderFailure {
+    let status = response.status();
+    let is_cloudflare = response
+        .headers()
+        .get("server")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cloudflare"));
+    let cf_ray = response
+        .headers()
+        .get("cf-ray")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MCP_GATEWAY_HTTP_CF_RAY_MAX_BYTES
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+        .map(str::to_string);
+
+    // Inspect only a small prefix for known edge-provider markers. Never
+    // surface the response body: error pages may contain request-specific data.
+    let mut body_prefix = Vec::new();
+    let _ = response
+        .take(MCP_GATEWAY_HTTP_ERROR_BODY_PREFIX_BYTES)
+        .read_to_end(&mut body_prefix);
+    let body_prefix = String::from_utf8_lossy(&body_prefix).to_ascii_lowercase();
+    let cloudflare_error =
+        if body_prefix.contains("error 1010") || body_prefix.contains("browser_signature_banned") {
+            Some("Cloudflare Error 1010 (browser signature blocked)")
+        } else if body_prefix.contains("error 1020") {
+            Some("Cloudflare Error 1020 (access denied by firewall rule)")
+        } else {
+            None
+        };
+
+    let mut detail = format!("Upstream returned HTTP {}", status.as_u16());
+    if is_cloudflare || cf_ray.is_some() {
+        detail.push_str("; Cloudflare edge");
+        if let Some(cf_ray) = cf_ray {
+            detail.push_str(" (Ray ID: ");
+            detail.push_str(&cf_ray);
+            detail.push(')');
+        }
+    }
+    if let Some(cloudflare_error) = cloudflare_error {
+        detail.push_str("; ");
+        detail.push_str(cloudflare_error);
+    }
+
+    let failure = if after_send {
+        ProviderFailure::after_send(code)
+    } else {
+        ProviderFailure::before_send(code)
+    };
+    failure.with_detail(detail)
+}
+
+fn accept_http_notification_ack(
+    response: reqwest::blocking::Response,
+    after_send: bool,
+) -> Result<(), ProviderFailure> {
+    let fault = |code: &'static str| -> ProviderFailure {
+        if after_send {
+            ProviderFailure::after_send(code)
+        } else {
+            ProviderFailure::before_send(code)
+        }
+    };
+    let status = response.status();
+    match status.as_u16() {
+        202 | 204 => Ok(()),
+        code if (200..300).contains(&code) => {
+            let body = read_bounded_http_body(
+                response,
+                MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES,
+                after_send,
+            )?;
+            if body.is_empty() {
+                Ok(())
+            } else {
+                Err(fault("provider_protocol_error"))
+            }
+        }
+        _ => Err(provider_http_response_failure(
+            response,
+            "provider_http_failed",
+            after_send,
+        )),
+    }
+}
+
+struct HttpProviderConnection {
+    client: reqwest::blocking::Client,
+    base_url: url::Url,
+    env_from_env: BTreeMap<String, String>,
+    header_mappings: Vec<(String, String)>,
+    query_mappings: Vec<(String, String)>,
+    session_id: Option<String>,
+    next_id: u64,
+    protocol_version: Option<String>,
+}
+
+impl HttpProviderConnection {
+    fn connect(
+        config: &McpGatewayProviderConfig,
+        timeout: Duration,
+    ) -> Result<Self, ProviderFailure> {
+        let raw_url = config
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| ProviderFailure::before_send("provider_url_invalid"))?;
+        let base_url = validate_mcp_gateway_http_url(raw_url)
+            .map_err(|_| ProviderFailure::before_send("provider_url_invalid"))?;
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .build()
+            .map_err(|_| ProviderFailure::before_send("provider_http_unavailable"))?;
+        let header_mappings = config
+            .http_headers_from_env
+            .iter()
+            .map(|(header, destination)| (header.clone(), destination.clone()))
+            .collect();
+        let query_mappings = config
+            .http_query_from_env
+            .iter()
+            .map(|(key, destination)| (key.clone(), destination.clone()))
+            .collect();
+        let env_from_env = config.env_from_env.clone();
+        let mut connection = Self {
+            client,
+            base_url,
+            env_from_env,
+            header_mappings,
+            query_mappings,
+            session_id: None,
+            next_id: 1,
+            protocol_version: None,
+        };
+        let connect_started = Instant::now();
+        let init_timeout = remaining_connect_budget(connect_started, timeout)?;
+        let initialized = connection.request(
+            "initialize",
+            json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "webcodex-runner-mcp-gateway",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+            init_timeout,
+        )?;
+        connection.protocol_version = Some(validate_initialize_result(&initialized)?);
+        let notify_timeout = remaining_connect_budget(connect_started, timeout)?;
+        connection.send_notification("notifications/initialized", json!({}), notify_timeout)?;
+        Ok(connection)
+    }
+
+    fn tools_list(
+        &mut self,
+        timeout: Duration,
+        max_description_bytes: usize,
+    ) -> Result<Vec<McpGatewayTool>, ProviderFailure> {
+        let result = self.request("tools/list", json!({}), timeout)?;
+        parse_tools_list_result(result, max_description_bytes)
+    }
+
+    fn tools_call(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        timeout: Duration,
+        allow_resource_links: bool,
+    ) -> Result<McpGatewayToolResult, ProviderFailure> {
+        let params = json!({"name": name, "arguments": arguments});
+        let result = self.request("tools/call", params, timeout)?;
+        parse_tools_call_result(result, allow_resource_links)
+    }
+
+    fn retire(&mut self) {
+        self.best_effort_delete_session();
+    }
+
+    fn best_effort_delete_session(&mut self) {
+        let Some(session_id) = self.session_id.take() else {
+            return;
+        };
+        let Ok(url) = self.build_request_url() else {
+            return;
+        };
+        let Ok(operator_headers) = self.build_operator_headers() else {
+            return;
+        };
+        let client = self.client.clone();
+        let protocol_version = self.protocol_version.clone();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = std::thread::Builder::new()
+                .name("wc-mcp-http-delete".into())
+                .spawn(move || {
+                    send_best_effort_http_session_delete(
+                        client,
+                        url,
+                        session_id,
+                        protocol_version,
+                        operator_headers,
+                    );
+                });
+            return;
+        }
+        send_best_effort_http_session_delete(
+            client,
+            url,
+            session_id,
+            protocol_version,
+            operator_headers,
+        );
+    }
+
+    fn resolve_env_value(&self, destination_key: &str) -> Result<String, ProviderFailure> {
+        let source = self
+            .env_from_env
+            .get(destination_key)
+            .ok_or_else(|| ProviderFailure::before_send("provider_env_missing"))?;
+        if is_sensitive_env_key(destination_key) || is_sensitive_env_key(source) {
+            return Err(ProviderFailure::before_send("provider_env_forbidden"));
+        }
+        let value = std::env::var_os(source)
+            .ok_or_else(|| ProviderFailure::before_send("provider_env_missing"))?;
+        let value = value
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| ProviderFailure::before_send("provider_env_invalid"))?;
+        validate_http_mapped_value(&value)?;
+        Ok(value)
+    }
+
+    fn build_operator_headers(&self) -> Result<Vec<(String, String)>, ProviderFailure> {
+        let mut headers = Vec::with_capacity(self.header_mappings.len());
+        for (name, destination) in &self.header_mappings {
+            headers.push((name.clone(), self.resolve_env_value(destination)?));
+        }
+        Ok(headers)
+    }
+
+    fn build_request_url(&self) -> Result<url::Url, ProviderFailure> {
+        let mut url = self.base_url.clone();
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, destination) in &self.query_mappings {
+                pairs.append_pair(key, &self.resolve_env_value(destination)?);
+            }
+        }
+        Ok(url)
+    }
+
+    fn send_notification(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<(), ProviderFailure> {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        self.post_message(message, None, timeout).map(|_| ())
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, ProviderFailure> {
+        let id = self.next_id;
+        self.next_id = id
+            .checked_add(1)
+            .ok_or_else(|| ProviderFailure::before_send("provider_request_id_exhausted"))?;
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let value = self.post_message(message, Some(id), timeout)?;
+        validate_rpc_response(value, id)
+    }
+
+    fn post_message(
+        &mut self,
+        message: Value,
+        expected_id: Option<u64>,
+        timeout: Duration,
+    ) -> Result<Value, ProviderFailure> {
+        let encoded = serde_json::to_vec(&message)
+            .map_err(|_| ProviderFailure::before_send("provider_request_invalid"))?;
+        if encoded.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
+            return Err(ProviderFailure::before_send("provider_request_too_large"));
+        }
+        let url = self.build_request_url()?;
+        let operator_headers = self.build_operator_headers()?;
+        let mut request = self
+            .client
+            .post(url)
+            .timeout(timeout)
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(encoded);
+        if let Some(protocol_version) = self
+            .protocol_version
+            .as_deref()
+            .filter(|version| protocol_version_requires_http_header(version))
+        {
+            request = request.header(MCP_PROTOCOL_VERSION_HEADER, protocol_version);
+        }
+        if let Some(session_id) = self.session_id.as_deref() {
+            request = request.header(MCP_SESSION_HEADER, session_id);
+        }
+        for (name, value) in operator_headers {
+            request = request.header(name, value);
+        }
+        let after_send = expected_id.is_some();
+        let fault = |code: &'static str| -> ProviderFailure {
+            if after_send {
+                ProviderFailure::after_send(code)
+            } else {
+                ProviderFailure::before_send(code)
+            }
+        };
+        let response = request.send().map_err(|error| {
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "other"
+            };
+            fault("provider_http_failed").with_detail(format!(
+                "HTTP transport failed before receiving a response ({kind})"
+            ))
+        })?;
+        if response.status().is_redirection() {
+            return Err(provider_http_response_failure(
+                response,
+                "provider_http_redirect",
+                after_send,
+            ));
+        }
+        if let Some(value) = response.headers().get(MCP_SESSION_HEADER) {
+            let session_id = value
+                .to_str()
+                .map_err(|_| fault("provider_protocol_error"))?
+                .trim();
+            if session_id.is_empty()
+                || session_id.len() > MCP_GATEWAY_MAX_PROVIDER_REQUEST_ID_BYTES
+                || session_id.chars().any(char::is_control)
+            {
+                return Err(fault("provider_protocol_error"));
+            }
+            self.session_id = Some(session_id.to_string());
+        }
+        let status = response.status();
+        if expected_id.is_none() {
+            accept_http_notification_ack(response, after_send)?;
+            return Ok(Value::Null);
+        }
+        if !status.is_success() {
+            return Err(provider_http_response_failure(
+                response,
+                "provider_http_failed",
+                after_send,
+            ));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if content_type == "text/event-stream" {
+            let id = expected_id.ok_or_else(|| fault("provider_protocol_error"))?;
+            let json_id = Value::Number(id.into());
+            return read_http_sse_response(response, &json_id, after_send);
+        }
+        if content_type != "application/json" {
+            return Err(fault("provider_protocol_error"));
+        }
+        let body =
+            read_bounded_http_body(response, MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES, after_send)?;
+        if body.is_empty() {
+            return Err(fault("provider_protocol_error"));
+        }
+        let value: Value =
+            serde_json::from_slice(&body).map_err(|_| fault("provider_malformed_json"))?;
+        Ok(value)
+    }
+}
+
+impl Drop for HttpProviderConnection {
+    fn drop(&mut self) {
+        self.best_effort_delete_session();
+    }
+}
+
+fn send_best_effort_http_session_delete(
+    client: reqwest::blocking::Client,
+    url: url::Url,
+    session_id: String,
+    protocol_version: Option<String>,
+    operator_headers: Vec<(String, String)>,
+) {
+    let mut request = client
+        .delete(url)
+        .timeout(MCP_HTTP_BEST_EFFORT_DELETE_TIMEOUT)
+        .header("accept", "application/json, text/event-stream")
+        .header(MCP_SESSION_HEADER, session_id);
+    if let Some(protocol_version) = protocol_version
+        .as_deref()
+        .filter(|version| protocol_version_requires_http_header(version))
+    {
+        request = request.header(MCP_PROTOCOL_VERSION_HEADER, protocol_version);
+    }
+    for (name, value) in operator_headers {
+        request = request.header(name, value);
+    }
+    let _ = request.send();
+}
+
+fn read_bounded_http_body(
+    response: reqwest::blocking::Response,
+    limit: usize,
+    after_send: bool,
+) -> Result<Vec<u8>, ProviderFailure> {
+    let fault = |code: &'static str| -> ProviderFailure {
+        if after_send {
+            ProviderFailure::after_send(code)
+        } else {
+            ProviderFailure::before_send(code)
+        }
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length as usize > limit)
+    {
+        return Err(fault("provider_message_too_large"));
+    }
+    let mut body = Vec::new();
+    let read = response
+        .take((limit.saturating_add(1)) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| fault("provider_http_failed"))?;
+    if read > limit || body.len() > limit {
+        return Err(fault("provider_message_too_large"));
+    }
+    Ok(body)
+}
+
+fn read_http_sse_response(
+    mut response: reqwest::blocking::Response,
+    expected_id: &Value,
+    after_send: bool,
+) -> Result<Value, ProviderFailure> {
+    let fault = |code: &'static str| -> ProviderFailure {
+        if after_send {
+            ProviderFailure::after_send(code)
+        } else {
+            ProviderFailure::before_send(code)
+        }
+    };
+    let mut decoder = HttpSseDecoder::new(MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES);
+    let mut buffer = [0u8; 4096];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|_| fault("provider_http_failed"))?;
+        if read == 0 {
+            break;
+        }
+        for byte in &buffer[..read] {
+            if let Some(data) = decoder.push(*byte)? {
+                if data.is_empty() {
+                    continue;
+                }
+                let value: Value = serde_json::from_slice(&data).map_err(|_| {
+                    fault("provider_malformed_json")
+                        .with_detail("Streamable HTTP SSE event data was not valid JSON")
+                })?;
+                if http_terminal_response(&value, expected_id) {
+                    // Return the complete JSON-RPC envelope. The request layer
+                    // validates its id/result exactly once, just as it does for
+                    // application/json responses.
+                    return Ok(value);
+                }
+                if !http_provider_notification(&value) {
+                    return Err(fault("provider_protocol_error").with_detail(
+                        "Streamable HTTP SSE event was neither the matching JSON-RPC response nor a valid notification",
+                    ));
+                }
+            }
+        }
+    }
+    Err(fault("provider_protocol_error").with_detail(
+        "Streamable HTTP SSE stream ended before the matching JSON-RPC response arrived",
+    ))
+}
+
+fn http_terminal_response(response: &Value, expected_id: &Value) -> bool {
+    response.is_object()
+        && response.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && response.get("id") == Some(expected_id)
+        && response.get("method").is_none()
+        && (response.get("result").is_some() ^ response.get("error").is_some())
+}
+
+fn http_provider_notification(value: &Value) -> bool {
+    is_provider_notification(value)
+}
+
+struct HttpSseDecoder {
+    line: Vec<u8>,
+    data: Vec<u8>,
+    max: usize,
+    stream_total: usize,
+    cr: bool,
+    first: bool,
+}
+
+impl HttpSseDecoder {
+    fn new(max: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            data: Vec::new(),
+            max,
+            stream_total: 0,
+            cr: false,
+            first: true,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> Result<Option<Vec<u8>>, ProviderFailure> {
+        self.stream_total = self.stream_total.saturating_add(1);
+        if self.stream_total > self.max {
+            return Err(ProviderFailure::after_send("provider_message_too_large"));
+        }
+        if byte == b'\n' && self.cr {
+            self.cr = false;
+            return Ok(None);
+        }
+        self.cr = byte == b'\r';
+        if byte != b'\n' && byte != b'\r' {
+            if self.line.len().saturating_add(self.data.len()) >= self.max {
+                return Err(ProviderFailure::after_send("provider_message_too_large"));
+            }
+            self.line.push(byte);
+            return Ok(None);
+        }
+        let mut line = std::mem::take(&mut self.line);
+        if self.first {
+            self.first = false;
+            if line.starts_with(&[0xef, 0xbb, 0xbf]) {
+                line.drain(..3);
+            }
+        }
+        if line.is_empty() {
+            if self.data.is_empty() {
+                return Ok(None);
+            }
+            self.data.pop();
+            return Ok(Some(std::mem::take(&mut self.data)));
+        }
+        let colon = line.iter().position(|b| *b == b':').unwrap_or(line.len());
+        if &line[..colon] == b"data" {
+            let mut value = line.get(colon + 1..).unwrap_or_default();
+            if value.first() == Some(&b' ') {
+                value = &value[1..];
+            }
+            if self
+                .data
+                .len()
+                .saturating_add(value.len())
+                .saturating_add(1)
+                > self.max
+            {
+                return Err(ProviderFailure::after_send("provider_message_too_large"));
+            }
+            self.data.extend_from_slice(value);
+            self.data.push(b'\n');
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

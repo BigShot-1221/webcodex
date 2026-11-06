@@ -1,9 +1,9 @@
 //! One ACP turn, prompt-dispatch fencing, and owned process I/O cleanup.
 
 use super::protocol::{
-    error_frame, normalize_update, notification_frame, permission_event, remaining_run_budget,
-    request_frame, result_frame, wait_outbound_write, AcpFailure, AcpOutboundWriter,
-    OutboundWriteOutcome, ReaderEvent,
+    AcpFailure, AcpOutboundWriter, OutboundWriteOutcome, ReaderEvent, error_frame,
+    normalize_update, notification_frame, permission_event, remaining_run_budget, request_frame,
+    result_frame, wait_outbound_write,
 };
 use super::store::DurableDispatchPhase;
 use super::*;
@@ -233,17 +233,15 @@ impl CodingAgentManager {
             }
         };
 
-        let Some((session_id, next_id, live_confirmed_effective_config)) =
-            self.initialize_session(
-                &request,
-                &provider,
-                &entry,
-                &mut child,
-                &mut outbound,
-                &rx,
-                run_deadline,
-            )
-        else {
+        let Some((session_id, next_id, live_confirmed_effective_config)) = self.initialize_session(
+            &request,
+            &provider,
+            &entry,
+            &mut child,
+            &mut outbound,
+            &rx,
+            run_deadline,
+        ) else {
             return;
         };
         if !live_confirmed_effective_config.is_empty() {

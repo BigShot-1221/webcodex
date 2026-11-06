@@ -8,6 +8,10 @@ fn mcp_gateway_register_request_projects_bounded_provider_inventory_without_loca
         id: "local-tools".to_string(),
         name: "Local tools".to_string(),
         executable: "/private/operator/bin/local-tools-mcp".to_string(),
+        transport: webcodex_runner::config::McpGatewayProviderTransport::Stdio,
+        url: None,
+        http_headers_from_env: std::collections::BTreeMap::new(),
+        http_query_from_env: std::collections::BTreeMap::new(),
         args: vec!["--secret-profile".to_string()],
         cwd: Some("/private/operator/provider-workdir".to_string()),
         env_from_env: std::collections::BTreeMap::from([(

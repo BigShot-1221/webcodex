@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
-pub const MCP_GATEWAY_MAX_PROVIDERS: usize = 8;
+pub const MCP_GATEWAY_MAX_PROVIDERS: usize = 16;
 pub const MCP_GATEWAY_MAX_ENV_MAPPINGS: usize = 64;
 pub const MCP_GATEWAY_MAX_PROVIDER_ID_BYTES: usize = 64;
 pub const MCP_GATEWAY_MAX_PROVIDER_NAME_BYTES: usize = 128;

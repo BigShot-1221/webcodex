@@ -62,13 +62,13 @@ fn corrupt_durable_record_after_possible_dispatch_fails_closed_without_redispatc
         Some("coding_agent_durable_state_unavailable")
     );
     assert_eq!(
-            received_methods(&wire_log(&temp))
-                .iter()
-                .filter(|method| method.as_str() == "session/prompt")
-                .count(),
-            1,
-            "missing or corrupt durable state after a possible prompt must never become retry authority"
-        );
+        received_methods(&wire_log(&temp))
+            .iter()
+            .filter(|method| method.as_str() == "session/prompt")
+            .count(),
+        1,
+        "missing or corrupt durable state after a possible prompt must never become retry authority"
+    );
 }
 
 #[test]
@@ -157,13 +157,15 @@ fn pre_barrier_restart_is_not_started_and_child_tree_is_reaped() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_reaptree0001";
-    assert!(manager
-        .handle(
-            start_request(&manager, &root, run, BTreeMap::new()),
-            &projects
-        )
-        .error
-        .is_none());
+    assert!(
+        manager
+            .handle(
+                start_request(&manager, &root, run, BTreeMap::new()),
+                &projects
+            )
+            .error
+            .is_none()
+    );
     wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     let descendant = wire_log(&temp)
         .iter()
@@ -235,18 +237,16 @@ fn inventory_selection_prefers_active_then_newest_terminal() {
 
 #[test]
 fn retention_evictable_skips_active_and_uncertain_terminals() {
-    assert!(!test_coding_agent_run_retention_evictable(&active_snapshot(
-        "wc_agent_run_active",
-        1
-    )));
+    assert!(!test_coding_agent_run_retention_evictable(
+        &active_snapshot("wc_agent_run_active", 1)
+    ));
     let mut lost = terminal_snapshot("wc_agent_run_lost", 1);
     lost.state = CodingAgentRunState::Lost;
     lost.execution_state = CodingAgentExecutionState::OutcomeUnknown;
     assert!(!test_coding_agent_run_retention_evictable(&lost));
-    assert!(test_coding_agent_run_retention_evictable(&terminal_snapshot(
-        "wc_agent_run_completed",
-        1
-    )));
+    assert!(test_coding_agent_run_retention_evictable(
+        &terminal_snapshot("wc_agent_run_completed", 1)
+    ));
 }
 
 #[test]
@@ -265,9 +265,7 @@ fn cleanup_expired_retains_terminal_within_twenty_four_hours() {
         recent.run_id.clone(),
         Arc::new(RunEntry::new(recent.clone())),
     );
-    store
-        .write(&durable_terminal_record(&recent))
-        .unwrap();
+    store.write(&durable_terminal_record(&recent)).unwrap();
     let expired = terminal_snapshot(
         "wc_agent_run_expired_terminal",
         now() - STORE_RETENTION_SECS - 1,
@@ -276,12 +274,22 @@ fn cleanup_expired_retains_terminal_within_twenty_four_hours() {
         expired.run_id.clone(),
         Arc::new(RunEntry::new(expired.clone())),
     );
-    store
-        .write(&durable_terminal_record(&expired))
-        .unwrap();
+    store.write(&durable_terminal_record(&expired)).unwrap();
     manager.inventory();
-    assert!(manager.runs.lock().unwrap().contains_key("wc_agent_run_recent_terminal"));
-    assert!(!manager.runs.lock().unwrap().contains_key("wc_agent_run_expired_terminal"));
+    assert!(
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .contains_key("wc_agent_run_recent_terminal")
+    );
+    assert!(
+        !manager
+            .runs
+            .lock()
+            .unwrap()
+            .contains_key("wc_agent_run_expired_terminal")
+    );
 }
 
 #[test]
@@ -299,10 +307,11 @@ fn cleanup_expired_retains_protected_terminal_past_twenty_four_hours() {
     let mut lost = terminal_snapshot("wc_agent_run_old_lost", old_ts);
     lost.state = CodingAgentRunState::Lost;
     lost.execution_state = CodingAgentExecutionState::OutcomeUnknown;
-    manager.runs.lock().unwrap().insert(
-        lost.run_id.clone(),
-        Arc::new(RunEntry::new(lost.clone())),
-    );
+    manager
+        .runs
+        .lock()
+        .unwrap()
+        .insert(lost.run_id.clone(), Arc::new(RunEntry::new(lost.clone())));
     store.write(&durable_terminal_record(&lost)).unwrap();
     let mut uncertain = terminal_snapshot("wc_agent_run_old_uncertain", old_ts);
     uncertain.state = CodingAgentRunState::Failed;
@@ -319,12 +328,20 @@ fn cleanup_expired_retains_protected_terminal_past_twenty_four_hours() {
     );
     store.write(&durable_terminal_record(&uncertain)).unwrap();
     manager.inventory();
-    assert!(manager.runs.lock().unwrap().contains_key("wc_agent_run_old_lost"));
-    assert!(manager
-        .runs
-        .lock()
-        .unwrap()
-        .contains_key("wc_agent_run_old_uncertain"));
+    assert!(
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .contains_key("wc_agent_run_old_lost")
+    );
+    assert!(
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .contains_key("wc_agent_run_old_uncertain")
+    );
 }
 
 #[test]
@@ -375,13 +392,12 @@ fn enforce_durable_capacity_evicts_oldest_terminal_before_new_claim() {
     for index in 0..CODING_AGENT_MAX_INVENTORY_RUNS {
         let run_id = format!("wc_agent_run_capacity_{index:03}");
         let snapshot = terminal_snapshot(&run_id, index as i64 + 1);
-        store
-            .write(&durable_terminal_record(&snapshot))
-            .unwrap();
-        manager.runs.lock().unwrap().insert(
-            run_id.clone(),
-            Arc::new(RunEntry::new(snapshot)),
-        );
+        store.write(&durable_terminal_record(&snapshot)).unwrap();
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), Arc::new(RunEntry::new(snapshot)));
     }
     manager
         .enforce_durable_capacity_for_admission_for_test(Some("wc_agent_run_new_admission"))
@@ -406,9 +422,7 @@ fn enforce_durable_capacity_fails_closed_when_only_protected_runs_remain() {
     };
     let manager = CodingAgentManager::with_store(&cfg, store.root.clone()).unwrap();
     let active = active_snapshot("wc_agent_run_active_only", 1);
-    store
-        .write(&durable_active_record(&active))
-        .unwrap();
+    store.write(&durable_active_record(&active)).unwrap();
     manager
         .runs
         .lock()
@@ -449,30 +463,26 @@ fn enforce_durable_capacity_skips_when_durable_intent_fingerprint_mismatches_liv
     let mut durable = durable_terminal_record(&live);
     durable.intent_fingerprint = "stale_intent_fingerprint".to_string();
     store.write(&durable).unwrap();
-    manager.runs.lock().unwrap().insert(
-        mismatch_id.to_string(),
-        Arc::new(RunEntry::new(live)),
-    );
+    manager
+        .runs
+        .lock()
+        .unwrap()
+        .insert(mismatch_id.to_string(), Arc::new(RunEntry::new(live)));
     for index in 1..CODING_AGENT_MAX_INVENTORY_RUNS {
         let run_id = format!("wc_agent_run_capacity_{index:03}");
         let snapshot = terminal_snapshot(&run_id, index as i64 + 1);
-        store
-            .write(&durable_terminal_record(&snapshot))
-            .unwrap();
-        manager.runs.lock().unwrap().insert(
-            run_id.clone(),
-            Arc::new(RunEntry::new(snapshot)),
-        );
+        store.write(&durable_terminal_record(&snapshot)).unwrap();
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), Arc::new(RunEntry::new(snapshot)));
     }
     manager
         .enforce_durable_capacity_for_admission_for_test(Some("wc_agent_run_new_admission"))
         .unwrap();
     assert!(store.read(mismatch_id).unwrap().is_some());
-    assert!(manager
-        .runs
-        .lock()
-        .unwrap()
-        .contains_key(mismatch_id));
+    assert!(manager.runs.lock().unwrap().contains_key(mismatch_id));
     assert_eq!(
         store.list_records_for_retention().unwrap().entry_count,
         CODING_AGENT_MAX_INVENTORY_RUNS - 1
@@ -495,30 +505,26 @@ fn enforce_durable_capacity_skips_when_durable_provider_instance_mismatches_live
     let mut durable = durable_terminal_record(&live);
     durable.provider_instance_id = "stale_acp_instance".to_string();
     store.write(&durable).unwrap();
-    manager.runs.lock().unwrap().insert(
-        mismatch_id.to_string(),
-        Arc::new(RunEntry::new(live)),
-    );
+    manager
+        .runs
+        .lock()
+        .unwrap()
+        .insert(mismatch_id.to_string(), Arc::new(RunEntry::new(live)));
     for index in 1..CODING_AGENT_MAX_INVENTORY_RUNS {
         let run_id = format!("wc_agent_run_capacity_{index:03}");
         let snapshot = terminal_snapshot(&run_id, index as i64 + 1);
-        store
-            .write(&durable_terminal_record(&snapshot))
-            .unwrap();
-        manager.runs.lock().unwrap().insert(
-            run_id.clone(),
-            Arc::new(RunEntry::new(snapshot)),
-        );
+        store.write(&durable_terminal_record(&snapshot)).unwrap();
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), Arc::new(RunEntry::new(snapshot)));
     }
     manager
         .enforce_durable_capacity_for_admission_for_test(Some("wc_agent_run_new_admission"))
         .unwrap();
     assert!(store.read(mismatch_id).unwrap().is_some());
-    assert!(manager
-        .runs
-        .lock()
-        .unwrap()
-        .contains_key(mismatch_id));
+    assert!(manager.runs.lock().unwrap().contains_key(mismatch_id));
     assert_eq!(
         store.list_records_for_retention().unwrap().entry_count,
         CODING_AGENT_MAX_INVENTORY_RUNS - 1
@@ -548,23 +554,18 @@ fn enforce_durable_capacity_skips_candidate_when_durable_terminal_precedes_live_
     for index in 1..CODING_AGENT_MAX_INVENTORY_RUNS {
         let run_id = format!("wc_agent_run_capacity_{index:03}");
         let snapshot = terminal_snapshot(&run_id, index as i64 + 1);
-        store
-            .write(&durable_terminal_record(&snapshot))
-            .unwrap();
-        manager.runs.lock().unwrap().insert(
-            run_id.clone(),
-            Arc::new(RunEntry::new(snapshot)),
-        );
+        store.write(&durable_terminal_record(&snapshot)).unwrap();
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), Arc::new(RunEntry::new(snapshot)));
     }
     manager
         .enforce_durable_capacity_for_admission_for_test(Some("wc_agent_run_new_admission"))
         .unwrap();
     assert!(store.read(mismatch_id).unwrap().is_some());
-    assert!(manager
-        .runs
-        .lock()
-        .unwrap()
-        .contains_key(mismatch_id));
+    assert!(manager.runs.lock().unwrap().contains_key(mismatch_id));
     assert_eq!(
         store.list_records_for_retention().unwrap().entry_count,
         CODING_AGENT_MAX_INVENTORY_RUNS - 1
@@ -592,9 +593,7 @@ fn cleanup_expired_rechecks_evictable_before_removal_under_terminal_transition()
         .lock()
         .unwrap()
         .insert(run.to_string(), Arc::clone(&entry));
-    store
-        .write(&durable_terminal_record(&completed))
-        .unwrap();
+    store.write(&durable_terminal_record(&completed)).unwrap();
 
     assert!(test_coding_agent_run_retention_evictable(&completed) && completed.updated_at < cutoff);
     let stale_candidates = vec![run.to_string()];
@@ -649,20 +648,21 @@ fn enforce_durable_capacity_fails_closed_when_durable_removal_fails() {
     for index in 0..CODING_AGENT_MAX_INVENTORY_RUNS {
         let run_id = format!("wc_agent_run_capacity_{index:03}");
         let snapshot = terminal_snapshot(&run_id, index as i64 + 1);
-        store
-            .write(&durable_terminal_record(&snapshot))
-            .unwrap();
-        manager.runs.lock().unwrap().insert(
-            run_id.clone(),
-            Arc::new(RunEntry::new(snapshot)),
-        );
+        store.write(&durable_terminal_record(&snapshot)).unwrap();
+        manager
+            .runs
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), Arc::new(RunEntry::new(snapshot)));
     }
     store.fail_next_removes(1);
     let error = manager
         .enforce_durable_capacity_for_admission_for_test(Some("wc_agent_run_new_admission"))
         .unwrap_err();
-    assert!(error.contains("failed to remove ACP Run state dir")
-        || error.contains("injected ACP durable run removal failure"));
+    assert!(
+        error.contains("failed to remove ACP Run state dir")
+            || error.contains("injected ACP durable run removal failure")
+    );
     assert_eq!(
         store.list_records_for_retention().unwrap().entry_count,
         CODING_AGENT_MAX_INVENTORY_RUNS
@@ -684,13 +684,12 @@ fn cleanup_expired_retains_run_when_durable_removal_fails() {
     let old_ts = now() - STORE_RETENTION_SECS - 1;
     let run = "wc_agent_run_cleanup_remove_fail";
     let completed = terminal_snapshot(run, old_ts);
-    manager.runs.lock().unwrap().insert(
-        run.to_string(),
-        Arc::new(RunEntry::new(completed.clone())),
-    );
-    store
-        .write(&durable_terminal_record(&completed))
-        .unwrap();
+    manager
+        .runs
+        .lock()
+        .unwrap()
+        .insert(run.to_string(), Arc::new(RunEntry::new(completed.clone())));
+    store.write(&durable_terminal_record(&completed)).unwrap();
     store.fail_next_removes(1);
     manager.cleanup_expired_for_test();
     assert!(manager.runs.lock().unwrap().contains_key(run));

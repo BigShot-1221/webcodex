@@ -1,4 +1,5 @@
 use super::*;
+use crate::mcp_providers::McpProviderRequest;
 
 #[test]
 fn acp_unavailable_provider_reports_identity_without_mutating_desired_config() {
@@ -32,6 +33,54 @@ fn acp_unavailable_provider_reports_identity_without_mutating_desired_config() {
         std::fs::read(dir.0.join("coding-agents.json")).unwrap(),
         original
     );
+}
+
+#[test]
+fn enabled_streamable_http_mcp_does_not_require_a_local_executable() {
+    let dir = crate::coding_agents::tests::Scratch::new();
+    let mut mcp = McpProviderStore::load(&dir.0);
+    mcp.update(McpProviderRequest {
+        id: None,
+        expected_revision: 0,
+        name: "Penpot".into(),
+        transport: ProviderTransport::StreamableHttp,
+        command: String::new(),
+        args: Vec::new(),
+        cwd: None,
+        url: Some("https://design.example/mcp/stream".into()),
+        http_headers: std::collections::BTreeMap::new(),
+        http_query_params: std::collections::BTreeMap::new(),
+        enabled: true,
+        env: std::collections::BTreeMap::new(),
+    })
+    .unwrap();
+
+    preflight_providers(None, &mcp, &CodingAgentStore::load(&dir.0)).unwrap();
+}
+
+#[test]
+fn operator_owned_streamable_http_mcp_does_not_require_an_executable() {
+    let dir = crate::coding_agents::tests::Scratch::new();
+    let path = dir.0.join("runner.toml");
+    let runtime = StoredRuntime {
+        server_url: "http://127.0.0.1:1".into(),
+        runner_client_id: Some("fixture".into()),
+        runner_config: Some(path.clone()),
+        server_env_file: None,
+        user_token_file: None,
+        project_id: None,
+        runtime_project_id: None,
+    };
+    let original = "client_id = 'fixture'\nserver_url = 'http://127.0.0.1:1'\nmcp = { providers = [{ id = 'operator-http', name = 'Remote MCP', transport = 'streamable_http', url = 'https://example.com/mcp', http_headers_from_env = {}, http_query_from_env = {}, env_from_env = {} }] }\n";
+    std::fs::write(&path, original).unwrap();
+
+    preflight_providers(
+        Some(&runtime),
+        &McpProviderStore::load(&dir.0),
+        &CodingAgentStore::load(&dir.0),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
 }
 
 #[test]

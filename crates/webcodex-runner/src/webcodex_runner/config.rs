@@ -209,11 +209,35 @@ pub(crate) struct McpGatewayConfig {
     pub(crate) providers: Vec<McpGatewayProviderConfig>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum McpGatewayProviderTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+fn default_mcp_gateway_executable() -> String {
+    String::new()
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct McpGatewayProviderConfig {
     pub(crate) id: String,
     pub(crate) name: String,
+    #[serde(default = "default_mcp_gateway_executable")]
     pub(crate) executable: String,
+    #[serde(default)]
+    pub(crate) transport: McpGatewayProviderTransport,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
+    /// HTTP header name -> env_from_env destination key. Values are resolved only
+    /// at request time through the provider's explicit env_from_env mapping.
+    #[serde(default)]
+    pub(crate) http_headers_from_env: BTreeMap<String, String>,
+    /// Query parameter name -> env_from_env destination key.
+    #[serde(default)]
+    pub(crate) http_query_from_env: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) args: Vec<String>,
     /// Optional host-local working directory used exactly as `Command::current_dir`.
@@ -1984,6 +2008,148 @@ fn validate_mcp_gateway_env_name(value: &str) -> Result<(), ()> {
     Ok(())
 }
 
+const MCP_GATEWAY_HTTP_URL_MAX_BYTES: usize = 4096;
+const MCP_GATEWAY_HTTP_QUERY_KEY_MAX_BYTES: usize = 256;
+/// Upper bound for resolved HTTP header/query values mapped through env_from_env.
+pub(crate) const MCP_GATEWAY_HTTP_MAPPED_VALUE_MAX_BYTES: usize = 8192;
+
+fn mcp_http_url_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+fn mcp_http_url_authority_has_userinfo(raw: &str) -> bool {
+    let Some(scheme_end) = raw.find("://") else {
+        return false;
+    };
+    let rest = &raw[scheme_end + 3..];
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .unwrap_or(rest.len());
+    rest[..authority_end].contains('@')
+}
+
+pub(crate) fn validate_mcp_gateway_http_url(raw: &str) -> Result<url::Url, ()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MCP_GATEWAY_HTTP_URL_MAX_BYTES || trimmed.contains('\0')
+    {
+        return Err(());
+    }
+    if mcp_http_url_authority_has_userinfo(trimmed) || trimmed.contains('#') {
+        return Err(());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|_| ())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || parsed.port() == Some(0)
+    {
+        return Err(());
+    }
+    if parsed.scheme() == "http" && !mcp_http_url_is_loopback(&parsed) {
+        return Err(());
+    }
+    if parsed.query().is_some() {
+        return Err(());
+    }
+    Ok(parsed)
+}
+
+fn mcp_http_field_name_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_'
+                | b'`' | b'|' | b'~'
+        )
+}
+
+fn validate_mcp_http_header_name(name: &str) -> Result<(), ()> {
+    if name.is_empty() || name.len() > MCP_GATEWAY_HTTP_QUERY_KEY_MAX_BYTES || !name.is_ascii() {
+        return Err(());
+    }
+    if !name.bytes().all(mcp_http_field_name_token_byte) {
+        return Err(());
+    }
+    const FORBIDDEN: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "transfer-encoding",
+        "upgrade",
+        "te",
+        "trailer",
+        "trailers",
+        "host",
+        "content-length",
+        "content-type",
+        "accept",
+        "expect",
+        "last-event-id",
+        "mcp-session-id",
+        "mcp-protocol-version",
+        "mcp-method",
+        "mcp-name",
+    ];
+    if FORBIDDEN
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_mcp_http_query_key(key: &str) -> Result<(), ()> {
+    if key.is_empty() || key.len() > MCP_GATEWAY_HTTP_QUERY_KEY_MAX_BYTES || !key.is_ascii() {
+        return Err(());
+    }
+    if key.contains(['\0', '\n', '\r', '=', '&']) {
+        return Err(());
+    }
+    if !key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_mcp_http_env_reference(
+    provider_id: &str,
+    field: &str,
+    destination_key: &str,
+    env_from_env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if validate_mcp_gateway_env_name(destination_key).is_err() {
+        return Err(format!(
+            "mcp provider '{provider_id}' {field} contains an invalid environment reference"
+        ));
+    }
+    if destination_key.eq_ignore_ascii_case("AUTHORIZATION") {
+        return Err(format!(
+            "mcp provider '{provider_id}' {field} may not reference an environment key named AUTHORIZATION"
+        ));
+    }
+    if !env_from_env.contains_key(destination_key) {
+        return Err(format!(
+            "mcp provider '{provider_id}' {field} must reference a key declared in env_from_env"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> {
     use std::collections::HashSet;
     use webcodex_core::mcp_gateway::{
@@ -2025,15 +2191,57 @@ fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> 
         if !ids.insert(provider.id.as_str()) {
             return Err("mcp provider ids must be unique".to_string());
         }
-        if provider.executable.is_empty()
-            || provider.executable.len() > 1_024
-            || provider.executable.contains('\0')
-            || !Path::new(&provider.executable).is_absolute()
-        {
-            return Err(format!(
-                "mcp provider '{}' executable must be an absolute path of at most 1024 bytes",
-                provider.id
-            ));
+        match provider.transport {
+            McpGatewayProviderTransport::Stdio => {
+                if provider.url.as_ref().is_some_and(|url| !url.trim().is_empty())
+                    || !provider.http_headers_from_env.is_empty()
+                    || !provider.http_query_from_env.is_empty()
+                {
+                    return Err(format!(
+                        "mcp provider '{}' stdio transport cannot declare HTTP-only fields",
+                        provider.id
+                    ));
+                }
+                if provider.executable.is_empty()
+                    || provider.executable.len() > 1_024
+                    || provider.executable.contains('\0')
+                    || !Path::new(&provider.executable).is_absolute()
+                {
+                    return Err(format!(
+                        "mcp provider '{}' executable must be an absolute path of at most 1024 bytes",
+                        provider.id
+                    ));
+                }
+            }
+            McpGatewayProviderTransport::StreamableHttp => {
+                let Some(url) = provider
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                else {
+                    return Err(format!(
+                        "mcp provider '{}' streamable_http transport requires url",
+                        provider.id
+                    ));
+                };
+                validate_mcp_gateway_http_url(url).map_err(|_| {
+                    format!(
+                        "mcp provider '{}' url must be a valid http(s) URL without credentials or fragment; plain http is allowed only for loopback development",
+                        provider.id
+                    )
+                })?;
+                if !provider.executable.is_empty()
+                    && (provider.executable.len() > 1_024
+                        || provider.executable.contains('\0')
+                        || !Path::new(&provider.executable).is_absolute())
+                {
+                    return Err(format!(
+                        "mcp provider '{}' executable must be empty or an absolute path of at most 1024 bytes",
+                        provider.id
+                    ));
+                }
+            }
         }
         if provider.args.len() > 64 {
             return Err(format!(
@@ -2103,6 +2311,49 @@ fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> 
                 ));
             }
             destinations.push(destination);
+        }
+        if provider.http_headers_from_env.len() + provider.http_query_from_env.len()
+            > MCP_GATEWAY_MAX_ENV_MAPPINGS
+        {
+            return Err(format!(
+                "mcp provider '{}' HTTP header and query mappings may contain at most {MCP_GATEWAY_MAX_ENV_MAPPINGS} entries combined",
+                provider.id
+            ));
+        }
+        let mut header_targets = HashSet::new();
+        for (header, destination) in &provider.http_headers_from_env {
+            validate_mcp_http_header_name(header).map_err(|_| {
+                format!(
+                    "mcp provider '{}' http_headers_from_env contains an invalid header name",
+                    provider.id
+                )
+            })?;
+            if !header_targets.insert(header.to_ascii_lowercase()) {
+                return Err(format!(
+                    "mcp provider '{}' http_headers_from_env contains conflicting header names",
+                    provider.id
+                ));
+            }
+            validate_mcp_http_env_reference(
+                &provider.id,
+                "http_headers_from_env",
+                destination,
+                &provider.env_from_env,
+            )?;
+        }
+        for (query_key, destination) in &provider.http_query_from_env {
+            validate_mcp_http_query_key(query_key).map_err(|_| {
+                format!(
+                    "mcp provider '{}' http_query_from_env contains an invalid query key",
+                    provider.id
+                )
+            })?;
+            validate_mcp_http_env_reference(
+                &provider.id,
+                "http_query_from_env",
+                destination,
+                &provider.env_from_env,
+            )?;
         }
     }
     Ok(())
@@ -2337,6 +2588,10 @@ mod mcp_gateway_config_tests {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
+            transport: McpGatewayProviderTransport::default(),
+            url: None,
+            http_headers_from_env: BTreeMap::new(),
+            http_query_from_env: BTreeMap::new(),
             args: Vec::new(),
             cwd: None,
             env_from_env: BTreeMap::new(),
@@ -2488,6 +2743,150 @@ mod mcp_gateway_config_tests {
                 .contains("conflicting destination names"));
         } else {
             validate(case_pair).unwrap();
+        }
+    }
+
+    fn streamable_http_provider() -> McpGatewayProviderConfig {
+        let mut provider = provider();
+        provider.transport = McpGatewayProviderTransport::StreamableHttp;
+        provider.executable.clear();
+        provider.url = Some("http://127.0.0.1/mcp/stream".to_string());
+        provider
+    }
+
+    #[test]
+    fn streamable_http_url_rejects_credentials_query_and_non_loopback_http() {
+        assert!(validate_mcp_gateway_http_url("https://design.example/mcp/stream").is_ok());
+        assert!(validate_mcp_gateway_http_url("http://127.0.0.1/mcp").is_ok());
+        assert!(validate_mcp_gateway_http_url("http://app.localhost/mcp").is_ok());
+        assert!(validate_mcp_gateway_http_url("http://127.0.0.1/mcp?").is_err());
+        assert!(validate_mcp_gateway_http_url("https://@design.example/mcp").is_err());
+        for bad in [
+            "https://user:secret@design.example/mcp",
+            "https://design.example/mcp?token=leak",
+            "https://design.example/mcp#frag",
+            "https://design.example/mcp#",
+            "http://example.com/mcp",
+            "ftp://127.0.0.1/mcp",
+            "https://design.example:0/mcp",
+        ] {
+            assert!(validate_mcp_gateway_http_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn streamable_http_config_validates_header_query_and_env_references() {
+        let mut ok = streamable_http_provider();
+        ok.env_from_env = BTreeMap::from([(
+            "PENPOT_USER_TOKEN".to_string(),
+            "WEBCODEX_DESKTOP_MCP_FIXTURE_0".to_string(),
+        )]);
+        ok.http_query_from_env = BTreeMap::from([(
+            "userToken".to_string(),
+            "PENPOT_USER_TOKEN".to_string(),
+        )]);
+        ok.http_headers_from_env = BTreeMap::from([(
+            "Authorization".to_string(),
+            "PENPOT_USER_TOKEN".to_string(),
+        )]);
+        validate(ok).unwrap();
+
+        let mut missing_env_key = streamable_http_provider();
+        missing_env_key.http_query_from_env = BTreeMap::from([(
+            "userToken".to_string(),
+            "PENPOT_USER_TOKEN".to_string(),
+        )]);
+        assert!(validate(missing_env_key)
+            .unwrap_err()
+            .contains("must reference a key declared in env_from_env"));
+
+        let mut maps_source_name = streamable_http_provider();
+        maps_source_name.env_from_env =
+            BTreeMap::from([("PENPOT_USER_TOKEN".to_string(), "RUNNER_SOURCE".to_string())]);
+        maps_source_name.http_headers_from_env = BTreeMap::from([(
+            "Authorization".to_string(),
+            "RUNNER_SOURCE".to_string(),
+        )]);
+        assert!(validate(maps_source_name)
+            .unwrap_err()
+            .contains("must reference a key declared in env_from_env"));
+
+        let mut bad_query = streamable_http_provider();
+        bad_query.env_from_env = BTreeMap::from([("TOKEN".to_string(), "SOURCE".to_string())]);
+        bad_query.http_query_from_env =
+            BTreeMap::from([("bad=name".to_string(), "TOKEN".to_string())]);
+        assert!(validate(bad_query)
+            .unwrap_err()
+            .contains("invalid query key"));
+
+        let mut bad_header = streamable_http_provider();
+        bad_header.env_from_env = BTreeMap::from([("TOKEN".to_string(), "SOURCE".to_string())]);
+        bad_header.http_headers_from_env =
+            BTreeMap::from([("Proxy-Authorization".to_string(), "TOKEN".to_string())]);
+        assert!(validate(bad_header)
+            .unwrap_err()
+            .contains("invalid header name"));
+
+        let mut duplicate = streamable_http_provider();
+        duplicate.env_from_env = BTreeMap::from([("TOKEN".to_string(), "SOURCE".to_string())]);
+        duplicate.http_headers_from_env = BTreeMap::from([
+            ("Authorization".to_string(), "TOKEN".to_string()),
+            ("authorization".to_string(), "TOKEN".to_string()),
+        ]);
+        assert!(validate(duplicate)
+            .unwrap_err()
+            .contains("conflicting header names"));
+    }
+
+    #[test]
+    fn streamable_http_rejects_forbidden_header_names_including_trailers() {
+        let mut ok = streamable_http_provider();
+        ok.env_from_env = BTreeMap::from([("MCP_ACCESS_TOKEN".to_string(), "SOURCE".to_string())]);
+        ok.http_headers_from_env = BTreeMap::from([(
+            "Authorization".to_string(),
+            "MCP_ACCESS_TOKEN".to_string(),
+        )]);
+        validate(ok).unwrap();
+
+        for header in ["trailers", "proxy-connection", "TrAiLeRs"] {
+            let mut bad = streamable_http_provider();
+            bad.env_from_env = BTreeMap::from([("TOKEN".to_string(), "SOURCE".to_string())]);
+            bad.http_headers_from_env = BTreeMap::from([(header.to_string(), "TOKEN".to_string())]);
+            assert!(
+                validate(bad)
+                    .unwrap_err()
+                    .contains("invalid header name"),
+                "expected {header} to be forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn streamable_http_rejects_authorization_provider_env_key_case_insensitively() {
+        let mut reserved = streamable_http_provider();
+        reserved.env_from_env =
+            BTreeMap::from([("authorization".to_string(), "RUNNER_SOURCE".to_string())]);
+        reserved.http_headers_from_env = BTreeMap::from([(
+            "Authorization".to_string(),
+            "authorization".to_string(),
+        )]);
+        assert!(validate(reserved).is_err());
+
+        let mut allowed = streamable_http_provider();
+        allowed.env_from_env =
+            BTreeMap::from([("MCP_ACCESS_TOKEN".to_string(), "RUNNER_SOURCE".to_string())]);
+        allowed.http_headers_from_env = BTreeMap::from([(
+            "Authorization".to_string(),
+            "MCP_ACCESS_TOKEN".to_string(),
+        )]);
+        validate(allowed).unwrap();
+
+        #[cfg(unix)]
+        {
+            let mut stdio = provider();
+            stdio.env_from_env =
+                BTreeMap::from([("authorization".to_string(), "RUNNER_SOURCE".to_string())]);
+            validate(stdio).unwrap();
         }
     }
 }

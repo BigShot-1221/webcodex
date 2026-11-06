@@ -150,13 +150,15 @@ fn capacity_stale_provider_and_replay_are_fenced_before_duplicate_prompt() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let first_run = "wc_agent_run_capacity0001";
-    assert!(manager
-        .handle(
-            start_request(&manager, &root, first_run, BTreeMap::new()),
-            &projects
-        )
-        .error
-        .is_none());
+    assert!(
+        manager
+            .handle(
+                start_request(&manager, &root, first_run, BTreeMap::new()),
+                &projects
+            )
+            .error
+            .is_none()
+    );
     let first_snapshot = wait_for_snapshot_until(
         &manager,
         first_run,
@@ -404,13 +406,15 @@ fn child_environment_is_cleared_and_missing_mapping_never_spawns() {
             let root = temp.path().join("repo");
             let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
             let run = "wc_agent_run_envclear0001";
-            assert!(manager
-                .handle(
-                    start_request(&manager, &root, run, BTreeMap::new()),
-                    &projects
-                )
-                .error
-                .is_none());
+            assert!(
+                manager
+                    .handle(
+                        start_request(&manager, &root, run, BTreeMap::new()),
+                        &projects
+                    )
+                    .error
+                    .is_none()
+            );
             wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
             let startup = wire_log(&temp)
                 .into_iter()

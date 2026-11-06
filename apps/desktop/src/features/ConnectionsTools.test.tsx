@@ -596,7 +596,7 @@ describe("Connections + Tools control surfaces", () => {
 
   it("saves MCP desired configuration then applies only an explicit Runner restart", async () => {
     const captured: McpProviderRequest[] = [];
-    const saved = state(); saved.mcp_providers = { revision: 1, config_error: false, restart_required: true, max_enabled: 8, profiles: [{ id: "provider", name: "Playwright", command: "npx", args: ["-y", "@playwright/mcp"], enabled: true, scope: "runner", env_keys: ["API_KEY"], cwd: null }] };
+    const saved = state(); saved.mcp_providers = { revision: 1, config_error: false, restart_required: true, max_enabled: 16, profiles: [{ id: "provider", name: "Playwright", command: "npx", args: ["-y", "@playwright/mcp"], enabled: true, scope: "runner", env_keys: ["API_KEY"], cwd: null }] };
     api.saveMcpProvider.mockImplementation(async request => { captured.push(structuredClone(request)); return saved; });
     api.restartOwnedRunner.mockResolvedValue({ ...saved, mcp_providers: { ...saved.mcp_providers, restart_required: false } });
     render(<Harness mode="mcp" />);

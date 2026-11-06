@@ -290,7 +290,9 @@ Linux 等价复现中，`codex-acp` **2.1.1** 搭配包内 Codex **0.159.3**，�
 
 ## 本地 MCP provider
 
-Runner 可以直接托管供 WebCodex 内建 MCP gateway 使用的 persistent stdio MCP provider：
+Runner 托管供 WebCodex 内建 MCP gateway 使用的 persistent MCP provider。**Stdio** 为默认 transport（`transport = "stdio"` 或省略）；未写 `transport` 的既有 provider 配置无需改动即可继续工作。**Streamable HTTP** 通过 HTTP 连接远程 MCP endpoint；见下文 [Streamable HTTP provider](#streamable-http-provider)。
+
+Stdio 示例：
 
 ```toml
 [mcp]
@@ -309,22 +311,55 @@ timeout_secs = 30
 
 `max_tool_description_bytes` 是 Runner 侧可由用户配置的单工具 `description` 长度上限（默认 65,536 字节；有效范围 4,096–262,144 字节），同时用于 `tools/list` 与 `tools/call` 前的 schema 重新检查。Server 仍独立执行固定 256 KiB 单描述协议硬上限、完整 `tools/list` 1 MiB 消息上限，以及 Schema/工具数量限制。可在 Runner `[mcp]` 下设置，并通过 generation-fenced 配置重新加载生效，无需重启未变化的 provider；不会截断原始描述，也不会扩大模型展示预算。
 
-`executable` 与可选 `cwd` 都是 Runner host-local operator 配置并且必须为绝对路径；非法路径会 fail closed。`[mcp]` 现在参与正常的 generation-fenced Runner config reload transaction：配置未变化的 provider 保留 exact provider identity 和现有 connection；配置发生变化的 provider 获得新的 provider identity；新增/删除 provider 会在不重启 Runner 的情况下更新 routing。旧的 exact provider identity 会 fail closed，绝不会被静默 retarget。
+Stdio provider 的 `executable` 与可选 `cwd` 都是 Runner host-local operator 配置并且必须为绝对路径；非法路径会 fail closed。`[mcp]` 现在参与正常的 generation-fenced Runner config reload transaction：配置未变化的 provider 保留 exact provider identity 和现有 connection；配置发生变化的 provider 获得新的 provider identity；新增/删除 provider 会在不重启 Runner 的情况下更新 routing。旧的 exact provider identity 会 fail closed，绝不会被静默 retarget。
 
-provider 不会整体继承 Runner 环境。`env_from_env` 只复制显式列出的变量，WebCodex 自己的 sensitive transport/account credential 变量不允许映射；配置的 source variable 缺失时会在 provider 启动前失败。Windows 上，Runner 在清空环境后会额外只提供非敏感的 `SYSTEMROOT` OS bootstrap（除非 operator 显式映射该 destination）；`PATH`、用户 profile 状态、代理与 credential 仍不会被整体继承。
+Stdio provider 子进程不会整体继承 Runner 环境。`env_from_env` 将每个 provider 可见的 destination 名称映射到 Runner 进程中的 source 变量，并在 spawn 前只把这些解析后的值注入子进程。WebCodex 自己的 sensitive transport/account credential 变量不允许映射；配置的 source variable 缺失时会在 provider 启动前失败。Windows 上，Runner 在清空环境后会额外只提供非敏感的 `SYSTEMROOT` OS bootstrap（除非 operator 显式映射该 destination）；`PATH`、用户 profile 状态、代理与 credential 仍不会被整体继承。
 
-把 credential 映射给 provider，就等于把这份 credential 委托给该 provider process。provider 可以按自身实现使用它，也可以通过正常 tool result 返回派生值甚至原始值；WebCodex 不会尝试对任意 provider output 做 secret redaction。因此应把 configured provider 视为 credential recipient，使用 least-privilege provider credential，并注意任何拥有 `mcp:local` 权限的 caller 都能行使这些 credential 为 provider 提供的能力。
+把 credential 映射给 provider，就等于把这份 credential 委托给该 provider（stdio 子进程或远程 HTTP endpoint）。provider 可以按自身实现使用它，也可以通过正常 tool result 返回派生值甚至原始值；WebCodex 不会尝试对任意 provider output 做 secret redaction。因此应把 configured provider 视为 credential recipient，使用 least-privilege provider credential，并注意任何拥有 `mcp:local` 权限的 caller 都能行使这些 credential 为 provider 提供的能力。
 
-provider connection 在第一次真实交互时启动，并在健康时复用。发生 fatal stdio/protocol failure 时只会退休当前 connection；WebCodex 绝不会重放刚才失败的 request。后续由 caller 明确发起的新 request 可以在同一逻辑 provider identity 下建立新 connection；effectful `tools/call` 在 dispatch 前仍会重新 `tools/list` 并核对已绑定 schema。Server 只看到逻辑 provider `id`/`name`，不会拿到 executable path、环境 value、PID、stderr 或 Runner credential。`mcp_tool(action=list)` 只表示 provider id 是否可路由。`mcp_tool(action=status, server=...)` 是纯 Runner-side lifecycle observation，不会启动、initialize 或 ping provider，只返回 `never_started`、`healthy`、`connection_retired` 或 `busy`。这里的 `healthy` 只表示当前保留 connection 的子进程仍在运行，不代表执行过端到端 MCP health probe。`list(server=...)` 与 `describe` 才会与 provider 交互。
+### Streamable HTTP provider
+
+远程 provider 使用 `transport = "streamable_http"` 与不含 `executable` 的裸 endpoint `url`：
+
+```toml
+[[mcp.providers]]
+id = "penpot"
+name = "Penpot"
+transport = "streamable_http"
+url = "https://design.penpot.app/mcp/stream"
+http_query_from_env = { userToken = "PENPOT_USER_TOKEN" }
+[mcp.providers.env_from_env]
+PENPOT_USER_TOKEN = "WEBCODEX_DESKTOP_MCP_<opaque>_0"
+```
+
+凭据采用两级映射：
+
+1. `http_query_from_env` 与 `http_headers_from_env` 将每个 HTTP query 参数名或 header 名映射到 **provider 可见 env key**；该 key 还必须出现在 `env_from_env` 中（例如 `userToken` → `PENPOT_USER_TOKEN`）。HTTP 映射表中的 value 是 key 名称，不是 secret。
+2. `env_from_env` 将每个 provider 可见 key 映射到 **Runner 进程环境变量名**，Runner 在使用 provider 前才读取其值（例如 `PENPOT_USER_TOKEN` → `WEBCODEX_DESKTOP_MCP_<opaque>_0`）。运行时，真实 secret 会注入 Runner 进程环境；不会写入 `runner.toml`、profile metadata、日志或 error message。
+
+Bearer 类认证可将 `Authorization` header 映射到 provider 可见 env key。不要使用名为 `AUTHORIZATION` 的 provider env key（该名称保留且会被拒绝）：
+
+```toml
+http_headers_from_env = { Authorization = "MCP_ACCESS_TOKEN" }
+[mcp.providers.env_from_env]
+MCP_ACCESS_TOKEN = "WEBCODEX_DESKTOP_MCP_<opaque>_0"
+```
+
+`url` 必须为 `http` 或 `https`，且不得包含 embedded userinfo、query string（包括仅含 `?` 的空 delimiter）或 fragment。仅 loopback 开发场景允许 plain `http`；生产 endpoint 应使用 `https`。动态 query 值必须通过 `http_query_from_env`（经上述映射）提供，不能写在 URL 字符串中。HTTP redirect 已禁用。
+
+Runner 通过 HTTP POST 发送 MCP JSON-RPC，并携带 `Accept: application/json, text/event-stream`。服务端可以返回单个 JSON body，也可以通过 SSE 流传递匹配的 JSON-RPC result。若响应包含 `mcp-session-id` header，同一 provider connection 上的后续请求会复用该 session；不返回 session id 的无状态服务端仍兼容。connection 退役或释放时，Runner 会 best-effort 发送 HTTP DELETE 结束该 session；DELETE 失败会被忽略，不改变 tool routing 语义。
+
+Penpot 要求：在使用此 Runner 级远程 provider 期间，浏览器中当前设计文件对应的 Penpot 内建 MCP connection 必须保持连接；Runner 配置不能替代 Penpot 内建 connection UI。
 
 ### Provider-side gateway V1 compatibility
 
-Runner 到 configured local provider 的内建 gateway 有意限制为 bounded stdio tool subset，并不是所有 MCP feature 的透明 bridge：
+Runner 到 configured local provider 的内建 gateway 有意限制为 stdio 与 Streamable HTTP 共用的 bounded MCP tool subset，并不是所有 MCP feature 的透明 bridge：
 
 - provider-side tool 行为基于 MCP `2025-06-18`；
 - 支持 `tools/list` 与 `tools/call`；
-- Provider 主动发起的 ping（数字或字符串 ID）即使在空闲期间也会收到空 JSON-RPC result；Notification 不回复，并有洪泛限制；
-- 合法但未支持的 Provider callback 返回 JSON-RPC -32601，不授予 sampling、roots 或 elicitation 能力；畸形消息与未知响应 ID 仍属于致命协议错误；
+- 对 stdio provider，Provider 主动发起的 ping request（数字或字符串 ID）即使在空闲期间也会收到空 JSON-RPC result；Notification 不回复，并有洪泛限制；
+- 对 stdio provider，合法但未支持的 callback 返回 JSON-RPC -32601，不授予 sampling、roots 或 elicitation 能力；畸形消息与未知响应 ID 仍属于致命协议错误；
+- Streamable HTTP 仅支持由客户端发起的 POST 流程（`initialize`、`notifications/initialized`、`tools/list`、`tools/call`），并支持 JSON 或 SSE 响应；SSE 响应中可以穿插合法的 Provider Notification。当前不支持 HTTP GET event-stream subscription，也不支持服务端主动发起 JSON-RPC request（包括 ping request）；此类 request event 会 fail closed 并使 HTTP connection 退役；
 - 不支持 list pagination 以及端到端 progress/cancellation 转发；
 - `tools/list` 保持目录 1 MiB、128 个工具的上限；4096 个 JSON 节点的预算分别应用于每个工具和响应外层字段，并保留现有深度及单个 schema 限制；
 - tool result 支持 text 以及标准的有界 image content block，并保持 provider `content` 原始顺序；image `data` 必须是 standard Base64，MIME 仅支持 `image/png`、`image/jpeg`、`image/webp`，单个 result 内全部 image block 合计 decoded data 上限为 4 MiB；
@@ -334,6 +369,8 @@ Runner 到 configured local provider 的内建 gateway 有意限制为 bounded s
 - audio、嵌入式 resource 以及未知 content block type 仍不支持。
 
 不支持的 protocol/content shape 会 fail closed，而不是静默转换；该 gateway 仍是 bounded MCP tool subset，不是透明的 media/resource bridge。
+
+provider connection 在第一次真实交互时启动，并在健康时复用。发生 fatal transport 或 protocol failure 时只会退休当前 connection；WebCodex 绝不会重放刚才失败的 request。后续由 caller 明确发起的新 request 可以在同一逻辑 provider identity 下建立新 connection；effectful `tools/call` 在 dispatch 前仍会重新 `tools/list` 并核对已绑定 schema。Server 只看到逻辑 provider `id`/`name`，不会拿到 executable path、环境 value、PID、stderr、endpoint secret 或 Runner credential。`mcp_tool(action=list)` 只表示 provider id 是否可路由。`mcp_tool(action=status, server=...)` 是纯 Runner-side lifecycle observation，不会启动、initialize 或 ping provider，只返回 `never_started`、`healthy`、`connection_retired` 或 `busy`。这里的 `healthy` 表示 stdio 子进程仍在运行，或 Streamable HTTP session 仍被保留；两种情况都不代表执行过端到端 MCP health probe。`list(server=...)` 与 `describe` 才会与 provider 交互。
 
 ## Shell profile
 

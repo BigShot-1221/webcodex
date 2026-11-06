@@ -51,7 +51,7 @@ try {
       const response = await route.fetch(); const state = await response.json();
       state.workspace_runner = { client_id: 'fixture-runner', config_path: '/fixture/runner.toml', server_url: 'http://127.0.0.1:1' };
       state.connections = { profiles: connections, running: 1, needs_attention: 1, config_error: false };
-      state.mcp_providers = { profiles: providers, revision: 1, restart_required: false, config_error: false, max_enabled: 8 };
+      state.mcp_providers = { profiles: providers, revision: 1, restart_required: false, config_error: false, max_enabled: 16 };
       await route.fulfill({ response, json: state });
     });
     await page.route('**/desktop-shim.js', async route => {

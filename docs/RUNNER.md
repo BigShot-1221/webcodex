@@ -348,7 +348,9 @@ for lifecycle and configuration boundaries.
 
 ## Local MCP providers
 
-The Runner can directly host persistent stdio MCP providers for WebCodex's built-in MCP gateway:
+The Runner hosts persistent MCP providers for WebCodex's built-in MCP gateway. **Stdio** is the default transport (`transport = "stdio"` or omitted); existing provider entries without `transport` continue to work unchanged. **Streamable HTTP** connects to a remote MCP endpoint over HTTP; see [Streamable HTTP providers](#streamable-http-providers) below.
+
+Stdio example:
 
 ```toml
 [mcp]
@@ -367,22 +369,55 @@ timeout_secs = 30
 
 `max_tool_description_bytes` is a Runner-owned, operator-configurable per-tool `description` admission limit (default 65,536 bytes; accepted range 4,096–262,144 bytes). It applies to both `tools/list` and the schema preflight before `tools/call`. The Server still enforces the fixed 256 KiB per-description protocol hard cap, 1 MiB whole `tools/list` message cap, and the existing schema/tool-count bounds. Set this in the Runner's `[mcp]` section; a generation-fenced Runner config reload applies it without restarting unchanged providers. This does not truncate third-party descriptions or expand model-facing budgets.
 
-`executable` and optional `cwd` must be absolute host-local operator configuration. Invalid paths fail closed. `[mcp]` participates in the normal generation-fenced Runner config reload transaction: unchanged providers keep their exact provider identity and live connection, changed providers receive a fresh provider identity, and added/removed providers update routing without restarting the Runner. Old exact provider identities fail closed and are never retargeted.
+For stdio providers, `executable` and optional `cwd` must be absolute host-local operator configuration. Invalid paths fail closed. `[mcp]` participates in the normal generation-fenced Runner config reload transaction: unchanged providers keep their exact provider identity and live connection, changed providers receive a fresh provider identity, and added/removed providers update routing without restarting the Runner. Old exact provider identities fail closed and are never retargeted.
 
-Provider processes do not inherit the Runner environment wholesale. `env_from_env` copies only explicitly named variables, and WebCodex's own sensitive transport/account credential variables cannot be mapped. A missing configured source variable fails before provider start. On Windows, the Runner additionally supplies only the non-secret `SYSTEMROOT` OS bootstrap after clearing the environment, unless that destination is explicitly mapped; `PATH`, user-profile state, proxies, and credentials are still not inherited.
+Stdio provider child processes do not inherit the Runner environment wholesale. `env_from_env` maps each provider-visible destination name to a Runner-process source variable and copies only those resolved values into the child immediately before spawn. WebCodex's own sensitive transport/account credential variables cannot be mapped. A missing configured source variable fails before provider start. On Windows, the Runner additionally supplies only the non-secret `SYSTEMROOT` OS bootstrap after clearing the environment, unless that destination is explicitly mapped; `PATH`, user-profile state, proxies, and credentials are still not inherited.
 
-Mapping a credential delegates that credential to the configured provider process. The provider can use it according to its own implementation and can choose to return derived or raw values through normal tool results; WebCodex does not attempt to redact arbitrary provider output. Treat configured providers as credential recipients, use least-privilege provider credentials, and remember that any caller authorized for `mcp:local` can exercise the provider capabilities that those credentials enable.
+Mapping a credential delegates that credential to the configured provider (stdio child process or remote HTTP endpoint). The provider can use it according to its own implementation and can choose to return derived or raw values through normal tool results; WebCodex does not attempt to redact arbitrary provider output. Treat configured providers as credential recipients, use least-privilege provider credentials, and remember that any caller authorized for `mcp:local` can exercise the provider capabilities that those credentials enable.
 
-A provider connection starts on first real interaction and is reused while healthy. A fatal stdio/protocol failure retires only that connection; WebCodex never replays the failed request. A later explicit request may start a fresh connection under the same logical provider identity, and an effectful `tools/call` re-lists and checks the bound tool schema before dispatch. The Server sees the logical provider `id`/`name`, not its executable path, environment values, PID, stderr, or Runner credential. `mcp_tool(action=list)` reports only routing resolvability. `mcp_tool(action=status, server=...)` is a passive Runner-side lifecycle observation that never starts, initializes, or pings a provider; it reports only `never_started`, `healthy`, `connection_retired`, or `busy`. Here `healthy` means the retained connection's child process is still running, not that an end-to-end MCP health probe was performed. `list(server=...)` and `describe` interact with the provider.
+### Streamable HTTP providers
+
+Remote providers use `transport = "streamable_http"` and a bare endpoint `url` (no `executable`):
+
+```toml
+[[mcp.providers]]
+id = "penpot"
+name = "Penpot"
+transport = "streamable_http"
+url = "https://design.penpot.app/mcp/stream"
+http_query_from_env = { userToken = "PENPOT_USER_TOKEN" }
+[mcp.providers.env_from_env]
+PENPOT_USER_TOKEN = "WEBCODEX_DESKTOP_MCP_<opaque>_0"
+```
+
+Credential wiring uses a two-stage mapping:
+
+1. `http_query_from_env` and `http_headers_from_env` map each HTTP query parameter or header name to a **provider-visible env key** that must also appear in `env_from_env` (for example `userToken` → `PENPOT_USER_TOKEN`). Values in these HTTP mapping tables are key names, not secrets.
+2. `env_from_env` maps each provider-visible key to a **Runner-process environment variable name** whose value is read immediately before the Runner uses the provider (for example `PENPOT_USER_TOKEN` → `WEBCODEX_DESKTOP_MCP_<opaque>_0`). At runtime, the actual secret is injected into the Runner process environment; it is never written to `runner.toml`, profile metadata, logs, or error messages.
+
+For bearer-style auth, map the `Authorization` header to a provider-visible env key. Do not use a provider env key named `AUTHORIZATION` (that name is reserved and rejected):
+
+```toml
+http_headers_from_env = { Authorization = "MCP_ACCESS_TOKEN" }
+[mcp.providers.env_from_env]
+MCP_ACCESS_TOKEN = "WEBCODEX_DESKTOP_MCP_<opaque>_0"
+```
+
+`url` must use `http` or `https` without embedded userinfo, query strings (including a bare `?` delimiter), or fragments. Plain `http` is accepted only for loopback development; production endpoints should use `https`. Dynamic query values must come from `http_query_from_env` (via the mapping above), not from the URL string. HTTP redirects are disabled.
+
+The Runner sends MCP JSON-RPC over HTTP POST with `Accept: application/json, text/event-stream`. The server may answer with a single JSON body or an SSE stream that carries the matching JSON-RPC result. If the server returns an `mcp-session-id` header, later requests on the same provider connection reuse it; servers that omit it remain compatible on a stateless per-request basis. When a connection is retired or dropped, the Runner best-effort sends HTTP DELETE for that session id; delete failures are ignored and do not change tool routing semantics.
+
+Penpot expects Penpot's own in-design MCP connection for the active design file to stay connected in the browser while you use this Runner-wide remote provider; the Runner configuration does not replace that built-in connection UI.
 
 ### Provider-side gateway V1 compatibility
 
-The built-in Runner-to-provider gateway is intentionally a bounded stdio tool subset, not a transparent bridge to every MCP feature:
+The built-in Runner-to-provider gateway is intentionally a bounded MCP tool subset for stdio and Streamable HTTP, not a transparent bridge to every MCP feature:
 
 - provider-side tool behavior is based on MCP `2025-06-18`;
 - `tools/list` and `tools/call` are supported;
-- provider-originated ping requests (numeric or string IDs) receive empty JSON-RPC results even while idle; notifications receive no replies, with bounded flood protection;
-- well-formed unsupported provider callbacks receive JSON-RPC -32601 without granting sampling, roots, or elicitation capabilities; invalid messages and unknown response IDs remain fatal;
+- for stdio providers, provider-originated ping requests (numeric or string IDs) receive empty JSON-RPC results even while idle; notifications receive no replies, with bounded flood protection;
+- for stdio providers, well-formed unsupported callbacks receive JSON-RPC -32601 without granting sampling, roots, or elicitation capabilities; invalid messages and unknown response IDs remain fatal;
+- Streamable HTTP supports the client-initiated POST flow (`initialize`, `notifications/initialized`, `tools/list`, and `tools/call`), with JSON or SSE responses; valid provider notifications may be interleaved in an SSE response. HTTP GET event-stream subscriptions and server-initiated JSON-RPC requests (including ping requests) are not supported; such request events fail closed and retire the HTTP connection;
 - list pagination and end-to-end progress/cancellation forwarding are not supported;
 - `tools/list` keeps the 1 MiB catalog and 128-tool caps; the 4096-node JSON budget applies separately to each tool and the response envelope, while existing depth and per-schema limits remain in effect;
 - tool results support text plus standard bounded image content blocks, preserving provider content order; image data must be standard Base64 with MIME `image/png`, `image/jpeg`, or `image/webp`, and all image blocks in one result share a 4 MiB decoded-data cap;
@@ -392,6 +427,8 @@ The built-in Runner-to-provider gateway is intentionally a bounded stdio tool su
 - audio, embedded resource, and unknown content block types remain unsupported.
 
 Unsupported protocol/content shapes fail closed instead of being silently translated. This remains a bounded MCP tool subset, not a transparent media/resource bridge.
+
+A provider connection starts on first real interaction and is reused while healthy. A fatal transport or protocol failure retires only that connection; WebCodex never replays the failed request. A later explicit request may start a fresh connection under the same logical provider identity, and an effectful `tools/call` re-lists and checks the bound tool schema before dispatch. The Server sees the logical provider `id`/`name`, not its executable path, environment values, PID, stderr, endpoint secrets, or Runner credential. `mcp_tool(action=list)` reports only routing resolvability. `mcp_tool(action=status, server=...)` is a passive Runner-side lifecycle observation that never starts, initializes, or pings a provider; it reports only `never_started`, `healthy`, `connection_retired`, or `busy`. Here `healthy` means the retained stdio child is still running or a Streamable HTTP session is still retained; neither case implies an end-to-end MCP health probe. `list(server=...)` and `describe` interact with the provider.
 
 ## Shell profiles
 

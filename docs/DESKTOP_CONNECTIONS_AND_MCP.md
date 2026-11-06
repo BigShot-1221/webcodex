@@ -163,8 +163,10 @@ revisions separately report whether the owning Server has applied the saved stat
 
 ## Persistent MCP Providers
 
-Open **Extensions → MCP Providers**. Configure an arbitrary Runner-compatible stdio
-provider, not just Playwright. For example:
+Open **Extensions → MCP Providers**. Configure an arbitrary Runner-compatible provider.
+Desktop supports **local stdio** processes and **remote Streamable HTTP** endpoints.
+
+Local stdio example:
 
 ```text
 Provider Name: Playwright
@@ -172,13 +174,36 @@ Command: npx
 Arguments: ["-y", "@playwright/mcp"]
 ```
 
+Remote Streamable HTTP example (Penpot design MCP):
+
+```text
+Provider Name: Penpot
+Transport: Streamable HTTP
+Endpoint URL: https://design.penpot.app/mcp/stream
+HTTP query parameters: {"userToken":"PENPOT_USER_TOKEN"}
+Private environment variable: PENPOT_USER_TOKEN (enter the token only in the password field)
+```
+
+The Penpot user token is **not** stored in the endpoint URL, `runner.toml`, public UI state,
+or `mcp-providers.json`. Desktop keeps the query-key → private env-key mapping in the
+manifest and, at Runner restart, writes that mapping into `http_query_from_env` /
+`http_headers_from_env` using the private env-key names (for Penpot,
+`userToken` → `PENPOT_USER_TOKEN`). `env_from_env` maps each such provider key to a
+generated `WEBCODEX_DESKTOP_MCP_*` Runner-process environment source; the secret value is
+injected only into that Runner environment, never into TOML. Penpot also expects its own in-design MCP connection to
+remain active; this Desktop provider adds Runner-wide tools and does not replace Penpot’s
+built-in connection UI.
+
 Install the required executable/package on the host first where appropriate. Bare
 command names are resolved against the Desktop host's PATH and standard local
 installation directories; an absolute executable path is also accepted. Resolution
 does not execute a command. Arguments are a JSON string array, not a shell command.
 A selected working directory must be absolute. Credential values belong in **Private
-environment variables**, not command arguments or names. Arguments and command
-metadata are ordinary configuration and are not secret storage.
+environment variables**, not command arguments, URL query strings, HTTP mapping JSON,
+or header names. Arguments, endpoint URLs (without secrets), and mapping metadata are
+ordinary configuration and are not secret storage. Remote endpoints must use `https`
+except loopback `http` for local development; userinfo, fragments, and URL-embedded
+query parameters are rejected.
 
 Save stages desired state and shows **Saved · Restart Runner to apply**. **Restart
 Runner** uses a fresh identity-checked target and restarts only the Desktop-owned
@@ -188,15 +213,29 @@ cannot possess those values.
 
 ### Storage and reconciliation
 
-- `mcp-providers.json`: schema/revision, provider IDs/names, command/arguments,
-  enabled state, `scope: runner`, environment key metadata and opaque private refs.
+- `mcp-providers.json`: schema/revision, provider IDs/names, transport (stdio default),
+  command/arguments for stdio, endpoint URL and HTTP header/query mappings (env key names
+  only) for Streamable HTTP, enabled state, `scope: runner`, environment key metadata and
+  opaque private refs.
 - `secrets/mcp-providers/<UUID>.json`: private environment values. Files are owner-only
   on Unix and their containing directory is private. Values are never projected to
   UI/activity/errors or ordinary Desktop state.
-- Current `runner.toml`: safely materialized `[mcp]` provider entries. It contains
-  `env_from_env` references, never these private values. Desktop injects the referenced
-  values only into the owned Runner's environment. Ordinary job child inheritance
-  filters the reserved `WEBCODEX_DESKTOP_MCP_` prefix; only explicit MCP mappings use it.
+- Current `runner.toml`: safely materialized `[mcp]` provider entries. It never contains
+  private credential values. For Streamable HTTP, Desktop also stores
+  `transport = "streamable_http"`, `url`, `http_headers_from_env`, and
+  `http_query_from_env`. The HTTP mapping tables map each header or query target name to
+  a **private provider env-key name** (not a generated source). `env_from_env` maps those
+  provider keys to generated `WEBCODEX_DESKTOP_MCP_*` Runner-process environment source
+  names. Penpot reconciliation materializes, for example:
+
+  ```toml
+  http_query_from_env = { userToken = "PENPOT_USER_TOKEN" }
+  env_from_env = { PENPOT_USER_TOKEN = "WEBCODEX_DESKTOP_MCP_<opaque>_0" }
+  ```
+
+  Desktop injects secret values only into the owned Runner's environment under those
+  generated sources. Ordinary job child inheritance filters the reserved
+  `WEBCODEX_DESKTOP_MCP_` prefix; only explicit MCP mappings use it.
 
 A new immutable private blob is flushed before the manifest points to it. Replacing
 or deleting a provider retires only that transaction's old private reference after
@@ -218,7 +257,7 @@ identity, missing executable and capacity violations fail before replacing the
 Runner file. Existing advanced provider options are preserved for managed entries
 unless they are the fields owned by this UI.
 
-The Runner currently permits eight enabled MCP providers in total (including
+The Runner currently permits sixteen enabled MCP providers in total (including
 operator-owned providers), and at most 64 environment mappings per provider,
 including explicit OS bootstrap variables. Disabled desired profiles are retained
 without being spawned. The Desktop model retains scope metadata for future

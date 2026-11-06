@@ -38,10 +38,15 @@ export function McpProvidersPanel({ state, onState, settings, onRestarted }: { s
     {(saved || providers.restart_required) && <div className="extension-apply-bar" role="status"><span>{c("saved")}{providers.restart_required ? ` · ${p("needsRestart")}` : ""}</span>{providers.restart_required && <button type="button" className="secondary-button" disabled={disabled || !settings?.can_restart} onClick={() => void restart()}>{p("restartRunner")}</button>}</div>}
     {providers.config_error && <p className="workspace-notice" role="alert">{c("configError")}</p>}
     {failed && !deleting && <p className="workspace-notice" role="alert">{c("operationFailed")}</p>}
-    {providers.profiles.map(profile => <article key={profile.id} className="extension-row mcp-provider-row" aria-labelledby={`mcp-provider-${profile.id}`} data-mcp-provider-id={profile.id}>
-      <div><h3 id={`mcp-provider-${profile.id}`}>{profile.name}</h3><span>Local MCP · {c(profile.enabled ? "configured" : "disabled")}</span><p className="mcp-command">{c("command")}: <code>{profile.command}</code></p>{profile.env_keys.length > 0 && <span>{c("credentials")}</span>}</div>
+    {providers.profiles.map(profile => {
+      const remote = profile.transport === "streamable_http";
+      return <article key={profile.id} className="extension-row mcp-provider-row" aria-labelledby={`mcp-provider-${profile.id}`} data-mcp-provider-id={profile.id}>
+      <div><h3 id={`mcp-provider-${profile.id}`}>{profile.name}</h3><span>{remote ? c("streamableHttpMcp") : c("localMcp")} · {c(profile.enabled ? "configured" : "disabled")}</span>
+        {remote ? profile.url && <p className="mcp-command">{c("mcpEndpointUrl")}: <code>{profile.url}</code></p> : <p className="mcp-command">{c("command")}: <code>{profile.command}</code></p>}
+        {profile.env_keys.length > 0 && <span>{c("credentials")}</span>}</div>
       <div className="connection-actions"><button type="button" className="secondary-button" disabled={disabled} aria-label={`${p("edit")} ${profile.name}`} onClick={() => setEditor({ profile, revision: providers.revision })}>{p("edit")}</button><button type="button" className="text-button" disabled={disabled} aria-label={`${c("delete")} ${profile.name}`} onClick={() => { setFailed(false); setDeleting({ profile, revision: providers.revision }); }}>{c("delete")}</button></div>
-    </article>)}
+    </article>;
+    })}
     {!providers.profiles.length && !providers.config_error && <p className="workspace-empty">{c("noProviders")}</p>}
     <details className="workspace-technical"><summary>{p("advanced")}</summary><p>{c("capacity")}: {providers.profiles.filter(profile => profile.enabled).length} / {providers.max_enabled}</p>{settings && <code>{settings.target.config_path}</code>}</details>
     {editor && <McpProviderEditor profile={editor.profile} revision={editor.revision} onState={next => { onState(next); setSaved(true); }} onClose={() => setEditor(null)} />}

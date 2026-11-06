@@ -66,12 +66,18 @@ export interface TunnelProfileRequest {
   expected_revision: number | null;
 }
 export type TunnelProfileAction = "start" | "stop" | "restart" | "delete";
+export type McpProviderTransport = "stdio" | "streamable_http";
 export interface McpProviderProfile {
   id: string;
   name: string;
+  /** Missing on legacy snapshots means stdio. */
+  transport?: McpProviderTransport;
   command: string;
   args: string[];
   cwd: string | null;
+  url?: string | null;
+  http_headers?: Record<string, string>;
+  http_query_params?: Record<string, string>;
   enabled: boolean;
   scope: "runner";
   env_keys: string[];
@@ -87,14 +93,18 @@ export interface McpProviderRequest {
   id: string | null;
   expected_revision: number;
   name: string;
+  transport?: McpProviderTransport;
   command: string;
   args: string[];
   cwd: string | null;
+  url?: string | null;
+  http_headers?: Record<string, string>;
+  http_query_params?: Record<string, string>;
   enabled: boolean;
   env: Record<string, string | null>;
 }
 export const EMPTY_CONNECTIONS: ConnectionsSnapshot = { profiles: [], running: 0, needs_attention: 0, config_error: false, server_restart_required: false };
-export const EMPTY_MCP_PROVIDERS: McpProvidersSnapshot = { revision: 0, profiles: [], restart_required: false, config_error: false, max_enabled: 8 };
+export const EMPTY_MCP_PROVIDERS: McpProvidersSnapshot = { revision: 0, profiles: [], restart_required: false, config_error: false, max_enabled: 16 };
 export function connectionActive(profile: TunnelConnection): boolean {
   return profile.lifecycle === "starting" || profile.lifecycle === "running" || profile.lifecycle === "stopping" || (profile.lifecycle === "error" && profile.pid !== null);
 }

@@ -94,14 +94,16 @@ to be needed, tightly related, and an existing primitive naturally supports the
 batch. Examples include several related `read_files` ranges, independent search
 queries, or a short bounded `run_shell` chain of predetermined observations.
 Result-dependent follow-ups stay sequential so the next call can incorporate the
-new evidence. In direct strategy the model chooses each follow-up across calls;
-with explicitly selected Code Mode guidance, an admitted read-only cell can inspect
-results and perform dependent follow-ups sequentially inside the same cell. Only
-independent observations run concurrently. Keep intermediate child results inside
-the cell and project compact decision evidence before `text(...)`; batching raw
-results into one output does not save model context. Do not preload unrelated data or combine permission, mutation,
-validation, commit, publish, deploy, or restart boundaries merely to reduce call
-count.
+new evidence. In Direct strategy, the model may issue already-known independent
+read-only tool calls concurrently in one Host turn; this is tool-call concurrency,
+not autonomous Agent spawning or ACP work. Same-tool native batches remain
+preferable. With explicitly selected Code Mode guidance, an admitted read-only
+cell can inspect results and perform dependent follow-ups sequentially inside the
+same cell. Only independent observations run concurrently. For Code Mode, keep
+intermediate child results inside the cell and project compact decision evidence
+before `text(...)`; batching raw results into one output does not save model
+context. Do not preload unrelated data or combine permission, mutation, validation,
+commit, publish, deploy, or restart boundaries merely to reduce call count.
 
 Inspection should narrow before it expands. Known symbols/tests/regions favor
 bounded targeted reads and related-range batching. Broad discovery should prefer

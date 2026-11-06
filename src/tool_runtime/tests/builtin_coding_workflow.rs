@@ -427,6 +427,23 @@ fn host_code_mode_catalog_is_derived_from_tool_definition_hints_only() {
     let direct = builtin_coding_workflow_projection(CodingGuidanceProfile::Direct);
     assert!(direct["tool_strategy"].get("host_orchestration").is_none());
 
+    let direct_strategy = strategy_text(&direct);
+    for phrase in [
+        "ChatGPT researches",
+        "WebCodex supplies evidence",
+        "Parallelize same-turn independent read-only calls",
+        "prefer native batches",
+        "Respect tool limits; avoid fan-out",
+        "Keep dependent calls sequential",
+        "Use read_tool_manifest for hints",
+        "No ACP for research",
+    ] {
+        assert!(
+            direct_strategy.contains(phrase),
+            "missing Direct research orchestration guidance: {phrase}"
+        );
+    }
+
     let host = builtin_coding_workflow_projection(CodingGuidanceProfile::HostCodeMode);
     let catalog = &host["tool_strategy"]["host_orchestration"];
     assert_eq!(catalog["guidance_only"], true);

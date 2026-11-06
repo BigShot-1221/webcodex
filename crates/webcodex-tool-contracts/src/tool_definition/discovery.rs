@@ -22,6 +22,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
         ),
         "Locate a registered workspace by exact Runner plus path or literal query; no Session or registration is created. Returns one resolved workspace or bounded ambiguous candidates, never the first fuzzy match. Git fields are cached Runner inventory, not current filesystem proof; incomplete inventory stays explicit. Starting or resuming work is a separate action. Gateway via call_runtime_tool.",
+    ).with_host_orchestration_hint(
+        super::ToolHostOrchestrationHint::independent_parallel_read(),
     ).with_discovery_keywords(&["locate", "resolve", "registered", "workspace", "path", "project", "定位", "已注册", "工作区", "路径", "项目"]),
     model_spec(
         control_def(
@@ -61,6 +63,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         .with_activity(
             super::ToolActivityPresentation::Support,
             super::ToolActivityInteraction::NonMeaningful,
+        )
+        .with_host_orchestration_hint(
+            super::ToolHostOrchestrationHint::independent_parallel_read(),
         ),
         "List registered Projects on an exact Runner; use resolve_workspace for unique path/name selection, or include_git_summary for cached maintenance facts. Results keep canonical Runtime Project ids and, when stable root identity is available, also issue a short principal-scoped project_ref for later model calls. project_ref is convenience only and grants no authority. When Runner/Project identity is known, pass exact client_id/project filters; use bounded query and summary_only instead of reading the full registry.",
     ),
@@ -135,6 +140,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         .with_activity(
             super::ToolActivityPresentation::Support,
             super::ToolActivityInteraction::NonMeaningful,
+        )
+        .with_host_orchestration_hint(
+            super::ToolHostOrchestrationHint::independent_parallel_read(),
         ),
         "Find Runners by client_id/client_ids, query, status or limit; summary_only returns compact health/build/Job counts without full inventories. Full mode includes shared Job concurrency and host_context advisory metadata; never authority.",
     ),
@@ -208,6 +216,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             .with_activity(
                 super::ToolActivityPresentation::Support,
                 super::ToolActivityInteraction::NonMeaningful,
+            )
+            .with_host_orchestration_hint(
+                super::ToolHostOrchestrationHint::independent_parallel_read(),
             ),
             "Exact tool_name returns an admitted contract/route; query/category/intent/limit search without execution. Prefer route.primary; use route.fallback only when authorized. Discovery grants no authority or Host registration. Retired tool_manifest failures do not imply ACP is absent; call call_runtime_tool with tool='read_tool_manifest' and canonical args.",
         ),

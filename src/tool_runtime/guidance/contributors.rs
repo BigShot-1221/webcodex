@@ -46,6 +46,7 @@ pub(super) static DIRECT: GuidanceContributor = GuidanceContributor {
         "Coalesce: read_files(items), search_project_texts(queries), search_file_context, project_validate with scope.packages, one edit_project_files batch. Keep result-dependent operations sequential. Avoid ritual turns.",
         "Simple observation: direct primitive. Batch predetermined independent observations; fixed read-only CLI: run_shell with exit checks. One literal command: run_process.",
         "Known target: bounded targeted reads. Broad discovery: small files/count search then targeted reads. Avoid ritual turns.",
+        "ChatGPT researches; WebCodex supplies evidence. Parallelize same-turn independent read-only calls; prefer native batches. Keep dependent calls sequential; never parallelize mutations/shared resources. Respect tool limits; avoid fan-out. Use read_tool_manifest for hints. No ACP for research; reserve it for code changes.",
     ],
 };
 

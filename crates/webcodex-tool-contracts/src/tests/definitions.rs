@@ -486,6 +486,36 @@ fn execution_selection_contract_is_canonical_closed_and_sparse() {
 }
 
 #[test]
+fn common_research_reads_advertise_independent_parallel_host_hints() {
+    use ToolHostConcurrencyHint::IndependentParallelRead;
+
+    for name in [
+        "read_project_overview",
+        "list_project_files",
+        "list_project_tracked_files",
+        "resolve_workspace",
+        "list_projects",
+        "list_runners",
+        "read_tool_manifest",
+        "review_changes",
+        "read_workspace_changes",
+        "read_git_log",
+    ] {
+        let definition = lookup_tool_definition(name).unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(
+            definition.host_orchestration.concurrency,
+            IndependentParallelRead,
+            "{name}"
+        );
+        assert_eq!(
+            runtime_tool_host_orchestration_hint(name),
+            definition.host_orchestration,
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn host_orchestration_hints_are_static_guidance_independent_from_nested_composition() {
     use ToolCompositionPolicy::{Denied, Parallel, Sequential};
     use ToolHostConcurrencyHint::{IndependentParallelRead, Sequential as HostSequential};

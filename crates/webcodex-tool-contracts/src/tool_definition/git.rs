@@ -60,7 +60,10 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
                     .review(super::ToolReviewEvidence::DiffReview)
                     .diff_review(super::ToolDiffReviewEvidence::Always),
             )
-            .with_composition_policy(super::ToolCompositionPolicy::Parallel),
+            .with_composition_policy(super::ToolCompositionPolicy::Parallel)
+            .with_host_orchestration_hint(
+                super::ToolHostOrchestrationHint::independent_parallel_read(),
+            ),
             "Review a fenced Git snapshot with three-line context. Workspace is the net HEAD-to-worktree patch, including staged/untracked contents, not an index-only plan. Committed scope pins commits/merge-base. Follow only next_call with unchanged inputs; workspace changes fail closed. Use get_git_status for cleanliness.",
         ).with_discovery_keywords(&["inspect", "review", "git", "changes", "code", "diff", "审查", "查看", "代码", "变动", "修改", "差异"]))),
         120,
@@ -89,7 +92,10 @@ pub(super) const SUMMARY_DEFINITIONS: &[ToolDefinition] = &[
                         .review(super::ToolReviewEvidence::WorkspaceReview)
                         .diff_review(super::ToolDiffReviewEvidence::ArgumentBool("include_diff")),
                 )
-                .with_composition_policy(super::ToolCompositionPolicy::Parallel),
+                .with_composition_policy(super::ToolCompositionPolicy::Parallel)
+                .with_host_orchestration_hint(
+                    super::ToolHostOrchestrationHint::independent_parallel_read(),
+                ),
                 "Read a structured workspace summary: Git branch, HEAD, staged/unstaged/untracked files and diff statistics, without a patch by default. Optional include_diff adds bounded unstaged hunks and safe untracked previews, not a complete staged patch. Protected or unverifiable tracked-file patches are omitted before capture, with explicit omitted counts and incomplete flags. Further diff review after such omissions requires explicitly selected ordinary paths in read_git_diff_hunks. Ordinary code review uses review_changes; recent Session event history is opt-in. Read-only.",
             ).with_discovery_keywords(&["workspace", "summary", "changes", "modified", "files", "工作区", "汇总", "变动", "修改", "文件"]),
         )),
@@ -184,7 +190,10 @@ pub(super) const DETAIL_DEFINITIONS: &[ToolDefinition] = &[
             GitOrShell,
             NoPath,
             super::ToolSessionEvidencePolicy::NONE,
-        ).with_composition_policy(super::ToolCompositionPolicy::Parallel),
+        ).with_composition_policy(super::ToolCompositionPolicy::Parallel)
+            .with_host_orchestration_hint(
+                super::ToolHostOrchestrationHint::independent_parallel_read(),
+            ),
         "Return bounded structured recent git commit history for a project. The first page resolves current HEAD to one exact 40-hex head_commit and reads that commit snapshot; later pages may supply the same head_commit so branch movement or rewrites cannot drift the traversal. When truncated and bounded forward progress is available, suggested_call is the sole parser-ready continuation and carries project, exact head_commit, effective limit, next skip, and Session identity when present. next_skip remains domain metadata only; null means the final page or the existing 10000 skip bound prevents a safe forward page. If the exact commit snapshot is no longer available, fail closed rather than falling back to current HEAD. Retained-tail or malformed source records also fail closed. Does not return commit bodies or modify the worktree.",
     )),
 ];

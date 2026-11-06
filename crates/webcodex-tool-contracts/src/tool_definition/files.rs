@@ -14,7 +14,10 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             FileRead,
             NoPath,
             super::ToolSessionEvidencePolicy::NONE.review(super::ToolReviewEvidence::ReadOnlyInspection),
-        ).with_composition_policy(super::ToolCompositionPolicy::Parallel),
+        ).with_composition_policy(super::ToolCompositionPolicy::Parallel)
+            .with_host_orchestration_hint(
+                super::ToolHostOrchestrationHint::independent_parallel_read(),
+            ),
         "Deterministic, bounded, metadata-only project overview. With the root/default scope it performs conservative project discovery from tracked state; with an explicit eligible path such as cache or build it can inspect ignored/generated directories through the bounded filesystem walk, while high-volume target/node_modules scopes remain excluded. Returns conventional project types, manifests, key files, roots, and direct children. Reads no file contents, uses no LLM, and is not semantic/LSP analysis; use read_files for exact file contents.",
     ).with_discovery_keywords(&["project", "overview", "structure", "manifests", "language", "framework", "项目", "概览", "结构", "清单", "框架"]),
     model_spec(
@@ -25,6 +28,8 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             FileRead,
             NoPath,
             super::ToolSessionEvidencePolicy::NONE.review(super::ToolReviewEvidence::ReadOnlyInspection),
+        ).with_host_orchestration_hint(
+            super::ToolHostOrchestrationHint::independent_parallel_read(),
         ),
         "List one live Project directory, including named generated/non-Git directories. Returns sorted project-relative paths and file/dir kinds. Follow next_call for another page; offsets are not snapshots, so concurrent directory changes can shift entries. Current Runners bound pages before transport; older Runners require a complete source or fail closed. Use list_project_tracked_files with query/globs/depth for repository discovery, search_project_texts for content, and read_files for a known file. Do not enumerate directories merely to confirm a known path.",
     ).with_discovery_keywords(&["list", "directory", "folder", "entries", "files", "列出", "目录", "文件夹", "文件"]),
@@ -38,7 +43,10 @@ pub(super) const SEARCH_DEFINITIONS: &[ToolDefinition] = &[
             Shell,
             NoPath,
             super::ToolSessionEvidencePolicy::NONE,
-        ).with_composition_policy(super::ToolCompositionPolicy::Parallel),
+        ).with_composition_policy(super::ToolCompositionPolicy::Parallel)
+            .with_host_orchestration_hint(
+                super::ToolHostOrchestrationHint::independent_parallel_read(),
+            ),
         "Default discovery tool: what files does this project contain? Lists Git-tracked paths from a bounded producer source, so ignored directories like .venv and target never appear. Supports globs, a project-relative path scope, rollup, and offset paging when source acquisition is complete. If list_truncated=true, the source itself is incomplete: next_offset is null and offset must not be treated as recovery for the full repository; narrow path and retry. Retained-tail source truncation fails closed rather than exposing a false continuation.",
     ).with_discovery_keywords(&["find", "filename", "glob", "tracked", "repository", "files", "文件名", "通配符", "跟踪", "仓库", "文件"]),
     adaptive_runtime_direct(

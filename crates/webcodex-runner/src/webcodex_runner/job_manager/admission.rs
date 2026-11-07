@@ -466,13 +466,11 @@ impl JobManager {
     pub(super) fn start_available_queued(&self) {
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
-                lock_unpoison(&self.queued).clear();
                 return;
             }
             let next = {
                 let _lifecycle = lock_unpoison(&self.lifecycle);
                 if self.shutting_down.load(Ordering::SeqCst) {
-                    lock_unpoison(&self.queued).clear();
                     return;
                 }
                 let mut jobs = lock_unpoison(&self.jobs);

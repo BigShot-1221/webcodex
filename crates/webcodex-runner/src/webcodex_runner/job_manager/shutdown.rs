@@ -93,6 +93,21 @@ impl JobShutdownOutcome {
     }
 }
 
+const QUEUED_SHUTDOWN_PRESTART_MSG: &str = "Runner shutdown before job start";
+
+fn queued_shutdown_prestart_delta(operation: &RunnerJobOperation) -> RunnerJobDelta {
+    RunnerJobDelta {
+        status: "stopped".to_string(),
+        stderr_chunk: Some(QUEUED_SHUTDOWN_PRESTART_MSG.to_string()),
+        exit_code: Some(-1),
+        duration_ms: Some(0),
+        error: Some(QUEUED_SHUTDOWN_PRESTART_MSG.to_string()),
+        command_execution_state: job_prestart_lifecycle(operation),
+        finished: true,
+        ..Default::default()
+    }
+}
+
 pub(super) fn shutdown_target_running(target: &mut JobShutdownTarget) -> bool {
     if managed_tree_running(&target.child) {
         return true;
@@ -120,11 +135,17 @@ impl JobManager {
     }
 
     pub(in crate::webcodex_runner) fn cancel_queued_for_shutdown(&self) -> usize {
-        let _lifecycle = lock_unpoison(&self.lifecycle);
-        self.shutting_down.store(true, Ordering::SeqCst);
-        let mut queued = lock_unpoison(&self.queued);
-        let cancelled = queued.len();
-        queued.clear();
+        let drained = {
+            let _lifecycle = lock_unpoison(&self.lifecycle);
+            self.shutting_down.store(true, Ordering::SeqCst);
+            let mut queued = lock_unpoison(&self.queued);
+            queued.drain(..).collect::<Vec<_>>()
+        };
+        let cancelled = drained.len();
+        for start in drained {
+            let job_id = start.operation.job_id();
+            self.update_and_send(job_id, queued_shutdown_prestart_delta(&start.operation));
+        }
         cancelled
     }
 
@@ -143,7 +164,10 @@ impl JobManager {
                 .map(|(_, job)| (job.child.clone(), Arc::clone(&job.stop_requested)))
                 .collect::<Vec<_>>()
         };
-        let running_count = running.len();
+        let running_count = running
+            .iter()
+            .filter(|(child, _)| child.is_some())
+            .count();
         let mut targets = Vec::with_capacity(running.len());
         let mut failures = 0;
         for (child, stop_requested) in running {

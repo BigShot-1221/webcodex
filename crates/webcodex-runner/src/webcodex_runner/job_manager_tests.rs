@@ -46,6 +46,153 @@ fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
 }
 
 #[test]
+fn cancel_queued_for_shutdown_terminals_agent_queued_prestart_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = JobManager::new(1);
+    let mut blocker = test_job_snapshot("blocker");
+    blocker.status = "running".to_string();
+    lock_unpoison(&manager.jobs).insert(
+        "blocker".to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot: blocker,
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    let (sink, _rx) = ws_sink("test-agent");
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            RunnerPolicy {
+                allow_cwd_anywhere: true,
+                ..RunnerPolicy::default()
+            },
+            ShellConfig::default(),
+            SshConfig::default(),
+            temp.path().join("projects"),
+            shell_job_request(temp.path(), "never executed"),
+        ),
+    );
+    assert_eq!(lock_unpoison(&manager.queued).len(), 1);
+    let queued = manager
+        .inventory()
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "job-profile")
+        .expect("queued job record");
+    assert_eq!(queued.status, "agent_queued");
+
+    assert_eq!(manager.cancel_queued_for_shutdown(), 1);
+    assert!(lock_unpoison(&manager.queued).is_empty());
+    assert!(manager.shutting_down.load(Ordering::SeqCst));
+
+    let terminal = manager
+        .inventory()
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "job-profile")
+        .expect("queued job retained");
+    assert_eq!(terminal.status, "stopped");
+    assert_eq!(terminal.exit_code, Some(-1));
+    assert_eq!(terminal.duration_ms, Some(0));
+    assert_eq!(
+        terminal.error.as_deref(),
+        Some("Runner shutdown before job start")
+    );
+    assert_eq!(
+        terminal.command_execution_state,
+        job_prestart_lifecycle(&decoded_job_operation(shell_job_request(
+            temp.path(),
+            "never executed"
+        )))
+    );
+    assert!(!lock_unpoison(&manager.jobs)
+        .get("job-profile")
+        .expect("queued job record")
+        .slot_reserved);
+}
+
+#[test]
+fn start_available_queued_during_shutdown_does_not_drop_queued_prestart_jobs() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = JobManager::new(1);
+    let mut blocker = test_job_snapshot("blocker");
+    blocker.status = "running".to_string();
+    lock_unpoison(&manager.jobs).insert(
+        "blocker".to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot: blocker,
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+    let (sink, _rx) = ws_sink("test-agent");
+    let wire_request = shell_job_request(temp.path(), "never executed");
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            RunnerPolicy {
+                allow_cwd_anywhere: true,
+                ..RunnerPolicy::default()
+            },
+            ShellConfig::default(),
+            SshConfig::default(),
+            temp.path().join("projects"),
+            wire_request.clone(),
+        ),
+    );
+    assert_eq!(lock_unpoison(&manager.queued).len(), 1);
+
+    manager.stop_accepting_work();
+    manager.start_available_queued();
+    manager.start_available_queued();
+
+    assert_eq!(
+        lock_unpoison(&manager.queued).len(),
+        1,
+        "shutdown scheduling must leave queued starts for cancel_queued_for_shutdown"
+    );
+    let pre_cancel = manager
+        .inventory()
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "job-profile")
+        .expect("queued job record");
+    assert_eq!(pre_cancel.status, "agent_queued");
+
+    assert_eq!(manager.cancel_queued_for_shutdown(), 1);
+    assert!(lock_unpoison(&manager.queued).is_empty());
+
+    let terminal = manager
+        .inventory()
+        .jobs
+        .iter()
+        .find(|snapshot| snapshot.job_id == "job-profile")
+        .expect("queued job retained");
+    assert_eq!(terminal.status, "stopped");
+    assert_eq!(terminal.exit_code, Some(-1));
+    assert_eq!(terminal.duration_ms, Some(0));
+    assert_eq!(
+        terminal.error.as_deref(),
+        Some("Runner shutdown before job start")
+    );
+    assert_eq!(
+        terminal.command_execution_state,
+        job_prestart_lifecycle(&decoded_job_operation(wire_request))
+    );
+}
+
+#[test]
 fn rejected_job_timestamps_preserve_server_creation_time() {
     let temp = tempfile::tempdir().unwrap();
     let manager = JobManager::new(1);

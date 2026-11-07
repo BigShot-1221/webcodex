@@ -1,5 +1,6 @@
 //! Process-wide Runner resources and ordered shutdown.
 
+use super::poll_dispatch::POLLING_DISPATCH_MAX_IN_FLIGHT;
 use super::*;
 
 impl RunnerRuntimeState {
@@ -40,6 +41,9 @@ impl RunnerRuntimeState {
                 InitialProjectScanState::default(),
             )),
             dispatches: ActivityTracker::default(),
+            request_dispatch_permits: Arc::new(tokio::sync::Semaphore::new(
+                POLLING_DISPATCH_MAX_IN_FLIGHT,
+            )),
             #[cfg(windows)]
             exit_diagnostics: None,
         }

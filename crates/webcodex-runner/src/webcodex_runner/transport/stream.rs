@@ -1,5 +1,8 @@
 //! Shared registered-stream reads, graceful close, and session loop.
 
+use super::stream_envelopes::{
+    reconcile_undispatched_stream_request, spawn_admitted_stream_request, StreamPendingRequest,
+};
 use super::*;
 
 pub(super) type RunnerWebSocket =
@@ -285,6 +288,7 @@ where
     let mut shutdown = Box::pin(shutdown);
     let mut shutdown_requested = false;
     let mut writer_observed = false;
+    let mut pending_stream_request: Option<StreamPendingRequest> = None;
 
     loop {
         if session_error.is_some() {
@@ -364,25 +368,52 @@ where
                 );
                 break;
             }
-            read = stream.receive() => {
+            read = stream.receive(), if pending_stream_request.is_none() => {
                 match read {
                     Ok(StreamRead::Envelope(envelope)) => {
-                        if let Some(error) = handle_stream_envelope(
-                            transport,
-                            envelope,
-                            cfg,
-                            &sink,
-                            &out_tx,
-                            &mut project_inventory,
-                            runtime,
-                        ) {
-                            session_error = Some(error);
-                            break;
+                        match envelope {
+                            RunnerEnvelope::Request { request } => {
+                                pending_stream_request = Some(StreamPendingRequest {
+                                    transport,
+                                    request,
+                                    sink: sink.clone(),
+                                    received_at: Instant::now(),
+                                });
+                            }
+                            other => {
+                                if let Some(error) = handle_stream_envelope(
+                                    transport,
+                                    other,
+                                    cfg,
+                                    &sink,
+                                    &out_tx,
+                                    &mut project_inventory,
+                                    runtime,
+                                ) {
+                                    session_error = Some(error);
+                                    break;
+                                }
+                            }
                         }
                     }
                     Ok(StreamRead::Closed) => break,
                     Err(error) => {
                         session_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            permit = runtime.request_dispatch_permits.clone().acquire_owned(), if pending_stream_request.is_some() => {
+                match permit {
+                    Ok(permit) => {
+                        let pending = pending_stream_request.take().expect("guarded pending request");
+                        if let Some(error) = spawn_admitted_stream_request(pending, permit, cfg, runtime) {
+                            session_error = Some(error);
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        session_error = Some("request_dispatch_permits_closed".to_string());
                         break;
                     }
                 }
@@ -413,6 +444,9 @@ where
         }
     }
 
+    if let Some(pending) = pending_stream_request.take() {
+        reconcile_undispatched_stream_request(pending, &out_tx).await;
+    }
     if shutdown_requested {
         let queue_started = Instant::now();
         match tokio::time::timeout(

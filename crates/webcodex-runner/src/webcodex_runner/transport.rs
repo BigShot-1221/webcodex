@@ -162,6 +162,11 @@ pub(crate) struct RunnerRuntimeState {
     background_threads: Arc<BackgroundThreads>,
     initial_project_scan: Arc<std::sync::Mutex<InitialProjectScanState>>,
     dispatches: ActivityTracker,
+    /// Process-wide ordinary request dispatch slots shared by stream and polling
+    /// transports so WebSocket/QUIC reconnect and polling fallback cannot
+    /// over-admit relative to each other. Capacity matches
+    /// `POLLING_DISPATCH_MAX_IN_FLIGHT`; Job concurrency is separate.
+    request_dispatch_permits: Arc<tokio::sync::Semaphore>,
     #[cfg(windows)]
     exit_diagnostics: Option<Arc<RunnerExitDiagnostics>>,
 }

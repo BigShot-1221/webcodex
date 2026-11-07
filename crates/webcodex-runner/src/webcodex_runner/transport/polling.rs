@@ -199,6 +199,7 @@ pub(super) fn run_polling_session(
     let mut polling_dispatches = PollingDispatchSupervisor::new(
         Arc::clone(&runtime.background_threads),
         runtime.dispatches.clone(),
+        Arc::clone(&runtime.request_dispatch_permits),
     );
     let mut registered = false;
     let mut recovering = false;
@@ -349,35 +350,6 @@ pub(super) fn run_polling_session(
                 },
             }
             continue;
-        }
-        if !once {
-            if let Err(error) = polling_dispatches
-                .wait_for_capacity_or_shutdown(&mut project_cache, shutdown.as_ref())
-            {
-                match handle_poll_failure(
-                    error,
-                    &cfg,
-                    runtime,
-                    shutdown.as_ref(),
-                    &mut registered,
-                    &mut recovering,
-                    &mut session_refreshed_during_recovery,
-                    &mut recovery_backoff,
-                )? {
-                    PollFailureDirective::Continue => continue,
-                    PollFailureDirective::Shutdown => {
-                        return complete_polling_after_shutdown(
-                            &client,
-                            &cfg,
-                            runner_instance_id,
-                            registered,
-                            runtime,
-                            &mut polling_dispatches,
-                            &mut project_cache,
-                        );
-                    }
-                }
-            }
         }
         if shutdown.load(Ordering::SeqCst) {
             return complete_polling_after_shutdown(

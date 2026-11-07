@@ -306,12 +306,14 @@ pub(crate) struct PollingDispatchSupervisor {
     in_flight: usize,
     background_threads: Arc<BackgroundThreads>,
     dispatches: ActivityTracker,
+    request_dispatch_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl PollingDispatchSupervisor {
     pub(crate) fn new(
         background_threads: Arc<BackgroundThreads>,
         dispatches: ActivityTracker,
+        request_dispatch_permits: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         let (completion_tx, completion_rx) = mpsc::sync_channel(POLLING_DISPATCH_MAX_IN_FLIGHT);
         Self {
@@ -320,6 +322,43 @@ impl PollingDispatchSupervisor {
             in_flight: 0,
             background_threads,
             dispatches,
+            request_dispatch_permits,
+        }
+    }
+
+    /// Block until one ordinary dispatch slot is owned or shutdown wins. Stream
+    /// releases and polling completions both restore capacity; there is no local
+    /// dequeue queue beyond the shared semaphore.
+    pub(crate) fn acquire_dequeue_permit(
+        &mut self,
+        project_cache: &mut RunnerProjectCache,
+        shutdown: &AtomicBool,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, PollError> {
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return Err(PollError::from_submit(SubmitResultError::Shutdown(
+                    "process shutdown".to_string(),
+                )));
+            }
+            match self.request_dispatch_permits.clone().try_acquire_owned() {
+                Ok(permit) => return Ok(permit),
+                Err(_) => match self.completion_rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(completion) => {
+                        let result = self
+                            .record_completion(project_cache, completion)
+                            .map(|_| ())
+                            .map_err(PollError::from_submit);
+                        let _ = self.background_threads.reap_finished();
+                        result?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(PollError::from_submit(SubmitResultError::TransportClosed(
+                            "polling dispatch completion channel closed".to_string(),
+                        )));
+                    }
+                },
+            }
         }
     }
 
@@ -329,23 +368,18 @@ impl PollingDispatchSupervisor {
         self.in_flight == 0
     }
 
-    pub(crate) fn has_capacity(&self) -> bool {
-        self.in_flight < POLLING_DISPATCH_MAX_IN_FLIGHT
-    }
-
-    pub(crate) fn spawn(&mut self, dispatch: PollingDispatch) -> Result<(), PollError> {
-        if !self.has_capacity() {
-            return Err(PollError::new(
-                PollErrorKind::Config,
-                "polling dispatch capacity invariant violated",
-            ));
-        }
+    pub(crate) fn spawn_with_permit(
+        &mut self,
+        dispatch: PollingDispatch,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), PollError> {
         let completion_tx = self.completion_tx.clone();
         let dispatch_guard = self.dispatches.enter();
         let request_id = dispatch.request_id.clone();
         let handle = std::thread::Builder::new()
             .name("webcodex-poll-dispatch".to_string())
             .spawn(move || {
+                let _permit = permit;
                 let mut completion =
                     PollingDispatchCompletionOnDrop::new(completion_tx, request_id);
                 let _dispatch_guard = dispatch_guard;
@@ -411,40 +445,6 @@ impl PollingDispatchSupervisor {
                 }
             }
         }
-    }
-
-    /// Apply backpressure before another Server dequeue. There is no local
-    /// pending queue: when all slots are occupied the control loop waits for
-    /// one worker completion (or shutdown) and only then polls again.
-    pub(crate) fn wait_for_capacity_or_shutdown(
-        &mut self,
-        project_cache: &mut RunnerProjectCache,
-        shutdown: &AtomicBool,
-    ) -> Result<(), PollError> {
-        while !self.has_capacity() {
-            if shutdown.load(Ordering::SeqCst) {
-                return Err(PollError::from_submit(SubmitResultError::Shutdown(
-                    "process shutdown".to_string(),
-                )));
-            }
-            match self.completion_rx.recv_timeout(Duration::from_millis(25)) {
-                Ok(completion) => {
-                    let result = self
-                        .record_completion(project_cache, completion)
-                        .map(|_| ())
-                        .map_err(PollError::from_submit);
-                    let _ = self.background_threads.reap_finished();
-                    result?;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(PollError::from_submit(SubmitResultError::TransportClosed(
-                        "polling dispatch completion channel closed".to_string(),
-                    )));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Preserve the former synchronous dispatch's bounded shutdown race:
@@ -538,6 +538,10 @@ pub(crate) fn handle_one_poll(
         computer_session_availability: computer_session_update,
         project_inventory_page,
     };
+    // Hold one slot for the whole poll round trip so a stream dispatch cannot
+    // consume the last permit after a capacity check but before spawn.
+    let dequeue_permit =
+        polling_dispatches.acquire_dequeue_permit(project_cache, shutdown.as_ref())?;
     let response: RunnerPollResponse = match post_json(client, cfg, RUNNER_POLL_PATH, &poll) {
         Ok(response) => response,
         Err(error) => {
@@ -598,7 +602,7 @@ pub(crate) fn handle_one_poll(
         request,
     };
     if !once {
-        polling_dispatches.spawn(dispatch)?;
+        polling_dispatches.spawn_with_permit(dispatch, dequeue_permit)?;
         return Ok((true, inventory_status));
     }
 
@@ -610,6 +614,7 @@ pub(crate) fn handle_one_poll(
     let handle = std::thread::Builder::new()
         .name("webcodex-poll-dispatch-once".to_string())
         .spawn(move || {
+            let _permit = dequeue_permit;
             let _dispatch_guard = dispatch_guard;
             let _ = result_tx.send(dispatch.run());
         })

@@ -8,6 +8,14 @@ use crate::tool_runtime::git::{
 };
 use serde_json::json;
 
+fn git_log_agent_caps() -> RunnerCapabilities {
+    RunnerCapabilities {
+        git: true,
+        internal_posix_script: true,
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn git_status_with_session_id_records_git_read_event() {
     let runtime = runtime_with_agent_project("telemetry-git");
@@ -65,11 +73,7 @@ async fn git_log_parses_commits() {
     commit_file(root, "a.txt", "two\n", "second commit");
     let stdout = git_log_stdout(root, 20, 0);
     let runtime = runtime_with_agent_project("git-log-parse");
-    let caps = RunnerCapabilities {
-        git: true,
-        ..Default::default()
-    };
-    register_agent(&runtime, "git-log-parse", None, caps).await;
+    register_agent(&runtime, "git-log-parse", None, git_log_agent_caps()).await;
     let project = agent_test_project_id("git-log-parse");
 
     let task = tokio::spawn({
@@ -92,8 +96,8 @@ async fn git_log_parses_commits() {
         }
     });
     let req = wait_for_patch_agent_request(&runtime, "git-log-parse").await;
-    assert!(req.command.contains("git log"));
-    assert!(req.command.contains("-n 21"));
+    assert_internal_posix_script_contains(&req, "git log");
+    assert_internal_posix_script_contains(&req, "-n 21");
     complete_patch_agent_request(&runtime, "git-log-parse", &req.request_id, 0, &stdout, "").await;
     let result = task.await.unwrap();
 
@@ -128,11 +132,7 @@ async fn git_log_limit_and_skip_returns_second_recent_and_truncated() {
     commit_file(root, "a.txt", "three\n", "third commit");
     let stdout = git_log_stdout(root, 1, 1);
     let runtime = runtime_with_agent_project("git-log-page");
-    let caps = RunnerCapabilities {
-        git: true,
-        ..Default::default()
-    };
-    register_agent(&runtime, "git-log-page", None, caps).await;
+    register_agent(&runtime, "git-log-page", None, git_log_agent_caps()).await;
     let project = agent_test_project_id("git-log-page");
 
     let task = tokio::spawn({
@@ -155,8 +155,8 @@ async fn git_log_limit_and_skip_returns_second_recent_and_truncated() {
         }
     });
     let req = wait_for_patch_agent_request(&runtime, "git-log-page").await;
-    assert!(req.command.contains("-n 2"));
-    assert!(req.command.contains("--skip 1"));
+    assert_internal_posix_script_contains(&req, "-n 2");
+    assert_internal_posix_script_contains(&req, "--skip 1");
     complete_patch_agent_request(&runtime, "git-log-page", &req.request_id, 0, &stdout, "").await;
     let result = task.await.unwrap();
 
@@ -186,16 +186,7 @@ async fn run_git_log_page_with_stdout(
     skip: usize,
 ) -> ToolResult {
     let runtime = runtime_with_agent_project(client_id);
-    register_agent(
-        &runtime,
-        client_id,
-        None,
-        RunnerCapabilities {
-            git: true,
-            ..Default::default()
-        },
-    )
-    .await;
+    register_agent(&runtime, client_id, None, git_log_agent_caps()).await;
     let project = "agent-proj".to_string();
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -216,8 +207,8 @@ async fn run_git_log_page_with_stdout(
         }
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert!(request.command.contains(&format!("-n {}", limit + 1)));
-    assert!(request.command.contains(&format!("--skip {skip}")));
+    assert_internal_posix_script_contains(&request, &format!("-n {}", limit + 1));
+    assert_internal_posix_script_contains(&request, &format!("--skip {skip}"));
     complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, &stdout, "").await;
     task.await.unwrap()
 }
@@ -229,16 +220,7 @@ async fn run_git_log_tool_call_with_stdout(
     expected_head: &str,
 ) -> ToolResult {
     let runtime = runtime_with_agent_project(client_id);
-    register_agent(
-        &runtime,
-        client_id,
-        None,
-        RunnerCapabilities {
-            git: true,
-            ..Default::default()
-        },
-    )
-    .await;
+    register_agent(&runtime, client_id, None, git_log_agent_caps()).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -247,16 +229,14 @@ async fn run_git_log_tool_call_with_stdout(
         }
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert!(
-        request.command.contains(expected_head),
-        "{}",
-        request.command
-    );
-    assert!(
-        !request.command.contains("HEAD^{commit}"),
-        "{}",
-        request.command
-    );
+    assert_internal_posix_script_contains(&request, expected_head);
+    let script = request
+        .script
+        .as_ref()
+        .expect("internal POSIX request must carry a typed script payload")
+        .script
+        .as_str();
+    assert!(!script.contains("HEAD^{commit}"), "{script}");
     complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, &stdout, "").await;
     task.await.unwrap()
 }
@@ -413,10 +393,7 @@ async fn git_log_missing_exact_snapshot_fails_closed_without_head_fallback() {
         &runtime,
         "git-log-missing-snapshot",
         None,
-        RunnerCapabilities {
-            git: true,
-            ..Default::default()
-        },
+        git_log_agent_caps(),
     )
     .await;
     let project = agent_test_project_id("git-log-missing-snapshot");
@@ -442,8 +419,14 @@ async fn git_log_missing_exact_snapshot_fails_closed_without_head_fallback() {
         }
     });
     let request = wait_for_patch_agent_request(&runtime, "git-log-missing-snapshot").await;
-    assert!(request.command.contains(&missing));
-    assert!(!request.command.contains("HEAD^{commit}"));
+    assert_internal_posix_script_contains(&request, &missing);
+    let script = request
+        .script
+        .as_ref()
+        .expect("internal POSIX request must carry a typed script payload")
+        .script
+        .as_str();
+    assert!(!script.contains("HEAD^{commit}"), "{script}");
     complete_patch_agent_request(
         &runtime,
         "git-log-missing-snapshot",
@@ -468,10 +451,7 @@ async fn git_log_unborn_repository_is_an_empty_final_page() {
         &runtime,
         "git-log-unborn",
         None,
-        RunnerCapabilities {
-            git: true,
-            ..Default::default()
-        },
+        git_log_agent_caps(),
     )
     .await;
     let project = agent_test_project_id("git-log-unborn");
@@ -557,11 +537,7 @@ async fn git_log_read_only_session_allowed_and_recorded() {
     commit_file(root, "a.txt", "two\n", "second commit");
     let stdout = git_log_stdout(root, 1, 0);
     let runtime = runtime_with_agent_project("git-log-readonly");
-    let caps = RunnerCapabilities {
-        git: true,
-        ..Default::default()
-    };
-    register_agent(&runtime, "git-log-readonly", None, caps).await;
+    register_agent(&runtime, "git-log-readonly", None, git_log_agent_caps()).await;
     let project = agent_test_project_id("git-log-readonly");
     let bootstrap = auth_context(None, true);
     let session_result = runtime

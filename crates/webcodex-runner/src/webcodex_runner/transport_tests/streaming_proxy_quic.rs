@@ -582,6 +582,185 @@ async fn streaming_graceful_writer_completion_is_not_a_failure_signal() {
 }
 
 #[tokio::test]
+async fn streaming_pending_dispatch_slot_does_not_block_ping_or_pong() {
+    use crate::webcodex_runner::transport::poll_dispatch::POLLING_DISPATCH_MAX_IN_FLIGHT;
+    use webcodex_core::runner_protocol::ShellCommandExecutionState;
+
+    let cfg = test_runner_config("http://127.0.0.1:9".to_string());
+    let runtime = test_runtime(&cfg);
+    let mut held_permits = Vec::new();
+    for _ in 0..POLLING_DISPATCH_MAX_IN_FLIGHT {
+        held_permits.push(
+            runtime
+                .request_dispatch_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test holds every shared dispatch slot"),
+        );
+    }
+
+    let registered_jobs = ShellJobInventory::default();
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    let (tap_tx, mut tap_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    let (read_tx, read_rx) = tokio::sync::mpsc::channel::<StreamRead>(8);
+    let writer_task = tokio::spawn(async move {
+        let mut out_rx = out_rx;
+        while let Some(env) = out_rx.recv().await {
+            let _ = tap_tx.send(env).await;
+        }
+        StreamWriterExit::ChannelClosed
+    });
+
+    let cfg_for_session = cfg.clone();
+    let runtime_for_session = runtime.clone();
+    let session = tokio::spawn(async move {
+        serve_registered_stream(
+            StreamTransport::WebSocket,
+            &cfg_for_session,
+            "inst-stream-backpressure",
+            &registered_jobs,
+            out_tx,
+            RegisteredStream::Test { reader: read_rx },
+            writer_task,
+            InitialProjectInventory::Disabled,
+            &runtime_for_session,
+            std::future::pending::<()>(),
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Request {
+            request: sync_file_request("req-held"),
+        }))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Ping { ts: 77 }))
+        .await
+        .unwrap();
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Request {
+            request: sync_file_request("req-overflow"),
+        }))
+        .await
+        .unwrap();
+
+    let pong = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(env) = tap_rx.recv().await {
+            if matches!(env, RunnerEnvelope::Pong { ts: 77 }) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("ping must be answered while a request waits for a dispatch permit");
+    assert!(pong, "expected Pong while shared dispatch slots are saturated");
+
+    let overflow = tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(env) = tap_rx.recv().await {
+            if let RunnerEnvelope::Result { payload } = env {
+                if payload.result.request_id == "req-overflow" {
+                    return payload;
+                }
+            }
+        }
+        panic!("expected terminal Result for overflow request");
+    })
+    .await
+    .expect("overflow request must get an immediate not_started terminal result");
+    assert_eq!(
+        overflow.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert!(
+        overflow
+            .result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("not_started:"),
+        "overflow rejection must not claim outcome_unknown"
+    );
+
+    drop(held_permits);
+    session.abort();
+    let _ = session.await;
+}
+
+#[tokio::test]
+async fn streaming_pending_slot_rejection_outbound_closed_terminates_session() {
+    use crate::webcodex_runner::transport::poll_dispatch::POLLING_DISPATCH_MAX_IN_FLIGHT;
+
+    let cfg = test_runner_config("http://127.0.0.1:9".to_string());
+    let runtime = test_runtime(&cfg);
+    let mut held_permits = Vec::new();
+    for _ in 0..POLLING_DISPATCH_MAX_IN_FLIGHT {
+        held_permits.push(
+            runtime
+                .request_dispatch_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test holds every shared dispatch slot"),
+        );
+    }
+
+    let registered_jobs = ShellJobInventory::default();
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    drop(out_rx);
+    let (read_tx, read_rx) = tokio::sync::mpsc::channel::<StreamRead>(8);
+    let writer_task = tokio::spawn(async { std::future::pending::<StreamWriterExit>().await });
+
+    let cfg_for_session = cfg.clone();
+    let runtime_for_session = runtime.clone();
+    let session = tokio::spawn(async move {
+        serve_registered_stream(
+            StreamTransport::WebSocket,
+            &cfg_for_session,
+            "inst-reject-outbound-closed",
+            &registered_jobs,
+            out_tx,
+            RegisteredStream::Test { reader: read_rx },
+            writer_task,
+            InitialProjectInventory::Disabled,
+            &runtime_for_session,
+            std::future::pending::<()>(),
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Request {
+            request: sync_file_request("req-held"),
+        }))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Request {
+            request: sync_file_request("req-overflow"),
+        }))
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_millis(500), session)
+        .await
+        .expect("session must exit promptly when overflow rejection cannot be sent")
+        .unwrap()
+        .expect_err("closed outbound must surface as session error, not a silent hang");
+    assert!(
+        error.contains("stream_outbound_channel_closed"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn websocket_close_returns_transport_disconnect_not_shutdown() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

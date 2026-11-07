@@ -1,7 +1,11 @@
 //! Shared registered-stream reads, graceful close, and session loop.
 
+use std::collections::VecDeque;
+
 use super::stream_envelopes::{
-    reconcile_undispatched_stream_request, spawn_admitted_stream_request, StreamPendingRequest,
+    drain_stream_pending_slot_rejection_queue, enqueue_stream_pending_slot_rejection,
+    reconcile_undispatched_stream_request, spawn_admitted_stream_request,
+    StreamOutboundSendFailure, StreamPendingRequest,
 };
 use super::*;
 
@@ -289,6 +293,7 @@ where
     let mut shutdown_requested = false;
     let mut writer_observed = false;
     let mut pending_stream_request: Option<StreamPendingRequest> = None;
+    let mut pending_slot_rejections: VecDeque<StreamPendingRequest> = VecDeque::new();
 
     loop {
         if session_error.is_some() {
@@ -368,17 +373,51 @@ where
                 );
                 break;
             }
-            read = stream.receive(), if pending_stream_request.is_none() => {
+            read = stream.receive() => {
                 match read {
                     Ok(StreamRead::Envelope(envelope)) => {
                         match envelope {
                             RunnerEnvelope::Request { request } => {
-                                pending_stream_request = Some(StreamPendingRequest {
-                                    transport,
-                                    request,
-                                    sink: sink.clone(),
-                                    received_at: Instant::now(),
-                                });
+                                if pending_stream_request.is_some() {
+                                    if let Err(failure) = enqueue_stream_pending_slot_rejection(
+                                        &mut pending_slot_rejections,
+                                        StreamPendingRequest {
+                                            transport,
+                                            request,
+                                            sink: sink.clone(),
+                                            received_at: Instant::now(),
+                                        },
+                                        &out_tx,
+                                    )
+                                    .await
+                                    {
+                                        session_error =
+                                            Some(failure.session_error_message().to_string());
+                                        break;
+                                    }
+                                } else if let Ok(permit) =
+                                    runtime.request_dispatch_permits.clone().try_acquire_owned()
+                                {
+                                    let pending = StreamPendingRequest {
+                                        transport,
+                                        request,
+                                        sink: sink.clone(),
+                                        received_at: Instant::now(),
+                                    };
+                                    if let Some(error) =
+                                        spawn_admitted_stream_request(pending, permit, cfg, runtime)
+                                    {
+                                        session_error = Some(error);
+                                        break;
+                                    }
+                                } else {
+                                    pending_stream_request = Some(StreamPendingRequest {
+                                        transport,
+                                        request,
+                                        sink: sink.clone(),
+                                        received_at: Instant::now(),
+                                    });
+                                }
                             }
                             other => {
                                 if let Some(error) = handle_stream_envelope(
@@ -418,6 +457,34 @@ where
                     }
                 }
             }
+            outbound_ready = out_tx.reserve(), if !pending_slot_rejections.is_empty() => {
+                match outbound_ready {
+                    Ok(permit) => {
+                        // Reserve only gates readiness in `select!`; popping the
+                        // queue happens after this branch wins so a dropped
+                        // sibling branch cannot dequeue a rejection.
+                        drop(permit);
+                        if let Err(failure) = drain_stream_pending_slot_rejection_queue(
+                            &mut pending_slot_rejections,
+                            &out_tx,
+                        )
+                        .await
+                        {
+                            session_error =
+                                Some(failure.session_error_message().to_string());
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        session_error = Some(
+                            StreamOutboundSendFailure::ChannelClosed
+                                .session_error_message()
+                                .to_string(),
+                        );
+                        break;
+                    }
+                }
+            }
             _ = ping_interval.tick() => {
                 tracing::debug!(
                     transport = transport.name(),
@@ -444,8 +511,16 @@ where
         }
     }
 
+    while !pending_slot_rejections.is_empty() {
+        if drain_stream_pending_slot_rejection_queue(&mut pending_slot_rejections, &out_tx)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
     if let Some(pending) = pending_stream_request.take() {
-        reconcile_undispatched_stream_request(pending, &out_tx).await;
+        let _ = reconcile_undispatched_stream_request(pending, &out_tx).await;
     }
     if shutdown_requested {
         let queue_started = Instant::now();

@@ -189,6 +189,24 @@ fn invalid_persistent_shell_result(
     })
 }
 
+/// Job-start wire kinds whose terminal pre-dispatch failures must surface as
+/// `RunnerEnvelope::JobUpdate`, matching `job_manager::decode_failure_prestart_lifecycle`
+/// and stream pre-dispatch rejection routing.
+fn is_job_start_decode_failure_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "start_job"
+            | "start_validation_job"
+            | "start_build_job"
+            | "start_format_job"
+            | "start_process_job"
+            | "start_interactive_process_job"
+            | "start_detached_process_job"
+            | "start_script_job"
+            | "start_skill_resource_job"
+    )
+}
+
 fn submit_invalid_job_start(sink: &RunnerSink, request: &RunnerRequest, error: String) -> bool {
     let Some(job_id) = request.job_id.clone() else {
         return false;
@@ -235,12 +253,7 @@ fn submit_decode_failure(
 ) -> Result<bool, SubmitResultError> {
     let request_id = request.request_id.clone();
     match request.kind.as_str() {
-        "start_job"
-        | "start_validation_job"
-        | "start_process_job"
-        | "start_detached_process_job"
-        | "start_script_job"
-        | "start_skill_resource_job" => {
+        kind if is_job_start_decode_failure_kind(kind) => {
             if submit_invalid_job_start(sink, &request, error.clone()) {
                 Ok(true)
             } else {
@@ -829,6 +842,32 @@ pub(crate) fn dispatch_request(
         request,
     )
     .map(|outcome| outcome.handled)
+}
+
+#[cfg(test)]
+mod submit_decode_failure_routing_tests {
+    use super::is_job_start_decode_failure_kind;
+
+    #[test]
+    fn job_start_decode_failure_kinds_include_build_format_and_interactive_process() {
+        for kind in [
+            "start_build_job",
+            "start_format_job",
+            "start_interactive_process_job",
+        ] {
+            assert!(
+                is_job_start_decode_failure_kind(kind),
+                "{kind} must route decode failures through JobUpdate, not RunnerEnvelope::Result"
+            );
+        }
+    }
+
+    #[test]
+    fn job_start_decode_failure_kinds_exclude_stop_job_and_immediate_results() {
+        assert!(!is_job_start_decode_failure_kind("stop_job"));
+        assert!(!is_job_start_decode_failure_kind("run_shell"));
+        assert!(!is_job_start_decode_failure_kind("job_input"));
+    }
 }
 
 fn lifecycle_project_id(operation: &RunnerProjectOperation) -> Option<String> {

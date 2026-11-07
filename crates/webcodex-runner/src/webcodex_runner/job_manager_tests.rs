@@ -6259,12 +6259,19 @@ fn decode_failure_prestart_lifecycle_matches_typed_rules_and_wire_fallback() {
         Some(ShellCommandExecutionState::NotStarted)
     );
 
-    let mut format = shell_job_request(temp.path(), "");
-    format.kind = "start_format_job".to_string();
-    assert_eq!(
-        decode_failure_prestart_lifecycle(&format),
-        Some(ShellCommandExecutionState::NotStarted)
-    );
+    for kind in [
+        "start_build_job",
+        "start_format_job",
+        "start_interactive_process_job",
+    ] {
+        let mut request = shell_job_request(temp.path(), "");
+        request.kind = kind.to_string();
+        assert_eq!(
+            decode_failure_prestart_lifecycle(&request),
+            Some(ShellCommandExecutionState::NotStarted),
+            "{kind} wire decode-failure prestart must stay NotStarted for JobUpdate routing"
+        );
+    }
 
     let mut validation = shell_job_request(temp.path(), "");
     validation.kind = "start_validation_job".to_string();

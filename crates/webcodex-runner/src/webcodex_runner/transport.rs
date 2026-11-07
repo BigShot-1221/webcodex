@@ -167,6 +167,10 @@ pub(crate) struct RunnerRuntimeState {
     /// over-admit relative to each other. Capacity matches
     /// `POLLING_DISPATCH_MAX_IN_FLIGHT`; Job concurrency is separate.
     request_dispatch_permits: Arc<tokio::sync::Semaphore>,
+    /// Process-wide `stop_job` control dispatches shared across stream
+    /// reconnects. These only route to `JobManager::stop` and must not compete
+    /// with `request_dispatch_permits`.
+    job_control_dispatch_permits: Arc<tokio::sync::Semaphore>,
     #[cfg(windows)]
     exit_diagnostics: Option<Arc<RunnerExitDiagnostics>>,
 }

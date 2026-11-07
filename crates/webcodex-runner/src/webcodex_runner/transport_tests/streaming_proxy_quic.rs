@@ -693,6 +693,260 @@ async fn streaming_pending_dispatch_slot_does_not_block_ping_or_pong() {
 }
 
 #[tokio::test]
+async fn streaming_stop_job_bypasses_shared_dispatch_backpressure() {
+    use crate::webcodex_runner::transport::poll_dispatch::POLLING_DISPATCH_MAX_IN_FLIGHT;
+    use crate::webcodex_runner::transport::stream_envelopes::STREAM_JOB_CONTROL_DISPATCH_MAX_IN_FLIGHT;
+    use webcodex_core::runner_operation::{
+        RunnerInvocationMetadata, RunnerJobOperation, RunnerOperation,
+    };
+
+    let cfg = test_runner_config("http://127.0.0.1:9".to_string());
+    let runtime = test_runtime(&cfg);
+    let cwd = tempfile::tempdir().unwrap();
+    let job_id = "job-stop-control";
+    let mut start_request = start_job_request(cwd.path(), "sleep 60");
+    start_request.job_id = Some(job_id.to_string());
+    start_request.request_id = "req-start-stop-target".to_string();
+
+    let registered_jobs = ShellJobInventory::default();
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    let (tap_tx, mut tap_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    let (read_tx, read_rx) = tokio::sync::mpsc::channel::<StreamRead>(8);
+    let writer_task = tokio::spawn(async move {
+        let mut out_rx = out_rx;
+        while let Some(env) = out_rx.recv().await {
+            let _ = tap_tx.send(env).await;
+        }
+        StreamWriterExit::ChannelClosed
+    });
+
+    let cfg_for_session = cfg.clone();
+    let runtime_for_session = runtime.clone();
+    let session = tokio::spawn(async move {
+        serve_registered_stream(
+            StreamTransport::WebSocket,
+            &cfg_for_session,
+            "inst-stop-job-control",
+            &registered_jobs,
+            out_tx,
+            RegisteredStream::Test { reader: read_rx },
+            writer_task,
+            InitialProjectInventory::Disabled,
+            &runtime_for_session,
+            std::future::pending::<()>(),
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Request {
+            request: start_request,
+        }))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(env) = tap_rx.recv().await {
+            if let RunnerEnvelope::JobUpdate { payload } = env {
+                if payload.job_id == job_id && payload.status == "running" {
+                    return;
+                }
+            }
+        }
+        panic!("expected running job before control-stop regression");
+    })
+    .await
+    .expect("start_job must reach running before stop_job");
+
+    let mut held_permits = Vec::new();
+    for _ in 0..POLLING_DISPATCH_MAX_IN_FLIGHT {
+        held_permits.push(
+            runtime
+                .request_dispatch_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test holds every shared dispatch slot"),
+        );
+    }
+    let mut held_control_permits = Vec::new();
+    for _ in 0..STREAM_JOB_CONTROL_DISPATCH_MAX_IN_FLIGHT {
+        held_control_permits.push(
+            runtime
+                .job_control_dispatch_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test holds every shared control dispatch slot"),
+        );
+    }
+    assert_eq!(
+        runtime.job_control_dispatch_permits.available_permits(),
+        0,
+        "control permits must be fully saturated before stop_job is queued"
+    );
+
+    let stop_request = RunnerRequest::from_operation(
+        RunnerInvocationMetadata {
+            request_id: "stop-under-pressure".to_string(),
+            client_id: "oe".to_string(),
+            requested_by: "tester".to_string(),
+            created_at: 0,
+        },
+        RunnerOperation::Job(RunnerJobOperation::Stop {
+            job_id: job_id.to_string(),
+        }),
+    )
+    .expect("valid stop_job");
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Request {
+            request: stop_request,
+        }))
+        .await
+        .unwrap();
+
+    for _ in 0..128 {
+        if let Ok(env) = tap_rx.try_recv() {
+            if let RunnerEnvelope::Result { payload } = env {
+                if payload.result.request_id == "stop-under-pressure" {
+                    panic!(
+                        "stop_job must bypass ordinary dispatch backpressure without emitting a pre-dispatch Result"
+                    );
+                }
+            }
+            if let RunnerEnvelope::JobUpdate { payload } = env {
+                if payload.job_id == job_id && payload.status == "stop_requested" {
+                    panic!("stop_job must remain pending while all control permits are held");
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        runtime.job_control_dispatch_permits.available_permits(),
+        0,
+        "queued stop_job must not consume a control permit until one is released"
+    );
+
+    held_control_permits.pop();
+    let stop_requested = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(env) = tap_rx.recv().await {
+            if let RunnerEnvelope::JobUpdate { payload } = env {
+                if payload.job_id == job_id && payload.status == "stop_requested" {
+                    return payload;
+                }
+            }
+        }
+        panic!("expected JobManager stop side effect after releasing a control permit");
+    })
+    .await
+    .expect("released control permit must admit pending stop_job dispatch");
+    assert_eq!(stop_requested.job_id, job_id);
+
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(env) = tap_rx.recv().await {
+            if let RunnerEnvelope::JobUpdate { payload } = env {
+                if payload.job_id == job_id && payload.finished {
+                    return payload;
+                }
+            }
+        }
+        panic!("expected terminal job update after stop side effect");
+    })
+    .await
+    .expect("stop must terminate the running sleep job");
+    assert_eq!(terminal.status, "stopped");
+
+    drop(held_permits);
+    drop(held_control_permits);
+    session.abort();
+    let _ = session.await;
+}
+
+#[tokio::test]
+async fn streaming_malformed_stop_job_fails_closed_without_synthetic_result() {
+    use crate::webcodex_runner::transport::poll_dispatch::POLLING_DISPATCH_MAX_IN_FLIGHT;
+    use crate::webcodex_runner::transport::stream_envelopes::STREAM_MALFORMED_STOP_JOB_SESSION_ERROR;
+
+    let cfg = test_runner_config("http://127.0.0.1:9".to_string());
+    let runtime = test_runtime(&cfg);
+    let mut held_permits = Vec::new();
+    for _ in 0..POLLING_DISPATCH_MAX_IN_FLIGHT {
+        held_permits.push(
+            runtime
+                .request_dispatch_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("test holds every shared dispatch slot"),
+        );
+    }
+
+    let registered_jobs = ShellJobInventory::default();
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    let (tap_tx, mut tap_rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    let (read_tx, read_rx) = tokio::sync::mpsc::channel::<StreamRead>(8);
+    let writer_task = tokio::spawn(async move {
+        let mut out_rx = out_rx;
+        while let Some(env) = out_rx.recv().await {
+            let _ = tap_tx.send(env).await;
+        }
+        StreamWriterExit::ChannelClosed
+    });
+
+    let cfg_for_session = cfg.clone();
+    let runtime_for_session = runtime.clone();
+    let session = tokio::spawn(async move {
+        serve_registered_stream(
+            StreamTransport::WebSocket,
+            &cfg_for_session,
+            "inst-malformed-stop",
+            &registered_jobs,
+            out_tx,
+            RegisteredStream::Test { reader: read_rx },
+            writer_task,
+            InitialProjectInventory::Disabled,
+            &runtime_for_session,
+            std::future::pending::<()>(),
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    let mut malformed = sync_file_request("malformed-stop");
+    malformed.kind = "stop_job".to_string();
+    malformed.job_id = None;
+    read_tx
+        .send(StreamRead::Envelope(RunnerEnvelope::Request {
+            request: malformed,
+        }))
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_millis(500), session)
+        .await
+        .expect("malformed stop_job must terminate the stream session promptly")
+        .unwrap()
+        .expect_err("malformed stop_job must fail closed for server reconciliation");
+    assert!(
+        error.contains(STREAM_MALFORMED_STOP_JOB_SESSION_ERROR),
+        "{error}"
+    );
+
+    for _ in 0..32 {
+        if let Ok(RunnerEnvelope::Result { payload }) = tap_rx.try_recv() {
+            if payload.result.request_id == "malformed-stop" {
+                panic!("malformed stop_job must not emit a synthetic terminal Result");
+            }
+        } else {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    drop(held_permits);
+}
+
+#[tokio::test]
 async fn streaming_pending_slot_rejection_outbound_closed_terminates_session() {
     use crate::webcodex_runner::transport::poll_dispatch::POLLING_DISPATCH_MAX_IN_FLIGHT;
 

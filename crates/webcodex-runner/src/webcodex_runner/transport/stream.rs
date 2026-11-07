@@ -4,8 +4,10 @@ use std::collections::VecDeque;
 
 use super::stream_envelopes::{
     drain_stream_pending_slot_rejection_queue, enqueue_stream_pending_slot_rejection,
-    reconcile_undispatched_stream_request, spawn_admitted_stream_request,
-    StreamOutboundSendFailure, StreamPendingRequest,
+    is_malformed_stream_job_stop_request, is_stream_job_stop_control_request,
+    reconcile_undispatched_stream_request, STREAM_MALFORMED_STOP_JOB_SESSION_ERROR,
+    abandon_undispatched_stream_control_request, spawn_admitted_stream_control_request,
+    spawn_admitted_stream_request, StreamOutboundSendFailure, StreamPendingRequest,
 };
 use super::*;
 
@@ -293,6 +295,7 @@ where
     let mut shutdown_requested = false;
     let mut writer_observed = false;
     let mut pending_stream_request: Option<StreamPendingRequest> = None;
+    let mut pending_stream_control_request: Option<StreamPendingRequest> = None;
     let mut pending_slot_rejections: VecDeque<StreamPendingRequest> = VecDeque::new();
 
     loop {
@@ -378,15 +381,50 @@ where
                     Ok(StreamRead::Envelope(envelope)) => {
                         match envelope {
                             RunnerEnvelope::Request { request } => {
-                                if pending_stream_request.is_some() {
+                                let pending = StreamPendingRequest {
+                                    transport,
+                                    request,
+                                    sink: sink.clone(),
+                                    received_at: Instant::now(),
+                                };
+                                if is_malformed_stream_job_stop_request(&pending.request) {
+                                    tracing::debug!(
+                                        transport = transport.name(),
+                                        request_id = %pending.request.request_id,
+                                        "webcodex-runner stream rejecting malformed stop_job; fail-closed disconnect for server reconciliation"
+                                    );
+                                    session_error =
+                                        Some(STREAM_MALFORMED_STOP_JOB_SESSION_ERROR.to_string());
+                                    break;
+                                } else if is_stream_job_stop_control_request(&pending.request) {
+                                    if pending_stream_control_request.is_some() {
+                                        tracing::debug!(
+                                            transport = transport.name(),
+                                            request_id = %pending.request.request_id,
+                                            "webcodex-runner stream rejected concurrent stop_job; fail-closed disconnect for server reconciliation"
+                                        );
+                                        break;
+                                    } else if let Ok(permit) = runtime
+                                        .job_control_dispatch_permits
+                                        .clone()
+                                        .try_acquire_owned()
+                                    {
+                                        if let Some(error) = spawn_admitted_stream_control_request(
+                                            pending,
+                                            permit,
+                                            cfg,
+                                            runtime,
+                                        ) {
+                                            session_error = Some(error);
+                                            break;
+                                        }
+                                    } else {
+                                        pending_stream_control_request = Some(pending);
+                                    }
+                                } else if pending_stream_request.is_some() {
                                     if let Err(failure) = enqueue_stream_pending_slot_rejection(
                                         &mut pending_slot_rejections,
-                                        StreamPendingRequest {
-                                            transport,
-                                            request,
-                                            sink: sink.clone(),
-                                            received_at: Instant::now(),
-                                        },
+                                        pending,
                                         &out_tx,
                                     )
                                     .await
@@ -398,12 +436,6 @@ where
                                 } else if let Ok(permit) =
                                     runtime.request_dispatch_permits.clone().try_acquire_owned()
                                 {
-                                    let pending = StreamPendingRequest {
-                                        transport,
-                                        request,
-                                        sink: sink.clone(),
-                                        received_at: Instant::now(),
-                                    };
                                     if let Some(error) =
                                         spawn_admitted_stream_request(pending, permit, cfg, runtime)
                                     {
@@ -411,12 +443,7 @@ where
                                         break;
                                     }
                                 } else {
-                                    pending_stream_request = Some(StreamPendingRequest {
-                                        transport,
-                                        request,
-                                        sink: sink.clone(),
-                                        received_at: Instant::now(),
-                                    });
+                                    pending_stream_request = Some(pending);
                                 }
                             }
                             other => {
@@ -453,6 +480,25 @@ where
                     }
                     Err(_) => {
                         session_error = Some("request_dispatch_permits_closed".to_string());
+                        break;
+                    }
+                }
+            }
+            control_permit = runtime.job_control_dispatch_permits.clone().acquire_owned(), if pending_stream_control_request.is_some() => {
+                match control_permit {
+                    Ok(permit) => {
+                        let pending = pending_stream_control_request
+                            .take()
+                            .expect("guarded pending control request");
+                        if let Some(error) =
+                            spawn_admitted_stream_control_request(pending, permit, cfg, runtime)
+                        {
+                            session_error = Some(error);
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        session_error = Some("stream_job_control_dispatch_permits_closed".to_string());
                         break;
                     }
                 }
@@ -521,6 +567,9 @@ where
     }
     if let Some(pending) = pending_stream_request.take() {
         let _ = reconcile_undispatched_stream_request(pending, &out_tx).await;
+    }
+    if let Some(pending) = pending_stream_control_request.take() {
+        abandon_undispatched_stream_control_request(pending);
     }
     if shutdown_requested {
         let queue_started = Instant::now();

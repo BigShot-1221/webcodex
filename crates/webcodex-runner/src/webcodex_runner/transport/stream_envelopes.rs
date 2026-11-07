@@ -5,10 +5,12 @@ use std::collections::VecDeque;
 use super::*;
 use crate::webcodex_runner::job_manager::decode_failure_prestart_lifecycle;
 use crate::webcodex_runner::{CommandResult, ShellCommandResult};
-use webcodex_core::runner_operation::RunnerFileOperation;
+use webcodex_core::runner_operation::{
+    RunnerFileOperation, RunnerJobOperation, RunnerOperation,
+};
 use webcodex_core::runner_protocol::{
     PersistentShellResult, RunnerJobUpdateRequest, RunnerPersistentShellResultRequest,
-    RunnerResultPayload, RunnerResultRequest,
+    RunnerRequest, RunnerResultPayload, RunnerResultRequest,
 };
 
 /// Pending overflow rejections awaiting a bounded async send on the stream loop.
@@ -16,10 +18,38 @@ use webcodex_core::runner_protocol::{
 /// unbounded tasks while shared dispatch slots are saturated.
 pub(in crate::webcodex_runner::transport) const STREAM_PENDING_SLOT_REJECTION_QUEUE_CAP: usize = 8;
 
+/// Bounded in-flight stop_job dispatches on one registered stream session. These
+/// requests only call `JobManager::stop` and must not compete with ordinary shell
+/// dispatch for `request_dispatch_permits`.
+pub(in crate::webcodex_runner::transport) const STREAM_JOB_CONTROL_DISPATCH_MAX_IN_FLIGHT: usize =
+    4;
+
+pub(in crate::webcodex_runner::transport) const STREAM_MALFORMED_STOP_JOB_SESSION_ERROR: &str =
+    "stream_malformed_stop_job";
+
+pub(in crate::webcodex_runner::transport) fn is_stream_job_stop_control_request(
+    request: &RunnerRequest,
+) -> bool {
+    matches!(
+        request.decode_operation(),
+        Ok(RunnerOperation::Job(RunnerJobOperation::Stop { .. }))
+    )
+}
+
+/// `kind == "stop_job"` on the wire but not a decodable Stop control. These must
+/// fail closed on the stream session; ordinary overflow Result routing would
+/// counterfeit Job terminal state or leave Server stop pending forever.
+pub(in crate::webcodex_runner::transport) fn is_malformed_stream_job_stop_request(
+    request: &RunnerRequest,
+) -> bool {
+    request.kind == "stop_job" && !is_stream_job_stop_control_request(request)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::webcodex_runner::transport) enum StreamOutboundSendFailure {
     ChannelClosed,
     SendTimeout,
+    MalformedStopJob,
 }
 
 impl StreamOutboundSendFailure {
@@ -27,6 +57,7 @@ impl StreamOutboundSendFailure {
         match self {
             Self::ChannelClosed => "stream_outbound_channel_closed",
             Self::SendTimeout => "stream_outbound_send_timeout",
+            Self::MalformedStopJob => STREAM_MALFORMED_STOP_JOB_SESSION_ERROR,
         }
     }
 }
@@ -378,6 +409,15 @@ async fn reject_stream_request_before_dispatch(
             )
             .await;
         }
+        "stop_job" => {
+            tracing::debug!(
+                transport = transport.name(),
+                request_id,
+                reason,
+                "webcodex-runner stream rejecting stop_job pre-dispatch reconciliation without synthetic Job terminal state"
+            );
+            return Err(StreamOutboundSendFailure::MalformedStopJob);
+        }
         kind if kind.starts_with("file_") && !RunnerFileOperation::is_wire_kind(kind) => {
             let payload = RunnerResultPayload {
                 result: RunnerResultRequest {
@@ -460,6 +500,41 @@ pub(in crate::webcodex_runner::transport) fn spawn_admitted_stream_request(
     cfg: &RunnerConfig,
     runtime: &RunnerRuntimeState,
 ) -> Option<String> {
+    spawn_admitted_stream_request_inner(
+        pending,
+        Some(permit),
+        None,
+        cfg,
+        runtime,
+    )
+}
+
+pub(in crate::webcodex_runner::transport) fn spawn_admitted_stream_control_request(
+    pending: StreamPendingRequest,
+    control_permit: tokio::sync::OwnedSemaphorePermit,
+    cfg: &RunnerConfig,
+    runtime: &RunnerRuntimeState,
+) -> Option<String> {
+    spawn_admitted_stream_request_inner(
+        pending,
+        None,
+        Some(control_permit),
+        cfg,
+        runtime,
+    )
+}
+
+fn spawn_admitted_stream_request_inner(
+    pending: StreamPendingRequest,
+    ordinary_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    control_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    cfg: &RunnerConfig,
+    runtime: &RunnerRuntimeState,
+) -> Option<String> {
+    debug_assert!(
+        ordinary_permit.is_some() ^ control_permit.is_some(),
+        "stream dispatch requires exactly one admission permit"
+    );
     let project_registry_dir = match project_registry_dir(cfg) {
         Ok(dir) => dir,
         Err(error) => return Some(error),
@@ -482,7 +557,8 @@ pub(in crate::webcodex_runner::transport) fn spawn_admitted_stream_request(
         webcodex_core::runner_operation::RunnerProjectOperationKind::from_wire(&request.kind)
             .is_some();
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _ordinary_permit = ordinary_permit;
+        let _control_permit = control_permit;
         let _dispatch_guard = dispatch_guard;
         observe_runner_stream_request_dispatch_wait(transport, received_at.elapsed());
         let dispatch_result = dispatch_request_with_outcome(
@@ -507,6 +583,19 @@ pub(in crate::webcodex_runner::transport) fn spawn_admitted_stream_request(
         }
     });
     None
+}
+
+/// Drop a `stop_job` control envelope that never reached dispatch. The Server
+/// keeps the pending control until transport reconnect reconciliation; emitting
+/// a stream Result here would counterfeit Job terminal state.
+pub(in crate::webcodex_runner::transport) fn abandon_undispatched_stream_control_request(
+    pending: StreamPendingRequest,
+) {
+    tracing::debug!(
+        transport = pending.transport.name(),
+        request_id = %pending.request.request_id,
+        "webcodex-runner stream abandoning undispatched stop_job without synthetic Result"
+    );
 }
 
 /// Best-effort terminal signal for a request envelope already accepted by the
@@ -584,6 +673,22 @@ pub(super) fn handle_stream_envelope(
                 sink: sink.clone(),
                 received_at: Instant::now(),
             };
+            if is_malformed_stream_job_stop_request(&pending.request) {
+                return Some(STREAM_MALFORMED_STOP_JOB_SESSION_ERROR.to_string());
+            }
+            if is_stream_job_stop_control_request(&pending.request) {
+                let permit = match runtime
+                    .job_control_dispatch_permits
+                    .clone()
+                    .try_acquire_owned()
+                {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return Some("stream_job_control_dispatch_capacity_unavailable".to_string());
+                    }
+                };
+                return spawn_admitted_stream_control_request(pending, permit, cfg, runtime);
+            }
             let permit = match runtime.request_dispatch_permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {

@@ -6249,6 +6249,70 @@ fn raw_shell_job_prestart_rejection_is_explicitly_not_started() {
 }
 
 #[test]
+fn decode_failure_prestart_lifecycle_matches_typed_rules_and_wire_fallback() {
+    use crate::webcodex_runner::job_manager::decode_failure_prestart_lifecycle;
+
+    let temp = tempfile::tempdir().unwrap();
+    let shell = shell_job_request(temp.path(), "printf ok");
+    assert_eq!(
+        decode_failure_prestart_lifecycle(&shell),
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+
+    let mut format = shell_job_request(temp.path(), "");
+    format.kind = "start_format_job".to_string();
+    assert_eq!(
+        decode_failure_prestart_lifecycle(&format),
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+
+    let mut validation = shell_job_request(temp.path(), "");
+    validation.kind = "start_validation_job".to_string();
+    validation.command = "[]".to_string();
+    let context = validation.job_context.as_mut().unwrap();
+    context.validation_steps.clear();
+    context.validation = None;
+    assert_eq!(decode_failure_prestart_lifecycle(&validation), None);
+
+    let mut structured_validation = shell_job_request(temp.path(), "");
+    structured_validation.kind = "start_validation_job".to_string();
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["check".to_string()],
+        env: Vec::new(),
+    };
+    structured_validation.command = serde_json::to_string(&[step.clone()]).unwrap();
+    let context = structured_validation.job_context.as_mut().unwrap();
+    context.validation_steps = vec!["check".to_string()];
+    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        project_validation: None,
+        source_fence: None,
+        tool: "cargo_check".to_string(),
+        kind: "check".to_string(),
+        steps: vec![step],
+        effective_timeout_secs: 1800,
+        sync_wait_secs: 30,
+        adapter: "cargo_check".to_string(),
+        validation_target_id: None,
+        minimum_tests: None,
+        require_tests: None,
+        no_run: None,
+    });
+    assert_eq!(
+        decode_failure_prestart_lifecycle(&structured_validation),
+        Some(ShellCommandExecutionState::NotStarted),
+        "stream/dispatch pre-dispatch rejections must mirror typed prestart evidence"
+    );
+
+    let operation = decoded_job_operation(structured_validation);
+    assert_eq!(
+        job_prestart_lifecycle(&operation),
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+}
+
+#[test]
 fn raw_shell_job_post_spawn_interruption_never_reuses_not_started_proof() {
     let temp = tempfile::tempdir().unwrap();
     let shell = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));

@@ -33,6 +33,26 @@ const PROJECT_ID: &str = "demo";
 const RUNTIME_PROJECT_ID: &str = "agent:oe:demo";
 const SESSION_ID: &str = "wc_sess_QGd6iAa67eC56FwA";
 
+/// Must stay aligned with `webcodex_runner::job_manager::lifecycle` pre-dispatch rules.
+fn wire_validation_prestart_command_state(
+    request: &RunnerRequest,
+) -> Option<ShellCommandExecutionState> {
+    let Ok(RunnerOperation::Job(RunnerJobOperation::StartValidation(operation))) =
+        RunnerOperation::from_wire(request)
+    else {
+        return None;
+    };
+    let project_validation = operation
+        .context
+        .validation
+        .as_ref()
+        .is_some_and(|metadata| metadata.project_validation.is_some());
+    let structured_plan = !operation.steps.is_empty()
+        && !operation.context.validation_steps.is_empty()
+        && operation.context.validation_steps_are_valid();
+    (project_validation || structured_plan).then_some(ShellCommandExecutionState::NotStarted)
+}
+
 fn reconciliation_capabilities() -> RunnerCapabilities {
     RunnerCapabilities {
         jobs: true,
@@ -458,6 +478,120 @@ async fn terminal_protocol_violation_during_recovery_keeps_execution_terminal_au
     let after_sweep = registry.get_job(&job.job_id).await.unwrap();
     assert_eq!(after_sweep.status, "failed");
     assert_eq!(after_sweep.recovery_state.as_deref(), Some("recovering"));
+}
+
+#[tokio::test]
+async fn not_started_terminal_validation_failure_may_omit_validation_progress() {
+    let registry = RunnerRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let steps = vec![
+        ShellJobValidationStep {
+            name: "check".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["check".to_string(), "--all-targets".to_string()],
+            env: Vec::new(),
+        },
+        ShellJobValidationStep {
+            name: "test".to_string(),
+            program: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            env: Vec::new(),
+        },
+    ];
+    let job = registry
+        .start_job_with_metadata(
+            start_request("validation"),
+            "tester".to_string(),
+            ShellJobStartMetadata {
+                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+                session_id: Some(SESSION_ID.to_string()),
+                project_cwd: Some("/srv/demo".to_string()),
+                purpose: Some("validation".to_string()),
+                shell: Some("bash".to_string()),
+                validation_steps: steps,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(RunnerPollRequest {
+            client_id: CLIENT_ID.to_string(),
+            runner_instance_id: INSTANCE_A.to_string(),
+        })
+        .await
+        .unwrap()
+        .expect("validation start request");
+    assert_eq!(request.kind, "start_validation_job");
+    let prestart_evidence = wire_validation_prestart_command_state(&request)
+        .expect("polled validation start wire must yield explicit not-started evidence");
+    assert_eq!(prestart_evidence, ShellCommandExecutionState::NotStarted);
+
+    let reason = "not_started: runner stream already holds one undispatched request while shared dispatch capacity is saturated";
+    let mut prestart = update(INSTANCE_A, &job.job_id, 1, "failed", None, true);
+    prestart.request_id = Some(request.request_id.clone());
+    prestart.exit_code = None;
+    prestart.duration_ms = Some(0);
+    prestart.error = Some(reason.to_string());
+    prestart.command_execution_state = Some(prestart_evidence);
+
+    let view = registry.update_job(prestart).await.unwrap();
+    assert_eq!(view.status, "failed");
+    assert_eq!(view.error.as_deref(), Some(reason));
+    assert!(!view
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("executor protocol violation")));
+
+    let started_job = registry
+        .start_job_with_metadata(
+            start_request("validation"),
+            "tester".to_string(),
+            ShellJobStartMetadata {
+                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+                session_id: Some(SESSION_ID.to_string()),
+                project_cwd: Some("/srv/demo".to_string()),
+                purpose: Some("validation".to_string()),
+                shell: Some("bash".to_string()),
+                validation_steps: vec![ShellJobValidationStep {
+                    name: "check".to_string(),
+                    program: "cargo".to_string(),
+                    args: vec!["check".to_string(), "--all-targets".to_string()],
+                    env: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let started_request = registry
+        .poll(RunnerPollRequest {
+            client_id: CLIENT_ID.to_string(),
+            runner_instance_id: INSTANCE_A.to_string(),
+        })
+        .await
+        .unwrap()
+        .expect("started validation request");
+
+    let mut running = update(INSTANCE_A, &started_job.job_id, 1, "running", None, false);
+    running.request_id = Some(started_request.request_id.clone());
+    running.exit_code = None;
+    running.duration_ms = None;
+    registry.update_job(running).await.unwrap();
+
+    let mut started_failure = update(INSTANCE_A, &started_job.job_id, 2, "failed", None, true);
+    started_failure.request_id = Some(started_request.request_id);
+    started_failure.exit_code = Some(1);
+    started_failure.duration_ms = Some(0);
+    started_failure.error = Some("step failed".to_string());
+    started_failure.command_execution_state = Some(ShellCommandExecutionState::Completed);
+
+    let violation = registry.update_job(started_failure).await.unwrap();
+    assert_eq!(violation.status, "failed");
+    assert!(violation
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("executor protocol violation")));
 }
 
 #[tokio::test]

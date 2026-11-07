@@ -1,6 +1,7 @@
 //! Pure Job lifecycle and activity projections across execution boundaries.
 
 use super::*;
+use webcodex_core::runner_operation::RunnerOperation;
 pub(super) fn process_running_activity() -> ShellJobActivity {
     ShellJobActivity {
         state: ShellJobActivityState::Working,
@@ -81,6 +82,23 @@ pub(super) fn runner_job_is_active(status: &str) -> bool {
     RunnerJobLifecycle::from_wire(status).is_ok_and(RunnerJobLifecycle::is_runner_active)
 }
 
+/// Typed command-execution evidence for jobs that never entered ordinary dispatch.
+/// Validation jobs with a canonical plan carry `NotStarted`; bare validation shapes
+/// and stop requests remain unset so running/cancel semantics are unchanged.
+fn validation_job_prestart_command_state(
+    context: &ShellJobContext,
+    steps_present: bool,
+) -> Option<ShellCommandExecutionState> {
+    let project_validation = context
+        .validation
+        .as_ref()
+        .is_some_and(|metadata| metadata.project_validation.is_some());
+    let structured_plan = steps_present
+        && !context.validation_steps.is_empty()
+        && context.validation_steps_are_valid();
+    (project_validation || structured_plan).then_some(ShellCommandExecutionState::NotStarted)
+}
+
 pub(super) fn job_prestart_lifecycle(
     operation: &RunnerJobOperation,
 ) -> Option<ShellCommandExecutionState> {
@@ -93,36 +111,47 @@ pub(super) fn job_prestart_lifecycle(
         | RunnerJobOperation::StartDetachedProcess(_)
         | RunnerJobOperation::StartScript(_)
         | RunnerJobOperation::StartSkillResource(_) => Some(ShellCommandExecutionState::NotStarted),
-        RunnerJobOperation::StartValidation(operation)
-            if operation
-                .context
-                .validation
-                .as_ref()
-                .is_some_and(|metadata| metadata.project_validation.is_some()) =>
-        {
-            Some(ShellCommandExecutionState::NotStarted)
+        RunnerJobOperation::StartValidation(operation) => {
+            validation_job_prestart_command_state(&operation.context, !operation.steps.is_empty())
         }
-        RunnerJobOperation::StartValidation(_) | RunnerJobOperation::Stop { .. } => None,
+        RunnerJobOperation::Stop { .. } => None,
+    }
+}
+
+fn wire_decode_failure_prestart_lifecycle(
+    request: &RunnerRequest,
+) -> Option<ShellCommandExecutionState> {
+    match request.kind.as_str() {
+        "start_validation_job" => request.job_context.as_ref().and_then(|context| {
+            let steps_present = !request.command.is_empty() && request.command != "[]";
+            validation_job_prestart_command_state(context, steps_present)
+        }),
+        kind if matches!(
+            kind,
+            "start_job"
+                | "start_build_job"
+                | "start_format_job"
+                | "start_process_job"
+                | "start_interactive_process_job"
+                | "start_detached_process_job"
+                | "start_script_job"
+                | "start_skill_resource_job"
+        ) => Some(ShellCommandExecutionState::NotStarted),
+        _ => None,
     }
 }
 
 /// Compatibility-only lifecycle projection for malformed V2 Job requests that
-/// fail before a canonical operation can be constructed. Production Job
-/// execution never uses this string registry.
+/// fail before a canonical operation can be constructed. Stream backpressure
+/// rejections for valid wire requests reuse the typed prestart rules when
+/// decode succeeds.
 pub(crate) fn decode_failure_prestart_lifecycle(
     request: &RunnerRequest,
 ) -> Option<ShellCommandExecutionState> {
-    matches!(
-        request.kind.as_str(),
-        "start_job"
-            | "start_build_job"
-            | "start_process_job"
-            | "start_interactive_process_job"
-            | "start_detached_process_job"
-            | "start_script_job"
-            | "start_skill_resource_job"
-    )
-    .then_some(ShellCommandExecutionState::NotStarted)
+    if let Ok(RunnerOperation::Job(operation)) = RunnerOperation::from_wire(request) {
+        return job_prestart_lifecycle(&operation);
+    }
+    wire_decode_failure_prestart_lifecycle(request)
 }
 
 pub(super) fn post_spawn_interruption_lifecycle(

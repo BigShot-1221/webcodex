@@ -406,6 +406,17 @@ fn invalid_progress(code: &'static str) -> Result<(), ValidationProtocolError> {
     Err(ValidationProtocolError(code))
 }
 
+fn is_not_started_terminal_failure(
+    job: &ShellJobRecord,
+    update: &RunnerJobUpdateRequest,
+    lifecycle: JobLifecycleState,
+) -> bool {
+    lifecycle == JobLifecycleState::Failed
+        && update.finished
+        && job.started_at.is_none()
+        && update.command_execution_state == Some(ShellCommandExecutionState::NotStarted)
+}
+
 fn validate_validation_progress(
     job: &ShellJobRecord,
     update: &RunnerJobUpdateRequest,
@@ -438,6 +449,9 @@ fn validate_validation_progress(
             JobLifecycleState::Queued | JobLifecycleState::RunnerQueued
         ) || cancelling
         {
+            return Ok(());
+        }
+        if is_not_started_terminal_failure(job, update, lifecycle) {
             return Ok(());
         }
         return invalid_progress("validation_progress_missing");

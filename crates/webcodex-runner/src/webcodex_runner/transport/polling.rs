@@ -79,6 +79,7 @@ pub(super) fn run_polling_runner(
 pub(super) enum PollFailureDirective {
     Continue,
     Shutdown,
+    RetryStream,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -101,6 +102,7 @@ pub(super) fn handle_poll_failure(
         .close_all("runner_transport_disconnected");
     match error.recovery_action() {
         PollingRecoveryAction::Shutdown => Ok(PollFailureDirective::Shutdown),
+        PollingRecoveryAction::RetryStream => Ok(PollFailureDirective::RetryStream),
         PollingRecoveryAction::Fatal => Err(error.into_message()),
         PollingRecoveryAction::RetryPoll => {
             *recovering = true;
@@ -231,6 +233,10 @@ pub(super) fn run_polling_session(
                 &mut recovery_backoff,
             )? {
                 PollFailureDirective::Continue => continue,
+                PollFailureDirective::RetryStream if polling_dispatches.is_idle() => {
+                    eprintln!("webcodex-runner transport auto: polling fallback retrying preferred stream; retaining jobs and runner instance");
+                    return Ok(PollingSessionExit::RetryStream);
+                }
                 PollFailureDirective::Shutdown => {
                     return complete_polling_after_shutdown(
                         &client,
@@ -242,6 +248,7 @@ pub(super) fn run_polling_session(
                         &mut project_cache,
                     );
                 }
+                PollFailureDirective::RetryStream => continue,
             }
         }
         if !once
@@ -412,6 +419,7 @@ pub(super) fn run_polling_session(
             &runtime.dispatches,
             &mut polling_dispatches,
             once,
+            retry_stream_at,
         );
         // A background fatal result submission takes precedence over an
         // unrelated poll response from the same turn.
@@ -419,6 +427,10 @@ pub(super) fn run_polling_session(
             poll_result = Err(error);
         }
         match poll_result {
+            Err(error) if error.is_retry_stream() && polling_dispatches.is_idle() => {
+                eprintln!("webcodex-runner transport auto: polling fallback retrying preferred stream; retaining jobs and runner instance");
+                return Ok(PollingSessionExit::RetryStream);
+            }
             Ok((ran_request, inventory_status)) => {
                 if sent_inventory_page {
                     match inventory_status {
@@ -519,6 +531,10 @@ pub(super) fn run_polling_session(
                 &mut recovery_backoff,
             )? {
                 PollFailureDirective::Continue => {}
+                PollFailureDirective::RetryStream if polling_dispatches.is_idle() => {
+                    eprintln!("webcodex-runner transport auto: polling fallback retrying preferred stream; retaining jobs and runner instance");
+                    return Ok(PollingSessionExit::RetryStream);
+                }
                 PollFailureDirective::Shutdown => {
                     return complete_polling_after_shutdown(
                         &client,
@@ -530,6 +546,7 @@ pub(super) fn run_polling_session(
                         &mut project_cache,
                     );
                 }
+                PollFailureDirective::RetryStream => {}
             },
         }
     }

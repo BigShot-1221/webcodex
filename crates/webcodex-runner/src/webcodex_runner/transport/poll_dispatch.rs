@@ -31,6 +31,9 @@ pub(crate) enum PollingRecoveryAction {
     ReRegister,
     Fatal,
     Shutdown,
+    /// Hand off to the preferred stream transport; must be handled before
+    /// ordinary recovery, not as a fatal poll failure.
+    RetryStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,9 @@ pub(crate) enum PollErrorKind {
     Config,
     Protocol,
     Shutdown,
+    /// Polling fallback may hand off to the preferred stream transport while
+    /// no Server request is held for dispatch (permit wait only).
+    RetryStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,7 +199,12 @@ impl PollError {
             | PollErrorKind::Config
             | PollErrorKind::Protocol => PollingRecoveryAction::Fatal,
             PollErrorKind::Shutdown => PollingRecoveryAction::Shutdown,
+            PollErrorKind::RetryStream => PollingRecoveryAction::RetryStream,
         }
+    }
+
+    pub(crate) fn is_retry_stream(&self) -> bool {
+        self.kind == PollErrorKind::RetryStream
     }
 
     #[cfg(test)]
@@ -223,6 +234,11 @@ impl std::fmt::Display for PollError {
 /// responsiveness target while avoiding an unbounded process-local thread fanout;
 /// Job scheduling remains a separate configured queue/concurrency contract.
 pub(crate) const POLLING_DISPATCH_MAX_IN_FLIGHT: usize = 4;
+
+/// When every shared dispatch slot is held elsewhere and polling has no local
+/// completions to reap, re-check admission on this cadence so shutdown and
+/// stream handoff deadlines stay responsive without busy waiting.
+const POLLING_PERMIT_EXTERNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 
 pub(crate) struct PollingDispatch {
     request_id: String,
@@ -326,13 +342,37 @@ impl PollingDispatchSupervisor {
         }
     }
 
-    /// Block until one ordinary dispatch slot is owned or shutdown wins. Stream
-    /// releases and polling completions both restore capacity; there is no local
-    /// dequeue queue beyond the shared semaphore.
+    fn reap_one_completion(
+        &mut self,
+        project_cache: &mut RunnerProjectCache,
+        completion: PollingDispatchCompletion,
+    ) -> Result<(), PollError> {
+        let result = self
+            .record_completion(project_cache, completion)
+            .map(|_| ())
+            .map_err(PollError::from_submit);
+        let _ = self.background_threads.reap_finished();
+        result
+    }
+
+    fn external_permit_wait_slice(retry_stream_at: Option<Instant>) -> Duration {
+        retry_stream_at
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            .map(|remaining| remaining.min(POLLING_PERMIT_EXTERNAL_WAIT_SLICE))
+            .unwrap_or(POLLING_PERMIT_EXTERNAL_WAIT_SLICE)
+    }
+
+    /// Block until one ordinary dispatch slot is owned, shutdown wins, or a
+    /// stream handoff deadline expires while no already-dequeued polling work
+    /// remains (`allow_stream_transition`). Stream releases and polling
+    /// completions both restore capacity; there is no local dequeue queue beyond
+    /// the shared semaphore.
     pub(crate) fn acquire_dequeue_permit(
         &mut self,
         project_cache: &mut RunnerProjectCache,
         shutdown: &AtomicBool,
+        retry_stream_at: Option<Instant>,
+        allow_stream_transition: bool,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, PollError> {
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -340,24 +380,52 @@ impl PollingDispatchSupervisor {
                     "process shutdown".to_string(),
                 )));
             }
+            if allow_stream_transition
+                && retry_stream_at.is_some_and(|deadline| Instant::now() >= deadline)
+                && self.in_flight == 0
+            {
+                return Err(PollError::new(
+                    PollErrorKind::RetryStream,
+                    "polling fallback stream retry deadline elapsed".to_string(),
+                ));
+            }
             match self.request_dispatch_permits.clone().try_acquire_owned() {
                 Ok(permit) => return Ok(permit),
-                Err(_) => match self.completion_rx.recv_timeout(Duration::from_millis(25)) {
-                    Ok(completion) => {
-                        let result = self
-                            .record_completion(project_cache, completion)
-                            .map(|_| ())
-                            .map_err(PollError::from_submit);
-                        let _ = self.background_threads.reap_finished();
-                        result?;
+                Err(_) => {
+                    if self.in_flight > 0 {
+                        match self
+                            .completion_rx
+                            .recv_timeout(POLLING_PERMIT_EXTERNAL_WAIT_SLICE)
+                        {
+                            Ok(completion) => self.reap_one_completion(project_cache, completion)?,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return Err(PollError::from_submit(
+                                    SubmitResultError::TransportClosed(
+                                        "polling dispatch completion channel closed".to_string(),
+                                    ),
+                                ));
+                            }
+                        }
+                    } else {
+                        match self
+                            .completion_rx
+                            .recv_timeout(Self::external_permit_wait_slice(retry_stream_at))
+                        {
+                            Ok(completion) => {
+                                self.reap_one_completion(project_cache, completion)?
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return Err(PollError::from_submit(
+                                    SubmitResultError::TransportClosed(
+                                        "polling dispatch completion channel closed".to_string(),
+                                    ),
+                                ));
+                            }
+                        }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(PollError::from_submit(SubmitResultError::TransportClosed(
-                            "polling dispatch completion channel closed".to_string(),
-                        )));
-                    }
-                },
+                }
             }
         }
     }
@@ -460,10 +528,15 @@ impl PollingDispatchSupervisor {
         let mut shutdown_error = None;
         while self.in_flight > 0 && Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match self
-                .completion_rx
-                .recv_timeout(remaining.min(Duration::from_millis(25)))
-            {
+            let receive = if remaining >= POLLING_PERMIT_EXTERNAL_WAIT_SLICE {
+                self.completion_rx
+                    .recv_timeout(remaining.min(POLLING_PERMIT_EXTERNAL_WAIT_SLICE))
+            } else if remaining.is_zero() {
+                break;
+            } else {
+                self.completion_rx.recv_timeout(remaining)
+            };
+            match receive {
                 Ok(completion) => {
                     match self.record_completion(project_cache, completion) {
                         Ok(_) => {}
@@ -509,7 +582,18 @@ pub(crate) fn handle_one_poll(
     dispatches: &ActivityTracker,
     polling_dispatches: &mut PollingDispatchSupervisor,
     once: bool,
+    retry_stream_at: Option<Instant>,
 ) -> Result<(bool, Option<ShellProjectInventoryStatus>), PollError> {
+    // Hold shared dispatch capacity before the poll round trip so the Server
+    // never delivers a request this process cannot admit. While slots are held
+    // elsewhere, bounded waits still observe shutdown and stream-handoff
+    // deadlines when no already-dequeued polling work remains.
+    let dequeue_permit = polling_dispatches.acquire_dequeue_permit(
+        project_cache,
+        shutdown.as_ref(),
+        retry_stream_at,
+        true,
+    )?;
     let metadata_config = runtime.snapshot();
     let provider_update =
         metadata_config
@@ -538,10 +622,6 @@ pub(crate) fn handle_one_poll(
         computer_session_availability: computer_session_update,
         project_inventory_page,
     };
-    // Hold one slot for the whole poll round trip so a stream dispatch cannot
-    // consume the last permit after a capacity check but before spawn.
-    let dequeue_permit =
-        polling_dispatches.acquire_dequeue_permit(project_cache, shutdown.as_ref())?;
     let response: RunnerPollResponse = match post_json(client, cfg, RUNNER_POLL_PATH, &poll) {
         Ok(response) => response,
         Err(error) => {

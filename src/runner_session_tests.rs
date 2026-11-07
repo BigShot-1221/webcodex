@@ -1,6 +1,6 @@
 use super::*;
 use crate::runner_http::{RunnerTransport, TRANSPORT_WEBSOCKET};
-use crate::runner_protocol::{RunnerCapabilities, ShellJobOpRequest};
+use crate::runner_protocol::{RunnerCapabilities, RunnerEnvelope, ShellJobOpRequest};
 use tokio::time::Instant;
 
 const SESSION_TEST_TIMEOUT: Duration = Duration::from_millis(250);
@@ -306,6 +306,87 @@ async fn same_instance_replacement_actively_terminates_old_session_without_losin
             .await
             .expect("stale A reconciliation must not remove B")
             .connected
+    );
+}
+
+#[tokio::test]
+async fn pump_abort_while_outbound_saturated_must_not_dequeue_request() {
+    let registry = Arc::new(RunnerRegistry::default());
+    let (notify, cancel) =
+        register_streaming(&registry, "pump-saturate", "inst-a", "conn-a").await;
+    let job = registry
+        .start_job(start_job_request("pump-saturate"), "test".to_string())
+        .await
+        .unwrap();
+    assert_eq!(job.status, "queued");
+    assert_eq!(
+        registry
+            .get_runner_view("pump-saturate")
+            .await
+            .unwrap()
+            .pending_requests,
+        1
+    );
+
+    let (out_tx, _out_rx) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
+    for ts in 0..OUTGOING_CHANNEL_CAPACITY as i64 {
+        out_tx
+            .try_send(RunnerEnvelope::Pong { ts })
+            .expect("saturated outgoing feed");
+    }
+
+    let ctx = SessionContext {
+        registry: &registry,
+        client_id: "pump-saturate",
+        runner_instance_id: "inst-a",
+        connection_id: "conn-a",
+        notify,
+        cancel,
+        transport: RunnerTransport::WebSocket,
+    };
+    let mut pump_task = super::spawn_request_pump(&ctx, out_tx);
+
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        registry
+            .get_runner_view("pump-saturate")
+            .await
+            .unwrap()
+            .pending_requests,
+        1,
+        "pump must not dequeue before outbound reserve unblocks"
+    );
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().status,
+        "queued",
+        "queued work must remain pending while pump waits on reserve"
+    );
+
+    pump_task.abort();
+    let join = tokio::time::timeout_at(deadline(), &mut pump_task)
+        .await
+        .expect("aborted pump must join promptly");
+    assert!(
+        join.is_err() && join.unwrap_err().is_cancelled(),
+        "pump must be cancelled while blocked on reserve"
+    );
+
+    assert_eq!(
+        registry
+            .get_runner_view("pump-saturate")
+            .await
+            .unwrap()
+            .pending_requests,
+        1,
+        "aborted pump must not dequeue while waiting for outbound capacity"
+    );
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().status,
+        "queued",
+        "request must remain undispatched when pump is cancelled on reserve"
     );
 }
 

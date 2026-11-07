@@ -184,9 +184,22 @@ fn spawn_request_pump(
     let pump_transport = ctx.transport;
     tokio::spawn(async move {
         loop {
-            // Create the notified future before polling so an enqueue that
-            // happens while poll returns None is not missed.
+            // Create the notified future before reserving/polling so an enqueue
+            // that happens while either call is in flight is not missed.
             let notified = pump_notify.notified();
+            let permit = match pump_tx.reserve().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    crate::runner_http::observe_server_stream_outgoing_channel(
+                        pump_transport,
+                        "request",
+                        None,
+                        false,
+                        RunnerStreamMetricOutcome::Closed,
+                    );
+                    return PumpExit::ChannelClosed;
+                }
+            };
             let poll_req = RunnerPollRequest {
                 client_id: pump_client_id.clone(),
                 runner_instance_id: pump_instance_id.clone(),
@@ -196,24 +209,11 @@ fn spawn_request_pump(
                 .await
             {
                 Ok(Some(request)) => {
-                    // Preserve the canonical awaited-send ordering semantics.
-                    // SendError payloads are never logged because requests can
-                    // contain command/stdin data.
+                    // Hold outbound capacity across dequeue and commit the send
+                    // without an intervening await so pump cancellation cannot
+                    // orphan a dequeued request in a saturated writer feed.
                     let send_started = Instant::now();
-                    if pump_tx
-                        .send(RunnerEnvelope::Request { request })
-                        .await
-                        .is_err()
-                    {
-                        crate::runner_http::observe_server_stream_outgoing_channel(
-                            pump_transport,
-                            "request",
-                            None,
-                            false,
-                            RunnerStreamMetricOutcome::Closed,
-                        );
-                        return PumpExit::ChannelClosed;
-                    }
+                    permit.send(RunnerEnvelope::Request { request });
                     crate::runner_http::observe_server_stream_outgoing_channel(
                         pump_transport,
                         "request",
@@ -222,8 +222,14 @@ fn spawn_request_pump(
                         RunnerStreamMetricOutcome::Success,
                     );
                 }
-                Ok(None) => notified.await,
-                Err(error) => return classify_pump_poll_error(&error),
+                Ok(None) => {
+                    drop(permit);
+                    notified.await;
+                }
+                Err(error) => {
+                    drop(permit);
+                    return classify_pump_poll_error(&error);
+                }
             }
         }
     })

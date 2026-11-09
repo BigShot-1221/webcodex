@@ -148,7 +148,7 @@ fn wire_decode_failure_prestart_lifecycle(
 pub(crate) fn decode_failure_prestart_lifecycle(
     request: &RunnerRequest,
 ) -> Option<ShellCommandExecutionState> {
-    if let Ok(RunnerOperation::Job(operation)) = RunnerOperation::from_wire(request) {
+    if let Ok(RunnerOperation::Job(operation)) = request.decode_operation() {
         return job_prestart_lifecycle(&operation);
     }
     wire_decode_failure_prestart_lifecycle(request)

@@ -38,7 +38,7 @@ fn wire_validation_prestart_command_state(
     request: &RunnerRequest,
 ) -> Option<ShellCommandExecutionState> {
     let Ok(RunnerOperation::Job(RunnerJobOperation::StartValidation(operation))) =
-        RunnerOperation::from_wire(request)
+        request.decode_operation()
     else {
         return None;
     };

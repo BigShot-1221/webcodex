@@ -78,8 +78,8 @@ fn persisted_message_ids_accept_only_compact_or_legacy_canonical_forms() {
     assert!(sanitized.resolved_by_message_id.is_none());
 }
 
-#[test]
-fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
+#[tokio::test]
+async fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&path, 10, 100);
@@ -91,11 +91,13 @@ fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
             message_id: note.message_id.clone(),
             message: "replacement".into(),
         })
+        .await
         .unwrap()
         .replacement;
     let todo = post(&store, &session.session_id, SessionMessageKind::Todo);
     let fence = store
         .get_assignment(&session.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     let answer = store
@@ -109,12 +111,13 @@ fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
             author_session_id: Some(session.session_id.clone()),
             expected_assignment_fence: fence,
         })
+        .await
         .unwrap()
         .answer;
     drop(store);
     // Construct a historical fixture; production never rewrites an old ledger.
     let legacy_session = format!("wc_sess_{}", "1".repeat(32));
-    let mut legacy = std::fs::read_to_string(&path)
+    let mut legacy = crate::test_storage::read_ledger(&path)
         .unwrap()
         .replace(&session.session_id, &legacy_session);
     let mut ids = Vec::new();
@@ -132,10 +135,10 @@ fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
         ids.push(old);
     }
     std::fs::write(&path, &legacy).unwrap();
-    let restored = SessionStore::with_persistence(&path, 10, 100);
+    let restored = crate::test_storage::import_ledger(&path, 10, 100);
     assert!(restored.summary(&legacy_session, None).is_some());
     assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
+        crate::test_storage::read_ledger(&path).unwrap(),
         legacy,
         "restoration does not rewrite the ledger"
     );
@@ -168,6 +171,7 @@ fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
     );
     let resumed = restored
         .ensure_coding_session(CodingSessionRequest {
+            project_identity: None,
             project: "demo".into(),
             authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.into(),
             resume_session_id: Some(legacy_session.clone()),

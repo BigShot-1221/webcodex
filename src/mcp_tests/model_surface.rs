@@ -104,7 +104,7 @@ async fn model_workflow_policy_changes_never_change_cached_tools_schemas_routes_
 
 #[tokio::test]
 async fn adaptive_tools_list_exposes_ranked_direct_tools_and_gateway() {
-    let runtime = test_runtime();
+    let runtime = workflow_runtime();
     let auth = adaptive_direct_auth();
     let outcome = handle_mcp_request(
         &runtime,
@@ -194,9 +194,82 @@ async fn adaptive_tools_list_exposes_ranked_direct_tools_and_gateway() {
 }
 
 #[tokio::test]
+async fn stale_host_file_import_name_rejects_and_guides_client_reconnection() {
+    let runtime = test_runtime();
+    let auth = adaptive_direct_auth();
+    let current = "import_host_files";
+    let retired = "import_conversation_files_to_project";
+    assert!(webcodex_tool_contracts::lookup_tool_definition(retired).is_none());
+
+    let list = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(61)), mcp_2026_params(json!({}))),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::Ok(value) = list else {
+        panic!("current Adaptive tools/list must succeed");
+    };
+    let names = tool_names(&value);
+    assert!(
+        names.contains(&current),
+        "canonical host import must be discoverable"
+    );
+    assert!(
+        !names.contains(&retired),
+        "retired host import must not be discoverable"
+    );
+
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(62)),
+            mcp_2026_params(json!({
+                "name": retired,
+                "arguments": {"project": "not-a-project", "openaiFileIdRefs": ["stale"]}
+            })),
+        ),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::BadRequest(response) = outcome else {
+        panic!("stale imported-file descriptor must fail closed: {outcome:?}");
+    };
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(message.contains("refresh tools/list"), "{message}");
+    assert!(message.contains("reconnect the MCP client"), "{message}");
+    assert!(!message.contains("call_runtime_tool"), "{message}");
+
+    // The recovery hint is specific to the retired import tool: changing the
+    // generic denial text would invalidate established conformance evidence.
+    let generic = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(63)),
+            mcp_2026_params(json!({
+                "name": "retired_unrelated_tool_name",
+                "arguments": {}
+            })),
+        ),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::BadRequest(response) = generic else {
+        panic!("unrelated unavailable tool must still fail closed: {generic:?}");
+    };
+    let generic_message = response["error"]["message"].as_str().unwrap();
+    assert_eq!(
+        generic_message,
+        "tool 'retired_unrelated_tool_name' is unavailable on the current MCP surface; refresh tools/list and select a current callable"
+    );
+}
+
+#[tokio::test]
 async fn list_jobs_direct_and_gateway_preserve_caller_visibility_and_validation() {
-    use crate::runner_protocol::ShellJobOpRequest;
-    use webcodex_runner_registry::ShellJobStartMetadata;
+    use webcodex_runner_registry::JobStartRequest;
+
     let runtime = test_runtime();
     let auth = crate::auth::shared_key_context("job-inventory-owner");
     let foreign = crate::auth::shared_key_context("job-inventory-foreign");
@@ -219,13 +292,12 @@ async fn list_jobs_direct_and_gateway_preserve_caller_visibility_and_validation(
             .unwrap();
         let job = runtime
             .runner_registry
-            .start_job_with_metadata_for_access(
-                serde_json::from_value::<ShellJobOpRequest>(json!({
-                    "op":"start", "client_id":client, "command":"fixture", "timeout_secs":60
-                }))
-                .unwrap(),
+            .start_job(
+                JobStartRequest {
+                    timeout_secs: 60,
+                    ..JobStartRequest::shell(client, "fixture")
+                },
                 "fixture".into(),
-                ShellJobStartMetadata::default(),
                 Some(&access),
                 None,
             )
@@ -373,7 +445,7 @@ async fn interactive_job_input_prefers_direct_and_keeps_gateway_fallback() {
 
 #[tokio::test]
 async fn specialist_tools_remain_discoverable_with_canonical_gateway_contracts() {
-    let runtime = test_runtime();
+    let runtime = workflow_runtime();
     let listed = crate::mcp::tools::mcp_tools_list_payload_with_compact(false);
     for name in [
         "cargo_check",
@@ -381,7 +453,6 @@ async fn specialist_tools_remain_discoverable_with_canonical_gateway_contracts()
         "go_test",
         "read_workspace_changes",
         "read_session_handoff",
-        "rotate_agent_continuation_endpoint",
         "run_skill_resource",
         "wait_for_agent_events",
         "wait_for_job_terminal",
@@ -431,7 +502,7 @@ async fn specialist_tools_remain_discoverable_with_canonical_gateway_contracts()
 
 #[tokio::test]
 async fn continuation_presentations_are_direct_and_preserve_app_routing_and_scopes() {
-    let runtime = test_runtime_with_mcp_settings(true, true);
+    let runtime = with_workflow_tools(test_runtime_with_mcp_settings(true, true));
     for apps in [false, true] {
         for name in [
             "present_agent_continuation",
@@ -782,7 +853,7 @@ async fn call_runtime_tool_cannot_target_itself() {
 
 #[tokio::test]
 async fn call_runtime_tool_rejects_direct_app_presentation_targets_when_apps_are_enabled() {
-    let runtime = test_runtime();
+    let runtime = workflow_runtime();
     for (index, target) in ["present_work_result", "present_pdf", "present_goal_plan"]
         .into_iter()
         .enumerate()
@@ -821,7 +892,7 @@ async fn call_runtime_tool_rejects_direct_app_presentation_targets_when_apps_are
 
 #[tokio::test]
 async fn pruned_tools_keep_exact_manifest_and_canonical_gateway_validation() {
-    let runtime = test_runtime();
+    let runtime = workflow_runtime();
     for (name, arguments) in [
         (
             "wait_for_job_terminal",

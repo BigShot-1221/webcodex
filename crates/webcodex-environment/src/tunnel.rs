@@ -183,11 +183,11 @@ fn tunnel_service_spec_for_provider(
             "A Tunnel can only be hosted by the Server machine",
         ));
     }
-    let id = if cfg!(windows) {
-        webcodex_runner_config::desktop_edition::windows_profile_tunnel_service_id(profile_id)
-    } else {
-        format!("webcodex-tunnel-{profile_id}")
-    };
+    #[cfg(windows)]
+    let id =
+        webcodex_runner_config::desktop_edition::windows_profile_tunnel_service_id(profile_id);
+    #[cfg(not(windows))]
+    let id = format!("webcodex-tunnel-{profile_id}");
     let directory = store.root().join("server/tunnels").join(profile_id);
     let env_file = directory.join("webcodex.env");
     let mut args = vec![
@@ -217,10 +217,12 @@ fn tunnel_service_spec_for_provider(
             "--json".into(),
         ];
     }
-    if cfg!(windows) && record.request.service_scope.is_system() {
+    #[cfg(windows)]
+    if record.request.service_scope.is_system() {
         args.splice(0..0, ["--windows-service".into(), id.clone()]);
     }
-    let account = if cfg!(windows) && record.request.service_scope.is_system() {
+    #[cfg(windows)]
+    let account = if record.request.service_scope.is_system() {
         ServiceAccount::WindowsVirtual {
             name: format!("NT SERVICE\\{id}"),
         }
@@ -231,6 +233,13 @@ fn tunnel_service_spec_for_provider(
             expected_identity: record.request.account.identity.clone(),
             home: Some(record.request.account.home.clone()),
         }
+    };
+    #[cfg(not(windows))]
+    let account = ServiceAccount::SystemUser {
+        name: record.request.account.name.clone(),
+        group: None,
+        expected_identity: record.request.account.identity.clone(),
+        home: Some(record.request.account.home.clone()),
     };
     let environment = if cfg!(target_os = "macos") {
         BTreeMap::from([(
@@ -1893,7 +1902,7 @@ pub(crate) fn read_tunnel_health(
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod health_tests;
 
 #[cfg(test)]

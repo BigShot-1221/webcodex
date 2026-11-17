@@ -9,8 +9,8 @@ use super::common::{
 };
 #[cfg(any(test, feature = "root-test-support"))]
 use super::common::{
-    authority_profile_schema, exploration_tool_name_schema, permission_decision_schema,
-    session_hint_schema, task_context_schema,
+    exploration_tool_name_schema, permission_decision_schema, session_hint_schema,
+    task_context_schema,
 };
 use super::files::{
     key_file_schema, path_kind_schema, project_type_schema, scan_schema, suggested_read_schema,
@@ -195,7 +195,6 @@ pub(super) fn coding_workflow_diagnostic_output_schema() -> Value {
                 "oneOf": [
                     startup_brief_output_schema("minimal"),
                     startup_brief_output_schema("standard"),
-                    full_startup_output_schema(),
                 ]
             },
             "error": {
@@ -336,59 +335,6 @@ fn startup_brief_schema(detail: &str) -> Value {
         ],
         "additionalProperties": false,
     })
-}
-
-#[cfg(any(test, feature = "root-test-support"))]
-fn full_startup_output_schema() -> Value {
-    let mut schema = json!({
-        "type": "object",
-        "description": "Full diagnostic startup output. Preserves the existing operator-facing blocks and embeds the shared model-facing startup_brief.",
-        "properties": {
-            "detail": {"type": "string", "const": "full"},
-            "project": schema_type("string", "Original project input."),
-            "project_resolution": project_resolution_schema(),
-            "resolved_project": open_object_schema("Resolved project id, absolute execution path, executor, and diagnostic project metadata."),
-            "session": open_object_schema("Full Workflow Session, guard, capability, context-refresh, exact-binding, and explicitly resumed session diagnostics."),
-            "runtime_status": open_object_schema("Full runtime status diagnostics."),
-            "connection_state": open_object_schema("Full layered connection diagnostics."),
-            "authority": authority_profile_schema("Canonical authority profile for this task."),
-            "rules": open_object_schema("Full deterministic rules source summary."),
-            "git": open_object_schema("Full bounded Git/worktree summary including recent commits."),
-            "semantic_navigation": semantic_navigation_schema(),
-            "tool_manifest": open_object_schema("Bounded compact tool manifest."),
-            "recommended_flow": open_object_schema("Deterministic recommended tool groups."),
-            "startup_verdict": open_object_schema("Legacy full diagnostic startup checks and suggested actions."),
-            "continuation_feedback": continuation_feedback_schema("Complete bounded continuation_feedback projection retained for full diagnostics."),
-            "warnings": array_schema(open_object_schema("Full diagnostic startup warning."), "Bounded diagnostic warnings."),
-            "startup_brief": startup_brief_schema("full"),
-            "deterministic": {"type": "boolean", "const": true},
-            "llm_summary": {"type": "boolean", "const": false}
-        },
-        "required": [
-            "detail",
-            "project",
-            "project_resolution",
-            "resolved_project",
-            "session",
-            "runtime_status",
-            "connection_state",
-            "authority",
-            "rules",
-            "git",
-            "semantic_navigation",
-            "tool_manifest",
-            "recommended_flow",
-            "startup_verdict",
-            "continuation_feedback",
-            "warnings",
-            "startup_brief",
-            "deterministic",
-            "llm_summary"
-        ],
-        "additionalProperties": false,
-    });
-    add_startup_model_metadata(&mut schema);
-    schema
 }
 
 fn project_resolution_schema() -> Value {
@@ -556,15 +502,14 @@ fn startup_workspace_schema() -> Value {
 fn startup_workflow_schema() -> Value {
     json!({
             "type": "object",
-            "description": "WebCodex-owned shared workflow, selected tool strategy and optional review role. Separate from project instructions and Session authority.",
+            "description": "WebCodex-owned shared project workflow and selected tool strategy. Coding/review guidance is an explicit context chapter; neither grants Session authority.",
             "properties": {
                 "contract": {"type": "string", "const": BUILTIN_CODING_WORKFLOW_CONTRACT},
                 "version": {"type": "integer", "const": BUILTIN_CODING_WORKFLOW_VERSION},
                 "authority": {"type": "string", "const": "model_guidance_only"},
-                "role_selection": {"type": "string", "maxLength": 240},
                 "guidance": {
                     "type": "array",
-                    "description": "Default behavior for every coding/review task, including tasks without a named role. Guidance never grants authority.",
+                    "description": "Shared behavior for project tasks. Task-specific implementation conventions are requested separately; guidance never grants authority.",
                     "minItems": 1,
                     "items": {"type": "string"}
                 },
@@ -600,6 +545,7 @@ fn startup_workflow_schema() -> Value {
                     "type": "object",
                     "description": "Shared model-invocation guidance. It is not Session state, authority, or execution policy.",
                     "properties": {
+                        "coding_guidance": {"type": "string", "maxLength": 480},
                         "handoff_recovery": {"type": "string", "maxLength": 720},
                         "session_recording": {"type": "string", "maxLength": 720},
                         "session_message_ack": {"type": "string", "maxLength": 720},
@@ -612,12 +558,11 @@ fn startup_workflow_schema() -> Value {
                         "runner_targeting": {"type": "string", "maxLength": 320},
                         "persistent_shell": {"type": "string", "maxLength": 320},
                         "goal_workflow": {"type": "string", "maxLength": 720},
-                        "goal_continuation": {"type": "string", "maxLength": 720},
-                        "goal_checkpoint": {"type": "string", "maxLength": 480},
                         "work_result_presentation": {"type": "string", "maxLength": 640},
                         "normal_closeout": {"type": "string", "maxLength": 480}
                     },
                     "required": [
+                        "coding_guidance",
                         "handoff_recovery",
                         "session_recording",
                         "session_message_ack",
@@ -630,43 +575,15 @@ fn startup_workflow_schema() -> Value {
                         "runner_targeting",
                         "persistent_shell",
                         "goal_workflow",
-                        "goal_continuation",
-                        "goal_checkpoint",
                         "work_result_presentation",
                         "normal_closeout"
                     ],
                     "additionalProperties": false
-                },
-                "roles": {
-                    "type": "object",
-                    "description": "Optional named review behavior. Ordinary implementation uses shared guidance and the selected tool strategy.",
-                    "properties": {
-                        "independent_review": startup_workflow_role_schema()
-                    },
-                    "required": ["independent_review"],
-                    "additionalProperties": false
                 }
             },
-            "required": ["contract", "version", "authority", "role_selection", "guidance", "tool_strategy", "model_protocol", "roles"],
+            "required": ["contract", "version", "authority", "guidance", "tool_strategy", "model_protocol"],
             "additionalProperties": false
         })
-}
-
-#[cfg(any(test, feature = "root-test-support"))]
-fn startup_workflow_role_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "purpose": {"type": "string", "maxLength": 240},
-            "guidance": {
-                "type": "array",
-                "minItems": 1,
-                "items": {"type": "string"}
-            }
-        },
-        "required": ["purpose", "guidance"],
-        "additionalProperties": false
-    })
 }
 
 #[cfg(any(test, feature = "root-test-support"))]
@@ -986,6 +903,7 @@ fn startup_semantic_navigation_schema() -> Value {
         "properties": {
             "supported": {"type": "boolean", "description": "Whether LSP read-only navigation is advertised for this project."},
             "status": semantic_navigation_status_schema(),
+            "index_readiness": serde_json::to_value(schemars::schema_for!(webcodex_core::lsp_bridge::LspIndexReadiness)).expect("readiness schema"),
             "available": nullable_schema("boolean", "Observed semantic-navigation availability. Null means startup finished without waiting for availability, or the bounded status probe timed out or failed; this is advisory, not unavailability."),
             "provider": nullable_schema("string", "Semantic provider when applicable."),
             "capability": nullable_schema("string", "Bounded advertised capability summary."),
@@ -1107,98 +1025,6 @@ fn startup_verdict_schema() -> Value {
     })
 }
 
-#[cfg(any(test, feature = "root-test-support"))]
-fn semantic_navigation_schema() -> Value {
-    json!({
-        "type": "object",
-        "description": "Always-present bounded Rust/Go semantic-navigation capability summary. Derived only from a typed agent status probe; never contains transport envelopes, process output, paths, environment variables, or symbol/location data.",
-        "additionalProperties": false,
-        "properties": {
-            "supported": schema_type("boolean", "True when the Project is Runner-backed, the owning Runner is connected, and it advertises lsp_read_only_navigation."),
-            "available": nullable_schema("boolean", "Observed semantic-navigation availability. True means supported Rust/Go navigation has an available executable or an existing running/initializing server slot; false is a positive unavailable observation; null means a bounded startup status probe timed out or failed before availability could be observed; this is advisory, not unavailability."),
-            "recommended": schema_type("boolean", "True only for available or running status."),
-            "status": semantic_navigation_status_schema(),
-            "language": {
-                "anyOf": [
-                    { "type": "string", "enum": ["rust", "go"] },
-                    { "type": "null" }
-                ]
-            },
-            "server": {
-                "anyOf": [
-                    { "type": "string", "enum": ["rust-analyzer", "gopls"] },
-                    { "type": "null" }
-                ]
-            },
-            "position_encoding": {
-                "anyOf": [
-                    { "type": "string", "enum": ["utf-8", "utf-16", "utf-32"] },
-                    { "type": "null" }
-                ]
-            },
-            "tools": {
-                "type": "array",
-                "maxItems": 7,
-                "uniqueItems": true,
-                "items": {
-                    "type": "string",
-                    "enum": ["get_lsp_status", "list_document_symbols", "find_definition", "find_references", "read_document_diagnostics", "read_symbol_hover", "list_workspace_symbols"]
-                }
-            },
-            "preferred_flow": {
-                "type": "array",
-                "maxItems": 6,
-                "uniqueItems": true,
-                "items": {
-                    "type": "string",
-                    "enum": ["list_document_symbols", "find_definition", "find_references", "read_symbol_hover", "read_files", "search_project_texts"]
-                }
-            },
-            "limitations": {
-                "type": "array",
-                "maxItems": 5,
-                "uniqueItems": true,
-                "items": {
-                    "type": "string",
-                    "enum": ["rust_only", "go_only", "read_only", "workspace_only", "no_dependency_navigation", "full_text_sync_only"]
-                }
-            },
-            "reason_code": {
-                "anyOf": [
-                    {
-                        "type": "string",
-                        "enum": [
-                            "project_not_agent_backed",
-                            "rust_not_detected",
-                            "agent_not_connected",
-                            "lsp_capability_not_advertised",
-                            "server_crashed",
-                            "server_unavailable",
-                            "status_probe_timed_out",
-                            "status_probe_failed",
-                            "malformed_agent_result"
-                        ]
-                    },
-                    { "type": "null" }
-                ]
-            }
-        },
-        "required": [
-            "supported",
-            "available",
-            "recommended",
-            "status",
-            "language",
-            "server",
-            "position_encoding",
-            "tools",
-            "preferred_flow",
-            "limitations",
-            "reason_code"
-        ]
-    })
-}
-
 fn work_on_project_instruction_source_schema() -> Value {
     let mut schema = startup_instruction_source_schema();
     schema["required"] = json!(["source_scope", "path", "fingerprint"]);
@@ -1282,6 +1108,7 @@ fn work_on_project_output_schema() -> Value {
             "supported": {"type": "boolean"},
             "available": nullable_schema("boolean", "Observed semantic-navigation availability. Null means startup finished without waiting for availability, or the bounded status probe timed out or failed; this does not lower coding readiness."),
             "status": semantic_navigation_status_schema(),
+            "index_readiness": serde_json::to_value(schemars::schema_for!(webcodex_core::lsp_bridge::LspIndexReadiness)).expect("readiness schema"),
             "capability": nullable_schema("string", "Bounded advertised capability summary."),
             "reason_code": nullable_schema("string", "Stable semantic-navigation reason.")
         },

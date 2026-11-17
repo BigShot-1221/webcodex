@@ -49,6 +49,7 @@ impl ToolRuntime {
                 limit,
                 expected_definition_revision,
                 expected_package_revision,
+                expected_resource_sha256,
                 ..
             } => {
                 let project = match project_resolution {
@@ -64,6 +65,7 @@ impl ToolRuntime {
                     limit,
                     expected_definition_revision,
                     expected_package_revision,
+                    expected_resource_sha256,
                     auth,
                 )
                 .await

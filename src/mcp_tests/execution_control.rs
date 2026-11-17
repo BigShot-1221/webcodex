@@ -98,7 +98,8 @@ async fn execution_control_schema_exposes_opt_in_and_validates_both_result_views
 
 #[tokio::test]
 async fn execution_control_observe_direct_gateway_preserves_job_and_diagnostics() {
-    use crate::runner_protocol::{RunnerJobUpdateRequest, ShellJobOpRequest};
+    use crate::runner_protocol::RunnerJobUpdateRequest;
+    use webcodex_runner_registry::JobStartRequest;
     let runtime = test_runtime();
     let registration: RunnerRegisterRequest = serde_json::from_value(json!({
         "client_id":"control-runner","agent_instance_id":"inst",
@@ -116,11 +117,13 @@ async fn execution_control_observe_direct_gateway_preserves_job_and_diagnostics(
     let job = runtime
         .runner_registry
         .start_job(
-            serde_json::from_value::<ShellJobOpRequest>(json!({
-                "op":"start","client_id":"control-runner","command":"fixture","timeout_secs":60
-            }))
-            .unwrap(),
+            JobStartRequest {
+                timeout_secs: 60,
+                ..JobStartRequest::shell("control-runner", "fixture")
+            },
             "fixture".into(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -219,7 +222,7 @@ async fn execution_control_observe_direct_gateway_preserves_job_and_diagnostics(
 
 #[tokio::test]
 async fn execution_control_gateway_cannot_apply_to_unrelated_or_hidden_tools() {
-    let runtime = test_runtime();
+    let runtime = workflow_runtime();
     for tool in ["list_projects", "sync_goal_plan"] {
         let result = handle_mcp_request(
             &runtime,

@@ -111,6 +111,7 @@ fn live_focus_control_smoke(application_matches: impl Fn(&str) -> bool) -> bool 
             &record,
             &element,
             ComputerAction::Focus,
+            &test_native_activity(),
         ) {
             Ok(output) => {
                 assert_eq!(output["action"], "focus");
@@ -338,6 +339,31 @@ fn computer_macos_application_launch_configuration_is_nonactivating_and_closed()
 fn computer_macos_accessibility_permission_live_smoke() {
     let status = platform::accessibility_status().expect("read accessibility status");
     assert_eq!(status["trusted"], true);
+}
+
+#[test]
+#[ignore = "requires a visible Calculator window and live macOS Accessibility permission"]
+fn computer_macos_accessibility_calculator_live_regression() {
+    let candidates = platform::list_windows(MAX_WINDOWS).expect("list live macOS windows");
+    let candidate = candidates
+        .into_iter()
+        .find(|candidate| {
+            let name = candidate.application.to_lowercase();
+            name.contains("calculator") || name.contains("kalkula")
+        })
+        .expect("Calculator must expose a visible native window");
+    let record = surface_record(candidate);
+    // A depth-zero failure isolates the window fingerprint from child traversal.
+    for depth in 0..=3 {
+        let tree = platform::accessibility_tree("surface_calculator_live", &record, depth, 64)
+            .unwrap_or_else(|error| {
+                panic!("Calculator AX read failed at max_depth={depth}: {error}")
+            });
+        assert!(
+            tree.output["node_count"].as_u64().unwrap_or(0) > 0,
+            "Calculator tree must include its root at depth {depth}"
+        );
+    }
 }
 
 #[test]

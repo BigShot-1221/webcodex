@@ -68,12 +68,12 @@ impl ToolRuntime {
                 )
                 .await
             }
-            ToolCall::CodingAgentInspectConfig {
+            ToolCall::CodingAgentDiagnose {
                 project,
                 provider_id,
                 include_live_acp,
             } => {
-                self.coding_agent_inspect_config(project, provider_id, include_live_acp, auth)
+                self.coding_agent_diagnose(project, provider_id, include_live_acp, auth)
                     .await
             }
 
@@ -107,6 +107,9 @@ impl ToolRuntime {
                 .await
             }
             ToolCall::ProjectBuild {
+                profile,
+                targets,
+                artifact_policy,
                 project,
                 session_id,
                 cwd,
@@ -124,6 +127,9 @@ impl ToolRuntime {
                     scope,
                     dependency_policy,
                     dependency_resolution_policy,
+                    profile,
+                    targets,
+                    artifact_policy,
                     timeout_secs,
                     structured_handoff_max_secs,
                     ssh_resource.as_deref(),

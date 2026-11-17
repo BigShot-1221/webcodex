@@ -3,9 +3,9 @@
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{
-    RunnerCapabilities, RunnerJobUpdateRequest, RunnerPollRequest, RunnerRegisterRequest,
-    RunnerResultRequest,
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerPollRequest, RunnerResultRequest,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -58,22 +58,55 @@ async fn read_files_snapshot_service_does_not_retain_unrelated_runtime_state() {
     assert!(unrelated_state.upgrade().is_none());
     registry
         .complete(RunnerResultRequest {
-            client_id: client.to_string(),
-            runner_instance_id: runner.runner_instance_id.clone(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_range("one\ntwo\nthree\n", 1, 2)),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                client.to_string(),
+                runner.runner_instance_id.clone(),
+                request.request_id,
+            )
         })
         .await
         .unwrap();
-    let result = read.await;
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["text"], "one\ntwo");
+    let result = read.await.unwrap();
+    assert_eq!(result.content, "one\ntwo");
+}
+
+#[tokio::test]
+async fn read_files_snapshot_service_fences_sha_without_read_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client = "read-service-unscoped-sha";
+    register_runner_project_at_path(&runtime, client, "demo", root.path()).await;
+    let resolved = runtime.resolve_project_input("demo").await.unwrap();
+    let runner = runtime
+        .runner_registry
+        .get_runner_view(client)
+        .await
+        .unwrap();
+    let runner_project_id =
+        crate::tool_runtime::runner_local_project_id(&resolved.resolved_id).unwrap();
+    let expected_sha = "a".repeat(64);
+    let read = runtime.read_project_snapshot(
+        &resolved,
+        runner_project_id,
+        &runner.runner_instance_id,
+        "a.rs".into(),
+        Some(1),
+        Some(2),
+        Some(&expected_sha),
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    );
+    tokio::pin!(read);
+    assert!(futures_util::poll!(&mut read).is_pending());
+    let request = next_read_request(&runtime, client).await;
+    complete_read(&runtime, client, &request, "one\ntwo\n").await;
+    assert_eq!(
+        read.await.unwrap_err(),
+        super::super::files::FileReadFailure::StaleRevision
+    );
 }
 
 #[tokio::test]
@@ -385,8 +418,8 @@ async fn read_files_singleflight_late_waiter_keeps_its_own_deadline_budget() {
 
     complete_read(&runtime, client, &first_request, "one\ntwo\n").await;
     complete_read(&runtime, client, &second_request, "one\ntwo\n").await;
-    assert!(first.await.success);
-    assert!(second.await.success);
+    assert!(first.await.is_ok());
+    assert!(second.await.is_ok());
 }
 
 #[tokio::test]
@@ -422,16 +455,11 @@ async fn read_files_singleflight_last_waiter_drop_cancels_runner_registry_reques
     let late = runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client.into(),
-            runner_instance_id: "inst".into(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_output("one\ntwo\n", 1)),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(client.into(), "inst".into(), request.request_id)
         })
         .await;
     assert!(
@@ -556,31 +584,16 @@ async fn replace_runner_project_at_path(
 ) {
     runtime
         .runner_registry
-        .register(crate::test_support::current_runner_registration(
-            RunnerRegisterRequest {
-                computer_session_availability: None,
-                process_started_at: None,
-                build: None,
-                job_concurrency_limit: None,
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: runner_instance_id.to_string(),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                display_name: None,
-                owner: None,
-                hostname: None,
-                host_context: None,
-                capabilities: RunnerCapabilities {
-                    shell: true,
-                    git: true,
-                    file_read: true,
-                    file_write: true,
-                    internal_posix_script: true,
-                    ..Default::default()
-                },
-                policy: None,
+        .register(crate::test_support::runner_registration(
+            client_id,
+            runner_instance_id,
+            RunnerCapabilities {
+                shell: true,
+                git: true,
+                file_read: true,
+                file_write: true,
+                internal_posix_script: true,
+                ..Default::default()
             },
         ))
         .await
@@ -831,10 +844,7 @@ async fn read_files_returns_ordered_normalized_successes_after_out_of_order_comp
             max_result_bytes: None,
         });
     projection.project(&mut result);
-    assert_eq!(
-        result.output["suggested_call"]["arguments"]["items"][0]["start_line"],
-        4
-    );
+    assert!(result.output.get("suggested_call").is_none());
     let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
@@ -938,19 +948,21 @@ async fn assert_merged_byte_fallback(content: String) {
 
 #[tokio::test]
 async fn read_files_coalesced_numbering_overflow_keeps_members_without_rereading() {
-    use webcodex_workspace::file_read_normalize::success_output;
     use webcodex_workspace::file_read_range::{read_range_from, EffectiveRange};
     let content = format!("{}\n", "\"".repeat(356)).repeat(360);
     let range =
         read_range_from(content.as_bytes(), EffectiveRange::new(Some(1), Some(360))).unwrap();
-    let parent = success_output(&range, false);
     let plain =
-        super::super::files::slice_read_file_result(&parent, Some(1), Some(360), false, "a.rs");
-    assert!(plain.success);
+        super::super::files::slice_read_file_range(&range, Some(1), Some(360), false, "a.rs");
+    assert!(plain.is_ok());
     let numbered =
-        super::super::files::slice_read_file_result(&parent, Some(1), Some(360), true, "a.rs");
-    assert!(!numbered.success);
-    assert_eq!(numbered.output["reason_code"], "range_too_large");
+        super::super::files::slice_read_file_range(&range, Some(1), Some(360), true, "a.rs");
+    assert_eq!(
+        numbered.unwrap_err(),
+        super::super::files::FileReadFailure::Read(
+            webcodex_workspace::file_read_range::ReadFileReason::RangeTooLarge,
+        )
+    );
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -970,7 +982,9 @@ async fn read_files_coalesced_numbering_overflow_keeps_members_without_rereading
     let request = next_read_request(&runtime, client).await;
     assert_eq!(request.end_line, Some(360));
     complete_read(&runtime, client, &request, &content).await;
-    let (result, items) = read.await;
+    let output = read.await;
+    let result = output.result;
+    let items = output.items;
     assert_eq!(result.output["succeeded_count"], 2);
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].limit, Some(180));
@@ -1222,7 +1236,7 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
 }
 
 #[tokio::test]
-async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
+async fn read_file_dispatch_explicit_range_does_not_suggest_unrequested_lines() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-partial-visible";
@@ -1275,58 +1289,8 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
     assert_eq!(item["output"]["returned_lines"], 1);
     assert_eq!(item["output"]["end_line"], 2);
     assert_eq!(item["output"]["has_more"], true);
-    assert_eq!(
-        result.output["suggested_call"]["arguments"]["items"][0]["start_line"],
-        3
-    );
-    let suggested = &result.output["suggested_call"];
-    let read_revision = item["output"]["read_revision"]
-        .as_u64()
-        .expect("successful read must expose read_revision");
-    assert!(item["output"].get("sha256").is_none());
-    assert!((1..=9_007_199_254_740_991).contains(&read_revision));
-    assert_eq!(suggested["tool"], "read_files");
-    assert_eq!(suggested["follow_up_kind"], "mechanically_followable");
-    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(suggested)
-        .expect("read_files continuation must pass the registered inputSchema");
-    assert_eq!(suggested["arguments"]["session_id"], session_id);
-    let next_call = ToolCall::from_tool_name(
-        suggested["tool"].as_str().unwrap(),
-        suggested["arguments"].clone(),
-    )
-    .expect("read_files continuation suggested_call must parse");
-    assert!(matches!(
-        &next_call,
-        ToolCall::ReadFiles {
-            project: next_project,
-            items,
-            session_id: Some(next_session_id),
-            with_line_numbers: None,
-            max_result_bytes: None,
-        } if next_project == &project
-            && items.len() == 1
-            && items[0].path == "src/lib.rs"
-            && items[0].start_line == Some(3)
-            && items[0].limit == Some(1)
-            && items[0].expected_read_revision == Some(read_revision)
-            && next_session_id == &session_id
-    ));
-
-    let second = tokio::spawn({
-        let runtime = runtime.clone();
-        let auth = auth.clone();
-        async move { runtime.dispatch_with_auth(next_call, Some(&auth)).await }
-    });
-    let second_request = next_read_request(&runtime, client_id).await;
-    assert_eq!(second_request.start_line, Some(3));
-    complete_read(&runtime, client_id, &second_request, content).await;
-    let second = second.await.unwrap();
-    assert!(second.success, "{:?}", second.error);
-    let second_item = &second.output["items"][0];
-    assert_eq!(second_item["success"], true);
-    assert_eq!(second_item["output"]["text"], "three");
-    assert_eq!(second_item["output"]["read_revision"], read_revision);
-
+    assert!(result.output.get("suggested_call").is_none());
+    assert!(item["output"]["read_revision"].is_u64());
     let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
     let serialized = serde_json::to_value(&result).unwrap();
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
@@ -1336,7 +1300,7 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
 }
 
 #[tokio::test]
-async fn read_files_continuation_rejects_changed_snapshot() {
+async fn read_files_explicit_followup_rejects_changed_snapshot() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-source-change";
@@ -1375,17 +1339,19 @@ async fn read_files_continuation_rejects_changed_snapshot() {
     let first_revision = first_item["output"]["read_revision"]
         .as_u64()
         .expect("first read revision");
-    let suggested = &first.output["suggested_call"];
-    let next_call = ToolCall::from_tool_name(
-        suggested["tool"].as_str().unwrap(),
-        suggested["arguments"].clone(),
-    )
-    .expect("snapshot-fenced continuation must parse");
-    assert!(matches!(
-        &next_call,
-        ToolCall::ReadFiles { items, .. }
-            if items[0].expected_read_revision == Some(first_revision)
-    ));
+    assert!(first.output.get("suggested_call").is_none());
+    let next_call = ToolCall::ReadFiles {
+        project: project.clone(),
+        items: vec![ReadFilesItem {
+            path: "src/lib.rs".into(),
+            start_line: Some(2),
+            limit: Some(1),
+            expected_read_revision: Some(first_revision),
+        }],
+        session_id: None,
+        with_line_numbers: None,
+        max_result_bytes: None,
+    };
 
     // Insert a line before the cursor between calls. The range request still
     // reaches the exact Runner, but Runtime must reject its changed full-file
@@ -1709,7 +1675,7 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
 }
 
 #[tokio::test]
-async fn read_files_partial_item_has_one_invocation_follow_up() {
+async fn read_files_completed_explicit_range_in_batch_has_no_follow_up() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-batch-item-continuation";
@@ -1759,32 +1725,7 @@ async fn read_files_partial_item_has_one_invocation_follow_up() {
     assert_eq!(result.output["output_truncated"], false);
     assert!(result.output.get("continuation").is_none());
     let items = result.output["items"].as_array().unwrap();
-    let suggested = &result.output["suggested_call"];
-    assert_eq!(suggested["arguments"]["session_id"], session_id);
-    assert_eq!(
-        suggested["arguments"]["items"][0]["expected_read_revision"],
-        items[0]["output"]["read_revision"]
-    );
-    let next_call = ToolCall::from_tool_name(
-        suggested["tool"].as_str().unwrap(),
-        suggested["arguments"].clone(),
-    )
-    .expect("item continuation must parse");
-    assert!(matches!(
-        next_call,
-        ToolCall::ReadFiles {
-            project: ref next_project,
-            ref items,
-            session_id: Some(ref next_session_id),
-            with_line_numbers: Some(true),
-            max_result_bytes: None,
-        } if next_project == &project
-            && items.len() == 1
-            && items[0].path == "src/lib.rs"
-            && items[0].start_line == Some(3)
-            && items[0].limit == Some(1)
-            && next_session_id == &session_id
-    ));
+    assert!(result.output.get("suggested_call").is_none());
     assert!(items[1].get("continuation").is_none());
 
     let schema = crate::tool_runtime::registry::output_schema_for_tool("read_files");
@@ -1898,16 +1839,7 @@ async fn read_files_dispatch_mixed_batch_keeps_outer_and_failure_semantics() {
     assert_eq!(items[0]["path"], "good.txt");
     assert_eq!(items[0]["output"]["text"], "ok");
     assert_eq!(items[0]["output"]["has_more"], true);
-    assert_eq!(
-        result.output["suggested_call"]["arguments"]["items"][0]["start_line"],
-        2
-    );
-    let suggested = &result.output["suggested_call"];
-    ToolCall::from_tool_name(
-        suggested["tool"].as_str().unwrap(),
-        suggested["arguments"].clone(),
-    )
-    .expect("successful mixed-batch item continuation must remain parseable");
+    assert!(result.output.get("suggested_call").is_none());
     assert_eq!(items[1]["success"], false);
     assert_eq!(items[1]["path"], ".env");
     assert_eq!(items[1]["output"]["error_kind"], "read_file_failed");
@@ -2088,16 +2020,15 @@ async fn read_files_deadline_preserves_completed_results_and_cancels_unfinished_
         let late = runtime
             .runner_registry
             .complete(RunnerResultRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id: request.request_id.clone(),
                 exit_code: Some(0),
                 stdout: Some(canonical_agent_file_read_output("late\n", 1)),
                 stderr: Some(String::new()),
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(100),
-                error: None,
+                ..runner_result_request(
+                    client_id.to_string(),
+                    "inst".to_string(),
+                    request.request_id.clone(),
+                )
             })
             .await;
         assert!(late.is_err(), "timed-out Runner request was not cancelled");
@@ -2188,7 +2119,7 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
         let auth = auth.clone();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata(
+                .dispatch_with_context(
                     ToolCall::ReadFiles {
                         project,
                         items: vec![
@@ -2201,10 +2132,11 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
                         with_line_numbers: None,
                         max_result_bytes: Some(MAX_SERIALIZED_OUTPUT_BYTES),
                     },
-                    Some(&auth),
-                    SessionTransport::Mcp,
-                    ToolCallRecorderMetadata {
-                        ..Default::default()
+                    DispatchContext {
+                        recorder: ToolCallRecorderMetadata {
+                            ..Default::default()
+                        },
+                        ..DispatchContext::internal(Some(&auth), SessionTransport::Mcp, None)
                     },
                 )
                 .await
@@ -2284,25 +2216,18 @@ async fn ordinary_read_delivers_terminal_attention_without_host_continuation_sup
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.into(),
-            runner_instance_id: "inst".into(),
-            job_id: job_id.clone(),
             request_id: job.request_id,
             update_seq: Some(2),
-            status: "completed".into(),
             stdout_chunk: Some("PRIVATE_JOB_OUTPUT".into()),
-            stderr_chunk: None,
-            log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(50),
-            error: None,
-            command_execution_state: None,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
-            activity: None,
-            finished: true,
+            ..runner_job_update(
+                client_id.into(),
+                "inst".into(),
+                job_id.clone(),
+                "completed".into(),
+                true,
+            )
         })
         .await
         .unwrap();
@@ -2597,6 +2522,7 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
     runtime
         .sessions
         .ensure_coding_session(crate::tool_runtime::sessions::CodingSessionRequest {
+            project_identity: None,
             project: project.clone(),
             authority_fingerprint:
                 crate::tool_runtime::sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT

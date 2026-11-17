@@ -8,14 +8,13 @@
 //! projection, and the pure-read contract.
 
 use super::support::*;
+use crate::tool_runtime::closeout_evidence::CloseoutSessionEvidence;
 use crate::tool_runtime::continuation_feedback::{
     continuation_feedback_value, continuation_projection_hooks, continuation_validation_snapshot,
     root_tool_is_meaningful, ContinuationFeedbackInput, ContinuationToolFailureSnapshot,
 };
-use crate::tool_runtime::handoff::reconcile_closeout_evidence;
 use crate::tool_runtime::sessions::{
-    self, tool_failure_summary_from_events, SessionDiscussionCounts, SessionGuards,
-    SessionTransport,
+    self, SessionDiscussionCounts, SessionGuards, SessionTransport,
 };
 use crate::tool_runtime::tool_definition::{
     runtime_tool_captures_validation_output, runtime_tool_is_git_like, runtime_tool_is_shell_like,
@@ -29,6 +28,8 @@ use crate::tool_runtime::{
     ToolRuntime, ToolSpec,
 };
 use serde_json::{json, Value};
+use webcodex_validation::ValidationReport;
+use webcodex_workflow_session::ContinuationJobSnapshot;
 
 fn continuation_feedback_subschema(specs: &[ToolSpec], tool: &str) -> Value {
     let spec = spec_named(specs, tool);
@@ -183,17 +184,16 @@ fn exploration_continuity_suggestion_is_lower_priority_than_blocking_evidence() 
     let conflict_validation = validation_summary_from_events(&conflict_summary.events, 20);
     let conflict_current_validation =
         current_validation_evidence_for_session(&conflict_summary, 20);
-    let conflict_tool_failures = tool_failure_summary_from_events(&conflict_summary.events, 20);
-    let conflict_reconciliation = reconcile_closeout_evidence(
-        &conflict_tool_failures,
-        &conflict_summary,
-        &conflict_validation,
+    let conflict_evidence = CloseoutSessionEvidence::new(
+        conflict_summary.clone(),
+        ValidationReport::from_events(&conflict_summary, &conflict_summary.events, 100),
+        None,
     );
     let conflict_discussion = empty_discussion();
     let conflict_feedback = continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: &conflict_summary,
         validation: &conflict_validation,
-        jobs: &json!({"active_count": 0, "running_count": 0, "recent": []}),
+        jobs: ContinuationJobSnapshot::default(),
         discussion: &conflict_discussion,
         continuation: "continued",
         suggest_exploration_continuity: true,
@@ -201,7 +201,7 @@ fn exploration_continuity_suggestion_is_lower_priority_than_blocking_evidence() 
         hooks: continuation_projection_hooks(),
         current_validation: continuation_validation_snapshot(&conflict_current_validation),
         tool_failures: ContinuationToolFailureSnapshot::new(
-            &conflict_reconciliation.actionable_unexpected_event_ids,
+            &conflict_evidence.failures.actionable_unexpected_event_ids,
         ),
     });
     assert!(!has_exploration_action(&conflict_feedback));
@@ -234,9 +234,7 @@ async fn diagnostic_coding_workflow(
                     SessionMode::Normal,
                     false,
                     false,
-                    // These integration assertions exercise the complete
-                    // continuation_feedback block retained by full diagnostics.
-                    StartupDetail::Full,
+                    StartupDetail::Standard,
                     resume,
                     None,
                     Some(&auth),
@@ -335,18 +333,11 @@ async fn coding_workflow_continuation_describes_previous_attempt_not_empty_new_o
         "resumed_explicitly"
     );
 
-    let feedback = &second.output["continuation_feedback"];
+    let feedback = &second.output["continuation"];
     // The feedback must describe A's attempt (real work), not the empty new B attempt.
     assert_eq!(feedback["status"], "available");
-    assert_eq!(
-        feedback["attempt"]["boundary"]["source"],
-        "task_instruction"
-    );
-    assert_eq!(feedback["attempt"]["instruction"]["status"], "available");
-    assert_eq!(
-        feedback["attempt"]["instruction"]["excerpt"],
-        "instruction A"
-    );
+    assert_eq!(feedback["instruction"]["status"], "available");
+    assert_eq!(feedback["instruction"]["excerpt"], "instruction A");
     // Instruction B must be appended exactly once.
     let summary = runtime.sessions.summary(&session_id, Some(200)).unwrap();
     let instructions: Vec<&str> = summary
@@ -395,7 +386,7 @@ async fn coding_workflow_fresh_session_continuation_is_not_applicable() {
         diagnostic_coding_workflow(&runtime, "fresh-agent", &project, "fresh start", None).await;
     assert!(first.success, "{:?}", first.error);
     assert_eq!(first.output["session"]["continuation"], "created");
-    let feedback = &first.output["continuation_feedback"];
+    let feedback = &first.output["continuation"];
     assert_eq!(feedback["status"], "not_applicable");
     assert_eq!(feedback["reason_code"], "fresh_session");
 }
@@ -829,6 +820,7 @@ fn add_instruction(runtime: &ToolRuntime, session_id: &str, instruction: &str, m
     runtime
         .sessions
         .ensure_coding_session(sessions::CodingSessionRequest {
+            project_identity: None,
             project: "test-project".to_string(),
             authority_fingerprint: sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
                 .to_string(),
@@ -936,6 +928,7 @@ fn add_instruction_for(
     runtime
         .sessions
         .ensure_coding_session(sessions::CodingSessionRequest {
+            project_identity: None,
             project: project.to_string(),
             authority_fingerprint: sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
                 .to_string(),
@@ -1109,13 +1102,16 @@ fn feedback_for_with_discussion(
 ) -> Value {
     let validation = validation_summary_from_events(&summary.events, 20);
     let current_validation = current_validation_evidence_for_session(summary, 20);
-    let tool_failures = tool_failure_summary_from_events(&summary.events, 20);
-    let reconciliation = reconcile_closeout_evidence(&tool_failures, summary, &validation);
+    let evidence = CloseoutSessionEvidence::new(
+        summary.clone(),
+        ValidationReport::from_events(summary, &summary.events, 100),
+        None,
+    );
     let jobs = json!({"active_count": 0, "terminal_pending_count": 0, "recent": []});
     continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: summary,
         validation: &validation,
-        jobs: &jobs,
+        jobs: ContinuationJobSnapshot::from_json(&jobs),
         discussion,
         continuation,
         suggest_exploration_continuity: true,
@@ -1123,7 +1119,7 @@ fn feedback_for_with_discussion(
         hooks: continuation_projection_hooks(),
         current_validation: continuation_validation_snapshot(&current_validation),
         tool_failures: ContinuationToolFailureSnapshot::new(
-            &reconciliation.actionable_unexpected_event_ids,
+            &evidence.failures.actionable_unexpected_event_ids,
         ),
     })
 }
@@ -1136,13 +1132,16 @@ fn feedback_for_with_jobs(
 ) -> Value {
     let validation = validation_summary_from_events(&summary.events, 20);
     let current_validation = current_validation_evidence_for_session(summary, 20);
-    let tool_failures = tool_failure_summary_from_events(&summary.events, 20);
-    let reconciliation = reconcile_closeout_evidence(&tool_failures, summary, &validation);
+    let evidence = CloseoutSessionEvidence::new(
+        summary.clone(),
+        ValidationReport::from_events(summary, &summary.events, 100),
+        None,
+    );
     let discussion = empty_discussion();
     continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: summary,
         validation: &validation,
-        jobs,
+        jobs: ContinuationJobSnapshot::from_json(jobs),
         discussion: &discussion,
         continuation,
         suggest_exploration_continuity: true,
@@ -1150,7 +1149,7 @@ fn feedback_for_with_jobs(
         hooks: continuation_projection_hooks(),
         current_validation: continuation_validation_snapshot(&current_validation),
         tool_failures: ContinuationToolFailureSnapshot::new(
-            &reconciliation.actionable_unexpected_event_ids,
+            &evidence.failures.actionable_unexpected_event_ids,
         ),
     })
 }

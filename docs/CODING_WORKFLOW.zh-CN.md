@@ -51,7 +51,13 @@ Bootstrap 或 discovery 返回 `project_ref` 后，普通 Project-scoped tool ca
 
 默认情况下，它还会返回一个很小且有界的 `extensions` selection catalog：Skill metadata 来自 canonical 的 project / Runner-configured `skills.roots` / Runner-managed Skill Store 三类来源；Plugin metadata 只包含 configured working directory 与当前 Project root 匹配、且已 ready/committed 的 provider。该 metadata 不授予任何 authority，也不会自动读取 Skill body 或创建 Plugin binding；模型选择后使用 `read_skill_file` 读取 Skill 文本，`run_skill_resource` 只执行可信 Runner-configured live `scripts/` resource（由 `expected_definition_revision` fence definition）或 Runner-installed managed resource（另由 `expected_package_revision` fence package），Plugin 则走 `plugin_tool describe -> call`。Configured resource bytes 会一直保持 live 到实际执行时，并不会预先被 package revision 固定。只有当前模型上下文仍明确保留这些 discovery metadata 时，才应设置 `include_extension_catalog=false`。
 
+应用原有字节预算前，启动结果会按当前 `instruction` 的词法相关性排序已发现条目：名称命中优先于描述命中，同分和未匹配条目保留原顺序。匹配复用工具发现的英文词形归一化，并识别 metadata 中出现的完整多字中文短语，不进行翻译或语义检索。最多检查指令前 2,048 个字符和 64 个不同英文词。排序只影响选择 metadata；显式目录、来源 revision、授权、资源加载与执行继续沿用原有路径。
+
 Skill 读取（`load_skill` 和 `read_skill_file`）返回规范化的包内路径 `skill_path`，供 `read_skill_file.path` 使用。Project Skill 另返回权威的项目相对路径 `project_path`：项目引用应使用它和返回的来源行号，即使包目录与 metadata name 不同。Runner-configured 和 managed Skill 不返回 `project_path`；引用其 Skill identity、`skill_path`、resource `sha256`、revision 和来源行号，不要编造项目路径。不会暴露 Skill 的本机根目录。
+
+Skill 读取返回 `has_more=true` 时，直接使用完整的 `suggested_call` 续读，不必重新拼装范围。该调用包含精确的 Project、Skill ID、包内路径、下一行、行数限制、definition revision、适用的 managed package revision，以及 `expected_resource_sha256`。这个可选输入必须是 64 位小写十六进制，校验 project、configured 和 managed 三类来源的完整资源哈希。跨页资源变化时返回 `skill_resource_changed`、`state_changed=false`，不返回替换正文；不要拼接这些页，也不要自动换成新版本。已有 definition/package 检查继续生效；省略新哈希的调用保留原有实时读取行为。
+
+完整读取不附加建议，现有分页字段保留。续读元数据计入既有 64 KiB 结果预算（正文 48 KiB、最多 400 行），Skill 页在选定范围超出正文预算时于完整行边界停止，仍校验全文哈希及 UTF-8。单行本身超过预算时继续失败，不返回无法前进的游标。普通文件范围读取仍沿用原有严格溢出行为。不推断 Session。MCP 沿已有准入和 gateway 路由投影建议，并移除不可用工具；建议不会自动读取或授予权限。
 
 跨轮次的重要工作可以用 durable Goal 记录目标和完成标准，无需用户管理步骤。`update_goal` 使用精确的 `expected_revision` 和 `idempotency_key` 编辑 active Goal：省略 `completion_conditions` 会保留原列表，传入 `[]` 则清空。替换条件沿用创建时的限制（最多八项，每项去除首尾空白后非空，且不超过 512 UTF-8 字节）。编辑完成标准保留已有步骤、checkpoint 和进度；不会自动判断验收、恢复执行或重新打开 completed/cancelled Goal。revision 冲突时重新读取；结果不确定时复用同一个 key 和完全相同的请求。
 
@@ -75,15 +81,32 @@ Fresh work 仍须明确 `project` 或 `client_id + path`。`mode="worktree"` 始
 
 ## 工具策略 guidance
 
+工程指导通过下文的可选章节按需请求；不能从 CLI presentation 推断任务类型。
+对于非简单代码变更，先定位职责所属层，追踪相关调用方和数据流，
+查找可复用实现，并阅读涉及边界的设计指导；调查范围应与任务规模相称。现有模式是需要
+判断的证据，新增抽象或平行实现必须有具体任务理由。共享展示之前的权威业务事实，
+用结构完整的最小改动解决根因，包括任务范围内必要的局部重构和被替代路径清理。
+交付前同时检查行为、职责归属、重复实现和跨层一致性；测试通过本身不能证明架构合适。
+
+编译器、Schema 和穷尽性检查的失败也可能暴露跨层修改遗漏。长任务应及时报告已验证的阶段
+成果；创建获授权的 PR 或其他外部交付物后，应尽早报告实际链接及验证状态，不要把所有
+结果都推迟到最终回复。提示指导本身无法避免模型服务额度耗尽导致的中断。
+
+`independent_review` 仅在明确要求独立评审时使用。除权限、安全和运行时契约外，还应检查
+此次改动引入或扩大的重复事实或执行流程、职责错位、展示数据反向解析和不完整迁移。
+发现应有具体代码及正确性、漂移风险或维护成本证据，区分必须修复的问题和可选清理；
+个人风格偏好本身不构成问题，无关重设计不在任务范围内。只读评审不授权修改代码，
+只有任务明确包含修正时才修复并执行针对性验证；角色本身不授予权限。
+
 需要切换账号或窗口时，用 `post_session_message` 保存已确认的决策和当前进度。不知道旧 Session 身份时，通过 `list_sessions(project)` 发现并显式选择候选，读取交接后再恢复。完整恢复及已配置模型评审流程见[任务接续](SESSION_CONTINUITY.zh-CN.md)。
 
 `work_on_project` 的 `guidance_profile` 是可选的：显式值只覆盖指导文本；MCP 省略时
 使用当次请求的 `X-WebCodex-MCP-Profile`，header 省略才使用部署默认
 `WEBCODEX_MCP_HOST_PROFILE`。HTTP header 独立决定返回/等待策略，见
 [MCP 客户端策略](MCP.zh-CN.md#同一-server-的客户端策略)。非 MCP/internal
-调用省略时仍回退到 `direct`。当前 workflow contract 保持共享的 `guidance`、
-`model_protocol` 和 review `roles`，并在显式 `context_request=["webcodex.workflow"]`
-时通过 `tool_strategy` 返回本次请求选中的 effective 策略。
+调用省略时仍回退到 `direct`。当前 workflow contract 保持共享的 `guidance` 和
+`model_protocol`；请求 `_wc.context=["webcodex.workflow"]` 时，通过 `tool_strategy`
+返回本次请求选中的 effective 策略。coding/review 角色位于独立的可选章节。
 
 - `direct`：简单 observation 直接调用最合适的 primitive；预先确定且独立的
   observations 可以批量执行，模型根据结果顺序决定 adaptive follow-up。
@@ -132,7 +155,8 @@ Fresh work 仍须明确 `project` 或 `client_id + path`。`mode="worktree"` 始
 `work_on_project` startup 与后续普通工具的 `webcodex.workflow` context refresh
 使用同一套 effective profile 规则；不会因为 Session/Window 历史选择发生漂移。
 
-这些策略共用 scope、recovery、validation truth、Job continuation、review 和 closeout。
+这些策略共用 scope、recovery、validation truth、Job continuation 和 closeout。
+coding/review 角色来自独立的可选章节，不影响策略选择。
 默认仍走 canonical edit 和 structured validation；只有多个相关 validation 或
 adaptive read → one guarded edit 确实减少外层往返时，才考虑相应的 effectful/mutating
 Code Mode。Nested canonical authority、effects、evidence 和 retry certainty 不变。
@@ -143,9 +167,15 @@ Code Mode。Nested canonical authority、effects、evidence 和 retry certainty 
 
 普通使用不需要理解 WebCodex 内部的 continuity/audit field；这些属于 implementation/maintainer contract。
 
-内置默认 guidance 本身就是普通 implementation workflow。正常的“implement/fix/refactor”任务不需要知道任何实现角色名：把已授权工作推进到具体、可评审的完成状态，端到端覆盖跨层改动，保持设计最小化，按范围验证，并如实报告证据。只使用当前暴露 schema 支持的工具与协议字段。
+共享的 `webcodex.workflow` 适用于各类项目任务，涵盖工具选择、权限、Session/Job 身份、
+重试、恢复和交付。需要代码实现或显式代码评审指导时，支持 `_wc` context sidecar 的
+MCP surface 可请求 `_wc.context=["webcodex.coding"]`。该可选章节包含 `coding` 和
+`independent_review` 任务角色，只选择适用的角色。它仅提供模型指导，不是 Session 状态
+或权限，也不改变 Direct、Host Code Mode 或 Code Mode 工具策略。选择 CLI presentation
+不代表任务是编码；CLI 没有 `_wc` 路线，不应凭空构造参数请求章节。语言、格式化、测试
+和 Git 规范由项目指令负责。只使用当前暴露 schema 支持的工具与协议字段。
 
-`independent_review` 是唯一保留的可选 named role，因为它确实改变行为。只有任务明确要求独立评审 pass 时才使用：
+`independent_review` 是该可选章节中的代码评审角色。只有任务明确要求独立评审 pass 时才使用：
 
 ```text
 使用 independent_review guidance。独立评审 <改动或 commit>，

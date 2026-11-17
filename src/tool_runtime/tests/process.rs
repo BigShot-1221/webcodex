@@ -6,6 +6,7 @@ use crate::runner_protocol::{
     RunnerCapabilities, RunnerJobUpdateRequest, RunnerPolicySummary, ShellCommandExecutionState,
     ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -71,6 +72,369 @@ fn structured_execution_calls(
         shell: None,
     };
     [("process", process), ("script", script), ("shell", shell)]
+}
+
+/// Exercise the four public execution entries against one in-memory Runner per
+/// policy case. The Runner request is Runtime-generated; no Server/process fixture
+/// is needed to observe admission budgets and the same-Job recovery contract.
+fn execution_timeout_calls(project: &str, timeout: Option<u64>) -> Vec<(&'static str, ToolCall)> {
+    let mut calls = structured_execution_calls(project, timeout.unwrap_or(60), None)
+        .into_iter()
+        .collect::<Vec<_>>();
+    for (_, call) in &mut calls {
+        match call {
+            ToolCall::RunProcess { timeout_secs, .. }
+            | ToolCall::RunScript { timeout_secs, .. }
+            | ToolCall::RunShell { timeout_secs, .. } => *timeout_secs = timeout,
+            _ => unreachable!(),
+        }
+    }
+    calls.push((
+        "job",
+        ToolCall::RunJob {
+            project: project.to_string(),
+            command: "printf lifecycle".to_string(),
+            session_id: None,
+            timeout_secs: timeout.map(|seconds| seconds as i64),
+            cwd: None,
+            purpose: Some(ExecutionPurpose::Diagnostic),
+            shell: None,
+        },
+    ));
+    calls
+}
+
+#[tokio::test]
+async fn execution_timeout_matrix_preserves_form_limits_and_runner_caps() {
+    let temp = tempfile::tempdir().unwrap();
+    let cases: [(&str, Option<u64>, Option<u64>, [u64; 4], &str); 5] = [
+        (
+            "default",
+            None,
+            Some(999_999),
+            [60, 60, 60, 3_600],
+            "request",
+        ),
+        ("normal", Some(30), Some(999_999), [30; 4], "request"),
+        (
+            "tool",
+            Some(999_999),
+            Some(999_999),
+            [604_800, 604_800, 3_600, 86_400],
+            "tool_limit",
+        ),
+        ("runner", Some(99_999), Some(120), [120; 4], "runner_policy"),
+        (
+            "unknown",
+            Some(7_200),
+            None,
+            [7_200, 7_200, 3_600, 7_200],
+            "runner_policy_unknown",
+        ),
+    ];
+    for (case, requested, runner_max, expected, source) in cases {
+        let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(25));
+        let client = format!("timeout-matrix-{case}");
+        let project = register_detached_process_job_agent_with_optional_policy(
+            &runtime,
+            &client,
+            temp.path(),
+            runner_max.map(|max_timeout_secs| RunnerPolicySummary {
+                max_timeout_secs,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let auth = auth_context(None, true);
+        for ((entry, call), effective) in execution_timeout_calls(&project, requested)
+            .into_iter()
+            .zip(expected)
+        {
+            let tool_name = call.tool_name();
+            let (task, request) =
+                dispatch_process_until_request(&runtime, &client, call, auth.clone()).await;
+            assert_eq!(request.timeout_secs, effective, "{case}/{entry}");
+            let result = task.await.unwrap();
+            assert!(result.success, "{case}/{entry}: {result:?}");
+            let job_id = request.job_id.as_ref().unwrap();
+            assert_eq!(result.output["continuation"]["tool"], "observe_jobs");
+            assert_eq!(
+                result.output["continuation"]["arguments"]["items"][0]["job_id"],
+                *job_id
+            );
+            assert!(result.output["continuation"]["arguments"]["items"][0]
+                ["after_observation_token"]
+                .is_string());
+            if entry == "job" {
+                assert_eq!(result.output["execution_state"], "queued");
+                assert_eq!(result.output["command_started"], false);
+                assert_eq!(result.output["execution_lifetime"], "runner");
+                assert_eq!(
+                    result.output["requested_timeout_secs"],
+                    requested.unwrap_or(3_600)
+                );
+                assert_eq!(result.output["timeout_limit_source"], source);
+                if runner_max.is_some() {
+                    assert_eq!(result.output["effective_timeout_secs"], effective);
+                    assert_eq!(
+                        result.output["timeout_policy_basis"],
+                        "last_registered_runner_policy"
+                    );
+                    assert!(result.output.get("dispatched_timeout_secs").is_none());
+                } else {
+                    assert_eq!(
+                        result.output["effective_timeout_secs"],
+                        serde_json::Value::Null
+                    );
+                    assert_eq!(result.output["dispatched_timeout_secs"], effective);
+                    assert_eq!(
+                        result.output["timeout_policy_basis"],
+                        "runner_policy_unavailable"
+                    );
+                    assert!(result.output["timeout_notice"]
+                        .as_str()
+                        .unwrap()
+                        .contains("may be lower"));
+                }
+            } else if runner_max.is_none() {
+                assert!(result.output["timeout"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Runner policy unavailable"));
+            } else if requested.is_some_and(|requested| effective < requested) {
+                let timeout = result.output["timeout"]
+                    .as_str()
+                    .expect("pending cap notice");
+                assert!(
+                    timeout.contains(&format!("{effective}s")),
+                    "{case}/{entry}: {timeout}"
+                );
+                assert!(timeout.contains(if source == "runner_policy" {
+                    "runner policy"
+                } else {
+                    "tool limit"
+                }));
+            }
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &serde_json::to_value(&result).unwrap(),
+                &crate::tool_runtime::registry::output_schema_for_tool(tool_name),
+            )
+            .unwrap();
+            update_process_job(
+                &runtime,
+                &client,
+                &request,
+                "completed",
+                Some(ShellCommandExecutionState::Completed),
+                Some(0),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn execution_timeout_matrix_rejects_zero_before_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client = "timeout-matrix-invalid";
+    let project = register_detached_process_job_agent_with_policy(
+        &runtime,
+        client,
+        temp.path(),
+        RunnerPolicySummary::default(),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    let mut calls = execution_timeout_calls(&project, Some(0));
+    calls.push((
+        "negative_job",
+        ToolCall::RunJob {
+            project: project.clone(),
+            command: "printf lifecycle".to_string(),
+            session_id: None,
+            timeout_secs: Some(-1),
+            cwd: None,
+            purpose: None,
+            shell: None,
+        },
+    ));
+    for (entry, call) in calls {
+        let result = runtime.dispatch_with_auth(call, Some(&auth)).await;
+        assert!(!result.success, "{entry}: {result:?}");
+        assert_eq!(result.output["execution_state"], "not_started", "{entry}");
+        assert_eq!(result.output["command_started"], false, "{entry}");
+        assert_eq!(
+            result.output["failure_kind"], "invalid_arguments",
+            "{entry}"
+        );
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("connected"),
+            "{entry}"
+        );
+        assert!(
+            probe_patch_agent_request(&runtime, client).await.is_none(),
+            "{entry} dispatched invalid input"
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_timeout_matrix_observes_same_job_after_start_failure_timeout_and_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(25));
+    let client = "timeout-matrix-lifecycle";
+    let project = register_detached_process_job_agent_with_policy(
+        &runtime,
+        client,
+        temp.path(),
+        RunnerPolicySummary::default(),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    for (status, state, exit_code, reason) in [
+        (
+            "failed",
+            ShellCommandExecutionState::NotStarted,
+            None,
+            "runner rejected command before spawn",
+        ),
+        (
+            "timeout",
+            ShellCommandExecutionState::TimedOut,
+            Some(-1),
+            "execution budget elapsed after command start",
+        ),
+        (
+            "lost",
+            ShellCommandExecutionState::OutcomeUnknown,
+            None,
+            "terminal outcome unavailable after command start",
+        ),
+    ] {
+        for (entry, call) in execution_timeout_calls(&project, Some(30)) {
+            let (task, request) =
+                dispatch_process_until_request(&runtime, client, call, auth.clone()).await;
+            let initial = task.await.unwrap();
+            assert!(initial.success, "{entry}: {initial:?}");
+            let job_id = request.job_id.as_ref().unwrap();
+            assert_eq!(
+                initial.output["continuation"]["arguments"]["items"][0]["job_id"],
+                *job_id
+            );
+            update_process_job(
+                &runtime,
+                client,
+                &request,
+                status,
+                Some(state),
+                exit_code,
+                Some("partial output\n"),
+                None,
+                Some(reason),
+            )
+            .await;
+            let observe = ToolCall::from_tool_name(
+                "observe_jobs",
+                json!({
+                    "items": [{"job_id": job_id}], "summary_only": false
+                }),
+            )
+            .unwrap();
+            let observation = runtime.dispatch_with_auth(observe, Some(&auth)).await;
+            assert!(observation.success, "{entry}/{status}: {observation:?}");
+            let observed = &observation.output["items"][0];
+            assert_eq!(observed["success"], true, "{entry}/{status}: {observed:?}");
+            let item = &observed["output"];
+            assert_eq!(item["job_id"], *job_id);
+            assert_eq!(item["status"], status);
+            assert_eq!(
+                item["command_execution_state"],
+                serde_json::to_value(state).unwrap()
+            );
+            assert_eq!(item["terminal"], true);
+            assert!(item["observation_token"].is_string());
+            assert!(item["error"].as_str().unwrap_or_default().contains(reason));
+            let cli = crate::mcp::cli_call_for_test(
+                &runtime,
+                "observe_jobs",
+                json!({"items": [{"job_id": job_id}], "summary_only": false}),
+                &auth,
+            )
+            .await;
+            assert_eq!(cli["result"]["isError"], false, "{entry}/{status}: {cli}");
+            let text = cli["result"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|content| content["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for evidence in [job_id.as_str(), status, reason] {
+                assert!(
+                    text.contains(evidence),
+                    "{entry}/{status}: missing {evidence}: {text}"
+                );
+            }
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &serde_json::to_value(&observation).unwrap(),
+                &crate::tool_runtime::registry::output_schema_for_tool("observe_jobs"),
+            )
+            .unwrap();
+
+            assert!(
+                probe_patch_agent_request(&runtime, client).await.is_none(),
+                "{entry}/{status} redispatched"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn execution_timeout_matrix_admission_errors_remain_typed_without_connection_hints() {
+    let temp = tempfile::tempdir().unwrap();
+    for client in ["job-admission", "offline-permission-denied-job-admission"] {
+        let runtime = test_runtime();
+        let project = register_detached_process_job_agent_with_policy(
+            &runtime,
+            client,
+            temp.path(),
+            RunnerPolicySummary::default(),
+        )
+        .await;
+        let result = runtime
+            .dispatch_with_auth(
+                ToolCall::RunJob {
+                    project,
+                    command: " ".to_string(),
+                    session_id: None,
+                    timeout_secs: Some(30),
+                    cwd: None,
+                    purpose: None,
+                    shell: None,
+                },
+                Some(&auth_context(None, true)),
+            )
+            .await;
+        assert!(!result.success, "{result:?}");
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert_eq!(result.output["command_started"], false);
+        assert_eq!(result.output["failure_kind"], "invalid_arguments");
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("correct the rejected execution arguments"));
+        assert!(!result.error.as_deref().unwrap().contains("connection"));
+        assert!(probe_patch_agent_request(&runtime, client).await.is_none());
+    }
 }
 
 fn structured_job_request_kind(entry: &str) -> String {
@@ -172,12 +536,23 @@ async fn register_detached_process_job_agent_with_policy(
     root: &std::path::Path,
     policy: RunnerPolicySummary,
 ) -> String {
+    register_detached_process_job_agent_with_optional_policy(runtime, client_id, root, Some(policy))
+        .await
+}
+
+async fn register_detached_process_job_agent_with_optional_policy(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    root: &std::path::Path,
+    policy: Option<RunnerPolicySummary>,
+) -> String {
     let capabilities = RunnerCapabilities {
         shell: true,
         async_jobs: true,
         async_shell_jobs: true,
         structured_validation_argv: true,
         structured_process_argv: true,
+        structured_script_payload: true,
         structured_execution_jobs: true,
         detached_process_jobs: true,
         ..Default::default()
@@ -188,7 +563,7 @@ async fn register_detached_process_job_agent_with_policy(
         None,
         capabilities,
         vec![registered_project("demo", &root.to_string_lossy())],
-        Some(policy),
+        policy,
     )
     .await;
     crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
@@ -245,25 +620,21 @@ async fn update_process_job(
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            job_id: request.job_id.clone().expect("structured Job id"),
             request_id: Some(request.request_id.clone()),
-            update_seq: None,
-            status: status.to_string(),
             stdout_chunk: stdout.map(str::to_string),
             stderr_chunk: stderr.map(str::to_string),
-            log_snapshot: None,
             exit_code,
             duration_ms: state.map(|_| 25),
             error: error.map(str::to_string),
             command_execution_state: state,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
             activity,
-            finished: state.is_some(),
+            ..runner_job_update(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.job_id.clone().expect("structured Job id"),
+                status.to_string(),
+                state.is_some(),
+            )
         })
         .await
         .unwrap();
@@ -318,11 +689,16 @@ async fn dispatch_typed_process_until_request(
         let runtime = runtime.clone();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata(
+                .dispatch_with_context(
                     call,
-                    Some(&auth),
-                    crate::tool_runtime::sessions::SessionTransport::Mcp,
-                    metadata,
+                    DispatchContext {
+                        recorder: metadata,
+                        ..DispatchContext::internal(
+                            Some(&auth),
+                            crate::tool_runtime::sessions::SessionTransport::Mcp,
+                            None,
+                        )
+                    },
                 )
                 .await
         }
@@ -912,7 +1288,7 @@ async fn detached_process_idempotency_replays_same_intent_and_rejects_conflict()
         )
         .await;
     assert!(first.success, "{:?}", first.error);
-    let job_id = first.output["job_id"].as_str().unwrap().to_string();
+    let job_id = observe_job_continuation_job_id(&first.output).to_string();
     let request = wait_for_patch_agent_request(&runtime, "detached-idempotency").await;
     assert_eq!(request.job_id.as_deref(), Some(job_id.as_str()));
 
@@ -929,7 +1305,7 @@ async fn detached_process_idempotency_replays_same_intent_and_rejects_conflict()
         )
         .await;
     assert!(replay.success, "{:?}", replay.error);
-    assert_eq!(replay.output["job_id"], job_id);
+    assert_eq!(observe_job_continuation_job_id(&replay.output), job_id);
     assert!(
         probe_patch_agent_request(&runtime, "detached-idempotency")
             .await
@@ -1029,7 +1405,7 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
         )
         .await;
     assert!(first.success, "{:?}", first.error);
-    let job_id = first.output["job_id"].as_str().unwrap().to_string();
+    let job_id = observe_job_continuation_job_id(&first.output).to_string();
     let request = wait_for_patch_agent_request(&first_runtime, "detached-restart-recovery").await;
     let context = request
         .job_context
@@ -1054,10 +1430,6 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
     restarted
         .runner_registry
         .register(crate::runner_protocol::RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
             job_inventory: Some(crate::runner_protocol::ShellJobInventory {
                 active_complete: true,
                 jobs: vec![crate::runner_protocol::ShellJobSnapshot {
@@ -1086,17 +1458,11 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
                     }),
                 }],
             }),
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "detached-restart-recovery".to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
-            owner: None,
-            hostname: None,
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(capabilities),
-            policy: None,
+            ..crate::test_support::runner_registration(
+                "detached-restart-recovery",
+                "inst",
+                capabilities,
+            )
         })
         .await
         .unwrap();
@@ -1138,14 +1504,11 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
         "lost-response recovery must not enqueue a second payload"
     );
     let status = restarted
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(
-        status.success,
-        "reconstructed logical Job must remain observable"
-    );
-    assert_eq!(status.output["job_id"], job_id);
-    assert_eq!(status.output["status"], "running");
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(status.job.job_id, job_id);
+    assert_eq!(status.job.status, "running");
 }
 
 #[tokio::test]
@@ -1179,8 +1542,8 @@ async fn detached_process_uses_existing_job_identity_and_typed_runner_request() 
         .dispatch_with_auth(detached_process_call(project), Some(&auth))
         .await;
     assert!(result.success, "{:?}", result.error);
-    let job_id = result.output["job_id"].as_str().unwrap().to_string();
-    assert_eq!(result.output["execution_source"], "run_detached_process");
+    let job_id =
+        assert_sparse_pending_job_handoff_with_unreported_policy(&result.output, 30).to_string();
     assert_observe_job_continuation(&result.output);
 
     let request = wait_for_patch_agent_request(&runtime, "detached-product-path").await;
@@ -1216,10 +1579,11 @@ async fn detached_process_reports_runner_policy_timeout_clamp_at_admission() {
 
     let result = runtime.dispatch_with_auth(call, Some(&auth)).await;
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["requested_timeout_secs"], 18_000);
-    assert_eq!(result.output["effective_timeout_secs"], 3_600);
-    assert_eq!(result.output["runner_policy_max_timeout_secs"], 3_600);
-    assert_eq!(result.output["timeout_clamped"], true);
+    assert_eq!(
+        result.output["timeout"],
+        "3600s (requested 18000; capped by runner policy)"
+    );
+    assert_observe_job_continuation(&result.output);
 
     let request = wait_for_patch_agent_request(&runtime, "detached-policy-clamp").await;
     assert_eq!(request.timeout_secs, 18_000);
@@ -1284,7 +1648,6 @@ async fn structured_execution_fast_terminal_jobs_project_back_without_visible_du
                     "exit_code",
                     "duration_ms",
                     "purpose",
-                    "cwd",
                     "executor",
                     "promoted_to_job",
                     "terminal",
@@ -1300,14 +1663,15 @@ async fn structured_execution_fast_terminal_jobs_project_back_without_visible_du
                     "stdout_truncated",
                     "stderr_truncated",
                 ] {
-                    if entry == "shell" && matches!(omitted, "purpose" | "cwd") {
-                        continue; // Shell retains its command presentation on fast success.
-                    }
                     assert!(
                         result.output.get(omitted).is_none(),
                         "{entry} boring terminal success field {omitted} should be omitted: {}",
                         result.output
                     );
+                }
+                assert!(result.output.get("cwd").is_none());
+                if entry == "shell" {
+                    assert!(result.output.get("shell").is_none());
                 }
             } else {
                 assert_eq!(result.output["execution_state"], "completed");
@@ -1426,11 +1790,12 @@ async fn run_process_terminal_success_is_sparse_after_full_session_effect_record
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
-            runtime.dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
-                call, Some(&auth), sessions::SessionTransport::Api,
-                Default::default(), None, true, Vec::new(), Default::default(),
-                Default::default(), super::super::return_timing::ToolReturnTimingPolicy::unconstrained(),
-            ).await
+            runtime
+                .dispatch_canonical(
+                    call,
+                    DispatchContext::internal(Some(&auth), sessions::SessionTransport::Api, None),
+                )
+                .await
         }
     });
     let request = wait_for_patch_agent_request(&runtime, "process-sparse-ledger").await;
@@ -1481,6 +1846,10 @@ async fn run_process_terminal_success_is_sparse_after_full_session_effect_record
     let metrics = timer.finish().record_for_tool_result(&result).unwrap();
     assert_eq!(metrics.execution_state.as_deref(), Some("completed"));
     assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        result.output["cwd"], ".",
+        "explicit Session context must remain visible"
+    );
     for omitted in [
         "execution_state",
         "command_started",
@@ -1489,7 +1858,6 @@ async fn run_process_terminal_success_is_sparse_after_full_session_effect_record
         "exit_code",
         "duration_ms",
         "purpose",
-        "cwd",
         "executor",
         "promoted_to_job",
         "terminal",
@@ -1552,65 +1920,120 @@ async fn run_process_terminal_success_is_sparse_after_full_session_effect_record
 }
 
 #[tokio::test]
-async fn run_process_fast_terminal_projection_does_not_silently_drop_retained_lines() {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(250));
-    let project = register_process_job_agent(&runtime, "process-fast-log-job", temp.path()).await;
-    let auth = auth_context(None, true);
-    let retained_stdout = (0..300)
-        .map(|line| format!("retained-line-{line:03}\n"))
-        .collect::<String>();
-    assert!(
-        retained_stdout.len() < crate::runner_protocol::JOB_SNAPSHOT_STREAM_MAX_BYTES,
-        "fixture must fit the Runner-retained snapshot bound"
-    );
-    assert!(
-        retained_stdout.chars().count() < super::super::helpers::COMMAND_STDIO_TAIL_CHARS,
-        "fixture must fit the model-facing terminal projection bound"
-    );
+async fn run_process_fast_terminal_projection_bounds_lines_with_explicit_loss_notice() {
+    for first_retained_line in [1, 101] {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime =
+            test_runtime().with_structured_execution_sync_wait(Duration::from_millis(250));
+        let registration = crate::test_support::runner_registration(
+            "process-fast-log-job",
+            "inst",
+            RunnerCapabilities {
+                shell: true,
+                async_jobs: true,
+                async_shell_jobs: true,
+                structured_process_argv: true,
+                structured_execution_jobs: true,
+                job_state_reconciliation: true,
+                ..Default::default()
+            },
+        );
+        runtime
+            .runner_registry
+            .register(crate::runner_protocol::RunnerRegisterRequest {
+                job_inventory: Some(crate::runner_protocol::ShellJobInventory {
+                    active_complete: true,
+                    jobs: vec![],
+                }),
+                ..registration
+            })
+            .await
+            .unwrap();
+        crate::test_support::apply_project_inventory_snapshot(
+            &runtime.runner_registry,
+            "process-fast-log-job",
+            "inst",
+            vec![registered_project("demo", &temp.path().to_string_lossy())],
+        )
+        .await;
+        let project =
+            crate::tool_runtime::runner_project_runtime_id("process-fast-log-job", "demo");
+        let auth = auth_context(None, true);
+        let retained_stdout = (0..300)
+            .map(|line| format!("retained-line-{line:03}\n"))
+            .collect::<String>();
+        assert!(
+            retained_stdout.len() < crate::runner_protocol::JOB_SNAPSHOT_STREAM_MAX_BYTES,
+            "fixture must fit the Runner-retained snapshot bound"
+        );
+        assert!(
+            retained_stdout.chars().count() < super::super::helpers::COMMAND_STDIO_TAIL_CHARS,
+            "fixture must fit the model-facing terminal projection bound"
+        );
 
-    let (task, request) = dispatch_process_until_request(
-        &runtime,
-        "process-fast-log-job",
-        process_call(project.clone(), None),
-        auth.clone(),
-    )
-    .await;
-    update_process_job(
-        &runtime,
-        "process-fast-log-job",
-        &request,
-        "running",
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
-    update_process_job(
-        &runtime,
-        "process-fast-log-job",
-        &request,
-        "completed",
-        Some(ShellCommandExecutionState::Completed),
-        Some(0),
-        Some(retained_stdout.as_str()),
-        None,
-        None,
-    )
-    .await;
+        let (task, request) = dispatch_process_until_request(
+            &runtime,
+            "process-fast-log-job",
+            process_call(project.clone(), None),
+            auth.clone(),
+        )
+        .await;
+        runtime
+            .runner_registry
+            .update_job(RunnerJobUpdateRequest {
+                request_id: Some(request.request_id.clone()),
+                update_seq: Some(1),
+                exit_code: Some(0),
+                command_execution_state: Some(ShellCommandExecutionState::Completed),
+                log_snapshot: Some(crate::runner_protocol::ShellJobLogSnapshot {
+                    stdout: crate::runner_protocol::ShellJobStreamSnapshot {
+                        tail: retained_stdout.clone(),
+                        first_retained_line,
+                        next_line: first_retained_line + 300,
+                        truncated: first_retained_line > 1,
+                    },
+                    stderr: Default::default(),
+                }),
+                ..runner_job_update(
+                    "process-fast-log-job".into(),
+                    "inst".into(),
+                    request.job_id.clone().unwrap(),
+                    "completed".into(),
+                    true,
+                )
+            })
+            .await
+            .unwrap();
 
-    let result = task.await.unwrap();
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(
-        result.output["stdout_tail"].as_str(),
-        Some(retained_stdout.as_str())
-    );
-    assert_eq!(result.output["stdout_lines"], 300);
-    assert!(result.output.get("stdout_truncated").is_none());
-    assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+        let result = task.await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let preview = result.output["stdout_tail"].as_str().unwrap();
+        assert!(preview.starts_with("retained-line-000"), "{preview}");
+        assert!(preview.contains("retained-line-299"), "{preview}");
+        assert!(preview.contains("output omitted"));
+        assert_eq!(result.output["stdout_lines"], 300);
+        assert_eq!(result.output["stdout_truncated"], true);
+        assert!(result.output["output_hint"]
+            .as_str()
+            .unwrap()
+            .contains("do not rerun"));
+        assert_eq!(result.output["promoted_to_job"], true);
+        assert_eq!(runtime.runner_registry.list_jobs(Some(10)).await.len(), 1);
+        let continuation = &result.output["continuation"];
+        let observed = runtime
+            .dispatch_with_auth(
+                ToolCall::from_tool_name("observe_jobs", continuation["arguments"].clone())
+                    .unwrap(),
+                Some(&auth),
+            )
+            .await;
+        assert!(observed.success, "{observed:?}");
+        assert!(observed.output.to_string().contains("retained-line-000"));
+        assert_eq!(
+            observed.output["items"][0]["output"]["stdout_lines"],
+            first_retained_line + 299
+        );
+    }
 }
 
 #[tokio::test]
@@ -1713,30 +2136,29 @@ async fn run_process_six_hour_handoff_is_queryable_once_and_keeps_the_original_b
     let handoff = task.await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(handoff.success, "{:?}", handoff.error);
-    let job_id = assert_sparse_pending_job_handoff(&handoff.output).to_string();
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 21_600)
+        .to_string();
     assert_eq!(request.job_id.as_deref(), Some(job_id.as_str()));
 
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["job_id"], job_id);
-    assert_eq!(status.output["status"], "running");
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(status.job.job_id, job_id);
+    assert_eq!(status.job.status, "running");
     assert_eq!(
-        status.output["activity"],
+        serde_json::to_value(&status.job.activity).unwrap(),
         json!({
             "state": "working",
             "phase": "process_running",
             "source": "runner_execution"
         })
     );
-    assert!(status.output["command_execution_state"].is_null());
-    assert_eq!(
-        status.output["structured_execution"]["execution_source"],
-        "run_process"
-    );
-    assert_eq!(status.output["structured_execution"]["arg_count"], 3);
-    assert_eq!(status.output["structured_execution"]["stdin_present"], true);
+    assert!(status.job.command_execution_state.is_none());
+    let execution = status.job.structured_execution.as_ref().unwrap();
+    assert_eq!(execution.execution_source, "run_process");
+    assert_eq!(execution.arg_count, 3);
+    assert!(execution.stdin_present);
     let list = runtime
         .dispatch_with_auth(
             ToolCall::ListJobs {
@@ -1770,14 +2192,22 @@ async fn run_process_six_hour_handoff_is_queryable_once_and_keeps_the_original_b
     )
     .await;
     let terminal = runtime
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(terminal.success, "{:?}", terminal.error);
-    assert_eq!(terminal.output["status"], "completed");
-    assert!(terminal.output["activity"].is_null());
-    assert_eq!(terminal.output["command_execution_state"], "completed");
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(terminal.job.status, "completed");
+    assert!(terminal.job.activity.is_none());
     assert_eq!(
-        terminal.output["structured_execution"]["execution_source"],
+        terminal.job.command_execution_state,
+        Some(ShellCommandExecutionState::Completed)
+    );
+    assert_eq!(
+        terminal
+            .job
+            .structured_execution
+            .as_ref()
+            .unwrap()
+            .execution_source,
         "run_process"
     );
     assert!(probe_patch_agent_request(&runtime, "process-slow-job")
@@ -1895,7 +2325,8 @@ async fn structured_execution_stop_job_preserves_handoff_identity_without_replac
         )
         .await;
         let handoff = task.await.unwrap();
-        let job_id = assert_sparse_pending_job_handoff(&handoff.output).to_string();
+        let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 30)
+            .to_string();
         assert_eq!(start_request.kind, structured_job_request_kind(entry));
         assert_eq!(start_request.job_id.as_deref(), Some(job_id.as_str()));
         assert!(
@@ -1979,7 +2410,7 @@ async fn promoted_process_inherits_the_initiating_session_without_a_second_tool_
     )
     .await;
     let handoff = task.await.unwrap();
-    let job_id = assert_sparse_pending_job_handoff(&handoff.output);
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 30);
     let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(job.session_id.as_deref(), Some(session.session_id.as_str()));
     assert_eq!(job.project_id.as_deref(), Some(project.as_str()));
@@ -2419,7 +2850,7 @@ async fn run_process_session_default_cwd_applies_without_default_shell() {
     .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert!(result.output.get("cwd").is_none());
+    assert_eq!(result.output["cwd"], "frontend");
     let summary = runtime
         .sessions
         .summary(&session.session_id, Some(20))
@@ -2857,11 +3288,16 @@ async fn run_process_shell_command_mode_recovery_is_lossless_parser_ready_and_pr
             let auth_copy = auth.clone();
             let task = tokio::spawn(async move {
                 runtime_copy
-                    .dispatch_with_auth_transport_options_and_metadata(
+                    .dispatch_with_context(
                         call,
-                        Some(&auth_copy),
-                        sessions::SessionTransport::Mcp,
-                        metadata,
+                        DispatchContext {
+                            recorder: metadata,
+                            ..DispatchContext::internal(
+                                Some(&auth_copy),
+                                sessions::SessionTransport::Mcp,
+                                None,
+                            )
+                        },
                     )
                     .await
             });
@@ -2957,21 +3393,10 @@ async fn shell_recovery_requires_raw_shell_policy_and_explicit_selection_capabil
         runtime
             .runner_registry
             .register(crate::runner_protocol::RunnerRegisterRequest {
-                computer_session_availability: None,
-                process_started_at: None,
-                build: None,
-                job_concurrency_limit: None,
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client.to_string(),
-                runner_instance_id: "inst".to_string(),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                display_name: None,
-                owner: None,
-                hostname: None,
-                host_context: None,
-                capabilities: crate::test_support::current_runner_capabilities(
+                policy: Some(policy(allow_raw_shell)),
+                ..crate::test_support::runner_registration(
+                    &client,
+                    "inst",
                     RunnerCapabilities {
                         shell: true,
                         structured_process_argv: true,
@@ -2979,8 +3404,7 @@ async fn shell_recovery_requires_raw_shell_policy_and_explicit_selection_capabil
                         bash_login_shell: true,
                         ..Default::default()
                     },
-                ),
-                policy: Some(policy(allow_raw_shell)),
+                )
             })
             .await
             .unwrap();
@@ -3048,6 +3472,81 @@ async fn typed_execution_admission_projection_preserves_not_started_for_all_runn
             assert_eq!(&result.output, expected);
         } else {
             expected_output = Some(result.output);
+        }
+    }
+}
+
+#[tokio::test]
+async fn structured_entries_apply_runner_ceiling_and_only_explain_background_caps() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(250));
+    let client = "structured-policy-cap";
+    let project = register_detached_process_job_agent_with_policy(
+        &runtime,
+        client,
+        temp.path(),
+        RunnerPolicySummary {
+            max_timeout_secs: 120,
+            ..Default::default()
+        },
+    )
+    .await;
+    let auth = auth_context(None, true);
+    for fast in [false, true] {
+        for (entry, call) in structured_execution_calls(&project, 99_999, None) {
+            let (task, request) =
+                dispatch_process_until_request(&runtime, client, call, auth.clone()).await;
+            assert_eq!(request.timeout_secs, 120, "{entry}");
+            if fast {
+                update_process_job(
+                    &runtime,
+                    client,
+                    &request,
+                    "completed",
+                    Some(ShellCommandExecutionState::Completed),
+                    Some(0),
+                    Some("done\n"),
+                    None,
+                    None,
+                )
+                .await;
+            }
+            let result = task.await.unwrap();
+            assert!(result.success, "{entry}: {result:?}");
+            if fast {
+                assert!(
+                    result.output.get("timeout").is_none(),
+                    "{entry}: {}",
+                    result.output
+                );
+            } else {
+                assert_eq!(
+                    result.output["timeout"], "120s (requested 99999; capped by runner policy)",
+                    "{entry}"
+                );
+                assert_observe_job_continuation(&result.output);
+                update_process_job(
+                    &runtime,
+                    client,
+                    &request,
+                    "completed",
+                    Some(ShellCommandExecutionState::Completed),
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &serde_json::to_value(&result).unwrap(),
+                &crate::tool_runtime::registry::output_schema_for_tool(match entry {
+                    "process" => "run_process",
+                    "script" => "run_script",
+                    _ => "run_shell",
+                }),
+            )
+            .unwrap();
         }
     }
 }

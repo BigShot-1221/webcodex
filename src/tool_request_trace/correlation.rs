@@ -147,6 +147,41 @@ pub(super) fn lookup_request_correlation(request_id: &str) -> Option<TraceCorrel
     correlations.requests.get(request_id).cloned()
 }
 
+/// Server queue boundaries only: dequeue does not attest native execution,
+/// and a closed waiter does not identify a UI Stop or cancel a durable Job.
+pub(crate) fn record_runner_request_dequeued(request_id: &str, queue_wait: Duration) {
+    record_runner_queue_stage(
+        request_id,
+        "tool_runner_request_dequeued",
+        json!({"queue_wait_ms":queue_wait.as_secs_f64() * 1000.0}),
+    );
+}
+
+pub(crate) fn record_runner_request_cancelled(
+    request_id: &str,
+    dispatched: bool,
+    reason: webcodex_runner_registry::RunnerRequestCancellationReason,
+) {
+    record_runner_queue_stage(
+        request_id,
+        "tool_runner_request_cancelled",
+        json!({"dispatched":dispatched, "reason":reason.as_str()}),
+    );
+}
+
+fn record_runner_queue_stage(request_id: &str, stage: &'static str, fields: Value) {
+    if !tool_request_trace_enabled() {
+        return;
+    }
+    let Some(correlation) = lookup_request_correlation(request_id) else {
+        return;
+    };
+    let mut event = base_event(&correlation.trace_id, stage);
+    merge_event_fields(&mut event, json!({"runner_request_id":request_id}));
+    merge_event_fields(&mut event, fields);
+    enqueue_metadata_event(&correlation.trace_id, stage, event);
+}
+
 pub(super) fn resolve_job_correlation(
     correlations: &TraceCorrelations,
     request_id: Option<&str>,

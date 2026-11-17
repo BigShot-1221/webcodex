@@ -747,21 +747,20 @@ impl SkillStore {
             return Err("skill_resource_too_large".to_string());
         }
         let range = file_read_range::EffectiveRange::new(Some(start_line), Some(limit));
-        let read = file_read_range::read_range_with_budget(
-            &target,
-            range,
-            MAX_SKILL_STORE_READ_TEXT_BYTES,
-        )
-        .map_err(|error| match error.reason {
-            file_read_range::ReadFileReason::InvalidUtf8 => {
-                "skill_resource_unsupported_encoding".to_string()
-            }
-            file_read_range::ReadFileReason::NotFound => "skill_resource_not_found".to_string(),
-            file_read_range::ReadFileReason::RangeTooLarge => {
-                "skill_read_result_too_large".to_string()
-            }
-            _ => "skill_resource_unavailable".to_string(),
-        })?;
+        let read =
+            file_read_range::read_page_with_budget(&target, range, MAX_SKILL_STORE_READ_TEXT_BYTES)
+                .map_err(|error| match error.reason {
+                    file_read_range::ReadFileReason::InvalidUtf8 => {
+                        "skill_resource_unsupported_encoding".to_string()
+                    }
+                    file_read_range::ReadFileReason::NotFound => {
+                        "skill_resource_not_found".to_string()
+                    }
+                    file_read_range::ReadFileReason::RangeTooLarge => {
+                        "skill_read_result_too_large".to_string()
+                    }
+                    _ => "skill_resource_unavailable".to_string(),
+                })?;
         // The package revision covers the full normalized package tree, not
         // only SKILL.md. Revalidate the complete immutable tree after reading
         // so an out-of-band regular-file edit cannot be returned under the old
@@ -3442,6 +3441,76 @@ mod tests {
                 .unwrap_err(),
             "skill_resource_path_invalid"
         );
+    }
+
+    #[test]
+    fn resource_read_pages_at_text_budget_with_complete_revision_and_cursor() {
+        let source = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = SkillStore::for_test(store_root.path().join("store"), "runner-a");
+        let policy = RunnerPolicy {
+            allow_cwd_anywhere: true,
+            ..RunnerPolicy::default()
+        };
+        let definition = b"---\nname: demo\ndescription: operator demo\n---\n";
+        let resource = (0..100)
+            .map(|i| format!("{i:03} {}", "x".repeat(1000)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let archive = zip_bytes(&[
+            ("SKILL.md", definition, None),
+            ("references/guide.md", resource.as_bytes(), None),
+        ]);
+        fs::write(source.path().join("skill.zip"), &archive).unwrap();
+        let installed = store
+            .install(
+                &policy,
+                "demo",
+                "project-a",
+                &source.path().to_string_lossy(),
+                "skill.zip",
+                &sha256_hex(&archive),
+                "install-page-test",
+                true,
+                None,
+            )
+            .unwrap();
+        let mut start = 1;
+        let mut lines = Vec::new();
+        loop {
+            let read = store
+                .read_resource(
+                    &installed.skill_id,
+                    "references/guide.md",
+                    start,
+                    100,
+                    Some(&installed.package_revision),
+                    Some(&installed.definition_revision),
+                )
+                .unwrap();
+            assert_eq!(read.sha256, sha256_hex(resource.as_bytes()));
+            assert_eq!(
+                read.skill.package_revision(),
+                Some(installed.package_revision.as_str())
+            );
+            assert_eq!(
+                read.skill.definition_revision(),
+                installed.definition_revision
+            );
+            assert!(read.returned_lines <= 100);
+            assert!(read.text.len() <= MAX_SKILL_STORE_READ_TEXT_BYTES);
+            assert!(read.returned_lines > 0);
+            lines.extend(read.text.split('\n').map(str::to_owned));
+            if let Some(next) = read.next_start_line {
+                assert!(read.has_more);
+                assert_eq!(next, start + read.returned_lines);
+                start = next;
+            } else {
+                assert!(!read.has_more);
+                break;
+            }
+        }
+        assert_eq!(lines.join("\n"), resource);
     }
 
     #[test]

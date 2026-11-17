@@ -8,20 +8,25 @@ use crate::client_window::ClientWindow;
 use crate::runner_http::RunnerTransport;
 use crate::runner_protocol::{
     RunnerBuildInfo, RunnerCapabilities, RunnerHostContext, RunnerProtocolGenerationNumber,
-    RunnerRegisterRequest, ShellJobOpRequest, RUNNER_PROTOCOL_GENERATION_V2,
+    RunnerRegisterRequest, RUNNER_PROTOCOL_GENERATION_V2,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 use crate::tool_runtime::observations::ToolCallObservation;
 use crate::tool_runtime::tool_inputs::{SessionMode, StartupDetail};
 use crate::tool_runtime::{ToolCall, ToolRuntime};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use webcodex_runner_registry::JobStartRequest;
 
 fn persisted_session_authority_fingerprint(
     ledger: &std::path::Path,
     session_id: &str,
 ) -> Option<String> {
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(ledger).unwrap()).unwrap();
+    let value: Value = serde_json::from_str(
+        &webcodex_workflow_session::root_test_support::read_ledger(ledger).unwrap(),
+    )
+    .unwrap();
     value["sessions"]
         .as_array()
         .unwrap()
@@ -32,7 +37,10 @@ fn persisted_session_authority_fingerprint(
 }
 
 fn rewrite_persisted_session_with_malformed_authority(ledger: &std::path::Path, session_id: &str) {
-    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(ledger).unwrap()).unwrap();
+    let mut value: Value = serde_json::from_str(
+        &webcodex_workflow_session::root_test_support::read_ledger(ledger).unwrap(),
+    )
+    .unwrap();
     let session = value["sessions"]
         .as_array_mut()
         .unwrap()
@@ -49,33 +57,24 @@ fn register_request(
     process_started_at: Option<i64>,
     build: Option<RunnerBuildInfo>,
 ) -> RunnerRegisterRequest {
-    crate::test_support::current_runner_registration(RunnerRegisterRequest {
-        computer_session_availability: None,
-        client_id: client_id.to_string(),
-        runner_instance_id: instance.to_string(),
-        runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-        display_name: None,
-        owner: None,
-        hostname: None,
-        host_context: None,
-        capabilities: RunnerCapabilities {
-            shell: true,
-            git: true,
-            file_read: true,
-            file_write: true,
-            jobs: true,
-            async_jobs: true,
-            async_shell_jobs: true,
-            ..Default::default()
-        },
-        policy: None,
+    RunnerRegisterRequest {
         process_started_at,
         build,
-        job_concurrency_limit: None,
-        job_inventory: None,
-        coding_agent_providers: None,
-        coding_agent_inventory: None,
-    })
+        ..crate::test_support::runner_registration(
+            client_id,
+            instance,
+            RunnerCapabilities {
+                shell: true,
+                git: true,
+                file_read: true,
+                file_write: true,
+                jobs: true,
+                async_jobs: true,
+                async_shell_jobs: true,
+                ..Default::default()
+            },
+        )
+    }
 }
 
 async fn register_with_project(
@@ -433,15 +432,42 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
         persisted_session_authority_fingerprint(&ledger, &session_id).as_deref(),
         Some(expected_fingerprint.as_str())
     );
+    let original_registration = runtime1
+        .runner_registry
+        .get_runner_view("canonical-restart-agent")
+        .await
+        .unwrap()
+        .projects
+        .into_iter()
+        .find(|project| project.id == "proj")
+        .unwrap();
     drop(runtime1);
 
     let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    register_runner_project_at_path_with_auth(
-        &runtime2,
+    runtime2
+        .runner_registry
+        .register_with_auth(
+            crate::test_support::runner_registration(
+                "canonical-restart-agent",
+                "inst",
+                RunnerCapabilities {
+                    shell: true,
+                    git: true,
+                    file_read: true,
+                    file_write: true,
+                    internal_posix_script: true,
+                    ..Default::default()
+                },
+            ),
+            Some(&crate::test_support::runner_access(&alice)),
+        )
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime2.runner_registry,
         "canonical-restart-agent",
-        "proj",
-        &project_root,
-        &alice,
+        "inst",
+        vec![original_registration],
     )
     .await;
     assert_eq!(runtime2.sessions.status().restored_sessions, 1);
@@ -465,7 +491,7 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
     );
 }
 #[tokio::test]
-async fn malformed_persisted_authority_is_discarded_fail_closed() {
+async fn malformed_persisted_authority_aborts_session_import_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let project_root = dir.path().join("proj");
@@ -496,13 +522,27 @@ async fn malformed_persisted_authority_is_discarded_fail_closed() {
     drop(runtime1);
     rewrite_persisted_session_with_malformed_authority(&ledger, &session_id);
 
-    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    assert_eq!(runtime2.sessions.status().restored_sessions, 0);
-    assert!(runtime2.sessions.summary(&session_id, None).is_none());
-    assert!(runtime2
-        .sessions
-        .session_target_authority(&session_id)
-        .is_none());
+    let original = std::fs::read(&ledger).unwrap();
+    let database = dir.path().join("rejected-import.db");
+    assert!(ToolRuntime::new_for_tests()
+        .with_session_database(&database, &ledger)
+        .is_err());
+    assert_eq!(std::fs::read(&ledger).unwrap(), original);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let published: i64 = connection
+        .query_row("SELECT count(*) FROM workflow_sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let imported: bool = connection
+        .query_row(
+            "SELECT imported FROM workflow_session_storage WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(published, 0);
+    assert!(!imported);
 }
 #[tokio::test]
 async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
@@ -513,21 +553,10 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
     let job = runtime
         .runner_registry
         .start_job(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("job-agent".to_string()),
-                cwd: None,
-                command: Some("sleep 60".to_string()),
-                timeout_secs: Some(120),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            JobStartRequest::shell("job-agent".to_string(), "sleep 60".to_string()),
             "reconnect-test".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -722,9 +751,6 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     assert_eq!(by_id("old-build")["version_matches_server"], false);
     assert!(by_id("old-build")["reason_code"].is_null());
     assert!(by_id("old-build")["action"].is_null());
-    let compact = crate::tool_runtime::runtime_info::compact_runtime_status(&status.output);
-    assert!(compact["runners"].get("clients").is_none());
-    assert_eq!(compact["compatibility"]["source_alignment"], "different");
 
     // No secrets/paths in the diagnostics.
     let text = compat.to_string().to_lowercase();
@@ -759,10 +785,6 @@ async fn runner_host_context_is_diagnostic_only() {
         full["host_context"]["architecture"],
         "Hosts the WebCodex Server/control plane."
     );
-
-    let compact = crate::tool_runtime::runtime_info::compact_runtime_status(&status.output);
-    assert!(compact["runners"].get("clients").is_none());
-    assert!(!compact.to_string().contains("host_context"));
 
     let listed = runtime.list_runners(None).await;
     assert!(listed.success);
@@ -847,12 +869,9 @@ async fn dispatch_coding_call_in_window_with_transport(
         async move {
             let window = ClientWindow::for_test(&window_id);
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_window(
+                .dispatch_with_context(
                     call,
-                    auth.as_ref(),
-                    transport,
-                    Default::default(),
-                    Some(&window),
+                    DispatchContext::internal(auth.as_ref(), transport, Some(&window)),
                 )
                 .await
         }

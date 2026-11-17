@@ -1,0 +1,4 @@
+ERROR: command failed
+completed; exit_code: 1
+stderr:
+permission denied

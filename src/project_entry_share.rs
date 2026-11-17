@@ -4,7 +4,8 @@ use super::client_handoff_service::{
 };
 use super::setup_service::{
     create_private_dir, generate_project_credential, read_private_value, read_project_credential,
-    write_new_private, ProjectConfig, ProjectPaths,
+    remove_private_state_file, replace_private_file, write_new_private, ProjectConfig,
+    ProjectPaths,
 };
 use super::{
     configured_project, ensure_local_runtime_port_available, parse_options,
@@ -49,18 +50,30 @@ pub(crate) struct ShareCommandOptions {
     pub(crate) tunnel: TunnelProvider,
     pub(crate) auth: ShareAuth,
     pub(crate) oauth_redirect_uri: Option<String>,
+    pub(crate) oauth_persist_on_restart: bool,
     pub(crate) public_url: Option<String>,
     pub(crate) copy_url: bool,
     pub(crate) stop_on_stdin_eof: bool,
+    /// Explicit parent-root grant for this OAuth share's project-share
+    /// subjects. Canonicalized and validated at parse time; persisted next to
+    /// the share OAuth client state so restarts keep the same grant.
+    pub(crate) oauth_project_roots: Vec<PathBuf>,
+    /// Whether the invocation expressed a parent-root choice at all
+    /// (`--project-roots` or `--no-project-roots`). Explicit invocations
+    /// replace the persisted grant; plain restarts restore it.
+    pub(crate) oauth_project_roots_explicit: bool,
 }
 
 pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions, String> {
     let mut tunnel = TunnelProvider::CloudflareQuick;
     let mut auth = ShareAuth::Bearer;
     let mut oauth_redirect_uri = None;
+    let mut oauth_persist_on_restart = false;
     let mut public_url = None;
     let mut copy_url = true;
     let mut stop_on_stdin_eof = false;
+    let mut oauth_project_roots: Vec<PathBuf> = Vec::new();
+    let mut oauth_project_roots_explicit = false;
     let mut project_args = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -121,8 +134,30 @@ pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions
                     return Err("--public-url may be specified only once".to_string());
                 }
             }
+            "--oauth-persist-on-restart" => oauth_persist_on_restart = true,
             "--no-copy-url" => copy_url = false,
             "--stop-on-stdin-eof" => stop_on_stdin_eof = true,
+            "--project-roots" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--project-roots requires a directory".to_string())?;
+                let root = validate_share_project_root(value)?;
+                if oauth_project_roots.len() >= crate::config::MAX_PROJECT_SHARE_ROOTS {
+                    return Err(format!(
+                        "at most {} --project-roots directories are supported",
+                        crate::config::MAX_PROJECT_SHARE_ROOTS
+                    ));
+                }
+                if !oauth_project_roots.contains(&root) {
+                    oauth_project_roots.push(root);
+                }
+                oauth_project_roots_explicit = true;
+            }
+            "--no-project-roots" => {
+                oauth_project_roots.clear();
+                oauth_project_roots_explicit = true;
+            }
             flag => project_args.push(flag.to_string()),
         }
         index += 1;
@@ -145,12 +180,21 @@ pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions
     if let Some(redirect_uri) = oauth_redirect_uri.as_deref() {
         crate::oauth_http::validate_redirect_uri(redirect_uri)?;
     }
+    if oauth_persist_on_restart && auth != ShareAuth::OAuth {
+        return Err("--oauth-persist-on-restart requires --auth oauth".to_string());
+    }
     let project = parse_options(&project_args, "share")?;
     if project.json && auth == ShareAuth::OAuth {
         return Err(
             "share --json supports bearer or query-token handoff; OAuth client secrets are intentionally excluded from the machine protocol"
                 .to_string(),
         );
+    }
+    if !oauth_project_roots.is_empty() && auth != ShareAuth::OAuth {
+        return Err("--project-roots requires --auth oauth".to_string());
+    }
+    if oauth_project_roots_explicit && auth != ShareAuth::OAuth {
+        return Err("--no-project-roots requires --auth oauth".to_string());
     }
     if stop_on_stdin_eof && !project.json {
         return Err("--stop-on-stdin-eof requires --json machine integration mode".to_string());
@@ -160,10 +204,115 @@ pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions
         tunnel,
         auth,
         oauth_redirect_uri,
+        oauth_persist_on_restart,
         public_url,
         copy_url,
         stop_on_stdin_eof,
+        oauth_project_roots,
+        oauth_project_roots_explicit,
     })
+}
+
+/// Validate one `--project-roots` value at share-start time. The root must be
+/// an existing absolute directory; it is canonicalized here so the persisted
+/// grant and the Server-side fence compare the same real directory, and so a
+/// symlinked spelling cannot smuggle a different authorization target.
+fn validate_share_project_root(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    let path = Path::new(trimmed);
+    if trimmed.is_empty() || !path.is_absolute() {
+        return Err(format!(
+            "--project-roots requires an absolute directory path, got '{trimmed}'"
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("--project-roots directory '{trimmed}' is not usable: {error}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("--project-roots '{trimmed}' is not a directory"));
+    }
+    Ok(canonical)
+}
+
+const SHARE_PROJECT_ROOTS_FILE: &str = "project-roots";
+
+/// Read the persisted parent-root grant from the share OAuth state directory.
+/// A JSON array of canonical absolute paths; unreadable or malformed state
+/// fails closed, and an absent file means no grant (the exact-path fence stays).
+fn read_persisted_share_project_roots(directory: &Path) -> Vec<PathBuf> {
+    let Ok(content) = std::fs::read_to_string(directory.join(SHARE_PROJECT_ROOTS_FILE)) else {
+        return Vec::new();
+    };
+    // A line-delimited path list is unsafe: on Unix a legitimate directory
+    // name may contain a newline, so a path like /tmp/grant\n/etc would
+    // restore as an unrelated grant to /etc. Persist one unambiguous JSON
+    // array instead and reject obsolete/malformed encodings fail closed.
+    let Ok(roots) = serde_json::from_str::<Vec<String>>(&content) else {
+        return Vec::new();
+    };
+    if roots.len() > crate::config::MAX_PROJECT_SHARE_ROOTS {
+        return Vec::new();
+    }
+    roots
+        .iter()
+        .filter_map(|path| validate_share_project_root(path).ok())
+        .collect()
+}
+
+/// Whether the stored roots file may serve as the no-op fast path: a regular
+/// file (never through a symlink) at owner-only permissions holding exactly
+/// the requested bytes. Anything else — a symlink with equal content, a
+/// wide-permission file, or a different value — falls through to the safe
+/// same-directory replacement, which repairs the target type and permissions
+/// instead of returning success while leaving a non-conforming target.
+fn stored_roots_is_owner_only_file_with(path: &Path, bytes: &[u8]) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return false;
+        }
+    }
+    std::fs::read(path).ok().as_deref() == Some(bytes)
+}
+
+/// Persist the parent-root grant next to the share OAuth client state.
+///
+/// Explicit invocations must be idempotent and updatable: the same list may be
+/// re-sent by an unchanging systemd unit on every restart, a changed list
+/// replaces the previous grant, and an empty list clears it. An identical
+/// stored grant is left untouched; a different one is replaced through an
+/// atomic same-directory rename that never destroys the previous value on
+/// failure. Failure is fatal for an explicit grant: a share that silently
+/// drops its roots would report success while denying the intended
+/// directories.
+fn persist_share_project_roots(directory: &Path, roots: &[PathBuf]) -> Result<(), ProductError> {
+    create_private_dir(directory)?;
+    let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+    if roots.is_empty() {
+        return remove_private_state_file(&path);
+    }
+    // JSON escapes embedded newlines and path delimiters. Never reinterpret
+    // one canonical user-approved root as multiple grants after a restart.
+    let encoded_roots = roots
+        .iter()
+        .map(|root| {
+            root.to_str()
+                .ok_or_else(|| share_oauth_state_error("project share root is not valid UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let bytes = serde_json::to_vec(&encoded_roots)
+        .map_err(|_| share_oauth_state_error("could not encode project share root grants"))?;
+    if stored_roots_is_owner_only_file_with(&path, &bytes) {
+        return Ok(());
+    }
+    replace_private_file(&path, &bytes)
 }
 
 fn mcp_query_token_url(public_url: &str, credential: &str) -> String {
@@ -298,6 +447,9 @@ struct ShareOAuthClient {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    /// Protected per-redirect share OAuth state directory; also holds the
+    /// persisted parent-root grant.
+    state_directory: PathBuf,
 }
 
 fn valid_generated_oauth_value(value: &str, prefix: &str) -> bool {
@@ -339,6 +491,7 @@ fn prepare_share_oauth_client(
     config: &ProjectConfig,
     paths: &ProjectPaths,
     redirect_uri: &str,
+    persist_on_restart: bool,
 ) -> Result<ShareOAuthClient, ProductError> {
     crate::oauth_http::validate_redirect_uri(redirect_uri).map_err(|message| {
         share_oauth_state_error(format!("invalid OAuth redirect URI: {message}"))
@@ -413,11 +566,17 @@ fn prepare_share_oauth_client(
                 share_oauth_state_error("WebCodex could not restore the share OAuth client")
             })?;
         }
-        revoke_previous_share_oauth_grants(&db, &client_id)?;
+        // An ordinary restart retires the previous run's grants. Persistence is
+        // an explicit opt-in: expiry, revocation and token replay rules still
+        // decide whether a retained grant remains usable.
+        if !persist_on_restart {
+            revoke_previous_share_oauth_grants(&db, &client_id)?;
+        }
         return Ok(ShareOAuthClient {
             client_id,
             client_secret,
             redirect_uri,
+            state_directory: directory,
         });
     }
 
@@ -456,6 +615,7 @@ fn prepare_share_oauth_client(
         client_id,
         client_secret,
         redirect_uri,
+        state_directory: directory,
     })
 }
 
@@ -630,14 +790,35 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
                 .oauth_redirect_uri
                 .as_deref()
                 .ok_or_else(|| share_oauth_state_error("OAuth redirect URI is missing"))?,
+            options.oauth_persist_on_restart,
         )?),
+    };
+    // Parent-root grant: an explicit flag replaces the persisted list; without
+    // the flag the persisted grant is restored so restarts keep the same
+    // authorization without retyping it.
+    let oauth_project_roots = match oauth_client.as_ref() {
+        Some(client) if options.oauth_project_roots_explicit => {
+            persist_share_project_roots(&client.state_directory, &options.oauth_project_roots)?;
+            options.oauth_project_roots.clone()
+        }
+        Some(client) => read_persisted_share_project_roots(&client.state_directory),
+        None => Vec::new(),
     };
     let project_share_oauth = oauth_client
         .as_ref()
-        .map(|_| ProjectShareOAuthRuntimeOptions {
-            project_grant_id: config.project_grant_id(&paths),
-            session_id: crate::auth::generate_project_share_session_id(),
-        });
+        .map(|client| {
+            Ok(ProjectShareOAuthRuntimeOptions {
+                project_grant_id: config.project_grant_id(&paths),
+                session_id: if options.oauth_persist_on_restart {
+                    crate::auth::project_share_session_id_for_client(&client.client_id)
+                        .map_err(share_oauth_state_error)?
+                } else {
+                    crate::auth::generate_project_share_session_id()
+                },
+                project_roots: oauth_project_roots.clone(),
+            })
+        })
+        .transpose()?;
 
     // All process/network readiness for this share uses one absolute budget.
     // Managed binary acquisition and local state setup above are preflight, not
@@ -1444,6 +1625,171 @@ mod tests {
     }
 
     #[test]
+    fn oauth_persist_on_restart_is_an_explicit_oauth_only_choice() {
+        let oauth = parse_share_options(&[
+            "--auth".to_string(),
+            "oauth".to_string(),
+            "--oauth-redirect-uri".to_string(),
+            "https://client.example/callback".to_string(),
+        ])
+        .unwrap();
+        assert!(!oauth.oauth_persist_on_restart);
+        let persistent = parse_share_options(&[
+            "--auth".to_string(),
+            "oauth".to_string(),
+            "--oauth-redirect-uri".to_string(),
+            "https://client.example/callback".to_string(),
+            "--oauth-persist-on-restart".to_string(),
+        ])
+        .unwrap();
+        assert!(persistent.oauth_persist_on_restart);
+        assert!(parse_share_options(&["--oauth-persist-on-restart".to_string()]).is_err());
+        assert!(parse_share_options(&[
+            "--auth".to_string(),
+            "bearer".to_string(),
+            "--oauth-persist-on-restart".to_string(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn project_share_restart_preserves_client_and_only_retires_default_mode_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("project-state");
+        let data = state.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let paths = ProjectPaths {
+            data,
+            credentials: state.join("credentials"),
+            project_registry: state.join("project-registry"),
+            logs: state.join("logs"),
+            config: state.join("project.toml"),
+            bootstrap_key: state.join("bootstrap-key"),
+            project_credential: state.join("project-credential"),
+            agent_token: state.join("agent-token"),
+            runner_config: state.join("runner-config"),
+            state,
+        };
+        let config = ProjectConfig {
+            version: 1,
+            project_name: "test-project".to_string(),
+            root: temp.path().join("project"),
+            profile: "default".to_string(),
+            port: 24444,
+            executor_project_id: "test-project".to_string(),
+            executor_client_id: "test-client".to_string(),
+        };
+        let redirect = "https://client.example/callback";
+        let first = prepare_share_oauth_client(&config, &paths, redirect, true).unwrap();
+        let stable = crate::auth::project_share_session_id_for_client(&first.client_id).unwrap();
+        let db = crate::Database::open(&paths.data.join("webcodex.db")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let access = crate::auth::generate_oauth_access_token();
+        let refresh = crate::auth::generate_oauth_refresh_token();
+        let revoked = crate::auth::generate_oauth_access_token();
+        let subject = format!("{}|{stable}", config.project_grant_id(&paths));
+        db.insert_oauth_access_token(&crate::models::OAuthAccessTokenRecord {
+            admin_authority: false,
+            id: uuid::Uuid::new_v4().to_string(),
+            token_hash: crate::auth::hash_token(&access),
+            client_id: first.client_id.clone(),
+            subject_kind: crate::auth::PROJECT_SHARE_OAUTH_SUBJECT_KIND.to_string(),
+            subject_id: subject.clone(),
+            user_id: None,
+            scopes: "runtime:read".to_string(),
+            resource: None,
+            shared_key_hash: None,
+            created_at: now,
+            expires_at: now + 3600,
+            revoked_at: None,
+            last_used_at: None,
+        })
+        .unwrap();
+        db.insert_oauth_access_token(&crate::models::OAuthAccessTokenRecord {
+            admin_authority: false,
+            id: uuid::Uuid::new_v4().to_string(),
+            token_hash: crate::auth::hash_token(&revoked),
+            client_id: first.client_id.clone(),
+            subject_kind: crate::auth::PROJECT_SHARE_OAUTH_SUBJECT_KIND.to_string(),
+            subject_id: subject.clone(),
+            user_id: None,
+            scopes: "runtime:read".to_string(),
+            resource: None,
+            shared_key_hash: None,
+            created_at: now,
+            expires_at: now + 3600,
+            revoked_at: Some(now),
+            last_used_at: None,
+        })
+        .unwrap();
+        db.insert_oauth_refresh_token(&crate::models::OAuthRefreshTokenRecord {
+            admin_authority: false,
+            id: uuid::Uuid::new_v4().to_string(),
+            token_hash: crate::auth::hash_token(&refresh),
+            client_id: first.client_id.clone(),
+            subject_kind: crate::auth::PROJECT_SHARE_OAUTH_SUBJECT_KIND.to_string(),
+            subject_id: subject,
+            user_id: None,
+            scopes: "runtime:read".to_string(),
+            resource: None,
+            shared_key_hash: None,
+            created_at: now,
+            expires_at: now + 3600,
+            revoked_at: None,
+            last_used_at: None,
+            rotated_from_id: None,
+        })
+        .unwrap();
+        drop(db);
+
+        // Repeated persisting restarts keep one validated client, one stable
+        // session identity and the still-valid grants.
+        for _ in 0..2 {
+            let restarted = prepare_share_oauth_client(&config, &paths, redirect, true).unwrap();
+            assert_eq!(restarted.client_id, first.client_id);
+            assert_eq!(restarted.client_secret, first.client_secret);
+            assert_eq!(
+                crate::auth::project_share_session_id_for_client(&restarted.client_id).unwrap(),
+                stable
+            );
+        }
+        let db = crate::Database::open(&paths.data.join("webcodex.db")).unwrap();
+        assert_eq!(
+            db.get_oauth_access_token_by_hash(&crate::auth::hash_token(&access))
+                .unwrap()
+                .unwrap()
+                .revoked_at,
+            None
+        );
+        assert_eq!(
+            db.get_oauth_refresh_token_by_hash(&crate::auth::hash_token(&refresh))
+                .unwrap()
+                .unwrap()
+                .revoked_at,
+            None
+        );
+        // A persisting restart never makes a revoked grant usable again; the
+        // store only resolves unrevoked tokens, so the revoked one stays absent.
+        assert!(db
+            .get_oauth_access_token_by_hash(&crate::auth::hash_token(&revoked))
+            .unwrap()
+            .is_none());
+        drop(db);
+
+        // Switching back to the default mode retires the retained grants.
+        prepare_share_oauth_client(&config, &paths, redirect, false).unwrap();
+        let db = crate::Database::open(&paths.data.join("webcodex.db")).unwrap();
+        assert!(db
+            .get_oauth_access_token_by_hash(&crate::auth::hash_token(&access))
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_oauth_refresh_token_by_hash(&crate::auth::hash_token(&refresh))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn machine_share_ready_event_never_contains_handoff_secret_material() {
         let cloudflare = machine_share_ready_event(
             "demo",
@@ -1569,6 +1915,7 @@ mod tests {
             client_id: "wc_client_test".to_string(),
             client_secret: "wc_csec_test".to_string(),
             redirect_uri: "https://client.example/callback".to_string(),
+            state_directory: PathBuf::new(),
         };
         let output = render_share_oauth_ready(
             "demo",
@@ -1699,12 +2046,44 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_cloudflared(script: &str) -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let temp = crate::test_support::executable_tempdir();
         let path = temp.path().join("cloudflared");
-        fs::write(&path, script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        // A concurrent fork can inherit a writable handle to an executable inode
+        // even after an atomic rename, so execute an immutable checked-in
+        // entrypoint and keep each test's body in a sibling data file.
+        fs::write(temp.path().join("cloudflared.script"), script).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cloudflared.sh"),
+            &path,
+        )
+        .unwrap();
         (temp, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_cloudflared_executes_with_open_fixture_writers() {
+        let (temp, binary) = fake_cloudflared("#!/bin/sh\nprintf fixture-ready");
+        // Model writable handles inherited by an unrelated concurrent fork.
+        let writers: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(entry.path())
+                    .unwrap()
+            })
+            .collect();
+        assert!(!writers.is_empty());
+        let output = std::process::Command::new(binary)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"fixture-ready");
+        drop(writers);
     }
 
     #[cfg(unix)]
@@ -1905,5 +2284,447 @@ mod tests {
         assert!(error.message.contains("stopped unexpectedly"));
         let deadline = Instant::now() + Duration::from_secs(5);
         assert_pid_gone(descendant_pid, deadline).await;
+    }
+
+    fn share_root_fixture() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn share_args(extra: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "--auth".into(),
+            "oauth".into(),
+            "--oauth-redirect-uri".into(),
+            "https://client.example/callback".into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        args
+    }
+
+    #[test]
+    fn parse_share_project_roots_canonicalize_and_dedupe() {
+        let temp = share_root_fixture();
+        let root = temp.path().join("Projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = root.canonicalize().unwrap();
+
+        let parsed = parse_share_options(&share_args(&[
+            "--project-roots",
+            &root.to_string_lossy(),
+            "--project-roots",
+            &canonical.to_string_lossy(),
+        ]))
+        .unwrap();
+        assert_eq!(parsed.oauth_project_roots, vec![canonical.clone()]);
+        assert!(parsed.oauth_project_roots_explicit);
+    }
+
+    #[test]
+    fn parse_share_project_roots_validate_inputs() {
+        let temp = share_root_fixture();
+        let root = temp.path().join("Projects");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Relative path rejected.
+        assert!(parse_share_options(&share_args(&["--project-roots", "relative/dir"])).is_err());
+        // Missing directory rejected.
+        let missing = temp.path().join("missing").to_string_lossy().into_owned();
+        assert!(parse_share_options(&share_args(&["--project-roots", &missing])).is_err());
+        // A file is not a directory root.
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let file = file.to_string_lossy().into_owned();
+        assert!(parse_share_options(&share_args(&["--project-roots", &file])).is_err());
+        // Missing value rejected.
+        assert!(parse_share_options(&share_args(&["--project-roots"])).is_err());
+        // Non-OAuth auth rejects the option.
+        let bearer_args: Vec<String> = vec![
+            "--auth".into(),
+            "bearer".into(),
+            "--project-roots".into(),
+            root.to_string_lossy().into_owned(),
+        ];
+        assert!(parse_share_options(&bearer_args).is_err());
+        // --no-project-roots is explicit but empty.
+        let cleared = parse_share_options(&share_args(&["--no-project-roots"])).unwrap();
+        assert!(cleared.oauth_project_roots.is_empty());
+        assert!(cleared.oauth_project_roots_explicit);
+    }
+
+    #[test]
+    fn share_project_roots_explicit_updates_are_idempotent_and_replaceable() {
+        let temp = share_root_fixture();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let roots_a = vec![root_a.canonicalize().unwrap()];
+        let roots_b = vec![root_b.canonicalize().unwrap()];
+        let directory = temp.path().join("share-oauth");
+
+        // First explicit grant persists.
+        persist_share_project_roots(&directory, &roots_a).unwrap();
+        let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+        let first = std::fs::read(&path).unwrap();
+
+        // Same explicit grant again: idempotent success, identical content.
+        persist_share_project_roots(&directory, &roots_a).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            first,
+            "same-value update churned the file"
+        );
+
+        // A different explicit list replaces the previous one.
+        persist_share_project_roots(&directory, &roots_b).unwrap();
+        assert_eq!(
+            read_persisted_share_project_roots(&directory),
+            roots_b,
+            "replacement grant not stored"
+        );
+
+        // Replacing an existing file never leaves temp segments behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".replace-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp segments left behind: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_project_roots_with_embedded_newline_do_not_widen_on_restart() {
+        let temp = share_root_fixture();
+        let nested = temp.path().join("granted\n").join("etc");
+        std::fs::create_dir_all(&nested).unwrap();
+        let original = nested.canonicalize().unwrap();
+        let directory = temp.path().join("share-oauth");
+
+        // A previously accepted directory path containing '\n' must never
+        // become a grant to the unrelated system /etc on the next launch.
+        persist_share_project_roots(&directory, &[original.clone()]).unwrap();
+        let persisted = std::fs::read_to_string(directory.join(SHARE_PROJECT_ROOTS_FILE)).unwrap();
+        assert!(persisted.contains(r"\n"), "newline must be escaped in JSON");
+        assert!(!persisted.contains("granted\n"));
+
+        let restored = read_persisted_share_project_roots(&directory);
+        assert_eq!(restored, vec![original]);
+        assert!(!restored.iter().any(|root| root == Path::new("/etc")));
+    }
+
+    #[test]
+    fn share_project_roots_rejects_ambiguous_legacy_line_format() {
+        let temp = share_root_fixture();
+        let directory = temp.path().join("share-oauth");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(SHARE_PROJECT_ROOTS_FILE),
+            b"/tmp/granted\n/etc\n",
+        )
+        .unwrap();
+        assert!(read_persisted_share_project_roots(&directory).is_empty());
+    }
+
+    #[test]
+    fn share_project_roots_clear_is_idempotent_and_goes_fully_away() {
+        let temp = share_root_fixture();
+        let root = temp.path().join("a");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = temp.path().join("share-oauth");
+        let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+
+        // Clearing an absent grant is already the cleared state.
+        persist_share_project_roots(&directory, &[]).unwrap();
+        assert!(!path.exists());
+
+        persist_share_project_roots(&directory, &[root.canonicalize().unwrap()]).unwrap();
+        assert!(path.exists());
+        persist_share_project_roots(&directory, &[]).unwrap();
+        assert!(!path.exists(), "cleared grant left the roots file behind");
+        // Repeated clear stays successful.
+        persist_share_project_roots(&directory, &[]).unwrap();
+        // And a later no-flag launch has nothing to restore.
+        assert!(read_persisted_share_project_roots(&directory).is_empty());
+    }
+
+    #[test]
+    fn share_project_roots_failed_update_leaves_previous_value_intact() {
+        let temp = share_root_fixture();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let directory = temp.path().join("share-oauth");
+        let roots_a = vec![root_a.canonicalize().unwrap()];
+        let roots_b = vec![root_b.canonicalize().unwrap()];
+        persist_share_project_roots(&directory, &roots_a).unwrap();
+        let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+        let previous = std::fs::read(&path).unwrap();
+
+        // Failure injection without a framework: occupy the target path with a
+        // directory holding a sentinel, so the final same-directory rename
+        // cannot replace it. (Making the parent read-only is not injectable:
+        // create_private_dir deliberately re-asserts owner-only permissions,
+        // which the self-healing test below pins instead.)
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"occupied").unwrap();
+
+        let update = persist_share_project_roots(&directory, &roots_b);
+        assert!(
+            update.is_err(),
+            "update over a directory unexpectedly succeeded"
+        );
+        assert!(
+            std::fs::read(path.join("sentinel")).unwrap() == b"occupied",
+            "failed update disturbed the occupied target"
+        );
+
+        // Clearing against the same occupied path must also fail explicitly
+        // instead of pretending the grant is gone.
+        let clear = persist_share_project_roots(&directory, &[]);
+        assert!(
+            clear.is_err(),
+            "clear over a directory unexpectedly succeeded"
+        );
+        assert!(path.is_dir(), "failed clear removed the occupied target");
+
+        // Restore the regular file and prove the previous grant survives the
+        // whole failed sequence.
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, &previous).unwrap();
+        assert_eq!(
+            read_persisted_share_project_roots(&directory),
+            roots_a,
+            "the previous grant was not preserved across the failed operations"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".replace-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed update left temp segments: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_project_roots_state_directory_self_heals_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = share_root_fixture();
+        let root = temp.path().join("a");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = temp.path().join("share-oauth");
+        persist_share_project_roots(&directory, &[root.canonicalize().unwrap()]).unwrap();
+
+        // A loosened directory must not stay loosened: the private-state
+        // helpers re-assert owner-only protection on every write.
+        let mut permissions = std::fs::metadata(&directory).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&directory, permissions).unwrap();
+        persist_share_project_roots(&directory, &[root.canonicalize().unwrap()]).unwrap();
+        let dir_mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "loosened state directory was not re-protected: {dir_mode:o}"
+        );
+    }
+
+    #[test]
+    fn share_project_roots_replacement_replaces_a_planted_symlink_not_its_target() {
+        let temp = share_root_fixture();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let directory = temp.path().join("share-oauth");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+
+        // Plant a symlink at the exact target path pointing outside the state
+        // directory; the replacement must overwrite the link, never write
+        // through it.
+        let decoy = temp.path().join("decoy-roots");
+        std::fs::write(&decoy, b"planted\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&decoy, &path).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(&path, b"planted\n").unwrap();
+
+        let roots_b = vec![root_b.canonicalize().unwrap()];
+        persist_share_project_roots(&directory, &roots_b).unwrap();
+
+        assert_eq!(
+            read_persisted_share_project_roots(&directory),
+            roots_b,
+            "replacement did not take effect over the planted link"
+        );
+        #[cfg(unix)]
+        {
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "target is still a symlink"
+            );
+            assert_eq!(
+                std::fs::read(&decoy).unwrap(),
+                b"planted\n",
+                "decoy was written through"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_project_roots_same_value_symlink_is_replaced_not_written_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = share_root_fixture();
+        let root_a = temp.path().join("a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let directory = temp.path().join("share-oauth");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+        let roots = vec![root_a.canonicalize().unwrap()];
+        // The pre-existing state must be byte-identical to the current JSON
+        // representation, so this exercises permission/target repair rather
+        // than accidentally migrating a legacy line-delimited fixture.
+        let content = serde_json::to_vec(&roots).unwrap();
+
+        // Plant a symlink at the target pointing OUTSIDE the state directory,
+        // holding exactly the bytes that would be stored.
+        let outside = temp.path().join("outside-roots");
+        std::fs::write(&outside, &content).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+        // Re-sending the identical grant must repair the target, not accept
+        // the link (and never write through it).
+        persist_share_project_roots(&directory, &roots).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "symlink survived a same-value update"
+        );
+        assert!(
+            metadata.is_file(),
+            "target is not a regular file after repair"
+        );
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "repaired target is not owner-private: {mode:o}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_slice());
+        // The external target was never written through: it still holds the
+        // planted bytes and remains a plain file outside the state directory.
+        assert_eq!(std::fs::read(&outside).unwrap(), content.as_slice());
+        assert!(std::fs::symlink_metadata(&outside).unwrap().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_project_roots_same_value_wide_permissions_are_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = share_root_fixture();
+        let root_a = temp.path().join("a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let directory = temp.path().join("share-oauth");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+        let roots = vec![root_a.canonicalize().unwrap()];
+        // The pre-existing state must be byte-identical to the current JSON
+        // representation, so this exercises permission/target repair rather
+        // than accidentally migrating a legacy line-delimited fixture.
+        let content = serde_json::to_vec(&roots).unwrap();
+
+        // A same-content file with group/other read bits must not qualify for
+        // the no-op fast path: the update repairs it to owner-only.
+        std::fs::write(&path, &content).unwrap();
+        let mut wide = std::fs::metadata(&path).unwrap().permissions();
+        wide.set_mode(0o644);
+        std::fs::set_permissions(&path, wide).unwrap();
+
+        persist_share_project_roots(&directory, &roots).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "wide permissions survived a same-value update: {mode:o}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_slice());
+        // A second same-value update now takes the no-op path and stays
+        // owner-only (idempotence preserved after the repair).
+        persist_share_project_roots(&directory, &roots).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn share_project_roots_replacement_keeps_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = share_root_fixture();
+        let root = temp.path().join("a");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = temp.path().join("share-oauth");
+        persist_share_project_roots(&directory, &[root.canonicalize().unwrap()]).unwrap();
+        let path = directory.join(SHARE_PROJECT_ROOTS_FILE);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "roots file is not owner-private: {mode:o}");
+        let dir_mode = std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "state directory is not owner-private: {dir_mode:o}"
+        );
+    }
+
+    #[test]
+    fn share_project_roots_persist_and_restore_round_trip() {
+        let temp = share_root_fixture();
+        let root_a = temp.path().join("a");
+        let root_b = temp.path().join("b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let roots = vec![
+            root_a.canonicalize().unwrap(),
+            root_b.canonicalize().unwrap(),
+        ];
+
+        let directory = temp.path().join("share-oauth");
+        persist_share_project_roots(&directory, &roots).unwrap();
+        assert_eq!(
+            read_persisted_share_project_roots(&directory),
+            roots,
+            "persisted roots must restore verbatim"
+        );
+
+        // An absent state directory means no grant.
+        assert!(read_persisted_share_project_roots(&temp.path().join("absent")).is_empty());
+
+        // Invalid entries in an otherwise well-formed JSON array are
+        // skipped, without changing the valid grant. Invalid encodings and
+        // the retired newline format are tested separately as fail-closed.
+        let mixed = serde_json::to_vec(&[
+            root_a.canonicalize().unwrap().to_str().unwrap(),
+            "not-a-directory",
+            "../escape",
+        ])
+        .unwrap();
+        std::fs::write(directory.join(SHARE_PROJECT_ROOTS_FILE), mixed).unwrap();
+        assert_eq!(
+            read_persisted_share_project_roots(&directory),
+            vec![root_a.canonicalize().unwrap()],
+            "only still-valid roots survive restore"
+        );
     }
 }

@@ -8,9 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use webcodex_core::runner_protocol::{normalize_rust_test_filter, ShellJobValidationStep};
 use webcodex_workspace::project_recipe::{
-    digest_project_cargo_all_packages_provenance, digest_project_recipe_files,
-    project_recipe_provenance_files, read_project_recipe_file, resolve_project_recipe_root,
-    validate_node_project_marker_chain, ProjectRecipeResolutionError,
+    digest_project_recipe_files, project_recipe_provenance_files, read_project_recipe_file,
+    resolve_project_recipe_root, validate_node_project_marker_chain, ProjectRecipeResolutionError,
 };
 
 pub use webcodex_workspace::project_recipe::ProjectRecipeId as RecipeId;
@@ -199,10 +198,39 @@ pub fn resolve_project_validation_recipe_with_resolution_policy(
     dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
     resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
 ) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_project_validation_recipe_with_scope_exclusions(
+        execution_root,
+        cwd,
+        explicit_recipe,
+        checks,
+        test_filter,
+        package_scope,
+        all_packages,
+        dependency_policy,
+        resolution_policy,
+        &[],
+    )
+}
+
+pub fn resolve_project_validation_recipe_with_scope_exclusions(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    explicit_recipe: Option<RecipeId>,
+    checks: &[SemanticCheck],
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+    all_packages: bool,
+    dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+    resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
+    exclude_packages: &[String],
+) -> Result<ResolvedValidationRecipe, RecipeError> {
     let resolved = resolve_project_recipe_root(execution_root, cwd, explicit_recipe)
         .map_err(map_project_recipe_error)?;
+    if !exclude_packages.is_empty() && resolved.recipe != RecipeId::Rust {
+        return Err(RecipeError::new("workspace_exclusions_unsupported"));
+    }
     if resolved.recipe != RecipeId::Python {
-        return resolve_validation_recipe_with_policies(
+        return resolve_validation_recipe_with_policies_and_exclusions(
             execution_root,
             cwd,
             explicit_recipe,
@@ -212,6 +240,7 @@ pub fn resolve_project_validation_recipe_with_resolution_policy(
             all_packages,
             dependency_policy,
             resolution_policy,
+            exclude_packages,
         );
     }
     if resolution_policy.is_some() {
@@ -227,11 +256,12 @@ pub fn resolve_project_validation_recipe_with_resolution_policy(
     };
     let mut steps = Vec::with_capacity(checks.len());
     for check in checks {
-        let operation = crate::project_validation_operation(
+        let operation = crate::project_validation_operation_with_excluded_packages(
             "python",
             *check,
             package_scope.map(<[String]>::to_vec),
             all_packages,
+            exclude_packages.to_vec(),
         )
         .and_then(|operation| operation.with_dependency_policy(dependency_policy))
         .and_then(|operation| operation.with_test_filter(test_filter))
@@ -475,6 +505,32 @@ pub fn resolve_validation_recipe_with_policies(
     dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
     resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
 ) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_validation_recipe_with_policies_and_exclusions(
+        execution_root,
+        cwd,
+        explicit_recipe,
+        checks,
+        test_filter,
+        package_scope,
+        all_packages,
+        dependency_policy,
+        resolution_policy,
+        &[],
+    )
+}
+
+fn resolve_validation_recipe_with_policies_and_exclusions(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    explicit_recipe: Option<RecipeId>,
+    checks: &[SemanticCheck],
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+    all_packages: bool,
+    dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+    resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
+    exclude_packages: &[String],
+) -> Result<ResolvedValidationRecipe, RecipeError> {
     let resolved_root = resolve_project_recipe_root(execution_root, cwd, explicit_recipe)
         .map_err(map_project_recipe_error)?;
     let root = &resolved_root.execution_root;
@@ -517,10 +573,27 @@ pub fn resolve_validation_recipe_with_policies(
                     all_packages,
                     dependency_policy,
                     resolution_policy,
+                    exclude_packages,
                 )?;
                 let manifest_digest = if recipe == RecipeId::Rust && all_packages {
-                    digest_project_cargo_all_packages_provenance(&resolved_root)
+                    if !exclude_packages.is_empty() {
+                        let (digest, members) = webcodex_workspace::project_recipe::project_cargo_all_packages_provenance(&resolved_root)
+                            .map_err(|_| RecipeError::new("validation_scope_unavailable"))?;
+                        let scope = webcodex_core::project_validation::ProjectValidationScope {
+                            packages: Vec::new(),
+                            all_packages: true,
+                            exclude_packages: exclude_packages.to_vec(),
+                        };
+                        scope
+                            .validate_excluded_members(&members)
+                            .map_err(|_| RecipeError::new("validation_scope_invalid"))?;
+                        digest
+                    } else {
+                        webcodex_workspace::project_recipe::digest_project_cargo_all_packages_provenance(
+                            &resolved_root,
+                        )
                         .map_err(|_| RecipeError::new("validation_scope_unavailable"))?
+                    }
                 } else {
                     let provenance_files = project_recipe_provenance_files(&resolved_root)
                         .map_err(map_project_recipe_error)?
@@ -588,14 +661,16 @@ fn canonical_adapter_steps(
     all_packages: bool,
     dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
     resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
+    exclude_packages: &[String],
 ) -> Result<Vec<ShellJobValidationStep>, RecipeError> {
     let mut steps = Vec::with_capacity(checks.len());
     for check in checks {
-        let operation = crate::project_validation_operation(
+        let operation = crate::project_validation_operation_with_excluded_packages(
             recipe.as_str(),
             *check,
             package_scope.map(<[String]>::to_vec),
             all_packages,
+            exclude_packages.to_vec(),
         )
         .map_err(|code| {
             if package_scope.is_none() && code == "validation_action_unsupported" {

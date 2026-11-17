@@ -609,6 +609,10 @@ pub(crate) fn handle_one_poll(
             });
     let computer_session_update = webcodex_runner::computer_session::changed_availability();
     let poll = RunnerPollPayload {
+        job_capacity: Some(webcodex_core::runner_protocol::RunnerJobCapacity {
+            generation: metadata_config.generation,
+            limit: metadata_config.max_concurrent_jobs,
+        }),
         request: RunnerPollRequest {
             client_id: cfg.client_id.clone(),
             runner_instance_id: runner_instance_id.to_string(),
@@ -620,6 +624,7 @@ pub(crate) fn handle_one_poll(
             .as_ref()
             .map(|_| runtime.mcp_gateway().provider_inventory()),
         computer_session_availability: computer_session_update,
+        computer_control_epoch: webcodex_runner::computer_session::control_epoch(),
         project_inventory_page,
     };
     let response: RunnerPollResponse = match post_json(client, cfg, RUNNER_POLL_PATH, &poll) {

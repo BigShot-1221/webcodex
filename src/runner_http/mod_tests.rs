@@ -1,8 +1,11 @@
 use super::*;
+use crate::runner_protocol::{RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest};
 use crate::runner_protocol::{
     RUNNER_ENVELOPE_MAX_BYTES, RUNNER_PROTOCOL_GENERATION_V2,
     RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES,
 };
+use serde_json::json;
+use tokio::sync::Notify;
 
 fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::AuthContext {
     let (role, scopes) = if is_bootstrap {
@@ -30,6 +33,8 @@ fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::Auth
         allowed_client_id: None,
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -52,6 +57,8 @@ fn agent_auth_context(
         allowed_client_id: Some(allowed_client_id.to_string()),
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -72,11 +79,14 @@ fn oauth_bridge_auth_context(hash: &str, scopes: Vec<&str>) -> crate::auth::Auth
         allowed_client_id: Some("oauth-client".to_string()),
         shared_key_hash: Some(hash.to_string()),
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 
 fn project_summary(id: &str, path: &str) -> RunnerProjectSummary {
     RunnerProjectSummary {
+        registration_incarnation: None,
         id: id.to_string(),
         name: Some(id.to_string()),
         path: path.to_string(),
@@ -104,6 +114,7 @@ fn runner_registration(
 ) -> RunnerRegisterRequest {
     RunnerRegisterRequest {
         computer_session_availability: None,
+        computer_control_epoch: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -151,5 +162,5 @@ mod shared_key_isolation;
 #[path = "mod_tests/protocol_http.rs"]
 mod protocol_http;
 
-#[path = "mod_tests/raw_shell_http.rs"]
-mod raw_shell_http;
+#[path = "mod_tests/retired_execution_routes.rs"]
+mod retired_execution_routes;

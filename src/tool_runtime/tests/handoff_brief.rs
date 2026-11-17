@@ -38,6 +38,7 @@ fn add_instruction_for_project(
 ) {
     store
         .ensure_coding_session(CodingSessionRequest {
+            project_identity: None,
             project: project.to_string(),
             authority_fingerprint:
                 crate::tool_runtime::sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
@@ -136,7 +137,7 @@ fn brief_for(
     let continuation = continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: &summary,
         validation: feedback_validation,
-        jobs: feedback_jobs,
+        jobs: webcodex_workflow_session::ContinuationJobSnapshot::from_json(feedback_jobs),
         discussion: &discussion,
         continuation: "continued",
         suggest_exploration_continuity: false,
@@ -146,7 +147,10 @@ fn brief_for(
             .unwrap_or(0)
             > 0,
         hooks: continuation_projection_hooks(),
-        current_validation: continuation_validation_snapshot(&current_validation),
+        current_validation: webcodex_workflow_session::ContinuationValidationSnapshot {
+            requested: validation_requested,
+            ..continuation_validation_snapshot(&current_validation)
+        },
         tool_failures: ContinuationToolFailureSnapshot::new(&actionable),
     });
     build_handoff_brief(HandoffBriefInput {

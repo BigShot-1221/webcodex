@@ -1348,8 +1348,14 @@ pub(crate) fn key_input(
     surface: &SurfaceRecord,
     key: &str,
     modifiers: &[String],
+    control: &local_control::ActivityGuard,
 ) -> Result<Value, String> {
     validate_key_input(key, modifiers)?;
+    if !webcodex_core::computer_input_contract::COMPUTER_KEY_INPUT_KEYS.contains(&key) {
+        return Err(
+            "invalid_request: extended computer key chords are supported only on Windows".into(),
+        );
+    }
     if !unsafe { AXIsProcessTrusted() } {
         return Err("permission_denied: macOS Accessibility permission is not granted".to_string());
     }
@@ -1377,7 +1383,7 @@ pub(crate) fn key_input(
     validate_key_input_target(&deadline, &application, &exact_window)?;
     deadline.ensure_remaining()?;
 
-    CGEvent::post_to_pid(pid, Some(&key_down));
+    control.commit(|| CGEvent::post_to_pid(pid, Some(&key_down)))?;
     CGEvent::post_to_pid(pid, Some(&key_up));
     Ok(json!({
         "platform": "macos",
@@ -1395,6 +1401,7 @@ pub(crate) fn input_text(
     surface: &SurfaceRecord,
     element: &ElementRecord,
     text: &str,
+    control: &local_control::ActivityGuard,
 ) -> Result<Value, String> {
     if !unsafe { AXIsProcessTrusted() } {
         return Err("permission_denied: macOS Accessibility permission is not granted".to_string());
@@ -1415,8 +1422,9 @@ pub(crate) fn input_text(
 
     let text_value = CFString::from_str(text);
     prepare_ax_call(&deadline, &current)?;
-    let error =
-        unsafe { current.set_attribute_value(&CFString::from_static_str("AXValue"), &text_value) };
+    let error = control.commit(|| unsafe {
+        current.set_attribute_value(&CFString::from_static_str("AXValue"), &text_value)
+    })?;
     if error != AXError::Success {
         return Err(text_input_attempt_error(error));
     }

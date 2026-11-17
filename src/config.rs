@@ -3,6 +3,37 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+pub const DEFAULT_ADDR: &str = "127.0.0.1:8080";
+
+fn addr_is_loopback(addr: &str) -> bool {
+    addr.parse::<SocketAddr>()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or_else(|_| {
+            addr.strip_prefix("localhost:")
+                .and_then(|port| port.parse::<u16>().ok())
+                .is_some()
+        })
+}
+
+/// Read the bootstrap credential without letting an undecodable or blank value
+/// silently disable authentication.
+fn env_token() -> Result<Option<String>, String> {
+    let Some(raw) = std::env::var_os("WEBCODEX_TOKEN") else {
+        return Ok(None);
+    };
+    let value = raw.into_string().map_err(|_| {
+        "WEBCODEX_TOKEN is not valid UTF-8; refusing to start without a usable bootstrap credential"
+            .to_string()
+    })?;
+    if value.trim().is_empty() {
+        return Err(
+            "WEBCODEX_TOKEN is set but empty; refusing to start without a usable bootstrap credential"
+                .to_string(),
+        );
+    }
+    Ok(Some(value))
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub addr: String,
@@ -457,7 +488,16 @@ pub struct OAuth2Config {
     /// Ephemeral share-session fence. A new `webcodex share --auth oauth`
     /// process uses a new value, invalidating every older project-share grant.
     pub project_share_session_id: Option<String>,
+    /// Parent directories this project share may admit new Projects from, on
+    /// demand, for its own project-share OAuth subjects. Empty by default:
+    /// without an explicit grant the exact-path project fence stays in force.
+    pub project_share_roots: Vec<PathBuf>,
 }
+
+/// Upper bound on parent-root grants per share. Keeps the per-token attach and
+/// the path fence bounded; one share with eight parent roots is already far
+/// beyond any real working setup.
+pub const MAX_PROJECT_SHARE_ROOTS: usize = 8;
 
 impl fmt::Debug for OAuth2Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -488,6 +528,7 @@ impl fmt::Debug for OAuth2Config {
                 "project_share_session_id",
                 &self.project_share_session_id.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("project_share_roots_count", &self.project_share_roots.len())
             .finish()
     }
 }
@@ -506,6 +547,7 @@ impl Default for OAuth2Config {
             trust_loopback_api_token_mcp_file_import: false,
             project_share_grant_id: None,
             project_share_session_id: None,
+            project_share_roots: Vec::new(),
         }
     }
 }
@@ -579,6 +621,15 @@ impl OAuth2Config {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let project_share_roots = std::env::var("WEBCODEX_OAUTH2_PROJECT_SHARE_ROOTS")
+            .ok()
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .take(MAX_PROJECT_SHARE_ROOTS)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Self {
             issuer,
             enabled,
@@ -591,33 +642,32 @@ impl OAuth2Config {
             trust_loopback_api_token_mcp_file_import,
             project_share_grant_id,
             project_share_session_id,
+            project_share_roots,
         }
     }
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        Self {
-            addr: std::env::var("WEBCODEX_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
+    /// Build the runtime configuration, refusing any configuration that would
+    /// expose the Server without authentication.
+    pub fn from_env() -> Result<Self, String> {
+        let config = Self {
+            addr: std::env::var("WEBCODEX_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()),
             data_dir: std::env::var("WEBCODEX_DATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./data")),
-            token: std::env::var("WEBCODEX_TOKEN").ok(),
+            token: env_token()?,
             max_text_size: 2 * 1024 * 1024,
             oauth2: OAuth2Config::from_env(),
+        };
+        if !config.is_auth_enabled() {
+            return Err("WEBCODEX_TOKEN is unset; configure a bootstrap credential before starting the Server".to_string());
         }
+        Ok(config)
     }
 
     pub(crate) fn is_loopback_bound(&self) -> bool {
-        self.addr
-            .parse::<SocketAddr>()
-            .map(|address| address.ip().is_loopback())
-            .unwrap_or_else(|_| {
-                self.addr
-                    .strip_prefix("localhost:")
-                    .and_then(|port| port.parse::<u16>().ok())
-                    .is_some()
-            })
+        addr_is_loopback(&self.addr)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -761,6 +811,39 @@ mod tests {
         assert!(!constant_time_eq(b"secret123", b"secret124"));
         assert!(!constant_time_eq(b"secret123", b"secret1234"));
         assert!(!constant_time_eq(b"secret123", b""));
+    }
+
+    #[test]
+    fn bootstrap_configuration_rejects_invalid_tokens_and_remote_binds() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.remove("WEBCODEX_ADDR");
+        env.remove("WEBCODEX_TOKEN");
+        assert!(Config::from_env().is_err());
+        for addr in ["0.0.0.0:8080", "[::]:8080", "192.0.2.1:8080"] {
+            env.set("WEBCODEX_ADDR", addr);
+            assert!(Config::from_env().is_err(), "{addr}");
+        }
+        for addr in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080"] {
+            env.set("WEBCODEX_ADDR", addr);
+            assert!(Config::from_env().is_err(), "{addr}");
+        }
+        for token in ["", " \t\n"] {
+            env.set("WEBCODEX_TOKEN", token);
+            assert!(Config::from_env().is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            env.set("WEBCODEX_TOKEN", std::ffi::OsStr::from_bytes(b"\xff"));
+            assert!(Config::from_env().is_err());
+        }
+        env.set("WEBCODEX_TOKEN", "  valid token  ");
+        env.set("WEBCODEX_ADDR", "0.0.0.0:8080");
+        let config = Config::from_env().unwrap();
+        env.remove("WEBCODEX_ADDR");
+        assert_eq!(Config::from_env().unwrap().addr, "127.0.0.1:8080");
+        assert!(config.validate_token("  valid token  "));
+        assert!(!config.validate_token("valid token"));
     }
 
     #[test]

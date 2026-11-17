@@ -11,6 +11,7 @@ pub(super) fn materialize(
     let PersistedSessionRecord {
         session_id,
         project,
+        project_identity,
         owner_authority_fingerprint,
         title,
         mode,
@@ -19,6 +20,8 @@ pub(super) fn materialize(
         lifecycle,
         created_at,
         updated_at,
+        current_instruction,
+        event_history_start,
         events,
         messages,
         message_delivery_replays,
@@ -46,8 +49,11 @@ pub(super) fn materialize(
             .or_insert(None);
     }
     SessionRecord {
+        pending_events: Default::default(),
+        durable: cold.database.as_ref().map(|_| cold.clone()),
         session_id,
         project,
+        project_identity,
         owner_authority_fingerprint,
         title,
         mode,
@@ -56,6 +62,9 @@ pub(super) fn materialize(
         lifecycle,
         created_at,
         updated_at,
+        current_instruction,
+        history_is_durable: cold.database.is_some(),
+        event_history_start,
         events: events.into(),
         messages: messages.into(),
         message_delivery_replays,

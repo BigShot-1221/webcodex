@@ -1,0 +1,2 @@
+stdout:
+wrote file

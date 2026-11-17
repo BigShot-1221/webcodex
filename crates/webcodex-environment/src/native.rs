@@ -15,7 +15,7 @@ mod project_addition;
 
 const HTTP_LIMIT: usize = 1024 * 1024;
 use webcodex_core::authority::{
-    profiles::LOCAL_USER as USER_SCOPES, AGENT_SCOPES as RUNNER_SCOPES,
+    profiles::LOCAL_USER as USER_SCOPES, validate_username, AGENT_SCOPES as RUNNER_SCOPES,
 };
 
 /// The production adapter. Neither frontend supplies its own deployment backend.
@@ -446,7 +446,7 @@ impl NativeEnvironment {
                 &record.request.server_url,
                 "/api/tools/call",
                 Some(token.expose()),
-                json!({"tool":"list_projects","params":{}}),
+                json!({"tool":"list_projects","params":{"project":selector,"limit":1,"summary_only":false}}),
             )
             .await?;
         let projects = tool_output(&inventory)?
@@ -920,6 +920,12 @@ impl NativeEnvironment {
             ensure_provisioning_username(record);
         }
         let username = record.username.clone().expect("provisioning username");
+        if !is_server_valid_username(&username) {
+            return Err(diagnostic(
+                "user_identity_conflict",
+                "The saved local username is invalid; resume the original setup to check recovery",
+            ));
+        }
         match self
             .post(
                 &record.request.server_url,
@@ -949,9 +955,11 @@ impl NativeEnvironment {
                         }
                     }
                 }
+            }
+            Err(mut error) => {
+                error.message = format!("Local user creation failed: {}", error.message);
                 return Err(error);
             }
-            Err(error) => return Err(error),
         }
         if !path.exists() {
             atomic_private_write(&path, generate_token("wc_pat_").as_bytes())?;
@@ -1221,7 +1229,14 @@ impl EnvironmentBackend for NativeEnvironment {
         use Reconciliation::*;
         use SetupStep::*;
         match step {
-            Preflight | ServerReachability | Readiness => Ok(Missing),
+            Preflight => {
+                // Inspect the original failed journal before starting another
+                // step clears its diagnostic. The engine saves any correction
+                // before applying preflight or sending a provisioning request.
+                recover_uncreated_username(store, record)?;
+                Ok(Missing)
+            }
+            ServerReachability | Readiness => Ok(Missing),
             ServerConfiguration => {
                 let path = store.root().join("server/webcodex.env");
                 if !path.exists() {
@@ -1432,10 +1447,9 @@ impl EnvironmentBackend for NativeEnvironment {
                     ensure_provisioning_username(record);
                 }
                 if record.request.local_runner() && record.runner_client_id.is_none() {
-                    let base = record
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| account_username(&record.request.account.name));
+                    let base = record.username.clone().unwrap_or_else(|| {
+                        account_client_id_prefix(&record.request.account.name)
+                    });
                     record.runner_client_id = Some(format!(
                         "{}-{}",
                         base,
@@ -2104,39 +2118,46 @@ pub fn service_spec(
     if component == Component::Tunnel {
         return crate::tunnel_service_spec(store, record, "default");
     }
-    let account = &record.request.account;
+    let request_account = &record.request.account;
     let server = component == Component::Server;
     let scope = record.request.service_scope;
-    let id = if cfg!(windows) {
-        match component {
-            Component::Server => webcodex_runner_config::desktop_edition::windows_server_service_id()
-                .into(),
-            Component::Runner => format!(
-                "{}{}",
-                webcodex_runner_config::desktop_edition::windows_runner_service_id_prefix(),
-                &format!("{:x}", Sha256::digest(account.identity.as_bytes()))[..12]
-            ),
-            Component::Tunnel => webcodex_runner_config::desktop_edition::windows_tunnel_service_id()
-                .into(),
-        }
-    } else {
-        match component {
-            Component::Server => "webcodex".into(),
-            Component::Runner => format!("webcodex-runner-{}", account.identity),
-            Component::Tunnel => "webcodex-tunnel".into(),
-        }
+    #[cfg(windows)]
+    let id = match component {
+        Component::Server => webcodex_runner_config::desktop_edition::windows_server_service_id()
+            .into(),
+        Component::Runner => format!(
+            "{}{}",
+            webcodex_runner_config::desktop_edition::windows_runner_service_id_prefix(),
+            &format!("{:x}", Sha256::digest(request_account.identity.as_bytes()))[..12]
+        ),
+        Component::Tunnel => webcodex_runner_config::desktop_edition::windows_tunnel_service_id()
+            .into(),
     };
-    let account = if cfg!(windows) && component != Component::Runner && scope.is_system() {
+    #[cfg(not(windows))]
+    let id = match component {
+        Component::Server => "webcodex".into(),
+        Component::Runner => format!("webcodex-runner-{}", request_account.identity),
+        Component::Tunnel => "webcodex-tunnel".into(),
+    };
+    #[cfg(windows)]
+    let account = if component != Component::Runner && scope.is_system() {
         ServiceAccount::WindowsVirtual {
             name: format!("NT SERVICE\\{id}"),
         }
     } else {
         ServiceAccount::SystemUser {
-            name: account.name.clone(),
+            name: request_account.name.clone(),
             group: None,
-            expected_identity: account.identity.clone(),
-            home: Some(account.home.clone()),
+            expected_identity: request_account.identity.clone(),
+            home: Some(request_account.home.clone()),
         }
+    };
+    #[cfg(not(windows))]
+    let account = ServiceAccount::SystemUser {
+        name: request_account.name.clone(),
+        group: None,
+        expected_identity: request_account.identity.clone(),
+        home: Some(request_account.home.clone()),
     };
     let env_file =
         (component != Component::Runner).then(|| store.root().join("server/webcodex.env"));
@@ -2154,18 +2175,30 @@ pub fn service_spec(
                 store.root().join("cu").to_string_lossy().into_owned(),
             ],
         ),
-        Component::Server if cfg!(windows) => (
+        #[cfg(windows)]
+        Component::Server => (
             record.request.binaries.server.clone(),
             vec![
                 "--env-file".into(),
                 env_file.as_ref().unwrap().to_string_lossy().into_owned(),
             ],
         ),
+        #[cfg(not(windows))]
         Component::Server | Component::Tunnel => (
             record.request.binaries.cli.clone(),
             vec![
                 "server".into(),
                 if server { "run" } else { "tunnel" }.into(),
+                "--env-file".into(),
+                env_file.as_ref().unwrap().to_string_lossy().into_owned(),
+            ],
+        ),
+        #[cfg(windows)]
+        Component::Tunnel => (
+            record.request.binaries.cli.clone(),
+            vec![
+                "server".into(),
+                "tunnel".into(),
                 "--env-file".into(),
                 env_file.as_ref().unwrap().to_string_lossy().into_owned(),
             ],
@@ -2177,7 +2210,8 @@ pub fn service_spec(
     if scope == service::ServiceScope::User && component == Component::Runner {
         args.truncate(2); // A signed-in user process does not use the system-service GUI relay.
     }
-    if cfg!(windows) && scope.is_system() {
+    #[cfg(windows)]
+    if scope.is_system() {
         args.splice(0..0, ["--windows-service".into(), id.clone()]);
     }
     let working_directory = if component != Component::Runner {
@@ -2252,63 +2286,34 @@ fn generate_token(prefix: &str) -> String {
         uuid::Uuid::new_v4().simple()
     )
 }
-fn is_username_character(character: char) -> bool {
-    character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '_' | '-')
-}
-
 fn is_server_valid_username(value: &str) -> bool {
-    !value.is_empty()
-        && value.chars().count() <= 64
-        && value.chars().all(is_username_character)
+    matches!(validate_username(value), Ok(normalized) if normalized == value)
 }
 
 /// Derive a Server-valid bootstrap username from the local account label. Does
 /// not preserve invalid journal values; call `ensure_provisioning_username`
 /// before first user creation when a saved username may predate validation.
 fn account_username(name: &str) -> String {
-    let trimmed = name
+    account_client_id_prefix(name)
+        .to_ascii_lowercase()
+        .replace('.', "_")
+}
+
+// Runner IDs accept uppercase and dots. Preserve their existing generation,
+// also used to recognize usernames written by the published broken setup.
+fn account_client_id_prefix(name: &str) -> String {
+    let value: String = name
         .rsplit(['\\', '/'])
         .next()
-        .unwrap_or(name)
-        .trim();
-    if is_server_valid_username(trimmed) {
-        return trimmed.to_string();
-    }
-    #[derive(PartialEq)]
-    enum Part {
-        Kept(char),
-        GeneratedSeparator,
-    }
-    let mut parts: Vec<Part> = Vec::with_capacity(trimmed.len().min(64));
-    for character in trimmed.chars() {
-        let lowered = character.to_ascii_lowercase();
-        if is_username_character(lowered) {
-            parts.push(Part::Kept(lowered));
-        } else if parts.last() != Some(&Part::GeneratedSeparator) {
-            parts.push(Part::GeneratedSeparator);
-        }
-    }
-    while parts.first() == Some(&Part::GeneratedSeparator) {
-        parts.remove(0);
-    }
-    while parts.last() == Some(&Part::GeneratedSeparator) {
-        parts.pop();
-    }
-    let mut normalized: Vec<Part> = parts.into_iter().take(64).collect();
-    while normalized.last() == Some(&Part::GeneratedSeparator) {
-        normalized.pop();
-    }
-    let normalized: String = normalized
-        .into_iter()
-        .map(|part| match part {
-            Part::Kept(character) => character,
-            Part::GeneratedSeparator => '-',
-        })
+        .unwrap_or("user")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(48)
         .collect();
-    if normalized.is_empty() {
+    if value.is_empty() {
         "user".into()
     } else {
-        normalized
+        value
     }
 }
 
@@ -2371,6 +2376,67 @@ fn server_http_error(status: reqwest::StatusCode, _bytes: &[u8]) -> SetupDiagnos
         ),
         _ => diagnostic("server_request_failed", "The Server rejected the operation"),
     }
+}
+
+fn recover_uncreated_username(
+    store: &EnvironmentStore,
+    record: &mut EnvironmentRecord,
+) -> SetupResultValue<()> {
+    let Some(username) = record.username.as_deref() else {
+        return Ok(());
+    };
+    if !record.request.local_server() || is_server_valid_username(username) {
+        return Ok(());
+    }
+    let conflict = || {
+        diagnostic(
+            "user_identity_conflict",
+            "The invalid saved username cannot be recovered without changing an established or uncertain identity",
+        )
+    };
+    let journal = store.load_journal()?.ok_or_else(conflict)?;
+    // v0.5.0 saved the OS-derived name after /users/create rejected uppercase
+    // or dots. The Server grammar proves that name could not have been created.
+    // Only repair that exact unfinished step, before any credential/Runner state.
+    if record.configured
+        || journal.environment.configured
+        || !record.projects.is_empty()
+        || !journal.environment.projects.is_empty()
+        || username != account_client_id_prefix(&record.request.account.name)
+        || journal.environment.environment_id != record.environment_id
+        || journal.environment.request != record.request
+        || journal.environment.username != record.username
+        || journal.steps.get(&SetupStep::UserAuthentication) != Some(&StepState::Started)
+        || journal
+            .steps
+            .keys()
+            .any(|step| *step > SetupStep::UserAuthentication)
+        || journal
+            .last_diagnostic
+            .as_ref()
+            .is_none_or(|error| {
+                error.code.as_str() != "request_validation_failed"
+                    || !error.message.contains("HTTP 400")
+            })
+        || store.load_environment()?.is_some()
+    {
+        return Err(conflict());
+    }
+    for name in [
+        "webcodex-user-token",
+        "runner.toml",
+        "enrollment-recovery.json",
+    ] {
+        match std::fs::symlink_metadata(store.root().join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SetupDiagnostic::io()),
+            Ok(_) => return Err(conflict()),
+        }
+    }
+    // The setup engine persists this correction before applying the step. Keep
+    // the environment, OS owner and already allocated Runner ID unchanged.
+    record.username = Some(account_username(&record.request.account.name));
+    Ok(())
 }
 fn project_record(path: &Path) -> ProjectRecord {
     ProjectRecord {

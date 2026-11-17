@@ -316,6 +316,19 @@ fn project_build_schema_is_closed_bounded_and_has_no_raw_execution_fields() {
         "timeout_secs": 1800
     });
     assert!(test_support::validate_schema_instance(&valid, &schema).is_ok());
+    assert!(test_support::validate_schema_instance(&serde_json::json!({"project":"demo","profile":"dogfood","targets":{"library":true,"binaries":["server"]},"artifact_policy":"observe"}), &schema).is_ok());
+    for targets in [
+        serde_json::json!({}),
+        serde_json::json!({"library":false,"binaries":[]}),
+        serde_json::json!({"args":["--all-targets"]}),
+        serde_json::json!({"binaries":vec!["x";9]}),
+    ] {
+        assert!(test_support::validate_schema_instance(
+            &serde_json::json!({"project":"demo","targets":targets}),
+            &schema
+        )
+        .is_err());
+    }
     assert!(test_support::validate_schema_instance(
         &serde_json::json!({"project":"demo","scope":{"all_packages":true}}),
         &schema,
@@ -379,6 +392,24 @@ fn project_validate_package_scope_schema_is_closed_and_bounded() {
         &schema,
     )
     .is_ok());
+    let empty_exclusions = serde_json::json!({
+        "project": "demo",
+        "action": "check",
+        "scope": {"all_packages": true, "exclude_packages": []}
+    });
+    assert!(test_support::validate_schema_instance(&empty_exclusions, &schema).is_ok());
+    assert!(ToolCall::from_tool_name("project_validate", empty_exclusions).is_ok());
+    let empty_with_packages = serde_json::json!({"project":"demo","action":"check","scope":{"packages":["demo"],"exclude_packages":[]}});
+    assert!(test_support::validate_schema_instance(&empty_with_packages, &schema).is_ok());
+    assert!(ToolCall::from_tool_name("project_validate", empty_with_packages).is_ok());
+
+    assert!(test_support::validate_schema_instance(
+        &serde_json::json!({
+            "project":"demo", "action":"check",
+            "scope":{"all_packages":true,"exclude_packages":(0..9).map(|i| format!("p-{i}")).collect::<Vec<_>>()}
+        }),
+        &schema,
+    ).is_err());
 
     for invalid in [
         serde_json::json!({
@@ -483,12 +514,7 @@ fn execution_timeout_schemas_keep_runtime_bounds_and_hide_sync_wait_tuning() {
         .get("sync_wait_secs")
         .is_none());
 
-    for name in [
-        "run_process",
-        "run_script",
-        "run_shell",
-        "run_skill_resource",
-    ] {
+    for name in ["run_process", "run_script", "run_skill_resource"] {
         let spec = spec_named(&specs, name);
         assert!(
             spec.input_schema["properties"]
@@ -499,6 +525,10 @@ fn execution_timeout_schemas_keep_runtime_bounds_and_hide_sync_wait_tuning() {
     }
 
     let run_shell = spec_named(&specs, "run_shell");
+    assert_eq!(
+        run_shell.input_schema["properties"]["sync_wait_secs"]["minimum"],
+        1
+    );
     let timeout = &run_shell.input_schema["properties"]["timeout_secs"];
     assert_eq!(timeout["type"], "integer");
     assert_eq!(timeout["minimum"], 1);
@@ -761,6 +791,36 @@ fn execution_timeout_schema_descriptions_keep_form_specific_lifetime_ceilings() 
             !description.contains("604800"),
             "{name} must retain the one-hour ceiling: {description}"
         );
+    }
+}
+
+#[test]
+fn run_job_timeout_schema_matches_bounded_admission() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "run_job").input_schema;
+    let timeout = &schema["properties"]["timeout_secs"];
+    assert_eq!(timeout["minimum"], 1);
+    assert_eq!(timeout["default"], 3600);
+    assert!(
+        timeout.get("maximum").is_none(),
+        "oversized budgets are normalized"
+    );
+    let description = timeout["description"].as_str().unwrap();
+    assert!(description.contains("86400"));
+    assert!(description.contains("Runner policy"));
+    for timeout_secs in [1, 3600, 86400, 86401] {
+        assert!(test_support::validate_schema_instance(
+            &json!({"project": "demo", "command": "echo ok", "timeout_secs": timeout_secs}),
+            schema,
+        )
+        .is_ok());
+    }
+    for timeout_secs in [0, -1] {
+        assert!(test_support::validate_schema_instance(
+            &json!({"project": "demo", "command": "echo ok", "timeout_secs": timeout_secs}),
+            schema,
+        )
+        .is_err());
     }
 }
 
@@ -1581,12 +1641,12 @@ fn rust_clippy_uses_project_validate_without_new_tool_or_argv() {
     for phrase in [
         "cargo clippy --all-targets -- -D clippy::correctness",
         "project_validation_rust_clippy_v1",
-        "Rust lint explicitly rejects offline",
+        "project_validation_rust_clippy_offline_v1",
     ] {
         assert!(spec.description.contains(phrase), "{phrase}");
     }
     for hint in ["rust", "auto"] {
-        let value = json!({"project":"demo", "action":"lint", "adapter":hint, "scope":{"packages":["demo"]}, "dependency_policy":{"mode":"locked"}});
+        let value = json!({"project":"demo", "action":"lint", "adapter":hint, "scope":{"packages":["demo"]}, "dependency_policy":{"mode":"locked"}, "dependency_resolution_policy":"offline"});
         test_support::validate_schema_instance(&value, &spec.input_schema).unwrap();
         assert!(ToolCall::from_tool_name("project_validate", value).is_ok());
     }
@@ -1595,5 +1655,72 @@ fn rust_clippy_uses_project_validate_without_new_tool_or_argv() {
         let value = json!({"project":"demo", "action":"lint", (field): "cargo clippy"});
         assert!(test_support::validate_schema_instance(&value, &spec.input_schema).is_err());
         assert!(ToolCall::from_tool_name("project_validate", value).is_err());
+    }
+}
+
+#[test]
+fn search_context_schema_has_one_effective_query_contract_and_legacy_parser_compatibility() {
+    let schema = input_schema_for_tool("search_file_context");
+    let properties = &schema["properties"];
+    assert!(properties.get("query").is_none());
+    assert_eq!(properties["queries"]["minItems"], 1);
+    assert_eq!(properties["queries"]["maxItems"], 8);
+    assert!(schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("queries")));
+    for key in ["result_mode", "context_before", "context_after"] {
+        assert!(properties["queries"]["items"]["properties"]
+            .get(key)
+            .is_none());
+        assert!(
+            input_schema_for_tool("search_project_texts")["properties"]["queries"]["items"]
+                ["properties"]
+                .get(key)
+                .is_some()
+        );
+    }
+    let current = json!({"project":"demo","queries":[{"pattern":"needle"}],"read_before":4});
+    crate::test_support::validate_schema_instance(&current, &schema).unwrap();
+    ToolCall::from_tool_name("search_file_context", current).unwrap();
+    for key in ["query", "queries"] {
+        let query =
+            json!({"pattern":"needle","result_mode":"count","context_before":9,"context_after":9});
+        let mut arguments = json!({"project":"demo"});
+        arguments[key] = if key == "query" {
+            query
+        } else {
+            json!([query])
+        };
+        ToolCall::from_tool_name("search_file_context", arguments).unwrap();
+    }
+    let bytes = schema.to_string().len();
+    eprintln!("search_file_context schema bytes={bytes}");
+    assert!(bytes < 3500, "{bytes}");
+}
+
+#[test]
+fn work_on_project_optional_selector_has_no_invalid_empty_default() {
+    let schema = input_schema_for_tool("work_on_project");
+    assert_eq!(schema["properties"]["project"]["minLength"], 1);
+    assert!(schema["properties"]["project"].get("default").is_none());
+    assert!(!schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("project")));
+    for arguments in [
+        json!({"project":"agent:c:p","instruction":"work"}),
+        json!({"client_id":"c","path":"/tmp/p","instruction":"work"}),
+        json!({"session_id":"wc_sess_exact","instruction":"work"}),
+    ] {
+        crate::test_support::validate_schema_instance(&arguments, &schema).unwrap();
+        ToolCall::from_tool_name("work_on_project", arguments).unwrap();
+    }
+    for project in ["", " "] {
+        assert!(ToolCall::from_tool_name(
+            "work_on_project",
+            json!({"project":project,"instruction":"work"})
+        )
+        .is_err());
     }
 }

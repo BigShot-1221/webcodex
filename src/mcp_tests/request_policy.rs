@@ -4,6 +4,8 @@ use crate::mcp_host::{McpHostConfig, McpHostProfile, McpHostRuntimePolicy};
 use salvo::http::{HeaderMap, HeaderValue};
 #[path = "request_policy/diagnostics.rs"]
 mod diagnostics;
+#[path = "request_policy/runtime_status.rs"]
+mod runtime_status;
 
 fn deployment() -> McpHostRuntimePolicy {
     McpHostConfig {
@@ -21,7 +23,6 @@ fn request_policy_is_explicit_bounded_and_never_sticky() {
     headers.insert(PROFILE_HEADER, HeaderValue::from_static("direct"));
     let direct = resolve(&headers, base).unwrap().effective;
     assert_eq!(direct.profile, McpHostProfile::Direct);
-    assert_eq!(direct.initial_job_handoff_secs, 10);
     assert_eq!(direct.max_sync_wait_secs, 50);
     assert_eq!(direct.continuation_wait_secs, 50);
     assert_eq!(direct.host_budget_secs, 55);
@@ -67,7 +68,6 @@ fn request_headers_cannot_escape_explicit_deployment_timing_caps() {
         (base.max_sync_wait_secs, base.continuation_wait_secs),
         (8, 12)
     );
-    assert_eq!(base.initial_job_handoff_secs, 5);
 
     let mut headers = HeaderMap::new();
     headers.insert(PROFILE_HEADER, HeaderValue::from_static("direct"));
@@ -77,7 +77,6 @@ fn request_headers_cannot_escape_explicit_deployment_timing_caps() {
         (swapped.max_sync_wait_secs, swapped.continuation_wait_secs),
         (8, 12)
     );
-    assert_eq!(swapped.initial_job_handoff_secs, 10);
 
     headers.insert(BUDGET_HEADER, HeaderValue::from_static("9"));
     let narrowed = resolve(&headers, base).unwrap().effective;
@@ -248,7 +247,7 @@ async fn request_policy_isolated_across_concurrent_http_direct_and_gateway_calls
     assert_eq!(compact_status.0, StatusCode::OK, "{}", compact_status.1);
     assert_eq!(
         compact_status.1["result"]["structuredContent"]["output"]["mcp_host"]["profile"],
-        "host_code_mode"
+        "direct"
     );
     let status = post(
         &service,
@@ -263,7 +262,6 @@ async fn request_policy_isolated_across_concurrent_http_direct_and_gateway_calls
         &status.1["result"]["structuredContent"]["output"]["effective_config"]["mcp_host"];
     assert_eq!(deployment_status["profile"], "host_code_mode");
     assert_eq!(deployment_status["host_budget_secs"], 55);
-    assert_eq!(deployment_status["initial_job_handoff_secs"], 5);
     assert_eq!(deployment_status["max_sync_wait_secs"], 5);
     assert_eq!(deployment_status["continuation_wait_secs"], 5);
     let bad = post(
@@ -297,6 +295,7 @@ async fn request_policy_pending_wait_and_terminal_observe_keep_one_execution_wit
                     ..Default::default()
                 },
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -317,6 +316,7 @@ async fn request_policy_pending_wait_and_terminal_observe_keep_one_execution_wit
         "request-policy",
         "inst-policy",
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: "demo".into(),
             name: None,
             path: "/tmp/request-policy".into(),

@@ -5,6 +5,18 @@ use super::common::{
     wrapped_output_schema,
 };
 
+fn mcp_workflow_tools_schema() -> Value {
+    json!({
+        "type":"object", "additionalProperties":false,
+        "properties":{
+            "goals":{"type":"boolean"},
+            "agent_continuation":{"type":"boolean"},
+            "job_continuation":{"type":"boolean"}
+        },
+        "required":["goals", "agent_continuation", "job_continuation"]
+    })
+}
+
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
         "read_current_window_activity" => Some(wrapped_output_schema(vec![
@@ -27,7 +39,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("truncated", schema_type("boolean", "Visible events from the bounded recent scan were omitted by the presentation or serialized byte bound; this is not a lifetime-history completeness claim.")),
         ])),
         "get_runtime_status" => Some(wrapped_output_schema(vec![
-            ("mcp_host", open_object_schema("Sparse status: effective MCP Host profile.")),
+            ("mcp_host", json!({
+                "type": "object", "additionalProperties": false,
+                "description": "Current request's effective Host profile and its provenance, alongside the immutable deployment default. This is guidance/wait strategy, never execution authority.",
+                "properties": {
+                    "profile": {"type": "string", "enum": ["direct", "host_code_mode"], "description": "Profile effective for this request."},
+                    "deployment_profile": {"type": "string", "enum": ["direct", "host_code_mode"]},
+                    "profile_source": {"type": "string", "enum": ["deployment", "request_header"]}
+                },
+                "required": ["profile", "deployment_profile", "profile_source"]
+            })),
             ("compatibility", open_object_schema("Sparse fleet protocol, build/source alignment and mixed-build evidence; no per-Runner rows.")),
             ("connection", open_object_schema("Sparse process, transport and Project registry states without timestamps.")),
 
@@ -50,12 +71,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                             "type": "object",
                             "additionalProperties": false,
                             "properties": {
+                                "shared_key_configured": {"type": "boolean", "description": "Deployment shared-key configuration before the remote-boundary policy is applied."},
+                                "shared_key_remote_enabled": {"type": "boolean", "description": "Explicit deployment opt-in for shared-key use at a remote boundary."},
                                 "shared_key_enabled": {"type": "boolean", "description": "Whether direct shared-key quick-start authentication is effective for the running Server."},
                                 "anonymous_enabled": {"type": "boolean", "description": "Whether explicit open-anonymous access is effective for the running Server."},
                                 "oauth2_enabled": {"type": "boolean", "description": "Whether OAuth2 support was enabled in the running Server configuration."},
                                 "oauth2_shared_key_bridge_enabled": {"type": "boolean", "description": "Whether the OAuth2 shared-key bridge is enabled in the running OAuth2 configuration; false whenever OAuth2 itself is disabled. This public OAuth flow is distinct from direct Bearer shared-key authentication."}
                             },
-                            "required": ["shared_key_enabled", "anonymous_enabled", "oauth2_enabled", "oauth2_shared_key_bridge_enabled"]
+                            "required": ["shared_key_configured", "shared_key_enabled", "shared_key_remote_enabled", "anonymous_enabled", "oauth2_enabled", "oauth2_shared_key_bridge_enabled"]
                         },
                         "mcp_host": {
                             "type": "object",
@@ -64,11 +87,20 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                             "properties": {
                                 "profile": {"type": "string", "enum": ["direct", "host_code_mode"]},
                                 "host_budget_secs": {"type": "integer", "minimum": 1},
-                                "initial_job_handoff_secs": {"type": "integer", "minimum": 1, "deprecated": true, "description": "Legacy compatibility-only timing hint. No independent execution consumer; max_sync_wait_secs controls structured handoff."},
                                 "max_sync_wait_secs": {"type": "integer", "minimum": 1},
                                 "continuation_wait_secs": {"type": "integer", "minimum": 1}
                             },
-                            "required": ["profile", "host_budget_secs", "initial_job_handoff_secs", "max_sync_wait_secs", "continuation_wait_secs"]
+                            "required": ["profile", "host_budget_secs", "max_sync_wait_secs", "continuation_wait_secs"]
+                        },
+                        "mcp_tool_exposure": {
+                            "type": "object", "additionalProperties": false,
+                            "description": "Startup MCP workflow-tool defaults and exact OAuth-client override count. No client identifiers or credentials.",
+                            "properties": {
+                                "adaptive": mcp_workflow_tools_schema(),
+                                "cli": mcp_workflow_tools_schema(),
+                                "oauth_client_overrides": {"type":"integer", "minimum":0, "maximum":64}
+                            },
+                            "required":["adaptive", "cli", "oauth_client_overrides"]
                         },
                         "tool_request_trace_mode": {
                             "type": "string",
@@ -76,7 +108,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                             "description": "Effective bounded tool-request trace mode; no trace paths, request bodies, headers, or environment values are exposed."
                         }
                     },
-                    "required": ["auth", "mcp_host", "tool_request_trace_mode"]
+                    "required": ["auth", "mcp_host", "mcp_tool_exposure", "tool_request_trace_mode"]
                 }),
             ),
             ("version", schema_type("string", "Runtime version.")),
@@ -132,6 +164,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("trace_mode", schema_type("string", "Observed captured mode: metadata, full, or unknown.")),
             ("capture_mode", schema_type("string", "Current capture switch; separate from retained data.")),
             ("capture_health", open_object_schema("Process-since-start queue/budget/write failure counters; not per-trace completeness or prior-process history.")),
+            ("handler_finished_observed", schema_type("boolean", "The HTTP adapter scope finished after synchronous finalizers. Does not prove client receipt or streamed-body EOF.")),
+            ("known_dropped_events", schema_type("integer", "Lower bound from retained per-trace loss markers. Zero is not proof of complete capture.")),
             ("response_handoff_observed", schema_type("boolean", "A handler-return event exists in the retained index; absence is inconclusive and presence does not prove remote delivery.")),
             ("status", schema_type("string", "available or unavailable; missing capture does not prove absent execution.")),
             ("coverage", schema_type("string", "Coverage boundary; observed events are not a completeness guarantee.")),
@@ -175,18 +209,26 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("items", array_schema(open_object_schema("Input-indexed Project result with success/output/error; partial outcomes are not atomic."), "Per-item results.")),
         ])),
         "list_projects" => Some(wrapped_output_schema(vec![
+            ("hint", schema_type("string", "Guidance when no caller-visible Projects match the filters; does not disclose hidden resources.")),
             (
                 "projects",
-                array_schema(open_object_schema("Project summary including canonical id, Server-issued project_ref when a stable Project root identity is available, and capabilities.git_available/supports_cleanup_verification/recommended_for_smoke."), "Runtime projects."),
+                {
+                    let mut schema = array_schema(open_object_schema("Project identity/path/state summary; exact id and optional principal-scoped project_ref remain reusable. Full mode also includes revision, policy, shell and smoke capabilities."), "Bounded page of caller-visible Runtime projects.");
+                    schema["maxItems"] = json!(100);
+                    schema
+                },
             ),
-            ("count", schema_type("integer", "Project count.")),
+            ("count", schema_type("integer", "Projects returned on this page.")),
+            ("offset", schema_type("integer", "Effective live offset after authorization, filtering and stable Runtime ID ordering.")),
+            ("limit", schema_type("integer", "Effective page size; default 30, maximum 100 for canonical tools.")),
+            ("next_offset", nullable_schema("integer", "Next live offset or null when no later page remains. Changes to registry or visibility may repeat/omit rows; restart at zero and deduplicate IDs.")),
             (
                 "matched_count",
                 schema_type("integer", "Caller-visible Project count matching filters before limit."),
             ),
             (
                 "truncated",
-                schema_type("boolean", "Whether limit truncated matching Projects."),
+                schema_type("boolean", "Whether later matching Projects remain after this page."),
             ),
             (
                 "recommended_for_smoke",
@@ -197,11 +239,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ])),
         "list_runners" => Some(wrapped_output_schema(vec![
-            ("matched_count", schema_type("integer", "Visible matching Runners before limit.")),
-            ("truncated", schema_type("boolean", "Narrow filters when more Runners matched than were returned.")),
+            ("hint", schema_type("string", "Guidance when no caller-visible Runners match the filters; does not disclose hidden resources.")),
+            ("matched_count", schema_type("integer", "Visible matching Runners before paging.")),
+            ("truncated", schema_type("boolean", "The page omits some currently matching Runners, including earlier pages.")),
+            ("offset", schema_type("integer", "Requested zero-based offset in stable client_id order.")),
+            ("limit", schema_type("integer", "Effective page size, default 30 and at most 100.")),
+            ("has_more", schema_type("boolean", "More matching Runners follow this page in the current authorized inventory.")),
+            ("next_offset", json!({"type":["integer","null"],"minimum":0,"description":"Continue with the same filters and this offset; null at the end. Inventory or authorization changes may repeat/skip entries; restart at zero to reconcile."})),
             (
                 "runners",
-                array_schema(open_object_schema("Runner summary including bounded Runner-configured host_context advisory data, never authority or proof of current state, plus job_concurrency limit/running/queued facts."), "Canonical Runner collection; per-Runner identity uses runner_instance_id and runner_protocol_generation."),
+                json!({"type":"array","maxItems":100,"items":open_object_schema("Compact Runner identity/status and Project/Job counts by default. Explicit detail adds build, capabilities, path-free project_inventory synchronization status and advisory host_context. Explicit projects contains at most 100 enabled entries with projects_offset, projects_returned_count, projects_truncated and nullable projects_next_offset; continue list_runners with exact client_id and projects_offset. projects_count is the full enabled count. Never authority."),"description":"Canonical Runner collection in client_id order; runner_instance_id and runner_protocol_generation remain exact."}),
             ),
             (
                 "summary",

@@ -24,9 +24,9 @@ Runner 文件系统 policy 仍然是权限边界。全新 Desktop 的本机 Runn
 
 **项目 → 设备** 显示每个 Runner 上报的持久任务运行数、排队数和当前生效的并发上限。计数来自 Server 的容量聚合；已请求停止的任务在真正终止前仍计入运行数，因为它们仍占用执行槽位。离线、过期、不可用或未上报的状态不会显示为零使用量；普通请求调度队列单独计算。
 
-打开 **设置 → Runtime 与服务 → Runner 任务容量**，可为 Desktop 管理的本地 Runner 保存 **1–64** 的整数并发上限。默认值仍为 **4**，已保存的配置与实际生效值分别显示。**保存，下次重启时生效** 只修改身份匹配的本地 Runner 配置，保留其他内容并拒绝冲突修改，不会热重载或自动重启。
+打开 **设置 → Runtime 与服务 → Runner 任务容量**，可为 Desktop 管理的本地 Runner 保存 **1–64** 的整数并发上限。未配置时默认值为 **32**，已有显式配置值保持不变，已保存的配置与实际生效值分别显示。**保存并热应用** 暂存身份匹配的本地 Runner 配置，保留其他内容，随后使用 Check → Reload 与 Generation Fence 验证生效。明确拒绝时只回滚未被外部修改的候选；结果不确定时要求核对，不盲目重试或回滚。运行中的 Job 继续执行。
 
-准备好后选择 **重启 Runner…**，确认中断警告。重启会应用已保存的 Runner 配置，可能中断任务、浏览器会话和用户接管。Desktop 复用现有进程所有权或持久服务重启机制。远程及独立管理的 Runner 保持只读，需由实际管理者修改配置并重启。只有刷新后的 Runner 状态上报新上限，界面才会确认它已生效。
+**重启 Runner…** 保留为独立操作，仍需确认中断警告。重启会应用已保存的 Runner 配置，可能中断任务、浏览器会话和用户接管。Desktop 复用现有进程所有权或持久服务重启机制。远程及独立管理的 Runner 保持只读，需由实际管理者修改并应用配置。只有刷新后的 Runner 状态上报新上限，界面才会确认它已生效。
 
 ## Windows 启动与升级
 
@@ -119,7 +119,7 @@ Desktop 的授权结果不等于独立 Runner 已获授权。持久 Runner 的 G
 
 **设置** 按通用、文件访问与权限、网络、Runtime、故障排查、关于与更新分区。选中分区后直接显示配置，无需展开折叠项；在分区之间切换会保留网络和追踪设置草稿，不会自动保存或重启服务。通用包含语言、外观和登录时启动；文件访问与权限包含 Runner 允许目录和 macOS Computer Use 权限。语言也可以在左下角直接切换。支持简体中文、繁體中文、English、日本語、한국어、Deutsch、Français；选择会保存，重开后恢复，活动时间按所选语言格式显示。系统托盘菜单跟随所选语言，后台启动时也会恢复上次选择；原始后端诊断仍使用英文，系统文件选择器的语言由操作系统决定。
 
-关闭窗口只会把 Desktop 隐藏到菜单栏或系统托盘。持久的 Server、Runner 和 Tunnel 服务独立于窗口运行，退出 Desktop 后也会继续运行。托盘中的 **退出 WebCodex** 会结束 Desktop 及其直接管理的进程，例如临时 Quick Share、旧版由 Desktop 管理的 Runtime 或普通 Tunnel。Core 管理的本机服务需要使用诊断页的明确控制；仅此电脑拥有的组件才显示对应控制。viewer 没有本机 Runner 控制，只有 Server 的电脑也没有 Runner 控制。Desktop 可以通过 Server 连接观察自定义旧服务，但不会接管其生命周期。首页用于旧版 Desktop Runtime 的停止操作还会更新已保存的启动偏好，不会停止独立服务。
+关闭窗口只会把 Desktop 隐藏到菜单栏或系统托盘。在 macOS 上，可在菜单栏菜单中开启 **关闭窗口后隐藏 Dock 图标**，窗口关闭期间 Dock 中不再显示图标。持久的 Server、Runner 和 Tunnel 服务独立于窗口运行，退出 Desktop 后也会继续运行。托盘中的 **退出 WebCodex** 会结束 Desktop 及其直接管理的进程，例如临时 Quick Share、旧版由 Desktop 管理的 Runtime 或普通 Tunnel。Core 管理的本机服务需要使用诊断页的明确控制；仅此电脑拥有的组件才显示对应控制。viewer 没有本机 Runner 控制，只有 Server 的电脑也没有 Runner 控制。Desktop 可以通过 Server 连接观察自定义旧服务，但不会接管其生命周期。首页用于旧版 Desktop Runtime 的停止操作还会更新已保存的启动偏好，不会停止独立服务。
 
 macOS 使用 **⌘ + 1–6**，Windows 使用 **Ctrl + 1–6**，依次切换首页、项目、活动、连接、扩展和设置；**⌘ / Ctrl + 7** 打开 Runtime Console，**⌘ / Ctrl + ,** 打开设置。按住 ⌘ 或 Ctrl 片刻，侧边栏会显示各页面对应的数字。这些导航快捷键在输入框和语言选择框内同样生效，普通输入及复制、粘贴等文本编辑快捷键不受影响。安装版中按 F5 或 ⌘ / Ctrl + R 不会重新加载窗口，避免丢失未保存的草稿；页面右键菜单仅在选中文字或输入框中出现。可用 Tab 聚焦按钮，用 Enter 激活；设置分区支持上下方向键及 Home / End 切换。
 
@@ -131,3 +131,9 @@ Full Runtime 由 Server、Runner 和 Runner 已观察到的 Project 清单组成
 Desktop 重启会恢复已保存的 Server/Runner 身份和 Connections，不会预先注册 Project。只有模型驱动的工作解析了具体目录时，才会出现对应 Runtime Project。在线且完整的 Runner inventory 是这些注册状态的权威来源；Desktop 可以清理过期的展示历史，但正常 Desktop UI 不负责修改 Project 注册状态。
 
 项目目录、Git 文件和 Runner policy 是彼此独立的边界：按需注册 Project 只是为已经获得授权的路径创建或复用 runtime identity，不会扩大 `allowed_roots`。
+
+## 本机 Computer 活动与暂停
+
+Windows 原生托盘显示 Computer 观察和控制活动，并为保存的本机 Runner 提供
+**暂停 Computer Control**。暂停控制后仍可观察。恢复、可选边缘提示、快捷键和执行边界
+见[本机 Computer Control](agent/computer-local-control.zh-CN.md)。

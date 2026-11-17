@@ -273,6 +273,7 @@ mod tests {
 
     fn project(id: &str, disabled: bool) -> RunnerProjectSummary {
         RunnerProjectSummary {
+            registration_incarnation: None,
             id: id.to_string(),
             name: Some(id.to_string()),
             path: format!("/tmp/{id}"),
@@ -325,6 +326,7 @@ mod tests {
                         ..Default::default()
                     },
                     computer_session_availability: None,
+                    computer_control_epoch: None,
                     host_context: None,
                     policy: None,
                     process_started_at: Some(100),

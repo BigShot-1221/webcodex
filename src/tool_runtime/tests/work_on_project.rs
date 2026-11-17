@@ -12,6 +12,7 @@ use super::support::*;
 use crate::db::{NewGoal, NewGoalStep};
 use crate::lsp_bridge::{RunnerLspRequest, RunnerLspResultEnvelope, AGENT_LSP_REQUEST_KIND};
 use crate::runner_protocol::{RunnerCapabilities, RunnerResultPayload, RunnerResultRequest};
+use crate::tool_runtime::dispatch::DispatchContext;
 use crate::tool_runtime::kernel::{
     HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
     ToolProtocolCapabilities, ToolTransport,
@@ -296,28 +297,20 @@ fn startup_plugin_catalog_fixture() -> ProjectPluginCatalog {
 async fn complete_startup_plugin_catalog_request(
     runtime: &ToolRuntime,
     request: crate::runner_protocol::RunnerRequest,
+    catalog: ProjectPluginCatalog,
 ) {
     runtime
         .runner_registry
         .complete(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: request.client_id,
-                runner_instance_id: "inst".to_string(),
-                request_id: request.request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                stdout_truncated: false,
-                stderr_truncated: false,
-                duration_ms: None,
-                error: None,
-            },
+            result: runner_result_request(
+                request.client_id,
+                "inst".to_string(),
+                request.request_id,
+            ),
             command_execution_state: None,
             mcp_gateway: None,
             plugin_gateway: Some(PluginGatewayResponse::success(
-                PluginGatewayResponsePayload::ProjectCatalog {
-                    catalog: startup_plugin_catalog_fixture(),
-                },
+                PluginGatewayResponsePayload::ProjectCatalog { catalog },
             )),
             coding_agent: None,
         })
@@ -501,6 +494,7 @@ async fn dispatch_with_managed_worktree_runner(
                     "disabled": false,
                     "revision": format!("sha256:{}", "b".repeat(64)),
                     "root_fingerprint": managed_target_root_fingerprint(),
+                    "registration_incarnation": "10000000-0000-4000-8000-000000000001",
                     "lineage": {
                         "kind": "managed_worktree_source",
                         "source_project_id": "source",
@@ -568,12 +562,13 @@ async fn dispatch_recording_startup_requests(
         async move {
             let window = crate::client_window::ClientWindow::for_test(&window_id);
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_window(
+                .dispatch_with_context(
                     call,
-                    auth.as_ref(),
-                    crate::tool_runtime::sessions::SessionTransport::Mcp,
-                    Default::default(),
-                    Some(&window),
+                    DispatchContext::internal(
+                        auth.as_ref(),
+                        crate::tool_runtime::sessions::SessionTransport::Mcp,
+                        Some(&window),
+                    ),
                 )
                 .await
         }
@@ -616,12 +611,13 @@ async fn dispatch_recording_startup_requests_with_runner_instructions(
         async move {
             let window = crate::client_window::ClientWindow::for_test(&window_id);
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_window(
+                .dispatch_with_context(
                     call,
-                    auth.as_ref(),
-                    crate::tool_runtime::sessions::SessionTransport::Mcp,
-                    Default::default(),
-                    Some(&window),
+                    DispatchContext::internal(
+                        auth.as_ref(),
+                        crate::tool_runtime::sessions::SessionTransport::Mcp,
+                        Some(&window),
+                    ),
                 )
                 .await
         }
@@ -736,6 +732,7 @@ async fn dispatch_startup_with_plugin_catalog(
     client_id: &str,
     call: ToolCall,
     auth: &crate::auth::AuthContext,
+    catalog: ProjectPluginCatalog,
 ) -> (ToolResult, Vec<String>) {
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -759,7 +756,7 @@ async fn dispatch_startup_with_plugin_catalog(
         {
             assert_eq!(project_id, "demo");
             request_kinds.push("plugin_project_catalog".to_string());
-            complete_startup_plugin_catalog_request(runtime, request).await;
+            complete_startup_plugin_catalog_request(runtime, request, catalog.clone()).await;
         } else if request.kind == AGENT_LSP_REQUEST_KIND {
             request_kinds.push(request.kind.clone());
             complete_patch_agent_request(
@@ -819,9 +816,6 @@ async fn dispatch_startup_with_configured_skill_catalog(
             runtime
                 .runner_registry
                 .complete(RunnerResultRequest {
-                    client_id: client_id.to_string(),
-                    runner_instance_id: "inst".to_string(),
-                    request_id: request.request_id,
                     exit_code: Some(0),
                     stdout: Some(
                         serde_json::to_string(&RunnerSkillListResponse {
@@ -834,10 +828,12 @@ async fn dispatch_startup_with_configured_skill_catalog(
                         .unwrap(),
                     ),
                     stderr: Some(String::new()),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
                     duration_ms: Some(1),
-                    error: None,
+                    ..runner_result_request(
+                        client_id.to_string(),
+                        "inst".to_string(),
+                        request.request_id,
+                    )
                 })
                 .await
                 .unwrap();
@@ -873,12 +869,13 @@ async fn dispatch_startup_without_window(
         let auth = auth.cloned();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_window(
+                .dispatch_with_context(
                     call,
-                    auth.as_ref(),
-                    crate::tool_runtime::sessions::SessionTransport::Mcp,
-                    Default::default(),
-                    None,
+                    DispatchContext::internal(
+                        auth.as_ref(),
+                        crate::tool_runtime::sessions::SessionTransport::Mcp,
+                        None,
+                    ),
                 )
                 .await
         }
@@ -912,15 +909,16 @@ async fn dispatch_with_path_runner(
         let auth = auth_context(None, true);
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+                .dispatch_with_context(
                     call,
-                    Some(&auth),
-                    crate::tool_runtime::sessions::SessionTransport::Mcp,
-                    Default::default(),
-                    None,
-                    true,
-                    vec!["project.instructions".into()],
-                    Default::default(),
+                    DispatchContext {
+                        context_request: vec!["project.instructions".into()],
+                        ..DispatchContext::internal(
+                            Some(&auth),
+                            crate::tool_runtime::sessions::SessionTransport::Mcp,
+                            None,
+                        )
+                    },
                 )
                 .await
         }
@@ -951,6 +949,7 @@ async fn dispatch_with_path_runner(
                     "disabled": false,
                     "revision": format!("sha256:{}", "a".repeat(64)),
                     "root_fingerprint": format!("wc_projroot_{}", "b".repeat(64)),
+                    "registration_incarnation": "10000000-0000-4000-8000-000000000002",
                     "source": "path",
                     "outcome": outcome,
                     "registered": registered,

@@ -70,6 +70,7 @@ pub(super) struct RunnerRecord {
     /// None preserves legacy direct-session behavior; brokered persistent
     /// Runners report current helper eligibility separately from support.
     pub(super) computer_session_availability: Option<bool>,
+    pub(super) computer_control_epoch: Option<String>,
     pub(super) projects: Vec<RunnerProjectSummary>,
     /// Authoritative project snapshot plus bounded in-progress staging. A
     /// staging failure never changes liveness or partially publishes projects.
@@ -105,9 +106,10 @@ pub(super) struct RunnerRecord {
     pub(super) process_started_at: Option<i64>,
     /// Runner-reported build identity (register payload).
     pub(super) build: Option<RunnerBuildInfo>,
-    /// Runner-reported effective static Job execution concurrency. This is
+    /// Runner-reported effective Job execution concurrency. This is
     /// safe operational metadata and remains unknown for older Runners.
     pub(super) job_concurrency_limit: Option<usize>,
+    pub(super) job_capacity_generation: u64,
     /// Sanitized startup-owned ACP providers for this exact Runner process.
     pub(super) coding_agent_providers: Vec<CodingAgentProvider>,
     /// Authoritative active/recent-terminal CodingAgentRun inventory from this

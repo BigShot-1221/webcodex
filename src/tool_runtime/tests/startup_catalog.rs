@@ -5,6 +5,7 @@ use crate::tool_runtime::startup_catalog::{
     StartupSkillEntry, StartupSkillsCatalog, STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES,
     STARTUP_PLUGIN_CATALOG_MAX_BYTES, STARTUP_SKILL_CATALOG_MAX_BYTES,
 };
+use crate::tool_runtime::surface::discovery::TaskRelevance;
 use serde_json::{json, Value};
 
 const SKILL_HINT: &str = "Use skills.catalog or list_skills for broader or refreshed discovery.";
@@ -197,4 +198,201 @@ fn startup_catalog_combined_budget_and_utf8_description_remain_bounded() {
     assert!(extensions.serialized_len() <= STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES);
     assert!(extensions.skills.truncated);
     assert!(extensions.plugins.truncated);
+}
+
+#[test]
+fn startup_catalog_task_relevance_preserves_late_skills_and_plugins_before_budgeting() {
+    let description = "Unrelated capability metadata. ".repeat(15);
+    let mut skills: Vec<_> = (0..20).map(|i| skill(i, &description)).collect();
+    skills[19].name = "quartz-audit".to_string();
+    let mut plugins: Vec<_> = (0..20).map(|i| plugin(i, &description)).collect();
+    plugins[19].title = Some("Quartz audit".to_string());
+    let query = TaskRelevance::new("Perform the quartz audit");
+    let original_skills =
+        StartupSkillsCatalog::available("revision".to_string(), true, skills.clone());
+    let original_plugins =
+        StartupPluginsCatalog::available("revision".to_string(), 27, plugins.clone());
+    assert!(!original_skills
+        .entries
+        .iter()
+        .any(|entry| entry.name == "quartz-audit"));
+    assert!(!original_plugins
+        .entries
+        .iter()
+        .any(|entry| entry.title.as_deref() == Some("Quartz audit")));
+    let ranked = StartupExtensions {
+        skills: StartupSkillsCatalog::available_for_task(
+            "revision".to_string(),
+            true,
+            skills,
+            &query,
+        ),
+        plugins: StartupPluginsCatalog::available_for_task(
+            "revision".to_string(),
+            27,
+            plugins,
+            &query,
+        ),
+    };
+    assert_eq!(ranked.skills.entries[0].name, "quartz-audit");
+    assert_eq!(ranked.plugins.entries[0].tool, "tool-19");
+    // A relevant row is promoted, not the only row retained. Unmatched rows
+    // keep discovery order; provider totals and source revisions stay canonical.
+    assert_eq!(ranked.skills.entries[1].name, "skill-0");
+    assert_eq!(ranked.plugins.entries[1].tool, "tool-0");
+    assert_eq!(ranked.skills.total_count, 20);
+    assert_eq!(ranked.plugins.total_count, 27);
+    assert_eq!(ranked.skills.catalog_revision.as_deref(), Some("revision"));
+    assert_eq!(ranked.plugins.catalog_revision.as_deref(), Some("revision"));
+    assert!(ranked.skills.truncated && ranked.plugins.truncated);
+    assert_eq!(ranked.skills.discovery_hint, Some(SKILL_HINT));
+    assert_eq!(ranked.plugins.discovery_hint, Some(PLUGIN_HINT));
+    assert!(serde_json::to_vec(&ranked.skills).unwrap().len() <= STARTUP_SKILL_CATALOG_MAX_BYTES);
+    assert!(serde_json::to_vec(&ranked.plugins).unwrap().len() <= STARTUP_PLUGIN_CATALOG_MAX_BYTES);
+    assert!(ranked.serialized_len() <= STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES);
+}
+
+#[test]
+fn startup_catalog_task_relevance_prefers_names_and_keeps_ties_and_unmatched_rows() {
+    let mut entries: Vec<_> = (0..4).map(|i| skill(i, "unrelated")).collect();
+    entries[0].description = "quartz audit invoices receipts".to_string();
+    entries[1].name = "quartz".to_string();
+    entries[2].name = "quartz".to_string();
+    let original = StartupSkillsCatalog::available("revision".to_string(), false, entries.clone());
+    for query in ["", "the and please", "nonexistent"] {
+        let actual = StartupSkillsCatalog::available_for_task(
+            "revision".to_string(),
+            false,
+            entries.clone(),
+            &TaskRelevance::new(query),
+        );
+        assert_eq!(actual, original);
+    }
+    let actual = StartupSkillsCatalog::available_for_task(
+        "revision".to_string(),
+        false,
+        entries.clone(),
+        &TaskRelevance::new("QUARTZ audit invoices receipts receipts"),
+    );
+    assert_eq!(
+        actual
+            .entries
+            .iter()
+            .map(|e| e.skill_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            entries[1].skill_id.as_str(),
+            entries[2].skill_id.as_str(),
+            entries[0].skill_id.as_str(),
+            entries[3].skill_id.as_str()
+        ]
+    );
+    assert!(!actual.truncated);
+    assert_eq!(actual.returned_count, 4);
+    assert_eq!(actual.discovery_hint, None);
+}
+
+#[test]
+fn startup_catalog_task_relevance_matches_complete_chinese_metadata_phrases() {
+    let mut entries: Vec<_> = (0..3).map(|i| plugin(i, "unrelated")).collect();
+    entries[0].name = "审".to_string();
+    entries[1].description = Some("发票审计".to_string());
+    entries[2].name = "发票审计".to_string();
+    let actual = StartupPluginsCatalog::available_for_task(
+        "revision".to_string(),
+        3,
+        entries,
+        &TaskRelevance::new("请完成发票审计，并给出当前流程"),
+    );
+    assert_eq!(
+        actual
+            .entries
+            .iter()
+            .map(|e| e.tool.as_str())
+            .collect::<Vec<_>>(),
+        ["tool-2", "tool-1", "tool-0"]
+    );
+}
+
+#[test]
+fn startup_catalog_long_skill_metadata_ranks_before_display_clipping() {
+    for (query, keyword) in [
+        ("QUARTZ audits", "Quartz audit"),
+        ("请完成发票审计", "发票审计"),
+    ] {
+        let description = format!(
+            "{} {keyword}. {}",
+            "Neutral metadata. ".repeat(35),
+            "后续说明。".repeat(15)
+        );
+        assert!(description.chars().count() <= 1024);
+        assert!(!bounded_extension_description(&description).contains(keyword));
+        let mut entries: Vec<_> = (0..20)
+            .map(|i| skill(i, &"Neutral metadata. ".repeat(30)))
+            .collect();
+        entries[19].description = description.clone();
+        let actual = StartupSkillsCatalog::available_for_task(
+            "revision".to_string(),
+            true,
+            entries,
+            &TaskRelevance::new(query),
+        );
+        assert_eq!(actual.entries[0].name, "skill-19");
+        let excerpt = &actual.entries[0].description;
+        assert!(excerpt.contains(keyword), "{excerpt}");
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.len() <= 512);
+        assert!(description.contains(excerpt.trim_matches('…')));
+        assert_eq!(actual.entries[1].name, "skill-0");
+        assert_eq!(actual.total_count, 20);
+        assert_eq!(actual.catalog_revision.as_deref(), Some("revision"));
+        assert!(actual.truncated);
+        assert!(serde_json::to_vec(&actual).unwrap().len() <= STARTUP_SKILL_CATALOG_MAX_BYTES);
+    }
+}
+
+#[test]
+fn startup_catalog_skill_excerpts_preserve_prefixes_and_original_utf8_text() {
+    let cases = [
+        ("unmatched".to_string(), "quartz"),
+        (format!("{} quartz", "x".repeat(512)), "missing"),
+        (format!("quartz {} quartz", "中".repeat(190)), "quartz"),
+        (format!("{} quartz", "中".repeat(171)), "quartz"),
+        (
+            format!("{} 发票审计、收据", "😀".repeat(128)),
+            "请完成发票审计",
+        ),
+        (
+            format!("{} quartz {} audit", "x".repeat(510), "中".repeat(10)),
+            "quartz audit",
+        ),
+        (format!("{} KUARTZ", "中".repeat(180)), "quartz"),
+        // Unicode lowercase expansion before a match must not shift source offsets.
+        (
+            format!("{} QUARTZ {}", "İ".repeat(260), "后".repeat(180)),
+            "quartz",
+        ),
+    ];
+    for (description, query) in cases {
+        let relevance = TaskRelevance::new(query);
+        let prefix = bounded_extension_description(&description);
+        let actual = StartupSkillsCatalog::available_for_task(
+            "revision".to_string(),
+            false,
+            vec![skill(0, &description)],
+            &relevance,
+        );
+        let excerpt = &actual.entries[0].description;
+        assert!(excerpt.len() <= 512);
+        if relevance.score(&[], &prefix).1 > 0 || relevance.score(&[], &description).1 == 0 {
+            assert_eq!(excerpt, &prefix);
+        } else {
+            assert!(excerpt.starts_with('…'));
+            assert!(description.contains(excerpt.trim_matches('…')));
+            if query == "quartz audit" {
+                assert!(excerpt.starts_with("…quartz"));
+            }
+            assert!(relevance.score(&[], excerpt).1 > 0, "{excerpt}");
+        }
+    }
 }

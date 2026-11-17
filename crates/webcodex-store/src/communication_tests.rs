@@ -960,6 +960,173 @@ fn message_deliveries_and_wake_commit_atomically() {
 }
 
 #[test]
+fn first_mount_host_window_reservation_is_inert_fenced_and_recoverable_after_expiry() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("first-mount-window.db")).unwrap();
+    let owner = principal("user", 'a');
+    let agent = db
+        .create_agent_identity(
+            &owner,
+            new_agent("first-mount", "First mount", "first-agent"),
+        )
+        .unwrap()
+        .agent;
+    let origin = "a".repeat(64);
+    let different = "b".repeat(64);
+    let input = endpoint(&agent.agent_id, "ChatGPT", "first-endpoint");
+    let initial = db
+        .attach_agent_endpoint_with_host_window(&owner, input.clone(), Some(&origin))
+        .unwrap();
+    assert!(!initial.endpoint.wake_capable);
+    let current = &initial.endpoint;
+    let stored: (Option<String>, Option<String>) = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT mcp_app_client_window_key, mcp_app_recovery_fingerprint
+             FROM wc_agent_endpoints WHERE endpoint_id = ?1",
+            [&current.endpoint_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (Some(origin.clone()), None));
+    assert!(db
+        .mcp_app_registration_window_allows(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            Some(&origin),
+        )
+        .unwrap());
+    assert!(!db
+        .mcp_app_registration_window_allows(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            Some(&different),
+        )
+        .unwrap());
+    // A retry of the same explicit attachment is inert even from a different
+    // Window: it may recover the original response but cannot retarget proof.
+    let replay = db
+        .attach_agent_endpoint_with_host_window(&owner, input, Some(&different))
+        .unwrap();
+    assert!(replay.replayed && !replay.state_changed);
+    assert_eq!(replay.endpoint.endpoint_id, current.endpoint_id);
+
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_endpoints SET lease_expires_at_unix_ms = 0
+             WHERE endpoint_id = ?1",
+            [&current.endpoint_id],
+        )
+        .unwrap();
+    assert_eq!(
+        db.recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &different,
+        )
+        .unwrap_err()
+        .code(),
+        "host_binding_stale",
+    );
+    let accepted = db
+        .recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &origin,
+        )
+        .unwrap();
+    let successor = match accepted {
+        McpAppEndpointRecovery::Replaced {
+            endpoint,
+            replayed: false,
+            state_changed: true,
+            successor_needs_recovery: false,
+            ..
+        } => endpoint,
+        other => panic!("expected one exact inert successor: {other:?}"),
+    };
+    assert_eq!(
+        successor.controller_generation,
+        current.controller_generation + 1
+    );
+    assert!(!successor.wake_capable);
+    let replay = db
+        .recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &origin,
+        )
+        .unwrap();
+    assert!(matches!(
+        replay,
+        McpAppEndpointRecovery::Replaced {
+            replayed: true,
+            state_changed: false,
+            ..
+        }
+    ));
+    db.detach_agent_endpoint(&owner, &successor.endpoint_id)
+        .unwrap();
+    assert!(db
+        .recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &origin,
+        )
+        .is_err());
+}
+
+#[test]
+fn first_mount_window_prebinding_rejects_unsafe_proof_or_wake_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("first-mount-inert.db")).unwrap();
+    let owner = principal("user", 'c');
+    let agent = db
+        .create_agent_identity(&owner, new_agent("inert", "Inert", "inert-agent"))
+        .unwrap()
+        .agent;
+    let input = endpoint(&agent.agent_id, "ChatGPT", "inert-endpoint");
+    let bad = db
+        .attach_agent_endpoint_with_host_window(&owner, input.clone(), Some("not-a-hashed-window"))
+        .unwrap_err();
+    assert_eq!(bad.code(), "invalid_mcp_app_client_window_key");
+    let mut capable = input.clone();
+    capable.wake_capable = true;
+    let bad = db
+        .attach_agent_endpoint_with_host_window(&owner, capable, Some(&"d".repeat(64)))
+        .unwrap_err();
+    assert_eq!(bad.code(), "host_window_requires_inert_endpoint");
+    let ordinary = db.attach_agent_endpoint(&owner, input).unwrap();
+    assert_eq!(ordinary.endpoint.controller_generation, 1);
+    assert!(!ordinary.endpoint.wake_capable);
+    let stored: Option<String> = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT mcp_app_client_window_key FROM wc_agent_endpoints
+         WHERE endpoint_id = ?1",
+            [&ordinary.endpoint.endpoint_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.is_none(),
+        "ordinary/Console attach retains legacy behavior"
+    );
+}
+
+#[test]
 fn detach_expired_mcp_app_endpoint_revokes_recovery_before_and_after_materialization() {
     for materialized in [false, true] {
         let temp = tempfile::tempdir().unwrap();

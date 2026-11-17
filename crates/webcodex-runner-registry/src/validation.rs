@@ -6,7 +6,8 @@ use webcodex_core::runner_protocol::{
     ShellProcessArgv, ShellRunRequest, ShellScriptPayload, ToolProvidersStatus,
     PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
     PROJECT_INVENTORY_SNAPSHOT_MAX_SERIALIZED_BYTES, PROJECT_ROOT_FINGERPRINT_PREFIX,
-    RUNNER_CONFIG_RESTART_REQUIRED_FIELDS, STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS,
+    RAW_SHELL_JOB_TIMEOUT_MAX_SECS, RUNNER_CONFIG_RESTART_REQUIRED_FIELDS,
+    STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS,
 };
 
 const MAX_CLIENT_ID_LEN: usize = 80;
@@ -22,7 +23,6 @@ const MAX_ARTIFACT_PAYLOAD_BYTES: usize = 15 * 1024 * 1024;
 const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 15 * 1024 * 1024;
 pub(super) const MAX_RUN_STDIN_BYTES: usize = 15 * 1024 * 1024;
 const MAX_SYNC_WAIT_SECS: u64 = 120;
-const MAX_COMMAND_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const MAX_PROVIDER_TEXT_CHARS: usize = 120;
 const MAX_PROVIDER_TOOL_NAMES: usize = 64;
 
@@ -541,6 +541,25 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
     Ok(())
 }
 
+/// Cwd and deadline limits shared by raw shell and argv validation Jobs.
+pub(super) fn validate_job_scope(cwd: Option<&str>, timeout_secs: u64) -> Result<(), String> {
+    if let Some(cwd) = cwd {
+        if cwd.len() > MAX_CWD_LEN {
+            return Err(format!("cwd is too long; maximum is {} bytes", MAX_CWD_LEN));
+        }
+        if cwd.contains('\0') {
+            return Err("cwd cannot contain NUL bytes".to_string());
+        }
+    }
+    if timeout_secs == 0 || timeout_secs > RAW_SHELL_JOB_TIMEOUT_MAX_SECS {
+        return Err(format!(
+            "timeout_secs must be between 1 and {}",
+            RAW_SHELL_JOB_TIMEOUT_MAX_SECS
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_run_request(body: &ShellRunRequest) -> Result<(), String> {
     validate_id(&body.client_id, "client_id")?;
     validate_raw_shell_wire_command(&body.command)?;
@@ -555,20 +574,7 @@ pub(super) fn validate_run_request(body: &ShellRunRequest) -> Result<(), String>
             return Err("stdin cannot contain NUL bytes".to_string());
         }
     }
-    if let Some(cwd) = &body.cwd {
-        if cwd.len() > MAX_CWD_LEN {
-            return Err(format!("cwd is too long; maximum is {} bytes", MAX_CWD_LEN));
-        }
-        if cwd.contains('\0') {
-            return Err("cwd cannot contain NUL bytes".to_string());
-        }
-    }
-    if body.timeout_secs == 0 || body.timeout_secs > MAX_COMMAND_TIMEOUT_SECS {
-        return Err(format!(
-            "timeout_secs must be between 1 and {}",
-            MAX_COMMAND_TIMEOUT_SECS
-        ));
-    }
+    validate_job_scope(body.cwd.as_deref(), body.timeout_secs)?;
     if body.wait_timeout_secs > MAX_SYNC_WAIT_SECS {
         return Err(format!(
             "wait_timeout_secs must be <= {} for synchronous runShell",
@@ -720,6 +726,13 @@ pub(super) fn validate_project_summary(project: &RunnerProjectSummary) -> Result
         .is_some_and(|fingerprint| !valid_project_root_fingerprint(fingerprint))
     {
         return Err("project_summary_invalid_root_fingerprint");
+    }
+    if project
+        .registration_incarnation
+        .as_deref()
+        .is_some_and(|value| uuid::Uuid::parse_str(value).is_err())
+    {
+        return Err("project_summary_invalid_registration_incarnation");
     }
     if let Some(RunnerProjectLineage::ManagedWorktreeSource {
         source_project_id,

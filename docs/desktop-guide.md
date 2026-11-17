@@ -43,16 +43,17 @@ never mean zero usage; ordinary request-dispatch queues are separate.
 
 In **Settings → Runtime & services → Runner job capacity**, Desktop-managed local
 Runners can save **Maximum concurrent jobs** as a whole number from **1 to 64**.
-The default remains **4**. The saved value and current effective limit are shown
-separately. **Save for next restart** only writes the exact local Runner's
-configuration, preserves unrelated settings, and rejects a conflicting edit.
-It does not hot-reload or restart services.
+The default for an omitted setting is **32**; explicit saved values are preserved. The saved value and current effective limit are shown
+separately. **Save and apply** stages the exact local Runner configuration, preserves
+unrelated settings, then validates and reloads with a generation fence. A definite
+rejection restores only an unchanged candidate; an uncertain result requires
+reconciliation and is never blindly retried or rolled back. Running Jobs continue.
 
-Choose **Restart Runner…** when ready and confirm the interruption warning.
+**Restart Runner…** remains a separate operation with an interruption warning.
 Restarting applies the saved Runner configuration and may interrupt Jobs,
 browser sessions, and handoffs. Desktop reuses its existing owned-process or
 persistent-service restart path. Remote and independently managed Runners remain
-read-only; their actual operator must edit the configuration and restart them.
+read-only; their actual operator must edit and apply their configuration.
 A restart is not reported as applying the saved limit until fresh Runner status
 reports that limit.
 
@@ -148,7 +149,7 @@ If the local Server exits during startup, expand the error's **Details**. Deskto
 
 **Settings** groups controls into General, Files & permissions, Network, Runtime, Troubleshooting, and About & updates. Selecting a category shows its configuration directly. Switching categories preserves network and tracing drafts without saving or restarting services. General contains language, appearance, and launch at login; Files & permissions contains allowed Runner folders and macOS Computer Use permissions. You can also switch language at the bottom of the sidebar. Supported languages are 简体中文, 繁體中文, English, 日本語, 한국어, Deutsch, and Français. The selection is remembered across restarts, and activity times follow the selected locale. System tray menus follow the selected language, including background startup. Raw backend diagnostics remain in English; the operating system controls native file-picker language.
 
-Closing the window hides Desktop in the menu bar or system tray. Persistent Server, Runner, and Tunnel services continue independently of that window, including when Desktop quits. **Quit WebCodex** ends Desktop and processes it directly owns, such as a temporary Quick Share and legacy Desktop-owned runtime or regular Tunnel. Use the explicit Diagnostics controls for Core-managed local services; they appear only for components this computer owns. A viewer has no local Runner control, and a Server-only computer has no Runner control. A custom legacy service can be observed through its Server connection without Desktop taking over its lifecycle. The legacy Desktop-managed runtime stop in Settings → Runtime also updates its saved startup preference; it does not stop an independent service.
+Closing the window hides Desktop in the menu bar or system tray. On macOS, turn on **Hide Dock icon when window is closed** in the menu bar menu to also remove the Dock icon while the window is closed. Persistent Server, Runner, and Tunnel services continue independently of that window, including when Desktop quits. **Quit WebCodex** ends Desktop and processes it directly owns, such as a temporary Quick Share and legacy Desktop-owned runtime or regular Tunnel. Use the explicit Diagnostics controls for Core-managed local services; they appear only for components this computer owns. A viewer has no local Runner control, and a Server-only computer has no Runner control. A custom legacy service can be observed through its Server connection without Desktop taking over its lifecycle. The legacy Desktop-managed runtime stop in Settings → Runtime also updates its saved startup preference; it does not stop an independent service.
 
 Use **⌘ + 1–6** on macOS or **Ctrl + 1–6** on Windows to switch between Home, Projects, Activity, Connections, Extensions, and Settings; **⌘ / Ctrl + 7** opens Runtime Console and **⌘ / Ctrl + ,** opens Settings. Hold ⌘ or Ctrl briefly to show each page's number in the sidebar. Navigation shortcuts also work inside inputs and language selectors; ordinary typing and text-editing shortcuts remain available. Installed builds do not reload the window on F5 or ⌘ / Ctrl + R, so unsaved drafts are not lost; the page context menu appears only for selected text and editable fields. Use Tab to focus controls and Enter to activate them; Settings categories support Up/Down arrows and Home/End.
 
@@ -160,3 +161,10 @@ A Full Runtime consists of the Server, Runner, and the Runner's observed Project
 Desktop restart resumes the saved Server/Runner identity and Connections without registering a Project. Concrete Runtime Projects appear when model-driven work resolves a workspace path. A complete online Runner inventory is authoritative for those registrations; Desktop may reconcile stale display history, but the normal Desktop UI does not mutate Project registration state.
 
 Project directories, Git files, and Runner policy remain separate concerns: lazy Project registration creates or reuses runtime identity for an already-authorized path and does not broaden `allowed_roots`.
+
+## Local Computer activity and pause
+
+On Windows, the native tray shows Computer observation/control activity and offers
+**Pause Computer Control** for the saved local Runner. Observation remains available
+while control is paused. See [Local Computer Control](agent/computer-local-control.md)
+for resume, optional edge hints, shortcuts, and execution boundaries.

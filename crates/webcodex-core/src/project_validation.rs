@@ -132,24 +132,41 @@ impl ProjectValidationRequest {
                 ProjectOperationScopeError::InvalidPackage => {
                     "invalid project validation package scope".to_string()
                 }
+                ProjectOperationScopeError::ExclusionRequiresAllPackages => {
+                    "exclude_packages requires all_packages=true".to_string()
+                }
+                ProjectOperationScopeError::ExclusionCount => {
+                    "exclude_packages must contain at most 8 items".to_string()
+                }
+                ProjectOperationScopeError::InvalidExclusion => {
+                    "invalid excluded package name".to_string()
+                }
             })?;
+            if self.action == ProjectValidationAction::FormatCheck
+                && !scope.exclude_packages.is_empty()
+            {
+                return Err("workspace_exclusions_unsupported: format_check".into());
+            }
         }
         if self.dependency_resolution_policy.is_some() {
-            if self.action == ProjectValidationAction::Lint {
-                return Err("dependency_resolution_policy_unsupported: lint offline policy requires maintainer approval".into());
-            }
             if !matches!(
                 self.action,
-                ProjectValidationAction::Check | ProjectValidationAction::Test
+                ProjectValidationAction::Check
+                    | ProjectValidationAction::Lint
+                    | ProjectValidationAction::Test
             ) || !matches!(
                 self.adapter,
                 ProjectValidationAdapter::Auto | ProjectValidationAdapter::Rust
             ) {
-                return Err("dependency_resolution_policy requires Rust check or test".into());
+                return Err(
+                    "dependency_resolution_policy requires Rust check, lint or test".into(),
+                );
             }
         }
         if self.dependency_policy.is_some() && self.action == ProjectValidationAction::FormatCheck {
-            return Err("dependency_policy requires project_validate action=check or test".into());
+            return Err(
+                "dependency_policy requires project_validate action=check, lint or test".into(),
+            );
         }
         if let Some(test) = &self.test {
             if self.action != ProjectValidationAction::Test {

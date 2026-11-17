@@ -4,7 +4,9 @@ use std::time::Duration;
 use webcodex_core::runner_operation::RunnerOperation;
 use webcodex_core::runner_protocol::{RunnerJobUpdateRequest, RunnerRequest, RunnerResultPayload};
 use webcodex_core::ssh_resource::SshResourceRequest;
-use webcodex_runner_registry::{RunnerRegistryTelemetry, RunnerTransport};
+use webcodex_runner_registry::{
+    RunnerRegistryTelemetry, RunnerRequestCancellationReason, RunnerTransport,
+};
 
 fn observe_runtime_metric_fail_open(observe: impl FnOnce()) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(observe));
@@ -229,7 +231,7 @@ impl RunnerRegistryTelemetry for ToolRequestTraceRunnerRegistryTelemetry {
 
     fn runner_request_dequeued(
         &self,
-        _request_id: &str,
+        request_id: &str,
         transport: RunnerTransport,
         queue_wait: Duration,
     ) {
@@ -238,6 +240,16 @@ impl RunnerRegistryTelemetry for ToolRequestTraceRunnerRegistryTelemetry {
             transport,
             queue_wait,
         );
+        crate::tool_request_trace::record_runner_request_dequeued(request_id, queue_wait);
+    }
+
+    fn runner_request_cancelled(
+        &self,
+        request_id: &str,
+        dispatched: bool,
+        reason: RunnerRequestCancellationReason,
+    ) {
+        crate::tool_request_trace::record_runner_request_cancelled(request_id, dispatched, reason);
     }
 
     fn runner_result_accepted(&self, request_id: &str, payload: &RunnerResultPayload) {

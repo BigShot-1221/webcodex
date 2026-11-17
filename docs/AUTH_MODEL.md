@@ -137,6 +137,12 @@ Computer Use permissions are intentionally separate from ordinary project/runtim
 
 OAuth clients receive these optional permissions only through explicit operator/user opt-in. The runtime still rechecks the current Runner capability and native OS permission at the moment of the call. See [Computer Use](COMPUTER_USE.md) for the product-facing feature overview.
 
+For `control_computer(action=press|input_text, observe_after=...)`, both
+`computer:control` and `computer:read` are required before the action. The optional
+read is limited to a bounded accessibility tree of the same window; it grants no
+display, clipboard, or alternate-target authority. Both phases retain the exact
+Runner instance and recheck access/capability at admission and dispatch.
+
 ## Public compatibility names you may still see
 
 Some compatibility-facing names remain because changing them would break stored configuration or wire compatibility:

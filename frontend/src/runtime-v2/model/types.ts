@@ -198,6 +198,9 @@ export type RunnerSummary = {
   status?: string;
   transport?: string;
   runner_protocol_generation?: number;
+  project_inventory_generation?: string;
+  project_inventory_sync_state?: string;
+  project_inventory_updated_at?: number;
   last_seen_age_secs?: number;
   version?: string;
   build_git_commit?: string;
@@ -217,7 +220,7 @@ export type RuntimeOverview = {
   detail_level?: "primary" | "full";
   effective_config?: {
     auth: Record<string, boolean>;
-    mcp_host: { profile: string; host_budget_secs: number; initial_job_handoff_secs: number; max_sync_wait_secs: number; continuation_wait_secs: number };
+    mcp_host: { profile: string; host_budget_secs: number; max_sync_wait_secs: number; continuation_wait_secs: number };
     tool_request_trace_mode: string;
   };
   service?: string;
@@ -254,6 +257,7 @@ export type RuntimeOverview = {
 };
 
 export type WindowSummary = {
+  label?: string | null;
   client_window_key: string;
   last_project?: string;
   source: string;
@@ -322,6 +326,7 @@ export type WindowJob = {
 };
 
 export type WindowDetail = {
+  label?: string | null;
   client_window_key: string;
   detail_level?: "primary" | "full";
   source: string;

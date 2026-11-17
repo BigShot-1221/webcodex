@@ -1,9 +1,10 @@
 //! Focused contract, Runner-boundary, deadline, and Session tests for batch search.
 
 use super::super::*;
+use super::files::{extract_single_search_batch_result, search_project_text_output};
 use super::support::*;
 use crate::runner_protocol::{RunnerPollRequest, RunnerRequest, RunnerResultRequest};
-use crate::tool_runtime::files::{search_project_text_output, SearchOptions, SearchRequest};
+use crate::tool_runtime::files::SearchOptions;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -126,20 +127,18 @@ fn canonical_search_result(
     stdout: &str,
     exit_code: i32,
 ) -> ToolResult {
-    let options = SearchOptions::normalize_with_pattern_mode(
-        SearchRequest {
-            pattern: pattern.to_string(),
-            path: None,
-            limit: Some(limit),
-            context_before: Some(context_before),
-            context_after: Some(context_after),
-            include_globs: None,
-            exclude_globs: None,
-            result_mode: Some(result_mode),
-            timeout_secs: None,
-        },
+    let options = SearchOptions::normalize(SearchProjectTextsQuery {
         pattern_mode,
-    )
+        pattern: pattern.to_string(),
+        path: None,
+        limit: Some(limit),
+        context_before: Some(context_before),
+        context_after: Some(context_after),
+        include_globs: None,
+        exclude_globs: None,
+        result_mode: Some(result_mode),
+        timeout_secs: None,
+    })
     .expect("canonical search options");
     search_project_text_output("demo", &options, stdout, Some(exit_code), "")
 }
@@ -152,29 +151,6 @@ fn project_single_search(canonical: &ToolResult) -> ToolResult {
         .expect("canonical search output object");
     crate::tool_runtime::result_projection::sparsify_search_output_for_model(output, true, false);
     projected
-}
-
-fn extract_single_search_batch_result(batch: &ToolResult) -> ToolResult {
-    assert!(batch.success, "{:?}", batch.error);
-    let items = batch.output["items"]
-        .as_array()
-        .expect("one-query search batch items");
-    assert_eq!(items.len(), 1, "one-query search batch: {}", batch.output);
-    let item = &items[0];
-    ToolResult {
-        success: if batch.output.get("requested_count").is_none() {
-            assert!(item.get("success").is_none());
-            assert!(item.get("error").is_none());
-            true // The complete sparse batch branch proves every item succeeded.
-        } else {
-            item["success"].as_bool().expect("full search item success")
-        },
-        output: item.get("output").cloned().unwrap_or(Value::Null),
-        error: item
-            .get("error")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    }
 }
 
 fn serialized_output_bytes(result: &ToolResult) -> usize {
@@ -739,7 +715,7 @@ async fn search_project_texts_one_query_default_success_is_sparse_after_session_
         .unwrap_or_else(|error| {
             panic!("sparse one-query batch search success must match schema: {error}")
         });
-    let result = extract_single_search_batch_result(&batch);
+    let result = extract_single_search_batch_result(batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["matches"][0]["path"], "src/a.rs");
     assert!(result.output.get("session_recorded").is_none());
@@ -833,7 +809,7 @@ async fn search_project_texts_one_query_nondefault_success_keeps_effective_selec
     complete_search_success(&runtime, client_id, &request, "src/a.rs").await;
 
     let batch = task.await.unwrap();
-    let result = extract_single_search_batch_result(&batch);
+    let result = extract_single_search_batch_result(batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["path"], "src");
     assert_eq!(result.output["effective_timeout_secs"], 5);
@@ -901,7 +877,7 @@ async fn search_project_texts_one_query_literal_mode_keeps_effective_metadata() 
     complete_search_success(&runtime, client_id, &request, "src/a.rs").await;
 
     let batch = task.await.unwrap();
-    let result = extract_single_search_batch_result(&batch);
+    let result = extract_single_search_batch_result(batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["pattern_mode"], "literal");
     assert!(result.output.get("backend").is_none());
@@ -1003,7 +979,7 @@ async fn search_project_texts_one_query_grep_fallback_keeps_backend_metadata() {
     complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, stdout, "").await;
 
     let batch = task.await.unwrap();
-    let result = extract_single_search_batch_result(&batch);
+    let result = extract_single_search_batch_result(batch);
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["backend"], "grep");
     assert_eq!(result.output["result_mode"], "matches");
@@ -1484,16 +1460,15 @@ async fn search_project_texts_retry_uses_only_remaining_absolute_deadline() {
     let late = runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(search_stdout("matches", "src/late.rs", "late")),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(200),
-            error: None,
+            ..runner_result_request(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.request_id,
+            )
         })
         .await;
     assert!(
@@ -2181,16 +2156,15 @@ async fn search_project_texts_deadline_preserves_fast_result_and_cancels_unfinis
         let late = runtime
             .runner_registry
             .complete(RunnerResultRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id: request.request_id,
                 exit_code: Some(0),
                 stdout: Some(search_stdout("matches", "src/late.rs", "late")),
                 stderr: Some(String::new()),
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(200),
-                error: None,
+                ..runner_result_request(
+                    client_id.to_string(),
+                    "inst".to_string(),
+                    request.request_id,
+                )
             })
             .await;
         assert!(late.is_err(), "timed-out Runner request was not cancelled");
@@ -2278,7 +2252,8 @@ async fn search_project_texts_records_one_event_without_patterns_and_aggregates_
         ]
     );
     assert_eq!(
-        super::super::handoff::review_evidence_summary_for_session(&summary)["search_count"],
+        super::super::closeout_evidence::ReviewEvidence::from_events(&summary.events).to_value()
+            ["search_count"],
         1
     );
     let memory_ledger = serde_json::to_string(&summary.events).unwrap();
@@ -2287,7 +2262,7 @@ async fn search_project_texts_records_one_event_without_patterns_and_aggregates_
     assert!(!memory_ledger.contains(&root.path().to_string_lossy().to_string()));
 
     runtime.sessions.flush_persistence();
-    let persisted = std::fs::read_to_string(&ledger).unwrap();
+    let persisted = webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap();
     assert!(!persisted.contains("RAW_BATCH_PATTERN_ALPHA"));
     assert!(!persisted.contains("RAW_BATCH_PATTERN_BETA"));
     assert!(!persisted.contains(&root.path().to_string_lossy().to_string()));

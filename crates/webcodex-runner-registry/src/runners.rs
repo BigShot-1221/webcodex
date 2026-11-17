@@ -36,6 +36,8 @@ use webcodex_core::runner_protocol::{
     RunnerRegisterRequest, RunnerView, RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN,
 };
 
+use webcodex_core::runner_operation::valid_computer_control_epoch;
+
 fn validate_coding_agent_registration(
     client_id: &str,
     capability: bool,
@@ -233,6 +235,16 @@ impl RunnerRegistry {
         auth: Option<&crate::RunnerAccess>,
         streaming: Option<StreamingSessionRegistration>,
     ) -> Result<RunnerView, String> {
+        if body
+            .computer_control_epoch
+            .as_deref()
+            .is_some_and(|epoch| !valid_computer_control_epoch(epoch))
+        {
+            return Err("invalid Computer control epoch".into());
+        }
+        if body.computer_control_epoch.is_some() && !body.capabilities.computer_local_control {
+            return Err("Computer control epoch requires computer_local_control support".into());
+        }
         validate_id(&body.client_id, "client_id")?;
         validate_runner_instance_id(&body.runner_instance_id)?;
         validate_optional_field(&body.display_name, "display_name")?;
@@ -298,6 +310,11 @@ impl RunnerRegistry {
         // exclusively through the bounded paged inventory protocol.
         let projects = Vec::new();
         let project_inventory = pending_inventory_state(0);
+        let job_capacity_generation = policy
+            .as_ref()
+            .and_then(|p| p.tool_providers.as_ref())
+            .map(|p| p.config_reload.generation)
+            .unwrap_or(0);
         let record = RunnerRecord {
             client_id: client_id.clone(),
             runner_instance_id: runner_instance_id.clone(),
@@ -308,6 +325,7 @@ impl RunnerRegistry {
             host_context,
             runner_features: runner_features.clone(),
             computer_session_availability: body.computer_session_availability,
+            computer_control_epoch: body.computer_control_epoch.clone(),
             projects,
             project_inventory,
             last_seen: now,
@@ -327,6 +345,7 @@ impl RunnerRegistry {
             process_started_at: body.process_started_at,
             build: body.build,
             job_concurrency_limit: body.job_concurrency_limit,
+            job_capacity_generation,
             coding_agent_providers: coding_agent_providers.clone(),
             coding_agent_inventory,
             projected_structured_terminal_suppressions: VecDeque::new(),
@@ -407,6 +426,15 @@ impl RunnerRegistry {
                 "runner {} instance was replaced and cannot reclaim the lease",
                 client_id
             ));
+        }
+        if let Some(existing) = inner.runners.get(&client_id) {
+            if existing.runner_instance_id == runner_instance_id
+                && (record.job_capacity_generation < existing.job_capacity_generation
+                    || (record.job_capacity_generation == existing.job_capacity_generation
+                        && record.job_concurrency_limit != existing.job_concurrency_limit))
+            {
+                return Err("stale or conflicting Runner capacity generation".into());
+            }
         }
         reject_same_instance_feature_downgrade(
             inner.runners.get(&client_id),
@@ -798,6 +826,47 @@ impl RunnerRegistry {
         Ok(())
     }
 
+    /// Capacity is observational metadata, accepted only for the active instance
+    /// and stream lease. A delayed same-instance poll cannot regress generation.
+    pub async fn update_job_capacity(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: Option<&str>,
+        capacity: Option<webcodex_core::runner_protocol::RunnerJobCapacity>,
+    ) -> Result<(), String> {
+        let Some(capacity) = capacity else {
+            return Ok(());
+        };
+        if capacity.generation == 0
+            || !(RUNNER_JOB_CONCURRENCY_MIN..=RUNNER_JOB_CONCURRENCY_MAX).contains(&capacity.limit)
+        {
+            return Err("invalid Runner capacity".into());
+        }
+        let mut inner = self.inner.lock().await;
+        let runner = inner.runners.get_mut(client_id).ok_or("unknown Runner")?;
+        if runner.runner_instance_id != runner_instance_id
+            || runner.disconnected_at.is_some()
+            || match connection_id {
+                Some(id) => runner.connection_id.as_deref() != Some(id),
+                None => runner.transport != RunnerTransport::Polling,
+            }
+        {
+            return Err("stale Runner capacity lease".into());
+        }
+        if capacity.generation < runner.job_capacity_generation
+            || (capacity.generation == runner.job_capacity_generation
+                && runner
+                    .job_concurrency_limit
+                    .is_some_and(|limit| limit != capacity.limit))
+        {
+            return Err("stale or conflicting Runner capacity generation".into());
+        }
+        runner.job_concurrency_limit = Some(capacity.limit);
+        runner.job_capacity_generation = capacity.generation;
+        Ok(())
+    }
+
     /// Update only brokered Computer availability for the exact active lease.
     /// A missing field leaves legacy/transient behavior unchanged.
     pub async fn update_computer_session_availability(
@@ -826,6 +895,33 @@ impl RunnerRegistry {
         }
         runner.computer_session_availability = Some(availability);
         runner.last_seen = now_ts();
+        Ok(())
+    }
+
+    pub async fn update_computer_control_epoch(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: Option<&str>,
+        epoch: Option<String>,
+    ) -> Result<(), String> {
+        let Some(epoch) = epoch else {
+            return Ok(());
+        };
+        if !valid_computer_control_epoch(&epoch) {
+            return Err("invalid Computer control epoch".into());
+        }
+        let mut inner = self.inner.lock().await;
+        let runner = inner.runners.get_mut(client_id).ok_or("unknown Runner")?;
+        if runner.runner_instance_id != runner_instance_id
+            || runner.connection_id.as_deref() != connection_id
+            || !runner
+                .runner_features
+                .supports(RunnerFeature::ComputerLocalControl)
+        {
+            return Err("Computer control epoch requires the active opted-in Runner lease".into());
+        }
+        runner.computer_control_epoch = Some(epoch);
         Ok(())
     }
 

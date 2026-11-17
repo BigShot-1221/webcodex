@@ -76,6 +76,7 @@ pub(super) fn reference_summary(
         created_at: record.created_at,
         updated_at: record.updated_at,
         counts,
+        current_instruction: record.current_instruction.as_deref().cloned(),
         events,
         events_total: observed_total,
         events_retained: retained_total,
@@ -85,6 +86,10 @@ pub(super) fn reference_summary(
         events_returned,
         events_truncated: observed_total > events_returned,
         first_retained_sequence: observed_total.saturating_sub(events_returned),
+        unclosed_mutating_call: crate::continuation::has_unclosed_mutating_call(
+            retained_events.iter(),
+            &record.session_id,
+        ),
         project_instructions,
         messages: build_messages_summary(record),
     }

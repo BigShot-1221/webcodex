@@ -3,6 +3,7 @@ import type { ReactElement } from "react";
 import { expect, it, vi } from "vitest";
 import type { RuntimeV2Client } from "../src/runtime-v2/api/client.js";
 import { TraceCallDetails } from "../src/runtime-v2/components/TraceCallDetails.js";
+import { RuntimeView } from "../src/runtime-v2/views/RuntimeView.js";
 import { TraceSearch } from "../src/runtime-v2/components/TraceSearch.js";
 import { UiProvider } from "../src/ui/UiProvider.js";
 
@@ -29,7 +30,9 @@ it("reads metadata only on expansion, caches it, pages and requires explicit ful
   fireEvent.click(screen.getByRole("button", { name: "More trace events" }));
   await screen.findByText("handler_returned");
   expect(post.mock.calls[1][1]).toEqual({ trace_ref: "exact-trace", offset: 2, limit: 12 });
-  fireEvent.click(screen.getByRole("button", { name: /Read retained full payload/ }));
+  expect(screen.queryByRole("button", { name: /Read retained full payload/ })).toBeNull();
+  fireEvent.click(screen.getByText("tool_trace_payload_captured"));
+  fireEvent.click(await screen.findByRole("button", { name: /Read retained full payload/ }));
   await screen.findByText(/explicit only/);
   expect(post.mock.calls[2][1]).toEqual({ trace_ref: "exact-trace", payload_index: 0 });
 });
@@ -93,4 +96,26 @@ it("queries without a Window hash and pages with the returned effective time ran
   fireEvent.click(screen.getByRole("button", { name: "Next call page" }));
   await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
   expect(post.mock.calls[1][1]).toEqual({ query, offset: 20, limit: 20 });
+});
+
+it("places collapsed call diagnostics under Runtime Overview and opens the exact Window", async () => {
+  const post = vi.fn(async () => ok({ status: "available", calls: [{ trace_ref: "trace", window_key: "target", observed_at_ms: 100 }] }));
+  const open = vi.fn();
+  render(<RuntimeView client={client(post)} language="en" overview={null} overviewAvailability="available" onOpenWork={vi.fn()} onOpenWindow={open} onUnauthorized={vi.fn()} />);
+  const summary = screen.getByText("Call diagnostics");
+  expect(summary.closest("details")?.open).toBe(false);
+  fireEvent.click(summary);
+  fireEvent.click(screen.getByRole("button", { name: "Search retained calls" }));
+  fireEvent.click(await screen.findByRole("button", { name: /Open Window/ }));
+  expect(open).toHaveBeenCalledWith("target");
+});
+
+it("shows incomplete capture even when response and handler finish were observed", async () => {
+  const post = vi.fn(async () => ok({ status: "available", coverage: "incomplete", known_dropped_events: 71,
+    response_handoff_observed: true, handler_finished_observed: true,
+    events: [{ event: "mcp_tool_handler_finished" }] }));
+  render(<TraceCallDetails client={client(post)} traceRef="lossy" language="en" expanded />);
+  expect((await screen.findByRole("alert")).textContent).toContain("Trace is incomplete");
+  expect(screen.getByRole("alert").textContent).toContain("71");
+  expect(screen.getByText("Capture completeness is unverified, even when a Handler finish is present.")).toBeTruthy();
 });

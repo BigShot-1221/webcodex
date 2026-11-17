@@ -22,7 +22,10 @@ const STOP_RUNTIME_ID: &str = "tray.stop_runtime";
 const CONNECT_ID: &str = "tray.connections";
 const STOP_QUICK_SHARE_ID: &str = "tray.stop_quick_share";
 const CANCEL_OPERATION_PREFIX: &str = "tray.cancel_operation:";
+const PAUSE_COMPUTER_PREFIX: &str = "tray.pause_computer:";
+const RESUME_COMPUTER_PREFIX: &str = "tray.resume_computer:";
 const LAUNCH_AT_LOGIN_ID: &str = "tray.launch_at_login";
+const HIDE_DOCK_ICON_ID: &str = "tray.hide_dock_icon";
 const QUIT_ID: &str = "tray.quit";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,8 @@ enum ConnectionAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrayProjection {
+    computer_status: &'static str,
+    computer: Option<webcodex_computer_control::ControlSnapshot>,
     locale: DesktopLocale,
     lightweight_available: bool,
     runtime_status: RuntimeStatus,
@@ -65,10 +70,13 @@ struct TrayProjection {
     cancel_operation_enabled: bool,
     operation_busy: bool,
     launch_at_login: Option<bool>,
+    hide_dock_icon: bool,
 }
 
 #[derive(Default)]
 pub struct TrayPresentationCache {
+    computer_io: tokio::sync::Mutex<()>,
+    computer: Mutex<Option<crate::computer_control::Observation>>,
     projection: Mutex<Option<TrayProjection>>,
     launch_at_login: Mutex<Option<bool>>,
 }
@@ -76,6 +84,11 @@ pub struct TrayPresentationCache {
 impl TrayProjection {
     fn with_lightweight_available(mut self, available: bool) -> Self {
         self.lightweight_available = available;
+        self
+    }
+
+    fn with_hide_dock_icon(mut self, hide: bool) -> Self {
+        self.hide_dock_icon = hide;
         self
     }
 }
@@ -142,6 +155,8 @@ impl TrayProjection {
                     operation.cancellable && operation.phase == DesktopOperationPhase::Running
                 });
         Self {
+            computer_status: "tray.computerUnavailable",
+            computer: None,
             locale,
             lightweight_available: true,
             runtime_status,
@@ -153,6 +168,7 @@ impl TrayProjection {
             cancel_operation_enabled,
             operation_busy: snapshot.current_operation.is_some(),
             launch_at_login,
+            hide_dock_icon: false,
         }
     }
 }
@@ -173,6 +189,10 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     .with_lightweight_available(
         app.state::<desktop_shell::DesktopShellState>()
             .can_enter_lightweight(),
+    )
+    .with_hide_dock_icon(
+        app.state::<desktop_shell::DockIconState>()
+            .hide_when_closed(),
     );
     let menu = build_menu(app, &projection)?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
@@ -249,6 +269,57 @@ pub fn start_background_observer(app: &AppHandle) {
     });
 }
 
+#[cfg(windows)]
+pub fn start_computer_observer(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if app
+                .state::<desktop_shell::DesktopShellState>()
+                .close_disposition()
+                == desktop_shell::CloseDisposition::AllowExit
+            {
+                break;
+            }
+            let snapshot = app.state::<AppState>().get_state();
+            let cache = app.state::<TrayPresentationCache>();
+            let _io = cache.computer_io.lock().await;
+            let observed =
+                tokio::task::spawn_blocking(move || crate::computer_control::observe(&snapshot))
+                    .await
+                    .ok()
+                    .flatten();
+            let snapshot = app.state::<AppState>().get_state();
+            let observed = observed.filter(|observation| observation.matches(&snapshot));
+            let edge_activity = observed.as_ref().is_some_and(|observation| {
+                observation.state.controlling
+                    || crate::computer_control::status_key(Some(&observation.state))
+                        == "tray.computerRecentControl"
+            });
+            app.state::<crate::computer_control::presentation::Presentation>()
+                .controlling
+                .store(
+                    edge_activity
+                        && observed
+                            .as_ref()
+                            .is_some_and(|observation| !observation.state.paused),
+                    std::sync::atomic::Ordering::Release,
+                );
+            *app.state::<TrayPresentationCache>()
+                .computer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = observed;
+            refresh_from_snapshot(&app, &snapshot);
+            // WebView construction stays on the asynchronous observer, never
+            // inside a synchronous native menu callback.
+            crate::computer_control::presentation::update_edge(&app, edge_activity);
+        }
+    });
+}
+
 fn should_refresh_persistent_status(snapshot: &DesktopStateSnapshot) -> bool {
     snapshot.persistent_environment.is_some() && snapshot.current_operation.is_none()
 }
@@ -259,7 +330,7 @@ pub fn refresh_from_snapshot(app: &AppHandle, snapshot: &DesktopStateSnapshot) {
         .launch_at_login
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let projection = TrayProjection::from_snapshot(
+    let mut projection = TrayProjection::from_snapshot(
         snapshot,
         launch_at_login,
         app.state::<DesktopLocaleState>().get(),
@@ -267,7 +338,19 @@ pub fn refresh_from_snapshot(app: &AppHandle, snapshot: &DesktopStateSnapshot) {
     .with_lightweight_available(
         app.state::<desktop_shell::DesktopShellState>()
             .can_enter_lightweight(),
+    )
+    .with_hide_dock_icon(
+        app.state::<desktop_shell::DockIconState>()
+            .hide_when_closed(),
     );
+    projection.computer = cache
+        .computer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .filter(|observation| observation.matches(snapshot))
+        .map(|observation| observation.state.clone());
+    projection.computer_status = crate::computer_control::status_key(projection.computer.as_ref());
     {
         let cached = cache
             .projection
@@ -280,6 +363,12 @@ pub fn refresh_from_snapshot(app: &AppHandle, snapshot: &DesktopStateSnapshot) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
+    if cfg!(windows) {
+        let _ = tray.set_tooltip(Some(format!(
+            "WebCodex · {}",
+            projection.locale.text(projection.computer_status)
+        )));
+    }
     match build_menu(app, &projection).and_then(|menu| tray.set_menu(Some(menu))) {
         Ok(()) => {
             cache
@@ -310,6 +399,24 @@ fn observe_launch_at_login(app: &AppHandle) {
 fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Menu<tauri::Wry>> {
     let locale = projection.locale;
     let menu = Menu::new(app)?;
+    if cfg!(windows) {
+        if let Some(state) = &projection.computer {
+            let (paused, key, enabled) = crate::computer_control::menu_action(state);
+            let prefix = if paused {
+                PAUSE_COMPUTER_PREFIX
+            } else {
+                RESUME_COMPUTER_PREFIX
+            };
+            let action = MenuItem::with_id(
+                app,
+                format!("{prefix}{}", state.epoch),
+                locale.text(key),
+                enabled,
+                None::<&str>,
+            )?;
+            menu.append(&action)?;
+        }
+    }
     let runtime = MenuItem::new(
         app,
         match projection.runtime_status {
@@ -428,16 +535,40 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
     )?;
     let quit_separator = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, QUIT_ID, locale.text("tray.quit"), true, None::<&str>)?;
-    menu.append_items(&[
-        &preferences_separator,
-        &launch_at_login,
-        &quit_separator,
-        &quit,
-    ])?;
+    menu.append_items(&[&preferences_separator, &launch_at_login])?;
+    if cfg!(target_os = "macos") {
+        menu.append(&CheckMenuItem::with_id(
+            app,
+            HIDE_DOCK_ICON_ID,
+            locale.text("tray.hideDockIcon"),
+            true,
+            projection.hide_dock_icon,
+            None::<&str>,
+        )?)?;
+    }
+    menu.append_items(&[&quit_separator, &quit])?;
     Ok(menu)
 }
 
 pub(crate) fn handle_menu_event(app: &AppHandle, id: &str) {
+    for (prefix, paused) in [
+        (PAUSE_COMPUTER_PREFIX, true),
+        (RESUME_COMPUTER_PREFIX, false),
+    ] {
+        if let Some(epoch) = id.strip_prefix(prefix) {
+            let observed = app
+                .state::<TrayPresentationCache>()
+                .computer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if let Some(observed) = observed.filter(|observation| observation.state.epoch == epoch)
+            {
+                set_computer_paused(app, observed, paused);
+            }
+            return;
+        }
+    }
     match id {
         OPEN_ID => {
             let _ = desktop_shell::show_main_window(app);
@@ -472,6 +603,14 @@ pub(crate) fn handle_menu_event(app: &AppHandle, id: &str) {
                 let _ = desktop_shell::navigate(app, NavigationTarget::Settings);
             }
         },
+        HIDE_DOCK_ICON_ID => {
+            let hide = !app
+                .state::<desktop_shell::DockIconState>()
+                .hide_when_closed();
+            desktop_shell::set_hide_dock_icon(app, hide);
+            let snapshot = app.state::<AppState>().get_state();
+            refresh_from_snapshot(app, &snapshot);
+        }
         QUIT_ID => desktop_shell::request_application_exit(app),
         _ => {
             if let Some(action) = cancel_action_from_menu_id(id) {
@@ -479,6 +618,52 @@ pub(crate) fn handle_menu_event(app: &AppHandle, id: &str) {
             }
         }
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn pause_computer(app: &AppHandle) {
+    let observed = app
+        .state::<TrayPresentationCache>()
+        .computer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(observed) = observed {
+        set_computer_paused(app, observed, true);
+    }
+}
+
+fn set_computer_paused(
+    app: &AppHandle,
+    observed: crate::computer_control::Observation,
+    paused: bool,
+) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let cache = app.state::<TrayPresentationCache>();
+        let _io = cache.computer_io.lock().await;
+        let snapshot = app.state::<AppState>().get_state();
+        let updated = tokio::task::spawn_blocking(move || {
+            match crate::computer_control::set_paused(&snapshot, observed, paused) {
+                Ok(updated) => Some(updated),
+                Err(error) => {
+                    eprintln!("WebCodex Computer control action failed: {error}");
+                    // Status owns the sticky persistence failure as well as the
+                    // new epoch. Re-read after a failed action to offer a fenced
+                    // retry rather than restoring an older menu observation.
+                    crate::computer_control::observe(&snapshot)
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        *app.state::<TrayPresentationCache>()
+            .computer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = updated;
+        refresh_from_snapshot(&app, &app.state::<AppState>().get_state());
+    });
 }
 
 fn cancel_action_from_menu_id(id: &str) -> Option<TrayStateAction> {
@@ -585,6 +770,15 @@ mod tests {
         assert_eq!(chinese.connection_status, english.connection_status);
         assert_eq!(chinese.locale.text("tray.open"), "打开 WebCodex");
         assert_eq!(english.locale.text("tray.open"), "Open WebCodex");
+    }
+
+    #[test]
+    fn dock_preference_change_invalidates_the_tray_cache() {
+        let snapshot = local_snapshot();
+        let shown = TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::EnUs);
+        let hidden = shown.clone().with_hide_dock_icon(true);
+        assert_ne!(shown, hidden);
+        assert_eq!(hidden.with_hide_dock_icon(false), shown);
     }
 
     #[test]

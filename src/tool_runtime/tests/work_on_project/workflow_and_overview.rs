@@ -1,4 +1,3 @@
-
 #[tokio::test]
 async fn work_on_project_sizes_and_runner_request_reduction_are_stable() {
     let root = tempfile::tempdir().unwrap();
@@ -216,16 +215,10 @@ async fn coding_workflow_standard_repository_overview_timeout_is_nonblocking() {
         let expired = runtime
             .runner_registry
             .complete(crate::runner_protocol::RunnerResultRequest {
-                client_id: "wop-timeout".to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id,
                 exit_code: Some(0),
                 stdout: Some("{}".to_string()),
-                stderr: None,
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(1),
-                error: None,
+                ..runner_result_request("wop-timeout".to_string(), "inst".to_string(), request_id)
             })
             .await
             .expect_err("timed-out overview probe must remove pending waiter");
@@ -557,7 +550,7 @@ async fn coding_workflow_standard_overview_strips_unknown_runner_fields_and_stay
 }
 
 #[tokio::test]
-async fn coding_workflow_standard_and_full_accept_valid_repository_overview() {
+async fn coding_workflow_briefs_accept_valid_repository_overview() {
     let root = tempfile::tempdir().unwrap();
     seed_coding_repository(root.path(), "rules load with valid overview");
     let runtime = ToolRuntime::new_for_tests();
@@ -565,7 +558,7 @@ async fn coding_workflow_standard_and_full_accept_valid_repository_overview() {
         register_runner_project_at_path(&runtime, "wop-valid-overview", "demo", root.path()).await;
 
     let auth = auth_context(None, true);
-    for detail in [StartupDetail::Standard, StartupDetail::Full] {
+    for detail in [StartupDetail::Minimal, StartupDetail::Standard] {
         let stdout = valid_agent_overview_stdout(&runtime, "wop-valid-overview", root.path());
         let (result, overview_id) = dispatch_coding_workflow_diagnostic_with_overview_stdout(
             &runtime,
@@ -582,8 +575,7 @@ async fn coding_workflow_standard_and_full_accept_valid_repository_overview() {
             overview_id.is_some(),
             "{detail:?}: overview probe must be issued"
         );
-        let brief = crate::tool_runtime::startup_brief::startup_brief_from_output(&result.output)
-            .expect("advanced startup brief");
+        let brief = &result.output;
         let semantic = &brief["semantic_navigation"];
         assert_eq!(semantic["status"], "probe_failed");
         assert_eq!(semantic["available"], Value::Null);
@@ -593,21 +585,6 @@ async fn coding_workflow_standard_and_full_accept_valid_repository_overview() {
             .unwrap()
             .iter()
             .any(|warning| warning == "semantic_navigation_unavailable"));
-        if detail == StartupDetail::Full {
-            // Full diagnostics retain the original probe status and reason.
-            assert_eq!(
-                result.output["semantic_navigation"]["status"],
-                "probe_failed"
-            );
-            assert_eq!(
-                result.output["semantic_navigation"]["available"],
-                Value::Null
-            );
-            assert_eq!(
-                result.output["semantic_navigation"]["reason_code"],
-                "malformed_agent_result"
-            );
-        }
         let repository = &brief["repository"];
         assert_eq!(
             repository["status"], "available",
@@ -741,7 +718,7 @@ async fn work_on_project_guidance_profile_is_request_local_and_not_durable() {
         1
     );
     runtime.sessions.flush_persistence();
-    let persisted = fs::read_to_string(&ledger).unwrap();
+    let persisted = webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap();
     for absent in [
         "guidance_profile",
         "tool_strategy",
@@ -963,6 +940,7 @@ async fn work_on_project_distinguishes_unavailable_from_inconclusive_lsp_probes(
                         available: false,
                         running: false,
                         status: LspAvailabilityStatus::Unavailable,
+                        index_readiness: Default::default(),
                         source: None,
                         position_encoding: None,
                     }],

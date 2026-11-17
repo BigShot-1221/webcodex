@@ -37,6 +37,8 @@ pub struct ValidationCommandOptions {
     /// Canonical sorted, duplicate-free package scope for `cargo_check`.
     pub cargo_packages: Option<Vec<String>>,
     pub all_packages: bool,
+    /// Canonical sorted, duplicate-free Cargo workspace members to exclude.
+    pub cargo_exclude_packages: Vec<String>,
     pub no_run: Option<bool>,
     /// First-class `go_test` package scope. Other validation adapters must
     /// reject this Go-specific option rather than silently ignoring it.
@@ -54,6 +56,7 @@ pub struct CargoCheckOptions {
     pub package: Option<String>,
     pub packages: Option<Vec<String>>,
     pub all_packages: bool,
+    pub exclude_packages: Vec<String>,
     pub dependency_mode: Option<ProjectDependencyMode>,
     pub dependency_resolution_policy: Option<ProjectDependencyResolutionPolicy>,
 }
@@ -69,6 +72,7 @@ pub struct CargoTestOptions {
     pub package: Option<String>,
     pub packages: Option<Vec<String>>,
     pub all_packages: bool,
+    pub exclude_packages: Vec<String>,
     pub no_run: Option<bool>,
     pub dependency_mode: Option<ProjectDependencyMode>,
     pub dependency_resolution_policy: Option<ProjectDependencyResolutionPolicy>,
@@ -191,7 +195,8 @@ impl ReadOnlyValidationOperation {
             return Ok(self);
         };
         match &mut self {
-            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => {
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
                 options.dependency_resolution_policy = Some(policy)
             }
             Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => {
@@ -202,9 +207,32 @@ impl ReadOnlyValidationOperation {
         Ok(self)
     }
 
+    pub fn with_excluded_packages(mut self, packages: Vec<String>) -> Result<Self, &'static str> {
+        if packages.is_empty() {
+            return Ok(self);
+        }
+        match &mut self {
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options))
+                if options.all_packages =>
+            {
+                options.exclude_packages = packages
+            }
+            Self::Cargo(CargoReadOnlyValidationOperation::Test(options))
+                if options.all_packages =>
+            {
+                options.exclude_packages = packages
+            }
+            Self::Cargo(_) => return Err("workspace_exclusions_require_rust_all_packages"),
+            _ => return Err("workspace_exclusions_unsupported"),
+        }
+        Ok(self)
+    }
+
     fn dependency_resolution_policy(&self) -> Option<ProjectDependencyResolutionPolicy> {
         match self {
-            Self::Cargo(CargoReadOnlyValidationOperation::Check(options)) => {
+            Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
                 options.dependency_resolution_policy
             }
             Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => {
@@ -369,27 +397,39 @@ impl ReadOnlyValidationOperation {
                 "check": true,
             }),
             Self::Cargo(CargoReadOnlyValidationOperation::Check(options))
-            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => serde_json::json!({
-                "cwd": cwd,
-                "all_targets": options.all_targets,
-                "all_features": options.all_features,
-                "no_default_features": options.no_default_features,
-                "features": options.features.as_deref(),
-                "package": options.package.as_deref(),
-                "packages": options.packages.as_ref(),
-            }),
-            Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => serde_json::json!({
-                "cwd": cwd,
-                "filter": options.filter.as_deref(),
-                "lib": options.lib,
-                "all_targets": options.all_targets,
-                "all_features": options.all_features,
-                "no_default_features": options.no_default_features,
-                "features": options.features.as_deref(),
-                "package": options.package.as_deref(),
-                "packages": options.packages.as_ref(),
-                "no_run": options.no_run,
-            }),
+            | Self::Cargo(CargoReadOnlyValidationOperation::Clippy(options)) => {
+                let mut arguments = serde_json::json!({
+                    "cwd": cwd,
+                    "all_targets": options.all_targets,
+                    "all_features": options.all_features,
+                    "no_default_features": options.no_default_features,
+                    "features": options.features.as_deref(),
+                    "package": options.package.as_deref(),
+                    "packages": options.packages.as_ref(),
+                });
+                if !options.exclude_packages.is_empty() {
+                    arguments["exclude_packages"] = serde_json::json!(options.exclude_packages);
+                }
+                arguments
+            }
+            Self::Cargo(CargoReadOnlyValidationOperation::Test(options)) => {
+                let mut arguments = serde_json::json!({
+                    "cwd": cwd,
+                    "filter": options.filter.as_deref(),
+                    "lib": options.lib,
+                    "all_targets": options.all_targets,
+                    "all_features": options.all_features,
+                    "no_default_features": options.no_default_features,
+                    "features": options.features.as_deref(),
+                    "package": options.package.as_deref(),
+                    "packages": options.packages.as_ref(),
+                    "no_run": options.no_run,
+                });
+                if !options.exclude_packages.is_empty() {
+                    arguments["exclude_packages"] = serde_json::json!(options.exclude_packages);
+                }
+                arguments
+            }
             Self::Go(GoReadOnlyValidationOperation::Check(options)) => serde_json::json!({
                 "cwd": cwd,
                 "packages": options.packages.as_ref(),
@@ -497,6 +537,17 @@ pub fn project_validation_operation(
     }
 }
 
+pub fn project_validation_operation_with_excluded_packages(
+    backend: &str,
+    action: crate::SemanticCheck,
+    packages: Option<Vec<String>>,
+    all_packages: bool,
+    exclude_packages: Vec<String>,
+) -> Result<ReadOnlyValidationOperation, &'static str> {
+    project_validation_operation(backend, action, packages, all_packages)?
+        .with_excluded_packages(exclude_packages)
+}
+
 impl From<CargoCheckOptions> for ValidationCommandOptions {
     fn from(options: CargoCheckOptions) -> Self {
         Self {
@@ -507,6 +558,7 @@ impl From<CargoCheckOptions> for ValidationCommandOptions {
             package: options.package,
             cargo_packages: options.packages,
             all_packages: options.all_packages,
+            cargo_exclude_packages: options.exclude_packages,
             dependency_mode: options.dependency_mode,
             dependency_resolution_policy: options.dependency_resolution_policy,
             ..Self::default()
@@ -526,6 +578,7 @@ impl From<CargoTestOptions> for ValidationCommandOptions {
             package: options.package,
             cargo_packages: options.packages,
             all_packages: options.all_packages,
+            cargo_exclude_packages: options.exclude_packages,
             no_run: options.no_run,
             dependency_mode: options.dependency_mode,
             dependency_resolution_policy: options.dependency_resolution_policy,

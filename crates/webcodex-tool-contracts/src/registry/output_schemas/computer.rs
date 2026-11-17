@@ -47,9 +47,13 @@ fn target_schema() -> Value {
                     "computer_clipboard_read": {"type": "boolean"},
                     "computer_clipboard_write": {"type": "boolean"},
                     "computer_snapshot_region": {"type": "boolean"},
-                    "computer_accessibility_observe": {"type": "boolean"}
+                    "computer_accessibility_observe": {"type": "boolean"},
+                    "computer_key_input": {"type": "boolean"},
+                    "computer_letter_shortcuts": {"type": "boolean"},
+                    "computer_key_chords": {"type": "boolean"},
+                    "computer_scroll": {"type": "boolean"}
                 },
-                "required": ["computer_observe", "computer_application_discovery", "computer_application_launch", "computer_display_observe", "computer_pointer_control", "computer_clipboard_read", "computer_clipboard_write", "computer_snapshot_region", "computer_accessibility_observe"]
+                "required": ["computer_observe", "computer_application_discovery", "computer_application_launch", "computer_display_observe", "computer_pointer_control", "computer_clipboard_read", "computer_clipboard_write", "computer_snapshot_region", "computer_accessibility_observe", "computer_key_input", "computer_letter_shortcuts", "computer_key_chords", "computer_scroll"]
             }
         },
         "required": ["client_id", "display_name", "connected", "capabilities"]
@@ -191,17 +195,24 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             "computer_snapshot_display",
             "computer_read_clipboard",
         ])),
-        "control_computer" => Some(merged_gateway_output_schema(&[
-            "computer_launch_application",
-            "computer_activate_window",
-            "__computer_element_control",
-            "computer_scroll_to_element",
-            "computer_key_input",
-            "computer_input_text",
-            "computer_pointer_move",
-            "computer_pointer_click",
-            "computer_write_clipboard",
-        ])),
+        "control_computer" => {
+            let mut schema = merged_gateway_output_schema(&[
+                "computer_launch_application",
+                "computer_activate_window",
+                "__computer_element_control",
+                "computer_scroll_to_element",
+                "computer_scroll",
+                "computer_key_input",
+                "computer_input_text",
+                "computer_pointer_move",
+                "computer_pointer_click",
+                "computer_write_clipboard",
+            ]);
+            schema["properties"]["output"]["properties"]["post_observation"] =
+                output_schema_for_tool("computer_accessibility_tree")
+                    .expect("canonical tree output");
+            Some(schema)
+        }
         "computer_list_targets" => Some(wrapped_output_schema(vec![
             (
                 "targets",
@@ -356,6 +367,18 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ("can_press", json!({"type": "boolean"})),
             ("can_focus", json!({"type": "boolean"})),
             ("can_input_text", json!({"type": "boolean"})),
+            ("can_select", json!({"type":"boolean"})),
+            ("selected", json!({"type":["boolean","null"]})),
+            (
+                "scroll",
+                json!({"anyOf":[{"type":"null"}, {
+                    "type":"object", "additionalProperties":false,
+                    "properties": {
+                        "horizontal_percent":{"type":["number","null"],"minimum":0,"maximum":100},
+                        "vertical_percent":{"type":["number","null"],"minimum":0,"maximum":100}
+                    }, "required":["horizontal_percent","vertical_percent"]
+                }]}),
+            ),
         ])),
         "computer_activate_window" => Some(wrapped_output_schema(vec![
             (
@@ -387,6 +410,40 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
+        "computer_scroll" => Some(wrapped_output_schema(vec![
+            ("platform", json!({"type":"string", "const":"windows"})),
+            (
+                "surface_id",
+                json!({"type":"string", "minLength":1, "maxLength":128}),
+            ),
+            (
+                "element_id",
+                json!({"type":"string", "minLength":1, "maxLength":128}),
+            ),
+            (
+                "direction",
+                serde_json::to_value(schemars::schema_for!(
+                    webcodex_core::computer_scroll_contract::ComputerScrollDirection
+                ))
+                .expect("scroll direction schema"),
+            ),
+            (
+                "amount",
+                serde_json::to_value(schemars::schema_for!(
+                    webcodex_core::computer_scroll_contract::ComputerScrollAmount
+                ))
+                .expect("scroll amount schema"),
+            ),
+            (
+                "position_before",
+                json!({"type":"number", "minimum":0, "maximum":100}),
+            ),
+            (
+                "position_after",
+                json!({"type":"number", "minimum":0, "maximum":100}),
+            ),
+            ("success", json!({"type":"boolean", "const":true})),
+        ])),
         "computer_scroll_to_element" => Some(wrapped_output_schema(vec![
             (
                 "platform",
@@ -402,25 +459,30 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
-        "computer_key_input" => Some(wrapped_output_schema(vec![
-            (
-                "platform",
-                json!({"type": "string", "enum": ["macos", "windows"]}),
-            ),
-            (
-                "surface_id",
-                json!({"type": "string", "minLength": 1, "maxLength": 128}),
-            ),
-            (
-                "key",
-                json!({"type": "string", "enum": ["enter", "escape", "tab", "arrow_up", "arrow_down", "arrow_left", "arrow_right", "page_up", "page_down", "home", "end"]}),
-            ),
-            (
-                "modifiers",
-                json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["shift", "control", "option", "command"]}}),
-            ),
-            ("success", json!({"type": "boolean", "const": true})),
-        ])),
+        "computer_key_input" => {
+            Some(wrapped_output_schema(vec![
+                (
+                    "platform",
+                    json!({"type": "string", "enum": ["macos", "windows"]}),
+                ),
+                (
+                    "surface_id",
+                    json!({"type": "string", "minLength": 1, "maxLength": 128}),
+                ),
+                (
+                    "key",
+                    webcodex_core::computer_input_contract::computer_key_schema(
+                        &mut Default::default(),
+                    )
+                    .to_value(),
+                ),
+                (
+                    "modifiers",
+                    json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["shift", "control", "option", "command"]}}),
+                ),
+                ("success", json!({"type": "boolean", "const": true})),
+            ]))
+        }
         "computer_input_text" => Some(wrapped_output_schema(vec![
             (
                 "platform",

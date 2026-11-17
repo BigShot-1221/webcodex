@@ -1,5 +1,10 @@
 # SessionStore access order and bounded write coalescing
 
+> Historical implementation report for the JSON snapshot writer. Current main
+> uses SQLite deltas and non-expiring identities; see
+> [Session storage and residency](session-active-residency.md). The scheduling and
+> retention statements below describe the measured version, not the current contract.
+
 ## Scope
 
 Follow-up to the #771 scale experiment, based on
@@ -106,6 +111,13 @@ window plus a generous 10-second completion bound verifies bypass without
 brittle millisecond assertions or sleep-based coordination.
 
 ## Reproduction
+
+Use an isolated checkout of report commit `347aa42d2` (#773) for the historical
+commands below. The full-file JSON writer experiment
+`populated_ledger_write_coalescing_experiment` is no longer a test on current main;
+a Cargo filter matching no tests is not a reproduction. Current SQLite writer
+behavior is covered by [`store/writer/sqlite_tests.rs`](../../crates/webcodex-workflow-session/src/store/writer/sqlite_tests.rs)
+and the current storage contract linked above.
 
 ```sh
 cargo test --locked -p webcodex-workflow-session --lib

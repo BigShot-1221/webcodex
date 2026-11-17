@@ -1010,6 +1010,44 @@ test("Host dispatch rejection after prepare is unknown and never resent", async 
   assert.equal(hostMessages(view).length, 1);
 });
 
+for (const hostReply of [
+  { isError: true }, { isError: "false" }, null, [],
+]) {
+  test(`resolved ui/message response ${JSON.stringify(hostReply)} never marks Host acceptance or retries`, async () => {
+    const view = await boundView();
+    await view.reply(view.calls("get_agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+    await view.reply(view.calls("acquire_agent_continuation_wake").at(-1), toolResult({ wake }));
+    await view.reply(view.calls("prepare_agent_continuation_wake").at(-1), prepared());
+    assert.equal(hostMessages(view).length, 1);
+    await view.reply(hostMessages(view)[0], hostReply);
+    const finish = view.calls("finish_agent_continuation_wake").at(-1);
+    assert.equal(finish.params.arguments.outcome, "delivery_unknown");
+    await view.reply(finish, toolResult({}));
+    await view.fireTimers(3000);
+    assert.equal(hostMessages(view).length, 1);
+  });
+}
+
+test("Host acceptance and uncertain delivery are distinct, without duplicate follow-up", async () => {
+  const view = await boundView();
+  await view.reply(view.calls("get_agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+  await view.reply(view.calls("acquire_agent_continuation_wake").at(-1), toolResult({ wake }));
+  await view.reply(view.calls("prepare_agent_continuation_wake").at(-1), prepared());
+  await view.reply(hostMessages(view)[0], {isError:false});
+  assert.equal(view.calls("finish_agent_continuation_wake").at(-1).params.arguments.outcome, "dispatch_accepted");
+  await view.reply(view.calls("finish_agent_continuation_wake").at(-1), toolResult({}));
+  await view.fireTimers(3000);
+  await view.reply(view.calls("get_agent_continuation_state").at(-1),
+    toolResult({ agent_continuation: { ...projection, dispatch_observation:"dispatch_accepted" } }));
+  assert.equal(view.nodes.status.textContent, "Host accepted follow-up · awaiting a fresh turn");
+  await view.reply(view.calls("acquire_agent_continuation_wake").at(-1), toolResult({ wake: null }));
+  await view.fireTimers(3000);
+  await view.reply(view.calls("get_agent_continuation_state").at(-1),
+    toolResult({ agent_continuation: { ...projection, dispatch_observation:"dispatch_unknown" } }));
+  assert.equal(view.nodes.status.textContent, "Host delivery unconfirmed · no automatic retry");
+  assert.equal(hostMessages(view).length, 1);
+});
+
 test("Host dispatch timeout is finished as unknown and the same Attempt is never resent", async () => {
   const view = await boundView();
   await view.reply(view.calls("get_agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
@@ -1588,4 +1626,68 @@ test("Agent opt-in timing stays local, bounded and clears across remount", async
   const remount = app("mcp_agent_continuation_app.html");
   assert.equal(remount.document.getElementById("timing-log").textContent, "");
   await remount.teardown();
+});
+
+const timingEvents = view => view.nodes["timing-log"].textContent.split("\n").filter(Boolean).map(JSON.parse);
+
+for (const result of ["accepted", "error", "cancelled", "timeout", "teardown"]) {
+  test(`opt-in Host dispatch timing records ${result} with closed outcomes and no private data`, async () => {
+    const view = await boundView();
+    view.nodes["timing-toggle"].onclick();
+    await view.reply(view.calls("get_agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+    await view.reply(view.calls("acquire_agent_continuation_wake").at(-1), toolResult({ wake }));
+    const token = "wc_wake_consume_zMzMzMzMzMzMzMzMzMzMzA";
+    const message = `PRIVATE automatic message consume_token=${token}`;
+    await view.reply(view.calls("prepare_agent_continuation_wake").at(-1), prepared(wake, message));
+    const hostCall = hostMessages(view)[0];
+    assert.ok(hostCall);
+    assert.equal(timingEvents(view).filter(event => event.event === "host_dispatch_start").length, 1);
+    await view.visibility(true);
+    await view.visibility(false);
+    if (result === "timeout") await view.fireTimers(10_000);
+    else {
+      view.advanceTime(2_300);
+      if (result === "accepted") await view.reply(hostCall, {});
+      else if (result === "teardown") await view.teardown();
+      else await view.reject(hostCall, { code: result === "cancelled" ? -32800 : -32000, message: `PRIVATE error ${token}` });
+    }
+    const finished = timingEvents(view).filter(event => ["host_dispatch_complete", "host_dispatch_error"].includes(event.event));
+    assert.equal(finished.length, 1);
+    assert.equal(finished[0].duration_ms, result === "timeout" ? 10_000 : 2_300);
+    assert.equal(finished[0].outcome, result === "accepted" ? "dispatch_accepted" : "delivery_unknown");
+    assert.equal(finished[0].event, result === "accepted" ? "host_dispatch_complete" : "host_dispatch_error");
+    if (result !== "accepted") assert.equal(finished[0].failure_kind,
+      result === "timeout" ? "bridge-timeout" : ["cancelled", "teardown"].includes(result) ? "bridge-cancelled" : "bridge-error");
+    if (result !== "teardown") {
+      const finish = view.calls("finish_agent_continuation_wake").at(-1);
+      assert.equal(finish.params.arguments.outcome, finished[0].outcome);
+      await view.reply(finish, toolResult({}));
+    }
+    await view.reply(hostCall, {}); // A late/duplicate ACK is inert.
+    assert.equal(hostMessages(view).length, 1);
+    assert.equal(timingEvents(view).filter(event => event.event === finished[0].event).length, 1);
+    const log = view.nodes["timing-log"].textContent;
+    for (const secret of [token, message, "PRIVATE error", bindingId(view), wake.wake_id, wake.attempt_id, projection.display_name]) {
+      assert.ok(!log.includes(secret), `timing ring must omit ${secret}`);
+    }
+    view.nodes["timing-toggle"].onclick();
+    assert.equal(view.nodes["timing-log"].textContent, "");
+    await view.teardown();
+    assert.equal(view.timers.size, 0);
+  });
+}
+
+test("Host dispatch timing remains off by default without an additional RPC", async () => {
+  const view = await boundView();
+  await view.reply(view.calls("get_agent_continuation_state").at(-1), toolResult({ agent_continuation: projection }));
+  await view.reply(view.calls("acquire_agent_continuation_wake").at(-1), toolResult({ wake }));
+  await view.reply(view.calls("prepare_agent_continuation_wake").at(-1), prepared());
+  await view.reply(hostMessages(view)[0], {});
+  await view.reply(view.calls("finish_agent_continuation_wake").at(-1), toolResult({}));
+  assert.equal(view.document.getElementById("timing-log").textContent, "");
+  assert.deepEqual(view.sent.filter(message => message.method === "tools/call").map(message => message.params.name), [
+    "bind_agent_continuation", "get_agent_continuation_state", "acquire_agent_continuation_wake",
+    "prepare_agent_continuation_wake", "finish_agent_continuation_wake",
+  ]);
+  await view.teardown();
 });

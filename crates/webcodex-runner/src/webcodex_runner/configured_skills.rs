@@ -499,7 +499,7 @@ pub(super) fn read_resource(
         _ => "skill_resource_unavailable".to_string(),
     })?;
     let range = file_read_range::EffectiveRange::new(Some(start_line), Some(limit));
-    let read = file_read_range::read_range_from_with_budget(
+    let read = file_read_range::read_page_from_with_budget(
         bytes.as_slice(),
         range,
         MAX_RUNNER_SKILL_READ_TEXT_BYTES,

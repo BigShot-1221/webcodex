@@ -9,7 +9,7 @@ use crate::lsp_bridge::{
     RunnerLspPayload, RunnerLspRequest, RunnerLspResultEnvelope, WorkspaceSymbolsResult,
     AGENT_LSP_REQUEST_KIND,
 };
-use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
+use crate::runner_protocol::RunnerCapabilities;
 use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use crate::tool_runtime::tool_definition::{
     lookup_tool_definition, model_visible_tool_definitions, RunnerCapabilityRequirement,
@@ -270,7 +270,12 @@ fn document_diagnostics_tool_call_parser_produces_only_typed_fields() {
         json!({"project": "agent:oe:demo", "path": "src/main.rs", "timeout": 30}),
     )
     .unwrap_err();
-    assert!(error.contains("unknown field `timeout`"), "{error}");
+    assert!(error.contains("[field]: unknown field"), "{error}");
+    assert!(
+        error.contains("accepted top-level fields include"),
+        "{error}"
+    );
+    assert!(!error.contains("`timeout`"), "{error}");
 }
 
 async fn register_lsp_agent(
@@ -302,31 +307,16 @@ async fn register_lsp_agent_capabilities(
     let project_path = root.to_string_lossy().to_string();
     runtime
         .runner_registry
-        .register(crate::test_support::current_runner_registration(
-            RunnerRegisterRequest {
-                computer_session_availability: None,
-                process_started_at: None,
-                build: None,
-                job_concurrency_limit: None,
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                display_name: None,
-                owner: None,
-                hostname: None,
-                host_context: None,
-                capabilities: RunnerCapabilities {
-                    shell: true,
-                    file_read: true,
-                    file_write: true,
-                    lsp_read_only_navigation: lsp_capable,
-                    lsp_call_hierarchy: call_hierarchy_capable,
-                    ..Default::default()
-                },
-                policy: None,
+        .register(crate::test_support::runner_registration(
+            client_id,
+            "inst",
+            RunnerCapabilities {
+                shell: true,
+                file_read: true,
+                file_write: true,
+                lsp_read_only_navigation: lsp_capable,
+                lsp_call_hierarchy: call_hierarchy_capable,
+                ..Default::default()
             },
         ))
         .await
@@ -1039,6 +1029,7 @@ async fn lsp_status_unavailable_still_succeeds() {
                 available: false,
                 running: false,
                 status: LspAvailabilityStatus::Unavailable,
+                index_readiness: Default::default(),
                 source: None,
                 position_encoding: None,
             }],

@@ -1,5 +1,6 @@
 //! Phase D bounded batch Job observation.
 
+mod mixed_projection;
 mod readiness;
 mod summary;
 
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 
 fn item(job_id: &str, token: Option<String>) -> ObserveJobsItem {
     ObserveJobsItem {
+        page: false,
         job_id: job_id.to_string(),
         after_observation_token: token,
         observation_ref: None,
@@ -26,6 +28,7 @@ fn item(job_id: &str, token: Option<String>) -> ObserveJobsItem {
 
 fn item_ref(observation_ref: &str) -> ObserveJobsItem {
     ObserveJobsItem {
+        page: false,
         job_id: String::new(),
         after_observation_token: None,
         observation_ref: Some(observation_ref.to_string()),
@@ -86,25 +89,11 @@ async fn register_and_start_sequenced_agent_job(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
             job_inventory: Some(ShellJobInventory {
                 active_complete: true,
                 jobs: Vec::new(),
             }),
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
-            owner: None,
-            hostname: None,
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(caps),
-            policy: None,
+            ..crate::test_support::runner_registration(client_id, "inst", caps)
         })
         .await
         .unwrap();
@@ -157,25 +146,18 @@ async fn update_observed_job(
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            update_seq: None,
-            job_id: request.job_id.clone().expect("Job request id"),
             request_id: Some(request.request_id.clone()),
-            status: status.to_string(),
             stdout_chunk: stdout_chunk.map(str::to_string),
-            stderr_chunk: None,
-            log_snapshot: None,
             exit_code: finished.then_some(0),
             duration_ms: finished.then_some(25),
-            error: None,
-            command_execution_state: None,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
             activity,
-            finished,
+            ..runner_job_update(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.job_id.clone().expect("Job request id"),
+                status.to_string(),
+                finished,
+            )
         })
         .await
         .unwrap();
@@ -191,25 +173,16 @@ async fn update_sequenced_observed_job(
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
             update_seq: Some(sequence),
-            job_id: request.job_id.clone().expect("Job request id"),
             request_id: Some(request.request_id.clone()),
-            status: "running".to_string(),
             stdout_chunk: stdout_chunk.map(str::to_string),
-            stderr_chunk: None,
-            log_snapshot: None,
-            exit_code: None,
-            duration_ms: None,
-            error: None,
-            command_execution_state: None,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
-            activity: None,
-            finished: false,
+            ..runner_job_update(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.job_id.clone().expect("Job request id"),
+                "running".to_string(),
+                false,
+            )
         })
         .await
         .unwrap();
@@ -396,7 +369,7 @@ fn observe_jobs_tool_call_enforces_batch_and_scalar_bounds() {
             ToolCall::ObserveJobs {
                 tail_lines: 40,
                 wait_secs: None,
-                wake_on: ObserveJobsWakeOn::Change,
+                wake_on: ObserveJobsWakeOn::Terminal,
 
                 summary_only: false,
                 ..
@@ -694,7 +667,7 @@ fn observe_jobs_compact_projection_single_running_unchanged_keeps_actionable_sta
     assert!(projected.output["wait"].get("waited_ms").is_none());
     let item = &projected.output["items"][0];
     assert_eq!(item["job_id"], "job-unchanged");
-    assert_eq!(item["project"], "agent:special:observe-kernel-projection");
+    assert!(item.get("project").is_none());
     assert_eq!(item["status"], "running");
     assert_eq!(item["terminal"], false);
     assert_eq!(item["changed"], false);
@@ -702,10 +675,7 @@ fn observe_jobs_compact_projection_single_running_unchanged_keeps_actionable_sta
     assert_eq!(item["observation_token"], token);
     assert!(item.get("continuation_semantics").is_none());
     assert!(projected.output.get("continuation_semantics").is_none());
-    assert_eq!(
-        item["activity"],
-        serde_json::to_value(process_activity()).unwrap()
-    );
+    assert!(item.get("activity").is_none());
     for omitted in [
         "index",
         "success",
@@ -792,10 +762,7 @@ async fn observe_jobs_kernel_model_surface_applies_compact_projection() {
     assert!(item["observation_token"]
         .as_str()
         .is_some_and(|token| !token.is_empty()));
-    assert_eq!(
-        item["activity"],
-        serde_json::to_value(process_activity()).unwrap()
-    );
+    assert!(item.get("activity").is_none());
     assert!(item.get("output").is_none());
     assert!(item.get("success").is_none());
 
@@ -958,10 +925,17 @@ fn observe_jobs_compact_projection_preserves_mixed_failure_and_budget_recovery()
         "error": "unknown job: missing-job"
     });
     let mixed = canonical_batch(vec![success.clone(), failure], "item_error", 0);
+    let projected = compact_projection(&mixed);
+    assert_eq!(projected.success, mixed.success);
+    assert_eq!(projected.error, mixed.error);
     assert_eq!(
-        serde_json::to_value(compact_projection(&mixed)).unwrap(),
-        serde_json::to_value(&mixed).unwrap()
+        projected.output["failed_count"],
+        mixed.output["failed_count"]
     );
+    assert_eq!(projected.output["wait"], mixed.output["wait"]);
+    assert_eq!(projected.output["items"][0]["status"], "running");
+    assert!(projected.output["items"][0].get("output").is_none());
+    assert_eq!(projected.output["items"][1], mixed.output["items"][1]);
     assert_eq!(
         mixed.output["items"][1]["suggested_call"],
         json!({"follow_up_kind": "fallback_recovery", "tool": "list_jobs", "arguments": {}})
@@ -1148,15 +1122,9 @@ fn observe_jobs_projection_reports_deterministic_byte_measurements() {
         println!(
             "OBSERVE_JOBS_PROJECTION_BYTES {name} canonical={canonical_bytes} projected={projected_bytes} reduction_pct={reduction:.1}"
         );
-        assert!(projected_bytes <= canonical_bytes);
-        if name != "mixed_success_unknown" {
-            assert!(projected_bytes < canonical_bytes);
-        } else {
-            assert_eq!(
-                serde_json::to_value(&projected).unwrap(),
-                serde_json::to_value(&canonical).unwrap()
-            );
-        }
+        assert!(projected_bytes < canonical_bytes, "{name}");
+        assert_eq!(projected.success, canonical.success);
+        assert_eq!(projected.error, canonical.error);
     }
 }
 
@@ -1199,7 +1167,7 @@ async fn observe_jobs_inaccessible_and_unknown_items_are_indistinguishable() {
 }
 
 #[tokio::test]
-async fn observe_jobs_compact_ref_roundtrips_and_survives_model_projection() {
+async fn observe_jobs_ref_roundtrips_but_model_keeps_restart_safe_token() {
     let runtime = test_runtime();
     let (job_id, request, auth) =
         register_and_start_agent_job(&runtime, "observe-ref-roundtrip").await;
@@ -1235,7 +1203,13 @@ async fn observe_jobs_compact_ref_roundtrips_and_survives_model_projection() {
         .is_some());
 
     let projected = compact_projection(&first);
-    assert_eq!(projected.output["items"][0]["observation_ref"], first_ref);
+    assert!(projected.output["items"][0]
+        .get("observation_ref")
+        .is_none());
+    assert_eq!(
+        projected.output["items"][0]["observation_token"],
+        first.output["items"][0]["output"]["observation_token"]
+    );
 
     let second = runtime
         .observe_jobs_for_auth(
@@ -1433,7 +1407,7 @@ async fn observe_jobs_mixed_success_result_matches_declared_output_schema_and_en
 }
 
 #[tokio::test]
-async fn observe_jobs_missing_baseline_is_immediate_and_projects_activity_without_item_wait() {
+async fn observe_jobs_change_without_baseline_reads_immediately() {
     let runtime = test_runtime();
     let (job_id, request, auth) = register_and_start_agent_job(&runtime, "observe-immediate").await;
     update_observed_job(
@@ -1453,7 +1427,7 @@ async fn observe_jobs_missing_baseline_is_immediate_and_projects_activity_withou
                 items: vec![item(&job_id, None)],
                 tail_lines: 40,
                 wait_secs: Some(120),
-                wake_on: ObserveJobsWakeOn::Terminal,
+                wake_on: ObserveJobsWakeOn::Change,
 
                 summary_only: false,
             },
@@ -1474,6 +1448,52 @@ async fn observe_jobs_missing_baseline_is_immediate_and_projects_activity_withou
         serde_json::to_value(process_activity()).unwrap()
     );
     assert_item_has_no_wait_metadata(&result.output["items"][0]);
+}
+
+#[tokio::test]
+async fn observe_jobs_terminal_wait_needs_no_prior_observation_token() {
+    for wake_on in [ObserveJobsWakeOn::Terminal, ObserveJobsWakeOn::AllTerminal] {
+        let runtime = test_runtime();
+        let (job_id, request, auth) =
+            register_and_start_agent_job(&runtime, "observe-no-token").await;
+        let observation = runtime.observe_jobs_for_auth(
+            vec![item(&job_id, None)],
+            40,
+            Some(5),
+            wake_on,
+            Some(&auth),
+        );
+        tokio::pin!(observation);
+        assert!(futures_util::poll!(&mut observation).is_pending());
+        update_observed_job(
+            &runtime,
+            "observe-no-token",
+            &request,
+            "running",
+            Some("before completion\n"),
+            None,
+            false,
+        )
+        .await;
+        assert!(futures_util::poll!(&mut observation).is_pending());
+        update_observed_job(
+            &runtime,
+            "observe-no-token",
+            &request,
+            "completed",
+            Some("done\n"),
+            None,
+            true,
+        )
+        .await;
+        let result = observation.await;
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["wait"]["outcome"], "terminal");
+        assert!(result.output["items"][0]["output"]["stdout_tail"]
+            .as_str()
+            .unwrap()
+            .contains("done"));
+    }
 }
 
 #[tokio::test]
@@ -1578,7 +1598,7 @@ async fn observe_jobs_one_item_update_wakes_shared_wait_and_refreshes_all_snapsh
                     ],
                     tail_lines: 40,
                     wait_secs: Some(5),
-                    wake_on: Default::default(),
+                    wake_on: ObserveJobsWakeOn::Change,
 
                     summary_only: false,
                 },
@@ -1816,25 +1836,18 @@ async fn ordinary_receipts_production_sqlite_dual_restart_observe_and_list_filte
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client.into(),
-            runner_instance_id: "inst".into(),
-            update_seq: None,
-            job_id: job_id.clone(),
             request_id: Some(request.request_id),
-            status: "completed".into(),
             stdout_chunk: Some("bounded stdout\n".into()),
             stderr_chunk: Some("bounded stderr\n".into()),
-            log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(42),
-            error: None,
-            command_execution_state: None,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
-            activity: None,
-            finished: true,
+            ..runner_job_update(
+                client.into(),
+                "inst".into(),
+                job_id.clone(),
+                "completed".into(),
+                true,
+            )
         })
         .await
         .unwrap();
@@ -1935,6 +1948,112 @@ async fn ordinary_receipts_production_sqlite_dual_restart_observe_and_list_filte
     assert!(probe_patch_agent_request(&runtime, client).await.is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn observe_jobs_stale_epoch_refreshes_before_wait_for_every_policy() {
+    use webcodex_core::job_observation::JobObservationToken;
+
+    assert_eq!(ObserveJobsWakeOn::default(), ObserveJobsWakeOn::Terminal);
+    for policy in [
+        ObserveJobsWakeOn::default(),
+        ObserveJobsWakeOn::AllTerminal,
+        ObserveJobsWakeOn::Change,
+        ObserveJobsWakeOn::MeaningfulChange,
+    ] {
+        let runtime = test_runtime();
+        let (job_id, request, auth) = register_and_start_agent_job(&runtime, "stale-epoch").await;
+        update_observed_job(
+            &runtime,
+            "stale-epoch",
+            &request,
+            "running",
+            Some("retained output\n"),
+            None,
+            false,
+        )
+        .await;
+        let current = observation_token(&runtime, &job_id, &auth).await;
+        let parsed = JobObservationToken::parse(&current).unwrap();
+        // Keep the exact Job and revision; change only the registry generation.
+        // Cover both log-aware tokens and initial handoff tokens without cursors.
+        for cursors in [false, true] {
+            let stale = if cursors {
+                JobObservationToken::new(
+                    &job_id,
+                    "previous-server-epoch",
+                    parsed.revision,
+                    parsed.stdout_cursor.unwrap(),
+                    parsed.stderr_cursor.unwrap(),
+                )
+            } else {
+                JobObservationToken::new_baseline(&job_id, "previous-server-epoch", parsed.revision)
+            }
+            .unwrap();
+            assert_ne!(stale.binding, parsed.binding);
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.observe_jobs_for_auth(
+                    vec![item(&job_id, Some(stale.encode()))],
+                    40,
+                    Some(30),
+                    policy,
+                    Some(&auth),
+                ),
+            )
+            .await
+            .expect("stale epoch must refresh before the long-poll deadline");
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(result.output["wait"]["outcome"], "updated");
+            assert_eq!(result.output["wait"]["waited_ms"], 0);
+            let output = &result.output["items"][0]["output"];
+            assert_eq!(output["job_id"], job_id);
+            assert_eq!(output["status"], "running");
+            assert_eq!(output["terminal"], false);
+            assert_eq!(output["changed"], true);
+            assert_eq!(output["meaningful_changed"], true);
+            assert_eq!(output["log_delta_status"], "reset");
+            assert_eq!(output["stdout_tail"], "retained output\n");
+            assert_eq!(output["observation_token"], current);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn observe_jobs_current_epoch_without_change_keeps_full_wait_for_every_policy() {
+    for policy in [
+        ObserveJobsWakeOn::default(),
+        ObserveJobsWakeOn::AllTerminal,
+        ObserveJobsWakeOn::Change,
+        ObserveJobsWakeOn::MeaningfulChange,
+    ] {
+        let runtime = test_runtime();
+        let (job_id, _, auth) = register_and_start_agent_job(&runtime, "current-epoch").await;
+        let token = observation_token(&runtime, &job_id, &auth).await;
+        let observation = runtime.observe_jobs_for_auth(
+            vec![item(&job_id, Some(token.clone()))],
+            40,
+            Some(30),
+            policy,
+            Some(&auth),
+        );
+        tokio::pin!(observation);
+        assert!(futures_util::poll!(&mut observation).is_pending());
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(futures_util::poll!(&mut observation).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = observation.await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["wait"]["outcome"], "timeout");
+        assert_eq!(result.output["wait"]["waited_ms"], 30_000);
+        let output = &result.output["items"][0]["output"];
+        assert_eq!(output["job_id"], job_id);
+        assert_eq!(output["terminal"], false);
+        assert_eq!(output["changed"], false);
+        assert_eq!(output["meaningful_changed"], false);
+        assert_eq!(output["log_delta_status"], "unchanged");
+        assert_eq!(output["observation_token"], token);
+    }
+}
+
 #[tokio::test]
 async fn observe_jobs_terminal_policy_coalesces_noisy_jobs_with_one_deadline_and_caller_delta() {
     for policy in [ObserveJobsWakeOn::Terminal, ObserveJobsWakeOn::AllTerminal] {
@@ -1985,25 +2104,16 @@ async fn observe_jobs_terminal_policy_coalesces_noisy_jobs_with_one_deadline_and
         runtime
             .runner_registry
             .update_job(RunnerJobUpdateRequest {
-                client_id: "coalesce-b".into(),
-                runner_instance_id: "inst".into(),
-                update_seq: None,
-                job_id: job_b.clone(),
                 request_id: Some(request_b.request_id.clone()),
-                status: "running".into(),
-                stdout_chunk: None,
                 stderr_chunk: Some("stderr during wait\n".into()),
-                log_snapshot: None,
-                exit_code: None,
-                duration_ms: None,
-                error: None,
-                command_execution_state: None,
-                validation_progress: None,
-                test_count_evidence: None,
-                format_mutation: None,
-                build_artifacts: None,
                 activity: Some(process_activity()),
-                finished: false,
+                ..runner_job_update(
+                    "coalesce-b".into(),
+                    "inst".into(),
+                    job_b.clone(),
+                    "running".into(),
+                    false,
+                )
             })
             .await
             .unwrap();
@@ -2339,34 +2449,27 @@ async fn observe_jobs_generic_failed_test_identity_survives_small_model_tail() {
         let request = wait_for_patch_agent_request(&runtime, client).await;
         let handoff = task.await.unwrap();
         assert!(handoff.success, "{handoff:?}");
-        let job = assert_sparse_pending_job_handoff(&handoff.output);
+        let job = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 30);
         let stdout = "running 1 test\ntest cases::outside_tail ... FAILED\n".to_string()
             + &"retained diagnostic padding\n".repeat(400)
             + "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
         runtime
             .runner_registry
             .update_job(RunnerJobUpdateRequest {
-                client_id: client.into(),
-                runner_instance_id: "inst".into(),
-                update_seq: None,
-                job_id: job.into(),
                 request_id: Some(request.request_id),
-                status: "failed".into(),
                 stdout_chunk: Some(stdout),
-                stderr_chunk: None,
-                log_snapshot: None,
                 exit_code: Some(101),
                 duration_ms: Some(100),
-                error: None,
                 command_execution_state: Some(
                     crate::runner_protocol::ShellCommandExecutionState::Completed,
                 ),
-                validation_progress: None,
-                test_count_evidence: None,
-                format_mutation: None,
-                build_artifacts: None,
-                activity: None,
-                finished: true,
+                ..runner_job_update(
+                    client.into(),
+                    "inst".into(),
+                    job.into(),
+                    "failed".into(),
+                    true,
+                )
             })
             .await
             .unwrap();
@@ -2400,4 +2503,215 @@ async fn observe_jobs_generic_failed_test_identity_survives_small_model_tail() {
         );
         assert!(snapshot.get("validation_target_id").is_none());
     }
+}
+
+#[tokio::test]
+async fn observe_jobs_metrics_sum_utf8_bytes_of_returned_producer_output() {
+    #[derive(Debug)]
+    struct RecordingMetrics {
+        returned_bytes: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl crate::tool_runtime::runtime_metrics::RuntimeMetrics for RecordingMetrics {
+        fn observe_tool_call(
+            &self,
+            _record: &crate::tool_runtime::model_ergonomics_telemetry::ModelErgonomicsRecord,
+        ) {
+        }
+
+        fn observe_mcp_call(
+            &self,
+            _observation: crate::tool_runtime::runtime_metrics::McpCallMetricObservation,
+        ) {
+        }
+
+        fn observe_job_observation(
+            &self,
+            observation: crate::tool_runtime::runtime_metrics::JobObservationMetricObservation,
+        ) {
+            self.returned_bytes
+                .lock()
+                .unwrap()
+                .push(observation.returned_bytes);
+        }
+
+        fn observe_skill_source(
+            &self,
+            _observation: crate::tool_runtime::runtime_metrics::SkillSourceMetricObservation,
+        ) {
+        }
+
+        fn observe_instruction_read_after_complete_bootstrap(
+            &self,
+            _target: crate::tool_runtime::model_ergonomics_telemetry::invocation::InstructionReadTarget,
+        ) {
+        }
+
+        fn observe_window_transition(
+            &self,
+            _transition: crate::tool_runtime::window_activity::WindowLoopTransition,
+        ) {
+        }
+
+        #[cfg(feature = "experimental-code-mode")]
+        fn observe_code_mode_composition(
+            &self,
+            _observation: &crate::tool_runtime::code_mode::CodeModeCompositionSummary,
+        ) {
+        }
+    }
+
+    async fn finish_with_chunks(
+        runtime: &ToolRuntime,
+        client_id: &str,
+        request: &crate::runner_protocol::RunnerRequest,
+        stdout_chunk: Option<&str>,
+        stderr_chunk: Option<&str>,
+    ) {
+        runtime
+            .runner_registry
+            .update_job(RunnerJobUpdateRequest {
+                request_id: Some(request.request_id.clone()),
+                stdout_chunk: stdout_chunk.map(str::to_string),
+                stderr_chunk: stderr_chunk.map(str::to_string),
+                exit_code: Some(0),
+                duration_ms: Some(5),
+                ..runner_job_update(
+                    client_id.to_string(),
+                    "inst".to_string(),
+                    request.job_id.clone().expect("Job request id"),
+                    "completed".to_string(),
+                    true,
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut runtime = test_runtime();
+    let sink = Arc::new(RecordingMetrics {
+        returned_bytes: std::sync::Mutex::new(Vec::new()),
+    });
+    let sink_handle: Arc<dyn crate::tool_runtime::runtime_metrics::RuntimeMetrics> = sink.clone();
+    runtime.metrics = sink_handle;
+
+    let (text_job, text_request, auth) =
+        register_and_start_agent_job(&runtime, "observe-bytes-text").await;
+    finish_with_chunks(
+        &runtime,
+        "observe-bytes-text",
+        &text_request,
+        Some("alpha\n\u{4e2d}\u{6587}-tail\n"),
+        Some("warn\n"),
+    )
+    .await;
+    let (stdout_job, stdout_request, _) =
+        register_and_start_agent_job(&runtime, "observe-bytes-out").await;
+    finish_with_chunks(
+        &runtime,
+        "observe-bytes-out",
+        &stdout_request,
+        Some("plain\n"),
+        None,
+    )
+    .await;
+    let (stderr_job, stderr_request, _) =
+        register_and_start_agent_job(&runtime, "observe-bytes-err").await;
+    finish_with_chunks(
+        &runtime,
+        "observe-bytes-err",
+        &stderr_request,
+        None,
+        Some("err-only\n"),
+    )
+    .await;
+    let (empty_job, empty_request, _) =
+        register_and_start_agent_job(&runtime, "observe-bytes-empty").await;
+    finish_with_chunks(&runtime, "observe-bytes-empty", &empty_request, None, None).await;
+
+    let observed = runtime
+        .observe_jobs_for_auth(
+            vec![
+                item(&text_job, None),
+                item(&stdout_job, None),
+                item(&stderr_job, None),
+                item(&empty_job, None),
+                item("observe-bytes-missing", Some("malformed".to_string())),
+            ],
+            40,
+            None,
+            Default::default(),
+            Some(&auth),
+        )
+        .await;
+    assert!(observed.success, "{observed:?}");
+    assert_eq!(observed.output["succeeded_count"], 4, "{observed:?}");
+    assert_eq!(observed.output["failed_count"], 1, "{observed:?}");
+
+    let expected = [
+        ("alpha\n\u{4e2d}\u{6587}-tail\n", "warn\n"),
+        ("plain\n", ""),
+        ("", "err-only\n"),
+        ("", ""),
+    ];
+    let mut expected_total = 0_u64;
+    for (index, (expected_stdout, expected_stderr)) in expected.iter().enumerate() {
+        let snapshot = &observed.output["items"][index]["output"];
+        assert_eq!(snapshot["stdout_tail"], *expected_stdout, "{snapshot}");
+        assert_eq!(snapshot["stderr_tail"], *expected_stderr, "{snapshot}");
+        assert_eq!(
+            snapshot["stdout_returned_bytes"].as_u64(),
+            Some(expected_stdout.len() as u64),
+            "stdout bytes must count returned UTF-8 bytes, not characters: {snapshot}"
+        );
+        assert_eq!(
+            snapshot["stderr_returned_bytes"].as_u64(),
+            Some(expected_stderr.len() as u64),
+            "stderr bytes must count returned UTF-8 bytes, not characters: {snapshot}"
+        );
+        expected_total += (expected_stdout.len() + expected_stderr.len()) as u64;
+    }
+    assert_ne!(
+        "alpha\n\u{4e2d}\u{6587}-tail\n".len(),
+        "alpha\n\u{4e2d}\u{6587}-tail\n".chars().count(),
+        "fixture must keep multibyte text distinct from character count"
+    );
+    assert_eq!(
+        *sink.returned_bytes.lock().unwrap(),
+        vec![expected_total],
+        "the observation metric must aggregate the successful items' returned bytes"
+    );
+
+    let truncated = runtime
+        .observe_jobs_for_auth(
+            vec![item(&text_job, None)],
+            1,
+            None,
+            Default::default(),
+            Some(&auth),
+        )
+        .await;
+    assert!(truncated.success, "{truncated:?}");
+    let snapshot = &truncated.output["items"][0]["output"];
+    assert_eq!(
+        snapshot["stdout_tail"], "\u{4e2d}\u{6587}-tail\n",
+        "{snapshot}"
+    );
+    assert_eq!(
+        snapshot["stdout_returned_bytes"].as_u64(),
+        Some("\u{4e2d}\u{6587}-tail\n".len() as u64),
+        "a bounded tail must report only the bytes it actually returned: {snapshot}"
+    );
+    let truncated_stdout = "\u{4e2d}\u{6587}-tail\n".len() as u64;
+    let truncated_stderr = "warn\n".len() as u64;
+    assert_eq!(
+        snapshot["stderr_returned_bytes"].as_u64(),
+        Some(truncated_stderr),
+        "{snapshot}"
+    );
+    assert_eq!(
+        sink.returned_bytes.lock().unwrap().last().copied(),
+        Some(truncated_stdout + truncated_stderr),
+        "the metric must aggregate the bounded stdout and stderr bytes"
+    );
 }

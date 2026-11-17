@@ -27,22 +27,19 @@ mod transport;
 mod tests;
 
 pub use job::{
-    normalize_cargo_packages, normalize_cargo_value, normalize_go_packages,
-    normalize_go_test_filter, normalize_go_test_packages, normalize_pytest_filter,
-    normalize_rust_test_filter, valid_rust_test_filter, RunnerJobLogRequest, RunnerJobLogResponse,
-    RunnerJobResult, RunnerJobStatusRequest, RunnerJobStatusResponse, RunnerJobStopRequest,
-    RunnerJobStopResponse, RunnerJobUpdateRequest, RunnerJobUpdateResponse, RunnerJobsListRequest,
-    RunnerJobsListResponse, RunnerShellJobResult, ShellJobActivity, ShellJobActivityPhase,
-    ShellJobActivitySource, ShellJobActivityState, ShellJobCodexMetadata, ShellJobContext,
-    ShellJobInfo, ShellJobInventory, ShellJobLogSnapshot, ShellJobOpRequest, ShellJobOpResponse,
-    ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobStructuredExecutionMetadata,
-    ShellJobTestCountEvidence, ShellJobValidationMetadata, ShellJobValidationProgress,
-    ShellJobValidationStep, CARGO_PACKAGE_MAX_ITEMS, CARGO_TEST_MIN_TESTS_MAX,
-    CARGO_VALUE_MAX_BYTES, GO_TEST_PACKAGE_MAX_BYTES, GO_TEST_PACKAGE_MAX_ITEMS,
-    JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
-    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
-    RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN, RUST_TEST_FILTER_MAX_BYTES,
-    VALIDATION_ASSERTION_NAME_MAX_CHARS,
+    normalize_cargo_excluded_packages, normalize_cargo_packages, normalize_cargo_value,
+    normalize_go_packages, normalize_go_test_filter, normalize_go_test_packages,
+    normalize_pytest_filter, normalize_rust_test_filter, valid_rust_test_filter, RunnerJobResult,
+    RunnerJobUpdateRequest, RunnerJobUpdateResponse, RunnerShellJobResult, ShellJobActivity,
+    ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState, ShellJobCodexMetadata,
+    ShellJobContext, ShellJobInfo, ShellJobInventory, ShellJobLogSnapshot, ShellJobSnapshot,
+    ShellJobStreamSnapshot, ShellJobStructuredExecutionMetadata, ShellJobTestCountEvidence,
+    ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
+    CARGO_PACKAGE_MAX_ITEMS, CARGO_TEST_MIN_TESTS_MAX, CARGO_VALUE_MAX_BYTES,
+    GO_TEST_PACKAGE_MAX_BYTES, GO_TEST_PACKAGE_MAX_ITEMS, JOB_INVENTORY_MAX_ACTIVE_JOBS,
+    JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
+    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, RUNNER_JOB_CONCURRENCY_MAX,
+    RUNNER_JOB_CONCURRENCY_MIN, RUST_TEST_FILTER_MAX_BYTES, VALIDATION_ASSERTION_NAME_MAX_CHARS,
 };
 
 pub use transport::{
@@ -410,6 +407,12 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub apply_patch: bool = false;
     }
+    /// Revision-fenced whole-file replacement in a transactional file batch.
+    ApplyFileWrite => RUNNER_CAPABILITY_APPLY_FILE_WRITE("apply_file_write"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub apply_file_write: bool = false;
+    }
     /// The Runner returns the complete trusted apply_patch patch-plan/match metadata
     /// required by the 0.4 success contract. Missing on older Runners is false; a
     /// current Server must reject apply_patch before dispatch rather than accepting a
@@ -558,12 +561,24 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_validation_rust_clippy_v1: bool = false;
     }
+    /// Cargo Clippy dependency resolution with --offline, independent of locked.
+    ProjectValidationRustClippyOffline => RUNNER_CAPABILITY_PROJECT_VALIDATION_RUST_CLIPPY_OFFLINE("project_validation_rust_clippy_offline_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_validation_rust_clippy_offline_v1: bool = false;
+    }
     /// Runner-owned project build planning plus typed StartBuild admission.
     /// Missing on older Runners is false and must fail closed.
     ProjectBuild => RUNNER_CAPABILITY_PROJECT_BUILD("project_build_v1"),
     v2_baseline = false {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_build_v1: bool = false;
+    }
+    /// Typed Rust profiles/targets and opt-in bounded artifact observation.
+    ProjectBuildRustOptions => RUNNER_CAPABILITY_PROJECT_BUILD_RUST_OPTIONS("project_build_rust_options_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_build_rust_options_v1: bool = false;
     }
     /// Manifest-declared Node build with bounded canonical manager argv.
     ProjectBuildNode => RUNNER_CAPABILITY_PROJECT_BUILD_NODE("project_build_node_v1"),
@@ -638,6 +653,14 @@ runner_capabilities! {
     v2_baseline = false {
         #[serde(default, skip_serializing_if = "is_false")]
         pub project_all_packages_v1: bool = false;
+    }
+    /// Exact Cargo package exclusions within a proven Project workspace.
+    /// Older Runners must reject these scoped requests before planning dispatch
+    /// and again at typed Job admission.
+    ProjectWorkspaceExclusions => RUNNER_CAPABILITY_PROJECT_WORKSPACE_EXCLUSIONS("project_workspace_exclusions_v1"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_workspace_exclusions_v1: bool = false;
     }
     /// Additive test filtering and evidence policy on project_validate. Never
     /// inferred from generic validation or existing package-scope support.
@@ -819,6 +842,13 @@ runner_capabilities! {
         /// runners and therefore fail-closed.
         #[serde(default)]
         pub project_lifecycle: bool = false;
+    }
+    /// Additive, revision-guarded Project allow_patch updates. An older Runner
+    /// can advertise project_lifecycle without understanding this wire kind.
+    ProjectSettingsUpdate => RUNNER_CAPABILITY_PROJECT_SETTINGS_UPDATE("project_settings_update"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub project_settings_update: bool = false;
     }
     /// Resolve an absolute canonical project path to an existing registration or
     /// atomically persist a new project registration record. Missing on older runners and
@@ -1031,8 +1061,16 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub computer_element_state: bool = false;
     }
-    /// Native bounded accessibility control. Missing on older Runners is false and
-    /// is never inferred from either observation capability.
+    /// Software support for local input gating, independently of helper readiness.
+    ComputerLocalControl => RUNNER_CAPABILITY_COMPUTER_LOCAL_CONTROL("computer_local_control"),
+    v2_baseline = false {
+        /// Local input gate and version-fenced Computer requests. This reports
+        /// support; an unavailable helper does not supply an execution epoch.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub computer_local_control: bool = false;
+    }
+    /// Native bounded accessibility control. Missing on older Runners is false
+    /// and is never inferred from observation or local gate support.
     ComputerControl => RUNNER_CAPABILITY_COMPUTER_CONTROL("computer_control"),
     v2_baseline = false {
         /// Native bounded accessibility control. Missing on older Runners is false
@@ -1040,8 +1078,21 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub computer_control: bool = false;
     }
+    /// Native Windows replacement selection; never inferred from general control.
+    ComputerSelection => RUNNER_CAPABILITY_COMPUTER_SELECTION("computer_selection"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub computer_selection: bool = false;
+    }
+    /// Windows single-increment scrolling on an exact observed UIA container.
+    /// Missing on older Runners is false and never follows from general control.
+    ComputerScroll => RUNNER_CAPABILITY_COMPUTER_SCROLL("computer_scroll"),
+    v2_baseline = false {
+        /// Single bounded ScrollPattern increment on an exact Windows container.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub computer_scroll: bool = false;
+    }
     /// Native semantic scroll-to-visible on one exact observed Accessibility element.
-    /// Missing on older Runners is false and is never inferred from computer_control.
     ComputerScrollToElement => RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT("computer_scroll_to_element"),
     v2_baseline = false {
         /// The Runner can semantically scroll one exact observed Accessibility element
@@ -1057,6 +1108,20 @@ runner_capabilities! {
         /// native window. Missing on older Runners is false and never follows from control.
         #[serde(default, skip_serializing_if = "is_false")]
         pub computer_key_input: bool = false;
+    }
+    /// Windows-only Ctrl+J/Ctrl+P through the existing key-input operation.
+    /// The original key-input capability never implies this additive chord set.
+    ComputerLetterShortcuts => RUNNER_CAPABILITY_COMPUTER_LETTER_SHORTCUTS("computer_letter_shortcuts"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub computer_letter_shortcuts: bool = false;
+    }
+    /// General Windows single-key chords; neither navigation nor the legacy
+    /// Ctrl+J/Ctrl+P capability implies this larger vocabulary or chord set.
+    ComputerKeyChords => RUNNER_CAPABILITY_COMPUTER_KEY_CHORDS("computer_key_chords"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub computer_key_chords: bool = false;
     }
     /// Native exact-window activation/raise. Missing on older Runners is false and
     /// is never inferred from accessibility control, observation, or platform.
@@ -1213,6 +1278,8 @@ pub enum RunnerConfigErrorField {
     SkillsRoots,
     #[serde(rename = "instructions.files")]
     InstructionsFiles,
+    #[serde(rename = "policy.managed_worktree_root")]
+    ManagedWorktreeRoot,
     #[serde(rename = "shell.max_persistent_shells")]
     ShellMaxPersistentShells,
     #[serde(rename = "shell.persistent_shell_idle_timeout_secs")]
@@ -1399,6 +1466,10 @@ pub struct RunnerProjectSummary {
     /// Stable SHA-256 revision of the persisted project registration record TOML content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// Opaque stable ID for this exact persisted Project registration. A new
+    /// registration must never reuse the ID, even for the same root and name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_incarnation: Option<String>,
     /// Domain-separated identity of the currently observed canonical Project
     /// root. Missing means the Runner could not prove a current root identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1666,6 +1737,8 @@ pub struct RunnerRegisterRequest {
     /// older Runners, which retain their existing direct Computer behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_session_availability: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_control_epoch: Option<String>,
     /// Optional bounded planning context declared by the Runner configuration.
     /// This is descriptive metadata only: it never grants authority or proves
     /// current host/service/network state.
@@ -1685,7 +1758,7 @@ pub struct RunnerRegisterRequest {
     /// for mixed-version diagnostics; never carries paths or environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<RunnerBuildInfo>,
-    /// Effective static Job execution concurrency configured for this Runner
+    /// Effective Job execution concurrency configured for this Runner
     /// process. Older Runners omit it, so the Server must preserve `None`
     /// rather than infer a value from capabilities or observed Jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1893,7 +1966,7 @@ pub struct RunnerView {
     /// Runner-reported build identity, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<RunnerBuildInfo>,
-    /// Runner-reported effective static Job execution concurrency. `None` for
+    /// Runner-reported effective Job execution concurrency. `None` for
     /// older Runners; the Server never infers this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_concurrency_limit: Option<usize>,
@@ -2019,6 +2092,10 @@ pub const DETACHED_IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
 pub const STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS: u64 = 1;
 pub const STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS: u64 = 3_600;
 pub const STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS: u64 = 60;
+/// Raw asynchronous shell Jobs keep the existing one-day admission ceiling.
+/// This is independent from the shorter sync-first shell tool ceiling.
+pub const RAW_SHELL_JOB_TIMEOUT_DEFAULT_SECS: u64 = 3_600;
+pub const RAW_SHELL_JOB_TIMEOUT_MAX_SECS: u64 = 24 * 60 * 60;
 /// Ceiling for direct synchronous structured Runner requests.
 /// Durable typed Jobs use their execution-form lifetime ceiling instead.
 pub const STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS: u64 = 120;
@@ -2033,13 +2110,15 @@ pub const SCRIPT_STDIN_MAX_BYTES: usize = 64 * 1024;
 pub const SCRIPT_CWD_MAX_BYTES: usize = 1_024;
 pub const SCRIPT_TIMEOUT_MAX_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Canonical maximum execution lifetime for a durable Job kind. Unknown,
-/// validation, shell, and Skill Job kinds retain the shared 1-hour ceiling.
+/// Canonical maximum execution lifetime for a durable Job kind. Shell includes
+/// raw asynchronous Jobs, whose admission ceiling is longer than sync-first shell.
+/// Unknown, validation, and Skill kinds retain the shared 1-hour ceiling.
 pub fn job_execution_timeout_max_secs(kind: &str) -> u64 {
     match kind {
         "project_format" => crate::project_format::PROJECT_FORMAT_TIMEOUT_MAX_SECS,
         "project_build" | "run_process" | "run_detached_process" => PROCESS_TIMEOUT_MAX_SECS,
         "run_script" => SCRIPT_TIMEOUT_MAX_SECS,
+        "shell" => RAW_SHELL_JOB_TIMEOUT_MAX_SECS,
         _ => STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
     }
 }
@@ -2237,8 +2316,17 @@ pub struct RunnerPollRequest {
 
 /// Polling transport wrapper. Current Runners may attach changed-only sanitized
 /// runtime metadata and one bounded project-inventory page.
+/// Applied scheduler capacity, fenced by the process-local config generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerJobCapacity {
+    pub generation: u64,
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerPollPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_capacity: Option<RunnerJobCapacity>,
     #[serde(flatten)]
     pub request: RunnerPollRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2250,6 +2338,8 @@ pub struct RunnerPollPayload {
     /// Changed-only login-session eligibility for a brokered persistent Runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer_session_availability: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_control_epoch: Option<String>,
     /// Optional bounded project inventory page for the canonical paged inventory protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_inventory_page: Option<ShellProjectInventoryPage>,
@@ -2257,6 +2347,8 @@ pub struct RunnerPollPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_control_epoch: Option<String>,
     pub request_id: String,
     pub client_id: String,
     #[serde(default = "default_runner_request_kind")]
@@ -2549,29 +2641,6 @@ pub struct ShellFileOpRequest {
     pub wait_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShellFileOpResponse {
-    pub success: bool,
-    pub op: String,
-    pub request_id: String,
-    pub client_id: String,
-    pub path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub entries: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stderr: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 #[cfg(test)]
 mod envelope_tests {
     use super::*;
@@ -2686,6 +2755,7 @@ mod envelope_tests {
 
     fn sample_process_request() -> RunnerRequest {
         RunnerRequest {
+            computer_control_epoch: None,
             login: false,
             request_id: "req-process-1".to_string(),
             client_id: "ws-1".to_string(),
@@ -2756,6 +2826,7 @@ mod envelope_tests {
 
     fn sample_script_request() -> RunnerRequest {
         RunnerRequest {
+            computer_control_epoch: None,
             login: false,
             request_id: "req-script-1".to_string(),
             client_id: "ws-1".to_string(),
@@ -2866,6 +2937,7 @@ mod envelope_tests {
     fn sample_register() -> RunnerRegisterRequest {
         RunnerRegisterRequest {
             computer_session_availability: None,
+            computer_control_epoch: None,
             process_started_at: None,
             build: None,
             client_id: "ws-1".to_string(),
@@ -2889,6 +2961,7 @@ mod envelope_tests {
                 apply_text_edit_local_guard_without_sha: false,
                 apply_text_edit_line_scope: false,
                 apply_text_edit_range: false,
+                apply_file_write: false,
                 apply_text_edit_expected_match_count: false,
                 apply_patch: false,
                 apply_patch_match_metadata: false,
@@ -2908,6 +2981,7 @@ mod envelope_tests {
                 structured_go_test_json: true,
                 project_validation_v1: false,
                 project_build_v1: false,
+                project_build_rust_options_v1: false,
                 project_build_node_v1: false,
                 project_validation_node_json_v1: false,
                 project_build_python_v1: false,
@@ -2918,12 +2992,14 @@ mod envelope_tests {
                 project_go_single_module_v1: false,
                 project_validation_package_scope_v1: false,
                 project_all_packages_v1: false,
+                project_workspace_exclusions_v1: false,
                 project_validation_test_options_v1: false,
                 project_validation_python_pytest_v1: false,
                 project_validation_python_ruff_v1: false,
                 project_validation_node_script_check_v1: false,
                 project_validation_node_tap_v1: false,
                 project_validation_rust_clippy_v1: false,
+                project_validation_rust_clippy_offline_v1: false,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,
                 structured_process_argv: true,
@@ -2938,6 +3014,7 @@ mod envelope_tests {
                 lsp_read_only_navigation: false,
                 lsp_call_hierarchy: false,
                 project_lifecycle: false,
+                project_settings_update: false,
                 project_path_registration: false,
                 managed_worktree: false,
                 skill_runtime: false,
@@ -2965,8 +3042,13 @@ mod envelope_tests {
                 computer_accessibility_observe: false,
                 computer_element_state: false,
                 computer_control: false,
+                computer_local_control: false,
                 computer_scroll_to_element: false,
                 computer_key_input: false,
+                computer_selection: false,
+                computer_scroll: false,
+                computer_letter_shortcuts: false,
+                computer_key_chords: false,
                 computer_window_activate: false,
                 computer_text_input: false,
                 job_state_reconciliation: false,
@@ -3310,8 +3392,40 @@ mod envelope_tests {
         let capabilities: RunnerCapabilities =
             serde_json::from_str(r#"{"computer_key_input":true}"#).unwrap();
         assert!(capabilities.computer_key_input);
+        assert!(!capabilities.computer_letter_shortcuts);
         assert!(!capabilities.computer_control);
         assert!(!capabilities.computer_observe);
+    }
+
+    #[test]
+    fn computer_letter_shortcuts_capability_is_additive() {
+        let caps: RunnerCapabilities =
+            serde_json::from_str(r#"{"computer_letter_shortcuts":true}"#).unwrap();
+        assert!(caps.supports(RunnerCapabilityId::ComputerLetterShortcuts));
+        assert!(!caps.computer_key_input);
+        assert!(!RunnerCapabilities::default().computer_letter_shortcuts);
+        assert_eq!(
+            RunnerCapabilityId::from_wire_name("computer_letter_shortcuts"),
+            Some(RunnerCapabilityId::ComputerLetterShortcuts)
+        );
+    }
+
+    #[test]
+    fn computer_key_chords_capability_is_not_implied_by_legacy_keys() {
+        let legacy: RunnerCapabilities =
+            serde_json::from_str(r#"{"computer_key_input":true,"computer_letter_shortcuts":true}"#)
+                .unwrap();
+        assert!(!legacy.computer_key_chords);
+        let chords: RunnerCapabilities =
+            serde_json::from_str(r#"{"computer_key_chords":true}"#).unwrap();
+        assert!(chords.supports(RunnerCapabilityId::ComputerKeyChords));
+        assert!(!chords.computer_key_input);
+        assert!(!chords.computer_letter_shortcuts);
+        assert!(!RunnerCapabilities::default().computer_key_chords);
+        assert_eq!(
+            RunnerCapabilityId::from_wire_name("computer_key_chords"),
+            Some(RunnerCapabilityId::ComputerKeyChords)
+        );
     }
 
     #[test]
@@ -3429,6 +3543,7 @@ mod envelope_tests {
     #[test]
     fn request_envelope_flattens_shell_request_fields() {
         let request = RunnerRequest {
+            computer_control_epoch: None,
             login: false,
             request_id: "req-1".to_string(),
             client_id: "ws-1".to_string(),
@@ -3844,7 +3959,12 @@ mod envelope_tests {
             job_execution_timeout_max_secs("run_script"),
             SCRIPT_TIMEOUT_MAX_SECS
         );
-        for kind in ["shell", "validation", "run_skill_resource", "unknown"] {
+        assert_eq!(
+            job_execution_timeout_max_secs("shell"),
+            RAW_SHELL_JOB_TIMEOUT_MAX_SECS
+        );
+        assert_eq!(RAW_SHELL_JOB_TIMEOUT_MAX_SECS, 86_400);
+        for kind in ["validation", "run_skill_resource", "unknown"] {
             assert_eq!(
                 job_execution_timeout_max_secs(kind),
                 STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS
@@ -4164,8 +4284,10 @@ mod envelope_tests {
     #[test]
     fn runtime_metadata_and_legacy_poll_payloads_round_trip() {
         let env = RunnerEnvelope::RuntimeMetadata {
+            job_capacity: None,
             tool_providers: sample_tool_providers(),
             computer_session_availability: None,
+            computer_control_epoch: None,
             mcp_gateway_providers: Some(vec![crate::mcp_gateway::McpGatewayProvider {
                 provider_id: "blender".to_string(),
                 provider_instance_id: "instance-1".to_string(),
@@ -4183,8 +4305,65 @@ mod envelope_tests {
         let legacy = r#"{"client_id":"oe","agent_instance_id":"inst","projects":null}"#;
         let payload: RunnerPollPayload = serde_json::from_str(legacy).unwrap();
         assert_eq!(payload.request.client_id, "oe");
+        assert!(payload.job_capacity.is_none());
         assert!(payload.tool_providers.is_none());
         assert!(payload.mcp_gateway_providers.is_none());
+    }
+
+    #[test]
+    fn capacity_metadata_is_optional_and_legacy_decoders_ignore_it() {
+        #[derive(Deserialize)]
+        struct LegacyMetadata {
+            tool_providers: ToolProvidersStatus,
+        }
+        let envelope = RunnerEnvelope::RuntimeMetadata {
+            job_capacity: Some(RunnerJobCapacity {
+                generation: 7,
+                limit: 32,
+            }),
+            tool_providers: sample_tool_providers(),
+            mcp_gateway_providers: None,
+            computer_session_availability: None,
+            computer_control_epoch: None,
+        };
+        let mut json = serde_json::to_value(&envelope).unwrap();
+        let old: LegacyMetadata = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            old.tool_providers.config_reload.generation,
+            sample_tool_providers().config_reload.generation
+        );
+        json.as_object_mut().unwrap().remove("job_capacity");
+        assert!(matches!(
+            serde_json::from_value::<RunnerEnvelope>(json).unwrap(),
+            RunnerEnvelope::RuntimeMetadata {
+                job_capacity: None,
+                ..
+            }
+        ));
+        let poll = RunnerPollPayload {
+            job_capacity: Some(RunnerJobCapacity {
+                generation: 7,
+                limit: 32,
+            }),
+            request: RunnerPollRequest {
+                client_id: "runner".into(),
+                runner_instance_id: "instance".into(),
+            },
+            tool_providers: None,
+            mcp_gateway_providers: None,
+            computer_session_availability: None,
+            computer_control_epoch: None,
+            project_inventory_page: None,
+        };
+        let json = serde_json::to_value(&poll).unwrap();
+        let old: RunnerPollRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(old.client_id, "runner");
+        assert_eq!(
+            serde_json::from_value::<RunnerPollPayload>(json)
+                .unwrap()
+                .job_capacity,
+            poll.job_capacity
+        );
     }
 
     #[test]
@@ -4501,6 +4680,7 @@ mod envelope_tests {
     async fn quic_register_codec_round_trips_current_wire_shape() {
         let payload = RunnerRegisterRequest {
             computer_session_availability: None,
+            computer_control_epoch: None,
             process_started_at: None,
             build: None,
             client_id: "q-1".to_string(),

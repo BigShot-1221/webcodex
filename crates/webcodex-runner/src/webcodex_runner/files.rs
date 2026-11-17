@@ -313,7 +313,7 @@ fn read_file_reason_message(reason: ReadFileReason) -> String {
     format!("read_file failed: {}", reason.as_str())
 }
 
-fn ensure_file_read_target_in_project(
+pub(super) fn ensure_file_read_target_in_project(
     request: &RunnerFilePayload,
     resolved: &Path,
 ) -> Result<(), ReadFileReason> {
@@ -324,8 +324,8 @@ fn ensure_file_read_target_in_project(
     let target = resolved
         .canonicalize()
         .map_err(|error| read_file_reason_from_io(&error))?;
-    if !target.starts_with(&project_root) {
-        return Err(ReadFileReason::InvalidPath);
+    if !webcodex_runner_config::paths::path_is_within(&target, &project_root) {
+        return Err(ReadFileReason::OutsideProject);
     }
     let relative = target
         .strip_prefix(&project_root)
@@ -731,7 +731,7 @@ fn handle_skill_read_file_request(
         .unwrap_or(48 * 1024)
         .min(policy.max_output_bytes)
         .min(file_read_range::MAX_RANGE_CONTENT_BYTES);
-    let result = match file_read_range::read_range_with_budget(&target, range, text_budget) {
+    let result = match file_read_range::read_page_with_budget(&target, range, text_budget) {
         Ok(result) => result,
         Err(error) => {
             return skill_command_error(

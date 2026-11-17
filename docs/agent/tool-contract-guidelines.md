@@ -540,7 +540,21 @@ The Direct reasons are:
   metadata; while that integration is enabled it must not be replaced by a
   generic gateway call;
 - **Continuation** — fresh-turn/continuation integration whose value depends on
-  concrete Host lifecycle capability.
+  concrete Host lifecycle capability;
+- **HostReview** — a dedicated Host descriptor is required for normal Host
+  review before trial. The nine canonical tools covered by this policy are
+  `create_agent_identity`, `rotate_agent_continuation_endpoint`,
+  `list_agent_identities`, `prepare_goal_workflow`, `get_goal`,
+  `checkpoint_goal`, `update_goal`, `bootstrap_agent_conversation`, and
+  `consume_agent_wake`. Their descriptors must retain the complete canonical
+  input schema, accurate effect annotations and applicable OAuth requirements;
+  permission checks remain authoritative on the Server. This reason
+  always blocks `call_runtime_tool` fallback and `_wc.control` forms of these
+  operations before any main or sidecar effect, including when the Host omits or
+  rejects the dedicated descriptor. It grants no runtime authority and does
+  not change the operation's ordinary authorization, ownership, lifecycle,
+  replay-safety, or effect checks. Host exposure does not establish that a
+  refusal has been fixed or that a Host will accept the tool.
 
 Gateway is the absence of a Direct policy plus ordinary model-visible admission,
 not another Direct reason or a second tool taxonomy.
@@ -552,6 +566,14 @@ changing its canonical name or domain contract. Presentation tools remain
 dedicated when their Host resource association requires the direct descriptor.
 CoreWorkflow tools should not be demoted merely to meet an arbitrary count
 target.
+
+HostReview is a static per-definition exposure reason, not a client profile or
+request-time override. MCP may omit the corresponding workflow group through
+[`WEBCODEX_MCP_TOOL_EXPOSURE`](../MCP.md#optional-workflow-tools-per-client);
+enabling it exposes the canonical dedicated tools on Adaptive. The execution-only CLI surface excludes these workflow tools even when legacy CLI flags are enabled. Disabling
+it must not translate HostReview into a gateway fallback. Its no-fallback rule is
+specific to the nine tools listed above. It does not change ordinary Direct fallback behavior, generic gateway
+annotations, or ModelHidden admission; hidden App methods remain hidden.
 
 Direct/Gateway decisions therefore belong to model-surface policy and measured
 Host ergonomics. Tool names, categories, parser variants, persisted identities,
@@ -686,9 +708,19 @@ avoidable contract friction.
 After canonical validation, revision/fence handling, Session recording and capture
 of audit/telemetry evidence, successful actual `edit_project_files` results omit
 `dry_run=false`, completed execution state, the two top-level effect echoes and
-applied/planned counts. `changed`, paths, summaries and per-file kind, destination,
-changed/no-op facts and final `read_revision` remain. Dry-run and exceptional
-results retain their existing detail.
+applied/planned counts. Top-level `changed` remains a programmatic effect receipt
+used by guarded-edit Code Mode before dependent validation. Paths, summaries and
+per-file kind, destination, changed/no-op facts, `would_change` and final
+`read_revision` remain. Dry-run and exceptional results retain their existing detail.
+
+The CLI renders this same model projection. It may fold fields already represented
+by a row or label, but does not reclassify execution or Job lifecycles, log loss,
+or read completeness from an absent follow-up. In particular, explicit partial
+read ranges and model-selected lifecycle evidence remain visible. `run_job`
+keeps its Job identity, ownership, start and timeout facts; an identical token
+and known observation-carrier metadata may be omitted only when an exact same-Job
+continuation carries a nonempty observation token. This start receipt never uses
+the synchronous execution projection that replaces a pending result with a handoff.
 
 Complete all-success `read_files` and `search_project_texts` batches omit each
 item's `success=true` and `error=null`. Item indices still map to request order;
@@ -711,10 +743,23 @@ and generic telemetry capture bounded facts, then the model receipt is compacted
 Existing process/script/Skill and validation success shapes are unchanged.
 `run_shell` removes lifecycle/Job/timing bookkeeping only for proven synchronous
 exit-zero completion without Job/recovery identity or observation ambiguity. It
-retains runtime-selected `command_summary`, `cwd`, `shell`, any `manage_ssh_resource`,
-nonempty output, truncation/loss, expectations, normalization and sidecars. Failure,
-timeout, uncertainty and exceptional handoff remain rich; normal pending receipts
-still contain `execution_state=pending` and the exact continuation.
+omits command/purpose echoes and local cwd/shell, while retaining remote target
+context, nonempty output, truncation/loss, expectations, normalization and sidecars.
+Ordinary nonzero exits omit generic retry prose and redundant timing; timeout,
+uncertainty and exceptional handoff retain their recovery evidence. Normal pending
+receipts contain `execution_state=pending`, available output tails and the exact
+continuation, plus a single `timeout` explanation only when the accepted lifetime
+was capped. Synchronous process/script/shell output displays at most 200 lines per
+stream, preserving the beginning and end. Truncated output retains the same Job
+under existing bounded retention; its continuation pages forward through retained
+logs without rerunning the command. Retention loss remains explicit.
+
+The CLI adapter selects model-facing content explicitly for core coding tools;
+new telemetry fields are not implicitly displayed. Keep output, revisions,
+uncertain effects, partial coverage and actionable recovery. CLI timing defaults
+to up to 50 seconds within every transport cap; its tokenless `observe_jobs`
+waits for terminal state. ChatGPT retains its adapter defaults. See
+[CLI MCP](../MCP.md) for the execution-only client contract.
 
 ### Runtime status projections
 

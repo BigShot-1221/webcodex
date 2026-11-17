@@ -1,0 +1,4 @@
+isError: false
+stdout:
+<ROOT>/src
+cwd: src

@@ -2116,7 +2116,7 @@ fn create_project_rejects_retired_allow_existing_empty_with_migration_hint() {
 #[test]
 fn observe_jobs_wake_policy_defaults_and_validates() {
     for (policy, expected) in [
-        (None, ObserveJobsWakeOn::Change),
+        (None, ObserveJobsWakeOn::Terminal),
         (Some("change"), ObserveJobsWakeOn::Change),
         (Some("terminal"), ObserveJobsWakeOn::Terminal),
         (Some("all_terminal"), ObserveJobsWakeOn::AllTerminal),
@@ -2589,4 +2589,47 @@ fn update_goal_completion_conditions_are_optional_and_bounded_in_schema() {
         .as_array()
         .unwrap()
         .contains(&json!("completion_conditions")));
+}
+
+#[test]
+fn skill_read_optional_resource_hash_preserves_legacy_calls_and_is_schema_bounded() {
+    let legacy =
+        json!({"project":"agent:runner:project", "skill_id":"wc_skill_AAAAAAAAAAAAAAAAAAAAAA"});
+    let call = ToolCall::from_tool_name("read_skill_file", legacy.clone()).unwrap();
+    assert!(matches!(
+        call,
+        ToolCall::SkillReadFile {
+            expected_resource_sha256: None,
+            session_id: None,
+            ..
+        }
+    ));
+    let mut fenced = legacy;
+    fenced["expected_resource_sha256"] = json!("a".repeat(64));
+    let call = ToolCall::from_tool_name("read_skill_file", fenced).unwrap();
+    assert!(
+        matches!(call, ToolCall::SkillReadFile { expected_resource_sha256: Some(hash), .. } if hash == "a".repeat(64))
+    );
+    let schema = input_schema_for_tool("read_skill_file");
+    assert_eq!(
+        schema["properties"]["expected_resource_sha256"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    assert!(!schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("expected_resource_sha256")));
+}
+
+#[test]
+fn observe_jobs_explicit_log_pages_require_a_cursor_and_roundtrip() {
+    for args in [
+        json!({"items":[{"job_id":"job", "page":true}]}),
+        json!({"items":[{"job_id":"job", "page":true, "after_observation_token":null}]}),
+    ] {
+        assert!(ToolCall::from_tool_name("observe_jobs", args).is_err());
+    }
+    let args = json!({"items":[{"job_id":"job", "page":true, "after_observation_token":"opaque"}], "tail_lines":200});
+    let parsed = ToolCall::from_tool_name("observe_jobs", args).unwrap();
+    assert!(matches!(parsed, ToolCall::ObserveJobs {items, tail_lines:200, ..} if items[0].page));
 }

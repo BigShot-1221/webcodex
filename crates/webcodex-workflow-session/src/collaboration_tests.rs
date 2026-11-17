@@ -1,6 +1,6 @@
 use super::messages::encode_observation_token;
 use super::model::{
-    SessionMessageObservationOutcome, DEFAULT_MAX_MESSAGES_PER_SESSION,
+    SessionMessageObservationOutcome, LEGACY_MESSAGE_RETENTION_LIMIT,
     MESSAGE_COMPLETION_FINGERPRINT_HEX_CHARS,
 };
 use super::*;
@@ -19,9 +19,10 @@ async fn baseline(store: &SessionStore, session_id: &str) -> SessionMessageObser
         .unwrap()
 }
 
-fn assignment_fence(store: &SessionStore, session_id: &str, todo_id: &str) -> String {
+async fn assignment_fence(store: &SessionStore, session_id: &str, todo_id: &str) -> String {
     store
         .get_assignment(session_id, todo_id)
+        .await
         .unwrap()
         .assignment_fence
 }
@@ -156,9 +157,10 @@ async fn observe_session_messages_baseline_append_resolve_completion_and_replay(
             &store,
             &session.session_id,
             &completion_todo.message_id,
-        ),
+        )
+        .await,
     };
-    let completion = store.complete_message(input.clone()).unwrap();
+    let completion = store.complete_message(input.clone()).await.unwrap();
     assert!(!completion.replayed);
     let completion_delta = store
         .observe_messages(
@@ -183,7 +185,7 @@ async fn observe_session_messages_baseline_append_resolve_completion_and_replay(
         completion.answer.message_id
     );
 
-    let replay = store.complete_message(input).unwrap();
+    let replay = store.complete_message(input).await.unwrap();
     assert!(replay.replayed);
     let after_replay = store
         .observe_messages(
@@ -244,7 +246,7 @@ async fn observe_session_messages_pagination_advances_only_through_returned_chan
 }
 
 #[tokio::test]
-async fn observe_session_messages_retention_reports_history_loss_for_protected_todo_hole() {
+async fn message_churn_preserves_old_messages_and_observation_continuity() {
     let store = SessionStore::default();
     let session = store.start_session(Some("proj".to_string()), None);
     let todo = post(
@@ -256,7 +258,7 @@ async fn observe_session_messages_retention_reports_history_loss_for_protected_t
     );
     let before_fill = baseline(&store, &session.session_id).await;
     let mut filler_ids = Vec::new();
-    for index in 0..(DEFAULT_MAX_MESSAGES_PER_SESSION - 1) {
+    for index in 0..(LEGACY_MESSAGE_RETENTION_LIMIT - 1) {
         filler_ids.push(
             post(
                 &store,
@@ -281,8 +283,10 @@ async fn observe_session_messages_retention_reports_history_loss_for_protected_t
                 &store,
                 &session.session_id,
                 &todo.message_id,
-            ),
+            )
+            .await,
         })
+        .await
         .unwrap();
 
     let retained_todo = store
@@ -314,7 +318,7 @@ async fn observe_session_messages_retention_reports_history_loss_for_protected_t
             },
         )
         .unwrap();
-    assert!(evicted_filler.is_empty());
+    assert_eq!(evicted_filler.len(), 1);
 
     let delta = store
         .observe_messages(
@@ -326,12 +330,12 @@ async fn observe_session_messages_retention_reports_history_loss_for_protected_t
         .await
         .unwrap();
     assert!(delta.changed);
-    assert!(delta.history_lost);
+    assert!(!delta.history_lost);
     assert!(delta.has_more);
     assert!(delta
         .messages
         .iter()
-        .all(|message| message.message_id != filler_ids[0]));
+        .any(|message| message.message_id == filler_ids[0]));
 }
 
 #[tokio::test]
@@ -409,7 +413,8 @@ async fn observe_session_messages_duplicate_persisted_positive_revisions_fail_cl
     store.flush_persistence();
     drop(store);
 
-    let mut raw: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let mut raw: Value =
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let record = raw["sessions"]
         .as_array_mut()
         .unwrap()
@@ -425,7 +430,7 @@ async fn observe_session_messages_duplicate_persisted_positive_revisions_fail_cl
     revisions.insert(second.message_id.clone(), Value::from(1));
     std::fs::write(&ledger, serde_json::to_vec(&raw).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 50);
+    let restored = crate::test_storage::import_ledger(&ledger, 10, 50);
     let recovered = restored
         .observe_messages(
             &session.session_id,
@@ -473,8 +478,8 @@ async fn observe_session_messages_duplicate_persisted_positive_revisions_fail_cl
     assert_eq!(delta.messages[0].message_id, after_restore.message_id);
 }
 
-#[test]
-fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
+#[tokio::test]
+async fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
     let temp = tempfile::tempdir().unwrap();
     let ledger = temp.path().join("session-message-delivery.json");
     let store = SessionStore::with_persistence(&ledger, 10, 50);
@@ -498,6 +503,7 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
             false,
             Some(delivery()),
         )
+        .await
         .unwrap();
     assert!(!first.replayed);
     assert!(first.state_changed);
@@ -507,6 +513,7 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
             false,
             Some(delivery()),
         )
+        .await
         .unwrap();
     assert_eq!(replay.message.message_id, first.message.message_id);
     assert!(replay.replayed);
@@ -519,11 +526,9 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
         1
     );
     assert!(matches!(
-        store.post_message_with_ack_and_delivery(
-            input("different payload"),
-            false,
-            Some(delivery())
-        ),
+        store
+            .post_message_with_ack_and_delivery(input("different payload"), false, Some(delivery()))
+            .await,
         Err(SessionMessageError::DeliveryKeyConflict)
     ));
 
@@ -535,6 +540,7 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
             false,
             Some(delivery()),
         )
+        .await
         .unwrap();
     assert_eq!(
         replay_after_restart.message.message_id,
@@ -551,8 +557,8 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
     );
 }
 
-#[test]
-fn session_message_delivery_retry_reestablishes_durable_barrier_after_persist_failure() {
+#[tokio::test]
+async fn session_message_delivery_retry_reestablishes_durable_barrier_after_persist_failure() {
     let root = tempfile::tempdir().unwrap();
     let ledger_dir = root.path().join("ledger");
     std::fs::create_dir_all(&ledger_dir).unwrap();
@@ -574,10 +580,11 @@ fn session_message_delivery_retry_reestablishes_durable_barrier_after_persist_fa
         delivery_key: "persist-retry".to_string(),
     };
 
-    std::fs::remove_dir_all(&ledger_dir).unwrap();
-    std::fs::write(&ledger_dir, b"block directory recreation").unwrap();
+    crate::test_storage::fail_writes(&store, true);
     assert!(matches!(
-        store.post_message_with_ack_and_delivery(input(), false, Some(delivery())),
+        store
+            .post_message_with_ack_and_delivery(input(), false, Some(delivery()))
+            .await,
         Err(SessionMessageError::DeliveryPersistenceUncertain)
     ));
     let in_memory = store
@@ -586,10 +593,10 @@ fn session_message_delivery_retry_reestablishes_durable_barrier_after_persist_fa
     assert_eq!(in_memory.len(), 1);
     let message_id = in_memory[0].message_id.clone();
 
-    std::fs::remove_file(&ledger_dir).unwrap();
-    std::fs::create_dir_all(&ledger_dir).unwrap();
+    crate::test_storage::fail_writes(&store, false);
     let replay = store
         .post_message_with_ack_and_delivery(input(), false, Some(delivery()))
+        .await
         .unwrap();
     assert!(replay.replayed);
     assert!(!replay.state_changed);
@@ -628,7 +635,8 @@ async fn observe_session_messages_unexplained_persisted_revision_gap_reports_his
     store.flush_persistence();
     drop(store);
 
-    let mut raw: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let mut raw: Value =
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let record = raw["sessions"]
         .as_array_mut()
         .unwrap()
@@ -640,7 +648,7 @@ async fn observe_session_messages_unexplained_persisted_revision_gap_reports_his
     record.insert("message_observation_revision".to_string(), Value::from(3));
     std::fs::write(&ledger, serde_json::to_vec(&raw).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 50);
+    let restored = crate::test_storage::import_ledger(&ledger, 10, 50);
     let recovered = restored
         .observe_messages(
             &session.session_id,
@@ -770,8 +778,8 @@ async fn observe_session_messages_wait_timeout_is_successful_unchanged_snapshot(
     assert!(timed_out.waited_ms >= 900);
 }
 
-#[test]
-fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent() {
+#[tokio::test]
+async fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent() {
     let store = SessionStore::default();
     let coordinator =
         store.start_session(Some("proj".to_string()), Some("coordinator".to_string()));
@@ -796,10 +804,11 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
             &store,
             &coordinator.session_id,
             &todo.message_id,
-        ),
+        )
+        .await,
     };
 
-    let completed = store.complete_message(input.clone()).unwrap();
+    let completed = store.complete_message(input.clone()).await.unwrap();
     assert!(!completed.replayed);
     assert_eq!(completed.todo.status, SessionMessageStatus::Resolved);
     assert_eq!(
@@ -859,7 +868,7 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].message_id, completed.answer.message_id);
 
-    let replay = store.complete_message(input.clone()).unwrap();
+    let replay = store.complete_message(input.clone()).await.unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.answer.message_id, completed.answer.message_id);
     assert_eq!(replay.todo.resolved_at, completed.todo.resolved_at);
@@ -874,18 +883,22 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
         .unwrap();
     assert_eq!(answers.len(), 1, "retry must not duplicate answers");
 
-    let conflict = store.complete_message(CompleteSessionMessageInput {
-        answer: "different answer".to_string(),
-        ..input.clone()
-    });
+    let conflict = store
+        .complete_message(CompleteSessionMessageInput {
+            answer: "different answer".to_string(),
+            ..input.clone()
+        })
+        .await;
     assert!(matches!(
         conflict,
         Err(SessionMessageError::IdempotencyConflict)
     ));
-    let already = store.complete_message(CompleteSessionMessageInput {
-        completion_id: completion_id('b'),
-        ..input
-    });
+    let already = store
+        .complete_message(CompleteSessionMessageInput {
+            completion_id: completion_id('b'),
+            ..input
+        })
+        .await;
     assert!(matches!(
         already,
         Err(SessionMessageError::AlreadyCompleted {
@@ -911,8 +924,8 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
     );
 }
 
-#[test]
-fn collaboration_session_message_completion_rejects_invalid_targets_and_author() {
+#[tokio::test]
+async fn collaboration_session_message_completion_rejects_invalid_targets_and_author() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let question = post(
@@ -937,42 +950,51 @@ fn collaboration_session_message_completion_rejects_invalid_targets_and_author()
         priority: SessionMessagePriority::Normal,
         completion_id: completion_id('c'),
         author_session_id: None,
-        expected_assignment_fence: assignment_fence(&store, &session.session_id, &todo.message_id),
+        expected_assignment_fence: assignment_fence(&store, &session.session_id, &todo.message_id)
+            .await,
     };
     assert!(matches!(
-        store.complete_message(base.clone()),
+        store.complete_message(base.clone()).await,
         Err(SessionMessageError::NotTodo)
     ));
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
-            message_id: "wc_msg_missing".to_string(),
-            ..base.clone()
-        }),
+        store
+            .complete_message(CompleteSessionMessageInput {
+                message_id: "wc_msg_missing".to_string(),
+                ..base.clone()
+            })
+            .await,
         Err(SessionMessageError::UnknownMessage)
     ));
 
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
-            message_id: todo.message_id.clone(),
-            author_session_id: Some("forged-author".to_string()),
-            ..base.clone()
-        }),
+        store
+            .complete_message(CompleteSessionMessageInput {
+                message_id: todo.message_id.clone(),
+                author_session_id: Some("forged-author".to_string()),
+                ..base.clone()
+            })
+            .await,
         Err(SessionMessageError::InvalidInput(_))
     ));
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
-            message_id: todo.message_id.clone(),
-            answer: "x".repeat(8001),
-            ..base.clone()
-        }),
+        store
+            .complete_message(CompleteSessionMessageInput {
+                message_id: todo.message_id.clone(),
+                answer: "x".repeat(8001),
+                ..base.clone()
+            })
+            .await,
         Err(SessionMessageError::InvalidInput(_))
     ));
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
-            message_id: todo.message_id.clone(),
-            tags: (0..17).map(|index| format!("tag-{index}")).collect(),
-            ..base.clone()
-        }),
+        store
+            .complete_message(CompleteSessionMessageInput {
+                message_id: todo.message_id.clone(),
+                tags: (0..17).map(|index| format!("tag-{index}")).collect(),
+                ..base.clone()
+            })
+            .await,
         Err(SessionMessageError::InvalidInput(_))
     ));
     let still_open = store
@@ -992,10 +1014,12 @@ fn collaboration_session_message_completion_rejects_invalid_targets_and_author()
     );
     store.close_session(&session.session_id).unwrap();
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
-            message_id: todo.message_id,
-            ..base
-        }),
+        store
+            .complete_message(CompleteSessionMessageInput {
+                message_id: todo.message_id,
+                ..base
+            })
+            .await,
         Err(SessionMessageError::SessionClosed { .. })
     ));
 }
@@ -1045,8 +1069,8 @@ fn collaboration_session_message_exact_lookup_finds_old_retained_todo() {
     assert!(missing.is_empty());
 }
 
-#[test]
-fn collaboration_session_message_completion_replays_after_current_v2_restart() {
+#[tokio::test]
+async fn collaboration_session_message_completion_replays_after_current_v2_restart() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 50);
@@ -1071,14 +1095,15 @@ fn collaboration_session_message_completion_replays_after_current_v2_restart() {
             &store,
             &coordinator.session_id,
             &todo.message_id,
-        ),
+        )
+        .await,
     };
-    let first = store.complete_message(input.clone()).unwrap();
+    let first = store.complete_message(input.clone()).await.unwrap();
 
     // Completion success durably fences the accepted intent, so a fresh
     // current-v2 store can replay it without a test-only flush or graceful Drop.
     let restored = SessionStore::with_persistence(&ledger, 10, 50);
-    let replay = restored.complete_message(input).unwrap();
+    let replay = restored.complete_message(input).await.unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.answer.message_id, first.answer.message_id);
     assert_eq!(
@@ -1096,8 +1121,8 @@ fn collaboration_session_message_completion_replays_after_current_v2_restart() {
     );
 }
 
-#[test]
-fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_recovers() {
+#[tokio::test]
+async fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_recovers() {
     let root = tempfile::tempdir().unwrap();
     let ledger_dir = root.path().join("ledger");
     std::fs::create_dir_all(&ledger_dir).unwrap();
@@ -1111,10 +1136,9 @@ fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_
         "durability failure",
         SessionMessagePriority::Normal,
     );
-    let assignment_fence = assignment_fence(&store, &session.session_id, &todo.message_id);
+    let assignment_fence = assignment_fence(&store, &session.session_id, &todo.message_id).await;
     store.flush_persistence();
-    std::fs::remove_dir_all(&ledger_dir).unwrap();
-    std::fs::write(&ledger_dir, b"block directory recreation").unwrap();
+    crate::test_storage::fail_writes(&store, true);
 
     let input = CompleteSessionMessageInput {
         session_id: session.session_id.clone(),
@@ -1127,7 +1151,7 @@ fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_
         expected_assignment_fence: assignment_fence,
     };
     assert!(matches!(
-        store.complete_message(input.clone()),
+        store.complete_message(input.clone()).await,
         Err(SessionMessageError::PersistenceUncertain)
     ));
     let in_memory = store
@@ -1145,9 +1169,8 @@ fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_
         "atomic in-memory completion remains exact"
     );
 
-    std::fs::remove_file(&ledger_dir).unwrap();
-    std::fs::create_dir_all(&ledger_dir).unwrap();
-    let replay = store.complete_message(input).unwrap();
+    crate::test_storage::fail_writes(&store, false);
+    let replay = store.complete_message(input).await.unwrap();
     assert!(replay.replayed);
     store.flush_persistence();
     let restored = SessionStore::with_persistence(&ledger, 10, 50);
@@ -1164,8 +1187,8 @@ fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_
     assert_eq!(restored_replies[0].message_id, replay.answer.message_id);
 }
 
-#[test]
-fn collaboration_session_message_partial_persisted_completion_fails_closed() {
+#[tokio::test]
+async fn collaboration_session_message_partial_persisted_completion_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 50);
@@ -1185,13 +1208,15 @@ fn collaboration_session_message_partial_persisted_completion_fails_closed() {
         priority: SessionMessagePriority::Normal,
         completion_id: completion_id('e'),
         author_session_id: None,
-        expected_assignment_fence: assignment_fence(&store, &session.session_id, &todo.message_id),
+        expected_assignment_fence: assignment_fence(&store, &session.session_id, &todo.message_id)
+            .await,
     };
-    store.complete_message(input.clone()).unwrap();
+    store.complete_message(input.clone()).await.unwrap();
     store.flush_persistence();
     drop(store);
 
-    let mut raw: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let mut raw: Value =
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let todo_raw = raw["sessions"]
         .as_array_mut()
         .unwrap()
@@ -1207,8 +1232,8 @@ fn collaboration_session_message_partial_persisted_completion_fails_closed() {
         .unwrap();
     todo_raw.remove("resolved_by_message_id");
     std::fs::write(&ledger, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
-    let restored = SessionStore::with_persistence(&ledger, 10, 50);
-    let err = restored.complete_message(input).unwrap_err();
+    let restored = crate::test_storage::import_ledger(&ledger, 10, 50);
+    let err = restored.complete_message(input).await.unwrap_err();
     assert!(matches!(err, SessionMessageError::InvalidCompletionState));
     let persisted_todo = restored
         .list_messages(
@@ -1248,7 +1273,8 @@ async fn observe_session_messages_duplicate_persisted_message_ids_fail_closed() 
     store.flush_persistence();
     drop(store);
 
-    let mut raw: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let mut raw: Value =
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let record = raw["sessions"]
         .as_array_mut()
         .unwrap()
@@ -1268,7 +1294,7 @@ async fn observe_session_messages_duplicate_persisted_message_ids_fail_closed() 
     revisions.insert(first.message_id.clone(), Value::from(2));
     std::fs::write(&ledger, serde_json::to_vec(&raw).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 50);
+    let restored = crate::test_storage::import_ledger(&ledger, 10, 50);
     let recovered = restored
         .observe_messages(
             &session.session_id,
@@ -1523,7 +1549,7 @@ fn ack_ref_worst_case_retained_set_stays_within_model_facing_bound() {
     let store = SessionStore::default();
     let session = store.start_session(Some("proj".to_string()), None);
     let mut ids = Vec::new();
-    for index in 0..DEFAULT_MAX_MESSAGES_PER_SESSION {
+    for index in 0..LEGACY_MESSAGE_RETENTION_LIMIT {
         ids.push(
             store
                 .post_message_with_ack(

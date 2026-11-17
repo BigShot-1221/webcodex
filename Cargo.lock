@@ -4281,6 +4281,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_repr"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4934,6 +4945,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 
@@ -5535,6 +5547,7 @@ dependencies = [
  "libc",
  "quinn",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",
@@ -5674,10 +5687,22 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "webcodex-computer-control",
  "webcodex-core",
  "windows",
  "windows-sys 0.61.2",
  "xcap",
+]
+
+[[package]]
+name = "webcodex-computer-control"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -5740,6 +5765,7 @@ dependencies = [
 name = "webcodex-openai-tunnel"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "fs2",
  "futures-util",
  "httpdate",
@@ -5796,6 +5822,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml 0.8.23",
+ "toml_edit 0.25.11+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -5866,6 +5893,7 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "webcodex-core",
 ]
 
@@ -5904,6 +5932,7 @@ version = "0.5.0"
 dependencies = [
  "base64",
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

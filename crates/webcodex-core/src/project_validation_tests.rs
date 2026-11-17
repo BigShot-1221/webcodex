@@ -97,6 +97,41 @@ fn project_node_check_step_identity_capability_and_metadata_are_closed() {
 }
 
 #[test]
+fn only_canonical_project_cargo_steps_accept_sorted_workspace_exclusions() {
+    use crate::runner_protocol::ShellJobValidationStep;
+    let step = |args: &[&str]| ShellJobValidationStep {
+        name: "check".into(),
+        program: "cargo".into(),
+        args: args.iter().map(|arg| (*arg).into()).collect(),
+        env: vec![],
+    };
+    let excluded = step(&[
+        "check",
+        "--workspace",
+        "--exclude",
+        "alpha",
+        "--exclude",
+        "zeta",
+    ]);
+    assert!(!excluded.is_canonical());
+    assert!(excluded.is_canonical_project_step());
+    assert!(
+        step(&[
+            "check",
+            "--workspace",
+            "--exclude",
+            "zeta",
+            "--exclude",
+            "alpha"
+        ])
+        .is_canonical_project_step()
+            == false
+    );
+    assert!(!step(&["check", "--exclude", "alpha"]).is_canonical_project_step());
+    assert!(!step(&["check", "--workspace", "--exclude", "../alpha"]).is_canonical_project_step());
+}
+
+#[test]
 fn explicit_lint_provenance_has_closed_backend_set() {
     let mut provenance = ProjectValidationProvenance {
         request: ProjectValidationRequest {
@@ -120,6 +155,8 @@ fn explicit_lint_provenance_has_closed_backend_set() {
     assert!(provenance.is_valid());
     provenance.request.dependency_resolution_policy =
         Some(ProjectDependencyResolutionPolicy::Offline);
+    assert!(provenance.is_valid());
+    provenance.backend = "node".into();
     assert!(!provenance.is_valid());
     provenance.request.dependency_resolution_policy = None;
     for backend in ["go", "python"] {
@@ -330,6 +367,7 @@ fn project_validation_package_scope_roundtrips_and_is_bounded() {
         scope: Some(ProjectValidationScope {
             packages: vec!["package-a".into(), "package-b".into()],
             all_packages: false,
+            exclude_packages: Vec::new(),
         }),
         dependency_policy: None,
         dependency_resolution_policy: None,
@@ -350,6 +388,7 @@ fn project_validation_package_scope_roundtrips_and_is_bounded() {
         invalid.scope = Some(ProjectValidationScope {
             packages,
             all_packages: false,
+            exclude_packages: Vec::new(),
         });
         assert!(invalid.validate().is_err());
     }
@@ -393,7 +432,7 @@ fn project_validation_locked_policy_rejects_format_check_without_silent_ignore()
     };
     assert_eq!(
         request.validate().unwrap_err(),
-        "dependency_policy requires project_validate action=check or test"
+        "dependency_policy requires project_validate action=check, lint or test"
     );
 }
 
@@ -591,14 +630,71 @@ fn dependency_resolution_offline_request_is_opt_in_and_closed() {
     let mut invalid = serde_json::to_value(&request).unwrap();
     invalid["dependency_resolution_policy"] = serde_json::json!("online");
     assert!(serde_json::from_value::<ProjectValidationRequest>(invalid).is_err());
-    for action in [
-        ProjectValidationAction::Lint,
-        ProjectValidationAction::FormatCheck,
+    request.action = ProjectValidationAction::Lint;
+    for adapter in [
+        ProjectValidationAdapter::Rust,
+        ProjectValidationAdapter::Auto,
     ] {
-        request.action = action;
-        assert!(request.validate().is_err());
+        request.adapter = adapter;
+        assert!(request.validate().is_ok());
     }
+    request.action = ProjectValidationAction::FormatCheck;
+    assert!(request.validate().is_err());
     request.action = ProjectValidationAction::Test;
     request.adapter = ProjectValidationAdapter::Node;
     assert!(request.validate().is_err());
+}
+
+#[test]
+fn rust_clippy_offline_capability_and_canonical_argv_are_additive() {
+    use crate::runner_protocol::{RunnerCapabilities, RunnerCapabilityId, ShellJobValidationStep};
+    let mut caps: RunnerCapabilities = serde_json::from_value(serde_json::json!({
+        "project_validation_rust_clippy_v1": true,
+        "project_dependency_resolution_offline_v1": true
+    }))
+    .unwrap();
+    assert!(!caps.project_validation_rust_clippy_offline_v1);
+    caps.set(RunnerCapabilityId::ProjectValidationRustClippyOffline, true);
+    let serialized = serde_json::to_value(&caps).unwrap();
+    assert_eq!(
+        serialized["project_validation_rust_clippy_offline_v1"],
+        true
+    );
+    for locked in [false, true] {
+        let mut args = vec!["clippy"];
+        if locked {
+            args.push("--locked");
+        }
+        args.extend([
+            "--offline",
+            "--all-targets",
+            "--",
+            "-D",
+            "clippy::correctness",
+        ]);
+        let step = ShellJobValidationStep {
+            name: "lint".into(),
+            program: "cargo".into(),
+            args: args.into_iter().map(str::to_string).collect(),
+            env: vec![],
+        };
+        assert!(step.is_canonical());
+        for forbidden in [
+            "--offline",
+            "--fix",
+            "--features",
+            "--frozen",
+            "--manifest-path",
+        ] {
+            let mut bad = step.clone();
+            bad.args.insert(1, forbidden.into());
+            assert!(!bad.is_canonical(), "{forbidden}");
+        }
+        let mut bad = step.clone();
+        bad.args.retain(|arg| arg != "--all-targets");
+        assert!(!bad.is_canonical());
+        let mut bad = step;
+        *bad.args.last_mut().unwrap() = "warnings".into();
+        assert!(!bad.is_canonical());
+    }
 }

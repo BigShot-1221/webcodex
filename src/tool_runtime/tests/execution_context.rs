@@ -5,6 +5,7 @@ use super::support::*;
 use crate::runner_protocol::{
     RunnerCapabilities, RunnerResultPayload, RunnerResultRequest, ShellCommandExecutionState,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 
 fn context(cwd: Option<&str>, shell: Option<ExecutionShell>) -> sessions::SessionExecutionContext {
     sessions::SessionExecutionContext {
@@ -190,6 +191,7 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
         Some(root.to_string_lossy().as_ref())
     );
     assert_eq!(no_session_request.command, "pwd");
+    assert!(no_session_request.shell.is_none());
     complete_patch_agent_request(
         &runtime,
         "context-shell",
@@ -201,8 +203,9 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
     .await;
     let no_session = no_session_task.await.unwrap();
     assert!(no_session.success, "{:?}", no_session.error);
-    assert_eq!(no_session.output["cwd"], ".");
-    assert_eq!(no_session.output["shell"], "configured");
+    // The Runner request above proves the defaults; the model receipt omits them.
+    assert!(no_session.output.get("cwd").is_none());
+    assert!(no_session.output.get("shell").is_none());
 }
 
 #[tokio::test]
@@ -476,7 +479,7 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
         let auth = auth.clone();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata(
+                .dispatch_with_context(
                     ToolCall::RunShell {
                         login: false,
                         project,
@@ -488,9 +491,7 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
                         purpose: None,
                         shell: None,
                     },
-                    Some(&auth),
-                    sessions::SessionTransport::Mcp,
-                    sessions::ToolCallRecorderMetadata::default(),
+                    DispatchContext::internal(Some(&auth), sessions::SessionTransport::Mcp, None),
                 )
                 .await
         }
@@ -551,10 +552,10 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
         Some("tmp")
     );
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["ssh_resource"], "tmp");
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(status.job.ssh_resource.as_deref(), Some("tmp"));
     let log = runtime
         .job_log_for_auth(job_id.clone(), None, Some(20), Some(&auth), None, None)
         .await;
@@ -815,16 +816,16 @@ async fn session_ssh_transport_failure_marks_remote_delivery_uncertain() {
         .runner_registry
         .complete(RunnerResultPayload {
             result: RunnerResultRequest {
-                client_id: "context-ssh-transport".to_string(),
-                runner_instance_id: "inst-context-ssh-transport".to_string(),
-                request_id: request.request_id,
                 exit_code: Some(255),
                 stdout: Some(String::new()),
                 stderr: Some("connection reset".to_string()),
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: Some("ssh transport failed after dispatch".to_string()),
+                ..runner_result_request(
+                    "context-ssh-transport".to_string(),
+                    "inst-context-ssh-transport".to_string(),
+                    request.request_id,
+                )
             },
             command_execution_state: Some(ShellCommandExecutionState::OutcomeUnknown),
             mcp_gateway: None,
@@ -967,16 +968,13 @@ async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "context-missing".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
             error: Some("cwd does not exist".to_string()),
+            ..runner_result_request(
+                "context-missing".to_string(),
+                "inst".to_string(),
+                request.request_id,
+            )
         })
         .await
         .unwrap();

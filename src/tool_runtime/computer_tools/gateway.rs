@@ -36,6 +36,23 @@ pub(super) fn computer_control_policy(
 ) -> SpecializedOperationPolicy {
     use ComputerControlToolCall::*;
     match call {
+        Press {
+            observe_after: Some(_),
+            ..
+        }
+        | InputText {
+            observe_after: Some(_),
+            ..
+        }
+        | Scroll {
+            observe_after: Some(_),
+            ..
+        } => SpecializedOperationPolicy::consequential_all(
+            SpecializedSource::Computer,
+            call.action_name(),
+            &[SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_READ],
+            "computer_control",
+        ),
         LaunchApplication { .. } => SpecializedOperationPolicy::consequential(
             SpecializedSource::Computer,
             call.action_name(),
@@ -61,8 +78,10 @@ pub(super) fn computer_control_policy(
         ),
         ActivateWindow { .. }
         | Press { .. }
+        | Select { .. }
         | Focus { .. }
         | ScrollToElement { .. }
+        | Scroll { .. }
         | Key { .. }
         | InputText { .. } => SpecializedOperationPolicy::consequential(
             SpecializedSource::Computer,

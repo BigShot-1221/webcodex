@@ -608,10 +608,28 @@ async fn dispatch_inbound(
             }
         }
         RunnerEnvelope::RuntimeMetadata {
+            job_capacity,
             tool_providers,
             mcp_gateway_providers,
             computer_session_availability,
+            computer_control_epoch,
         } => {
+            let _ = registry
+                .update_computer_control_epoch(
+                    client_id,
+                    runner_instance_id,
+                    Some(connection_id),
+                    computer_control_epoch,
+                )
+                .await;
+            let _ = registry
+                .update_job_capacity(
+                    client_id,
+                    runner_instance_id,
+                    Some(connection_id),
+                    job_capacity,
+                )
+                .await;
             let _ = registry
                 .update_runtime_metadata_for_connection(
                     client_id,

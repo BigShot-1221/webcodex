@@ -4,6 +4,8 @@ use super::support::*;
 use crate::runner_protocol::{RunnerBuildInfo, RunnerCapabilities, RunnerRegisterRequest};
 use serde_json::json;
 
+mod bounded_discovery;
+
 fn list_projects_call(
     client_id: Option<&str>,
     project: Option<&str>,
@@ -17,6 +19,7 @@ fn list_projects_call(
         project: project.map(str::to_string),
         query: query.map(str::to_string),
         limit,
+        offset: 0,
         summary_only,
     }
 }
@@ -28,6 +31,8 @@ fn list_runners_call(
     summary_only: bool,
 ) -> ToolCall {
     ToolCall::ListRunners {
+        projects_offset: 0,
+        offset: 0,
         query: None,
         status: None,
         limit: None,
@@ -55,26 +60,19 @@ async fn register_target_agent(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
             build,
             job_concurrency_limit: Some(4),
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: format!("inst-{client_id}"),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: Some(format!("Runner {client_id}")),
-            owner: None,
             hostname: Some(format!("host-{client_id}")),
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(RunnerCapabilities {
-                git: true,
-                async_shell_jobs: true,
-                ..Default::default()
-            }),
-            policy: None,
+            ..crate::test_support::runner_registration(
+                client_id,
+                &format!("inst-{client_id}"),
+                RunnerCapabilities {
+                    git: true,
+                    async_shell_jobs: true,
+                    ..Default::default()
+                },
+            )
         })
         .await
         .unwrap();
@@ -97,24 +95,12 @@ async fn register_target_agent_for_auth(
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
-                computer_session_availability: None,
-                process_started_at: None,
-                build: None,
                 job_concurrency_limit: Some(4),
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: format!("inst-{client_id}"),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                display_name: None,
-                owner: None,
-                hostname: None,
-                host_context: None,
-                capabilities: crate::test_support::current_runner_capabilities(
+                ..crate::test_support::runner_registration(
+                    client_id,
+                    &format!("inst-{client_id}"),
                     RunnerCapabilities::default(),
-                ),
-                policy: None,
+                )
             },
             Some(&crate::test_support::runner_access(auth)),
         )
@@ -151,24 +137,15 @@ async fn register_managed_target_agent(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
             job_concurrency_limit: Some(4),
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: format!("inst-{client_id}"),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
             display_name: Some(format!("{owner} private runner")),
             owner: Some(owner.to_string()),
             hostname: Some(format!("{owner}-private-host")),
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(
+            ..crate::test_support::runner_registration(
+                client_id,
+                &format!("inst-{client_id}"),
                 RunnerCapabilities::default(),
-            ),
-            policy: None,
+            )
         })
         .await
         .unwrap();
@@ -228,26 +205,18 @@ async fn list_projects_batch_job_counts_join_exact_projects_and_skip_empty_selec
     for id in ["a", "a", "b"] {
         runtime
             .runner_registry
-            .start_job_with_metadata(
-                crate::runner_protocol::ShellJobOpRequest {
-                    login: false,
-                    op: "start".into(),
-                    client_id: Some("batch".into()),
-                    cwd: None,
-                    command: Some("echo fixture".into()),
-                    timeout_secs: Some(60),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
-                    codex: None,
+            .start_job(
+                webcodex_runner_registry::JobStartRequest {
+                    timeout_secs: 60,
+                    context: webcodex_runner_registry::JobStartContext {
+                        project_id: Some(format!("agent:batch:{id}")),
+                        ..Default::default()
+                    },
+                    ..webcodex_runner_registry::JobStartRequest::shell("batch", "echo fixture")
                 },
                 "fixture".into(),
-                webcodex_runner_registry::ShellJobStartMetadata {
-                    project_id: Some(format!("agent:batch:{id}")),
-                    ..Default::default()
-                },
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -342,20 +311,21 @@ async fn list_projects_large_single_runner_inventory_preserves_linear_staging_co
             .await;
         assert!(full.success, "{:?}", full.error);
         assert_eq!(full.output["matched_count"], project_count);
-        assert_eq!(full.output["count"], project_count);
-        assert_eq!(full.output["truncated"], false);
+        assert_eq!(full.output["count"], 30);
+        assert_eq!(full.output["truncated"], true);
+        assert_eq!(full.output["next_offset"], 30);
         assert_eq!(
             runtime.runner_registry.project_job_scan_count_for_test(),
             3,
-            "a full inventory must scan Jobs once, not once per Project"
+            "a page must scan Jobs once, not once per Project"
         );
         assert_eq!(
             full.output["projects"][0]["id"],
             "agent:special:project-0000"
         );
         assert_eq!(
-            full.output["projects"][project_count - 1]["id"],
-            format!("agent:special:project-{:04}", project_count - 1)
+            full.output["projects"][29]["id"],
+            "agent:special:project-0029"
         );
         let first = &full.output["projects"][0];
         assert!(
@@ -406,7 +376,9 @@ async fn list_projects_targets_visible_inventory_before_limit_and_compacts() {
         .dispatch(list_projects_call(None, None, None, None, false))
         .await;
     assert!(full.success, "{:?}", full.error);
-    assert_eq!(full.output["count"], 124);
+    assert_eq!(full.output["count"], 30);
+    assert_eq!(full.output["matched_count"], 124);
+    assert_eq!(full.output["next_offset"], 30);
 
     let focused = runtime
         .dispatch(list_projects_call(
@@ -430,10 +402,8 @@ async fn list_projects_targets_visible_inventory_before_limit_and_compacts() {
             "summary_only leaked {omitted}: {project}"
         );
     }
-    let capabilities = project["capabilities"].as_object().unwrap();
-    assert_eq!(capabilities.len(), 2);
-    assert!(capabilities.contains_key("git_available"));
-    assert!(capabilities.contains_key("recommended_for_smoke"));
+    assert!(project.get("capabilities").is_none());
+    assert!(project.get("shell_profile_status").is_none());
 
     let exact = runtime
         .dispatch(list_projects_call(
@@ -479,7 +449,8 @@ async fn list_projects_targets_visible_inventory_before_limit_and_compacts() {
         .await;
     assert!(bounded_query.success);
     assert_eq!(bounded_query.output["matched_count"], 123);
-    assert_eq!(bounded_query.output["count"], 100);
+    assert_eq!(bounded_query.output["count"], 30);
+    assert_eq!(bounded_query.output["next_offset"], 30);
     assert_eq!(bounded_query.output["truncated"], true);
 
     for query in ["   ".to_string(), "x".repeat(201)] {
@@ -488,6 +459,147 @@ async fn list_projects_targets_visible_inventory_before_limit_and_compacts() {
             .await;
         assert!(!invalid.success);
         assert_eq!(invalid.output["error_kind"], "invalid_query");
+    }
+}
+
+#[tokio::test]
+async fn empty_inventory_hints_do_not_distinguish_hidden_from_nonexistent_resources() {
+    for managed in [false, true] {
+        let runtime = test_runtime();
+        let caller = if managed {
+            managed_discovery_auth("visible-owner")
+        } else {
+            shared_key_auth_context("visible-owner")
+        };
+        let hidden_owner = if managed {
+            managed_discovery_auth("hidden-owner")
+        } else {
+            shared_key_auth_context("hidden-owner")
+        };
+        let empty_caller = if managed {
+            managed_discovery_auth("empty-owner")
+        } else {
+            shared_key_auth_context("empty-owner")
+        };
+        if managed {
+            register_managed_target_agent(
+                &runtime,
+                "visible-client",
+                "visible-owner",
+                "visible-project",
+                "/tmp/visible-project",
+            )
+            .await;
+            register_managed_target_agent(
+                &runtime,
+                "hidden-client",
+                "hidden-owner",
+                "hidden-project",
+                "/tmp/hidden-project",
+            )
+            .await;
+        } else {
+            register_target_agent_for_auth(&runtime, "visible-client", "visible-project", &caller)
+                .await;
+            register_target_agent_for_auth(
+                &runtime,
+                "hidden-client",
+                "hidden-project",
+                &hidden_owner,
+            )
+            .await;
+        }
+
+        for summary in [false, true] {
+            for (hidden_call, missing_call, resource) in [
+                (
+                    list_projects_call(Some("hidden-client"), None, None, None, summary),
+                    list_projects_call(Some("missing-client"), None, None, None, summary),
+                    "Projects",
+                ),
+                (
+                    list_projects_call(
+                        None,
+                        Some("agent:hidden-client:hidden-project"),
+                        None,
+                        None,
+                        summary,
+                    ),
+                    list_projects_call(
+                        None,
+                        Some("agent:missing-client:missing-project"),
+                        None,
+                        None,
+                        summary,
+                    ),
+                    "Projects",
+                ),
+                (
+                    list_projects_call(None, None, Some("hidden-project"), None, summary),
+                    list_projects_call(None, None, Some("missing-project"), None, summary),
+                    "Projects",
+                ),
+                (
+                    list_runners_call(Some("hidden-client"), None, Some(true), summary),
+                    list_runners_call(Some("missing-client"), None, Some(true), summary),
+                    "Runners",
+                ),
+                (
+                    list_runners_call(None, Some(&["hidden-client"]), Some(true), summary),
+                    list_runners_call(None, Some(&["missing-client"]), Some(true), summary),
+                    "Runners",
+                ),
+            ] {
+                let hidden = runtime.dispatch_with_auth(hidden_call, Some(&caller)).await;
+                let missing = runtime
+                    .dispatch_with_auth(missing_call, Some(&caller))
+                    .await;
+                assert!(hidden.success && missing.success);
+                assert_eq!(
+                    serde_json::to_value(&hidden).unwrap(),
+                    serde_json::to_value(&missing).unwrap(),
+                    "whole response must not reveal existence: managed={managed}, summary={summary}"
+                );
+                assert_eq!(hidden.output["count"], 0);
+                assert_eq!(hidden.output["matched_count"], 0);
+                assert_eq!(
+                    hidden.output["hint"],
+                    format!("No accessible {resource} match this request. Check the filters and the current credential identity and authorization.")
+                );
+                let text = serde_json::to_string(&hidden).unwrap();
+                for secret in ["hidden-client", "hidden-owner", "hidden-project"] {
+                    assert!(!text.contains(secret), "{text}");
+                }
+            }
+
+            for (call, resource) in [
+                (
+                    list_projects_call(None, None, None, None, summary),
+                    "Projects",
+                ),
+                (
+                    list_runners_call(None, None, Some(true), summary),
+                    "Runners",
+                ),
+            ] {
+                let empty = runtime.dispatch_with_auth(call, Some(&empty_caller)).await;
+                assert!(empty.success);
+                assert_eq!(empty.output["count"], 0);
+                assert_eq!(
+                    empty.output["hint"],
+                    format!("No accessible {resource} match this request. Check the filters and the current credential identity and authorization.")
+                );
+            }
+            for call in [
+                list_projects_call(None, None, None, None, summary),
+                list_runners_call(None, None, Some(true), summary),
+            ] {
+                let visible = runtime.dispatch_with_auth(call, Some(&caller)).await;
+                assert!(visible.success);
+                assert_eq!(visible.output["count"], 1);
+                assert!(visible.output.get("hint").is_none());
+            }
+        }
     }
 }
 
@@ -688,7 +800,7 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
     .await;
 
     let legacy = runtime
-        .dispatch(list_runners_call(None, None, None, false))
+        .dispatch(list_runners_call(None, None, Some(true), false))
         .await;
     assert!(legacy.success);
     assert_eq!(legacy.output["count"], 3);
@@ -703,9 +815,14 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
     let agent = &focused.output["runners"][0];
     assert_eq!(agent["client_id"], "special");
     assert_eq!(agent["projects_count"], 2);
-    assert_eq!(agent["build"]["built_at"], "300");
-    assert_eq!(agent["build"]["target"], "x86_64-pc-windows-msvc");
-    assert_eq!(agent["build"]["architecture"], "x86_64");
+    assert!(agent.get("build").is_none());
+    let detailed = runtime
+        .dispatch(list_runners_call(Some("special"), None, Some(false), false))
+        .await;
+    let build = &detailed.output["runners"][0]["build"];
+    assert_eq!(build["built_at"], "300");
+    assert_eq!(build["target"], "x86_64-pc-windows-msvc");
+    assert_eq!(build["architecture"], "x86_64");
     for omitted in [
         "projects",
         "capabilities",
@@ -757,6 +874,8 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
         .collect::<Vec<_>>();
     let too_many = runtime
         .dispatch(ToolCall::ListRunners {
+            projects_offset: 0,
+            offset: 0,
             query: None,
             status: None,
             limit: None,
@@ -790,26 +909,21 @@ async fn runtime_status_focused_job_counts_do_not_leak_other_runners() {
         for _ in 0..count {
             runtime
                 .runner_registry
-                .start_job_with_metadata(
-                    crate::runner_protocol::ShellJobOpRequest {
-                        login: false,
-                        op: "start".into(),
-                        client_id: Some(client_id.into()),
-                        cwd: None,
-                        command: Some("echo fixture".into()),
-                        timeout_secs: Some(60),
-                        job_id: None,
-                        since_stdout_line: None,
-                        since_stderr_line: None,
-                        tail_lines: None,
-                        limit: None,
-                        codex: None,
+                .start_job(
+                    webcodex_runner_registry::JobStartRequest {
+                        timeout_secs: 60,
+                        context: webcodex_runner_registry::JobStartContext {
+                            project_id: Some(format!("agent:{client_id}:root")),
+                            ..Default::default()
+                        },
+                        ..webcodex_runner_registry::JobStartRequest::shell(
+                            client_id,
+                            "echo fixture",
+                        )
                     },
                     "fixture".into(),
-                    webcodex_runner_registry::ShellJobStartMetadata {
-                        project_id: Some(format!("agent:{client_id}:root")),
-                        ..Default::default()
-                    },
+                    None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1063,6 +1177,7 @@ fn targeted_inventory_schemas_and_tool_parsing_are_bounded() {
             query: Some(_),
             limit: Some(3),
             summary_only: true,
+            offset: 0,
         }
     ));
 
@@ -1078,6 +1193,8 @@ fn targeted_inventory_schemas_and_tool_parsing_are_bounded() {
     assert!(matches!(
         agents,
         ToolCall::ListRunners {
+            projects_offset: 0,
+            offset: 0,
             query: None,
             status: None,
             limit: None,
@@ -1149,8 +1266,12 @@ fn targeted_inventory_tool_calls_reject_unknown_filter_fields() {
     ] {
         let error = ToolCall::from_tool_name(tool, arguments)
             .expect_err("unknown targeted-inventory fields must not widen the query");
-        assert!(error.contains("unknown field"), "{tool}: {error}");
-        assert!(error.contains(typo), "{tool}: {error}");
+        assert!(error.contains("[field]: unknown field"), "{tool}: {error}");
+        assert!(
+            error.contains("accepted top-level fields include"),
+            "{tool}: {error}"
+        );
+        assert!(!error.contains(typo), "{tool}: {error}");
     }
 }
 

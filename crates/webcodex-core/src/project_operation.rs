@@ -34,6 +34,10 @@ pub struct ProjectOperationScope {
     pub packages: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub all_packages: bool,
+    /// Exact Cargo package names to omit from an all-packages Rust workspace
+    /// operation. Other lifecycle adapters reject this field explicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_packages: Vec<String>,
 }
 
 #[expect(dead_code, reason = "schema-only type; never instantiated at runtime")]
@@ -51,6 +55,10 @@ struct ProjectOperationPackagesScopeSchema {
     #[schemars(length(min = 1, max = 8))]
     #[schemars(inner(length(min = 1, max = 256)))]
     packages: Vec<String>,
+    // Empty exclusions mean omission for every otherwise-valid scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 0))]
+    exclude_packages: Vec<String>,
 }
 
 #[expect(dead_code, reason = "schema-only type; never instantiated at runtime")]
@@ -59,6 +67,12 @@ struct ProjectOperationPackagesScopeSchema {
 struct ProjectOperationAllPackagesScopeSchema {
     #[schemars(schema_with = "all_packages_true_schema")]
     all_packages: bool,
+    // Allow omission or a bounded exact list under the same all_packages=true
+    // schema, instead of duplicating the entire workspace union branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 8))]
+    #[schemars(inner(length(min = 1, max = 256)))]
+    exclude_packages: Vec<String>,
 }
 
 fn all_packages_true_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -84,13 +98,15 @@ pub(crate) enum ProjectOperationScopeError {
     Selection,
     PackageCount,
     InvalidPackage,
+    ExclusionRequiresAllPackages,
+    ExclusionCount,
+    InvalidExclusion,
 }
 
 impl ProjectOperationScope {
     pub(crate) fn validate(&self) -> Result<(), ProjectOperationScopeError> {
         match (self.packages.is_empty(), self.all_packages) {
-            (true, true) => return Ok(()),
-            (false, false) => {}
+            (true, true) | (false, false) => {}
             _ => return Err(ProjectOperationScopeError::Selection),
         }
         if self.packages.len() > PROJECT_OPERATION_SCOPE_MAX_PACKAGES {
@@ -103,6 +119,23 @@ impl ProjectOperationScope {
         }) {
             return Err(ProjectOperationScopeError::InvalidPackage);
         }
+        if !self.exclude_packages.is_empty() && !self.all_packages {
+            return Err(ProjectOperationScopeError::ExclusionRequiresAllPackages);
+        }
+        if !self.exclude_packages.is_empty() {
+            if self.exclude_packages.len() > PROJECT_OPERATION_SCOPE_MAX_PACKAGES {
+                return Err(ProjectOperationScopeError::ExclusionCount);
+            }
+            if self
+                .exclude_packages
+                .iter()
+                .any(|package| package.len() > PROJECT_OPERATION_SCOPE_MAX_PACKAGE_BYTES)
+                || crate::runner_protocol::normalize_cargo_excluded_packages(&self.exclude_packages)
+                    .is_err()
+            {
+                return Err(ProjectOperationScopeError::InvalidExclusion);
+            }
+        }
         Ok(())
     }
 
@@ -112,5 +145,30 @@ impl ProjectOperationScope {
 
     pub const fn selects_all_packages(&self) -> bool {
         self.all_packages
+    }
+
+    pub fn normalized_exclude_packages(&self) -> Result<Vec<String>, &'static str> {
+        crate::runner_protocol::normalize_cargo_excluded_packages(&self.exclude_packages)
+    }
+
+    pub fn validate_excluded_members(
+        &self,
+        workspace_members: &[String],
+    ) -> Result<(), &'static str> {
+        let exclusions = self.normalized_exclude_packages()?;
+        if exclusions
+            .iter()
+            .any(|excluded| !workspace_members.iter().any(|member| member == excluded))
+        {
+            return Err("excluded package is not a workspace member");
+        }
+        if !workspace_members.is_empty()
+            && workspace_members
+                .iter()
+                .all(|member| exclusions.binary_search(member).is_ok())
+        {
+            return Err("scope cannot exclude every workspace member");
+        }
+        Ok(())
     }
 }

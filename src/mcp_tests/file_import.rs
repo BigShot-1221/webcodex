@@ -77,7 +77,7 @@ fn mcp_import_config_from_startup_env(
         "explicit env file must not override already-present OAuth trust settings"
     );
 
-    let config = Arc::new(crate::Config::from_env());
+    let config = Arc::new(crate::Config::from_env().unwrap());
     assert!(config.oauth2.enabled);
     assert_eq!(
         config.oauth2.trusted_mcp_file_client_ids,
@@ -185,6 +185,47 @@ async fn start_mcp_import_mock_server(response: Vec<u8>) -> McpImportMockServer 
     }
 }
 
+#[tokio::test]
+async fn mcp_import_loopback_proxy_sends_https_connect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local test listener");
+    let local_port = listener.local_addr().unwrap().port();
+    let client = crate::tool_runtime::conversation_import::build_loopback_proxy_client_for_test(
+        &format!("http://127.0.0.1:{local_port}"),
+    )
+    .expect("client must accept an explicit loopback proxy");
+    let probe = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.expect("CONNECT should arrive");
+        let mut buf = [0u8; 2048];
+        let count = connection
+            .read(&mut buf)
+            .await
+            .expect("read CONNECT request");
+        let request = String::from_utf8_lossy(&buf[..count]);
+        assert!(
+            request.starts_with("CONNECT files.oaiusercontent.com:443 HTTP/1.1"),
+            "unexpected CONNECT target"
+        );
+        connection
+            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("reply to CONNECT");
+    });
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.get("https://files.oaiusercontent.com/file").send(),
+    )
+    .await
+    .expect("the mocked proxy must respond promptly");
+    tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+        .await
+        .expect("the local proxy was not contacted")
+        .expect("proxy probe failed");
+}
+
 fn mcp_import_config(trusted_client_ids: &[&str]) -> Arc<crate::Config> {
     let mut config = (*test_config_oauth2(Some("secret"))).clone();
     config.oauth2.trusted_mcp_file_client_ids = trusted_client_ids
@@ -263,6 +304,7 @@ async fn mcp_import_runtime_inner(
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -290,6 +332,7 @@ async fn mcp_import_runtime_inner(
         "importer",
         "inst-import",
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: root.to_string_lossy().into_owned(),
@@ -348,10 +391,7 @@ async fn complete_mcp_import_save(
     assert!(begin.get("download_url").is_none());
     assert!(begin.get("download_link").is_none());
     assert!(begin.get("openaiFileIdRefs").is_none());
-    assert_eq!(
-        begin["max_bytes"],
-        crate::tool_runtime::files::MAX_PROJECT_ARTIFACT_UPLOAD_BYTES
-    );
+    assert_eq!(begin["max_bytes"], expected_bytes.len().max(1));
     assert_eq!(begin["expected_bytes"], expected_bytes.len());
     let path = begin["path"].as_str().unwrap().to_string();
     let mime_type = begin["mime_type"].as_str().unwrap().to_string();
@@ -370,7 +410,7 @@ async fn complete_mcp_import_save(
                     "next_offset": 0,
                     "expected_bytes": expected_bytes.len(),
                     "expected_sha256": null,
-                    "max_bytes": crate::tool_runtime::files::MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
+                    "max_bytes": expected_bytes.len(),
                     "mime_type": mime_type,
                     "committed": false
                 })
@@ -421,7 +461,7 @@ async fn complete_mcp_import_save(
                                 "next_offset": bytes.len(),
                                 "expected_bytes": expected_bytes.len(),
                                 "expected_sha256": null,
-                                "max_bytes": crate::tool_runtime::files::MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
+                                "max_bytes": expected_bytes.len(),
                                 "mime_type": mime_type,
                                 "committed": false
                             })
@@ -853,9 +893,11 @@ async fn oauth_mcp_file_import_startup_env_stateless_2026_crosses_provenance_gat
     )
     .expect_err("caller-controlled host provenance must fail closed at the canonical parser");
     assert!(
-        forged_provenance_error.contains("unknown field `host_file_import_provenance`"),
+        forged_provenance_error.contains("unknown field"),
         "{forged_provenance_error}"
     );
+    assert!(!forged_provenance_error.contains(temporary_url));
+    assert!(!forged_provenance_error.contains("TrustedMcpHostFile"));
     let (status, body, _) = oauth_mcp_request(
         &service,
         &token,

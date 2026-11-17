@@ -49,7 +49,13 @@ Its bounded workspace snapshot reuses the same startup Git observation for branc
 For substantial coding, present the exact Workflow Session once with `present_work_result(project, session_id)` after it becomes materially stateful (for example after the first meaningful source mutation or when long-running validation begins). The mounted MCP App performs bounded live Workspace / Validation / Review reads itself, so do not repeatedly present it or spend model turns polling solely to keep it current. Tiny and read-only work does not need a progress card. A non-blocking `finish_coding_task` seals eligible final changes at closeout; the already-mounted card discovers that immutable snapshot on a later App refresh. If no card was mounted and closeout returns the explicit presentation suggestion, present it once then.
 By default it also returns a small bounded `extensions` catalog for selection: Skill metadata comes from the canonical project/configured/managed Skill union, and Plugin metadata is restricted to ready providers whose configured working directory matches the Project root. This metadata grants no authority and does not load Skill bodies or create Plugin bindings; use `read_skill_file` for Skill text, `run_skill_resource` only for trusted Runner-configured live `scripts/` resources guarded by `expected_definition_revision` or Runner-installed managed resources additionally fenced by `expected_package_revision`, or `plugin_tool describe -> call` after selecting a relevant entry. Configured resource bytes remain live until execution rather than being package-revision-pinned. Set `include_extension_catalog=false` only when the current model context already retains that discovery metadata.
 
+Before applying those existing byte limits, startup orders the already-discovered entries by lexical relevance to the current `instruction`. Name matches precede description matches; equal scores and unmatched entries retain their original order. Matching reuses tool discovery's English word normalization and recognizes complete multi-character Chinese phrases present in metadata, without translation or semantic search. It examines at most the first 2,048 instruction characters and 64 unique English terms. Only selection metadata is reordered: explicit catalogs, source revisions, authorization, resource loading and execution remain owned by their existing paths.
+
 Skill reads (`load_skill` and `read_skill_file`) return `skill_path`, the normalized package-relative path used by `read_skill_file.path`. Project Skills also return authoritative `project_path`: use it with returned source line ranges for Project citations, even when the package folder differs from the metadata name. Runner-configured and managed Skills omit `project_path`; cite their Skill identity, `skill_path`, resource `sha256`, revisions and source lines without inventing a Project path. Native Skill roots are not exposed.
+
+When a Skill read returns `has_more=true`, continue with its complete `suggested_call` rather than constructing a new range. The call carries the exact Project, Skill ID, package-relative path, next line, limit, definition revision, managed package revision when applicable, and `expected_resource_sha256`. This optional 64-character lowercase hexadecimal input fences the full resource for project, configured and managed Skills. If the resource changes between pages, `skill_resource_changed` returns `state_changed=false` with no replacement text; do not combine those pages or silently restart on new content. Existing definition/package guards still apply. Calls omitting the new hash retain their prior live-read behavior.
+
+Complete reads omit the suggestion; pagination fields remain available. Continuation metadata counts against the existing 64 KiB result limit (48 KiB text, at most 400 lines). Skill pages stop at a whole-line boundary when the selected range exceeds the text budget, while hashing and validating UTF-8 for the full file. A single source line larger than the budget still fails instead of returning a cursor that cannot advance. Ordinary file-range reads keep their existing strict overflow behavior. No Session is inferred. MCP projects suggestions through its existing admitted gateway, and suppresses unavailable tools; a suggestion neither executes a read nor grants access.
 
 For substantial cross-turn work, a durable Goal can record the objective and completion conditions without requiring user-managed steps. `update_goal` edits an active Goal with an exact `expected_revision` and `idempotency_key`: omitted `completion_conditions` preserves the list, while `[]` clears it. Replacement conditions use the same bounds as creation (at most eight, each nonempty after trimming and at most 512 UTF-8 bytes). Editing conditions preserves existing steps, checkpoints and progress; it does not evaluate acceptance, resume execution or reopen a completed/cancelled Goal. Re-observe a revision conflict; reuse the same key and exact request after an uncertain result.
 
@@ -69,13 +75,35 @@ Use `work_on_project` for both a new coding task and an explicit continuation. W
 
 For ordinary use you do not need to reason about WebCodex's internal continuity or audit fields. Those are implementation/maintainer contracts.
 
-The built-in default guidance is the ordinary implementation workflow. A normal
-“implement/fix/refactor” task needs no role name: carry authorized work to a
-concrete, reviewable completion, map cross-layer changes end to end, keep the
-design minimal, validate proportionally, and report evidence honestly. Use only
-tools and protocol fields supported by the current exposed schemas.
+The shared `webcodex.workflow` guidance applies to any project task: tool
+selection, permissions, Session/Job identity, retries, recovery and delivery.
+For code implementation or an explicit code review, MCP surfaces that support
+`_wc` context sidecars can request `_wc.context=["webcodex.coding"]`. That
+optional chapter contains `coding` and `independent_review` task roles; select
+only the role applicable to the task. It is model guidance, not Session state or
+authority, and does not change Direct, Host Code Mode or Code Mode tool strategy.
+A CLI presentation choice does not imply a coding task; CLI has no `_wc` route,
+so do not invent a field to request the chapter there. Project instructions own
+language, formatting, testing and Git conventions. Use only the protocol fields
+supported by the current exposed schemas.
 
-`independent_review` is the only optional named role because it changes behavior.
+For nontrivial coding, locate the owning layer, trace relevant callers and data
+flow, and look for reusable implementations before editing. Read design guidance
+for the affected boundaries and keep exploration proportional to the task.
+Existing patterns are evidence to assess; new abstractions or parallel paths
+need a concrete task reason. Share authoritative business facts before
+presentation. Solve the root cause with the smallest coherent change, including
+necessary local refactoring and removal of superseded paths within scope.
+Before delivery, review ownership, duplication and cross-layer consistency as
+well as behavior; passing tests alone do not establish architectural fit.
+
+Compiler, schema and exhaustiveness failures can reveal missing cross-layer
+changes. For lengthy tasks, report verified milestones as they become available;
+after creating an authorized PR or other external deliverable, communicate its
+actual link and validation status promptly rather than relying entirely on a
+final reply. Guidance cannot prevent a provider quota interruption.
+
+`independent_review` is the code review role in the optional chapter.
 Use it only when the task explicitly asks for an independent review pass:
 
 ```text
@@ -86,6 +114,12 @@ report concrete findings with file/line evidence and impact, and do not edit.
 To request corrections as well, explicitly add “fix concrete findings and run
 focused regression validation.” Naming a review role alone does not authorize edits,
 and no role ever grants authority.
+
+Independent review also examines duplicated facts or execution flows, misplaced
+responsibilities, presentation round-trips and incomplete migrations introduced
+or worsened by the change. Findings need concrete code and correctness, drift or
+maintenance impact; distinguish required fixes from optional cleanup. Style
+preference alone is not a finding, and unrelated redesign stays outside scope.
 
 Guidance is delivered in tool results; it is not the client's system prompt and
 does not grant execution authority. Host instructions, the user's task,
@@ -127,9 +161,10 @@ wins for guidance only. MCP omission uses the current request's
 See [request-local client policy](MCP.md#request-local-client-policy); HTTP headers
 select transport timing independently from this tool argument. Non-MCP/internal
 omission falls back to `direct`.
-The current workflow contract returns shared `guidance`, `model_protocol` and review `roles`,
-plus only the selected `tool_strategy`, when explicitly requested through
-`context_request=["webcodex.workflow"]`. The selection is request-local: choose again
+The current workflow contract returns shared `guidance` and `model_protocol`,
+plus only the selected `tool_strategy`, when requested through
+`_wc.context=["webcodex.workflow"]`. Coding/review roles are in the separate
+optional chapter. The selection is request-local: choose again
 on exact resume without changing Session identity or business state. It is never
 remembered from a Window, Session or past tool use, and grants no tools, admission,
 authority or execution semantics. Builds without Experimental Code Mode reject

@@ -9,6 +9,7 @@ use crate::runner_protocol::{
     RunnerCapabilities, RunnerJobUpdateRequest, RunnerRegisterRequest, RunnerResultPayload,
     RunnerResultRequest, ShellCommandExecutionState,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 use serde_json::json;
 
 #[test]
@@ -659,16 +660,13 @@ async fn run_shell_via_agent_lifecycle_error(
         .runner_registry
         .complete(RunnerResultPayload {
             result: RunnerResultRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id: request.request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: Some(error.to_string()),
+                ..runner_result_request(
+                    client_id.to_string(),
+                    "inst".to_string(),
+                    request.request_id,
+                )
             },
             command_execution_state: Some(execution_state),
             mcp_gateway: None,
@@ -696,25 +694,20 @@ async fn update_agent_shell_job(
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            job_id: job_id.to_string(),
             request_id: Some(request_id.to_string()),
-            update_seq: None,
-            status: status.to_string(),
             stdout_chunk: stdout_chunk.map(str::to_string),
             stderr_chunk: stderr_chunk.map(str::to_string),
-            log_snapshot: None,
             exit_code,
             duration_ms: finished.then_some(25),
             error: error.map(str::to_string),
             command_execution_state,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
-            activity: None,
-            finished,
+            ..runner_job_update(
+                client_id.to_string(),
+                "inst".to_string(),
+                job_id.to_string(),
+                status.to_string(),
+                finished,
+            )
         })
         .await
         .unwrap();
@@ -836,7 +829,10 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(assert_sparse_pending_job_handoff(&result.output), job_id);
+    assert_eq!(
+        assert_sparse_pending_job_handoff_with_unreported_policy(&result.output, 600),
+        job_id
+    );
     assert_run_shell_result_matches_schema(&result);
     assert!(
         probe_patch_agent_request(&runtime, client_id)
@@ -858,13 +854,12 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
     assert!(finished.failure_kind.is_none());
 
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["job_id"], job_id);
-    assert_eq!(status.output["status"], "running");
-    assert!(status.output.as_object().unwrap().contains_key("activity"));
-    assert!(status.output["activity"].is_null());
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(status.job.job_id, job_id);
+    assert_eq!(status.job.status, "running");
+    assert!(status.job.activity.is_none());
 
     let log = runtime
         .job_log_for_auth(job_id.clone(), None, Some(40), Some(&auth), None, None)
@@ -888,12 +883,13 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
         .iter()
         .find(|job| job["job_id"] == job_id)
         .expect("durable shell Job in list_jobs");
-    assert!(listed_job.as_object().unwrap().contains_key("activity"));
-    assert!(listed_job["activity"].is_null());
+    assert!(listed_job.get("activity").is_none());
+    assert!(listed_job["command_summary"].is_string());
 
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
+                page: false,
                 job_id: job_id.clone(),
                 after_observation_token: None,
                 observation_ref: None,
@@ -939,10 +935,10 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
     )
     .await;
     let terminal = runtime
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(terminal.success, "{:?}", terminal.error);
-    assert_eq!(terminal.output["status"], "stopped");
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(terminal.job.status, "stopped");
     assert!(runtime.runner_registry.remove_job_record(&job_id).await);
 }
 
@@ -970,16 +966,22 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
         let session_id = session_id.clone();
         async move {
             let auth = auth_context(None, true);
-            runtime.dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
-                ToolCall::RunShell {
-                    project, command: "printf fast".to_string(), timeout_secs: Some(600),
-                    sync_wait_secs: None, cwd: None, purpose: None, shell: None,
-                    session_id: Some(session_id), login: false,
-                },
-                Some(&auth), sessions::SessionTransport::Api, Default::default(),
-                None, true, Vec::new(), Default::default(), Default::default(),
-                super::super::return_timing::ToolReturnTimingPolicy::unconstrained(),
-            ).await
+            runtime
+                .dispatch_canonical(
+                    ToolCall::RunShell {
+                        project,
+                        command: "printf fast".to_string(),
+                        timeout_secs: Some(600),
+                        sync_wait_secs: None,
+                        cwd: None,
+                        purpose: None,
+                        shell: None,
+                        session_id: Some(session_id),
+                        login: false,
+                    },
+                    DispatchContext::internal(Some(&auth), sessions::SessionTransport::Api, None),
+                )
+                .await
         }
     });
     let start = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -1059,7 +1061,9 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
     }
     assert_eq!(result.output["stdout_tail"], "fast\n");
     assert_eq!(result.output["stderr_tail"], "warning\n");
-    assert_eq!(result.output["command_summary"], "printf fast");
+    for key in ["command_summary", "purpose"] {
+        assert!(result.output.get(key).is_none(), "{key}");
+    }
     assert!(result.output["cwd"].is_string());
     assert!(result.output["shell"].is_string());
     assert_run_shell_result_matches_schema(&result);
@@ -1218,28 +1222,16 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
-                computer_session_availability: None,
-                process_started_at: None,
-                build: None,
                 job_concurrency_limit: Some(4),
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                display_name: None,
-                owner: None,
-                hostname: None,
-                host_context: None,
-                capabilities: crate::test_support::current_runner_capabilities(
+                ..crate::test_support::runner_registration(
+                    client_id,
+                    "inst",
                     RunnerCapabilities {
                         shell: false,
                         async_shell_jobs: true,
                         ..Default::default()
                     },
-                ),
-                policy: None,
+                )
             },
             Some(&crate::test_support::runner_access(&auth)),
         )
@@ -1348,11 +1340,19 @@ async fn long_run_shell_job_timeout_is_terminal_and_never_becomes_fake_outcome_u
         true,
     )
     .await;
-    let status = runtime.job_status(job_id.clone()).await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["status"], "timeout");
-    assert_eq!(status.output["command_execution_state"], "timed_out");
-    assert_ne!(status.output["command_execution_state"], "outcome_unknown");
+    let status = runtime
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    assert_eq!(status.job.status, "timeout");
+    assert_eq!(
+        status.job.command_execution_state,
+        Some(ShellCommandExecutionState::TimedOut)
+    );
+    assert_ne!(
+        status.job.command_execution_state,
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
     let log = runtime.job_log(job_id.clone(), None, Some(40)).await;
     assert!(log.success, "{:?}", log.error);
     assert_eq!(log.output["command_execution_state"], "timed_out");
@@ -1378,10 +1378,10 @@ async fn run_shell_failure_reports_command_started_and_output_tail() {
     assert!(!result.success);
     let error = result.error.as_deref().unwrap_or("");
     assert!(error.contains("Command exited with status 7"));
-    assert!(error.contains("No files were modified by WebCodex itself"));
+    assert!(!error.contains("No files were modified by WebCodex itself"));
     assert!(error.contains("stdout_tail"));
     assert!(error.contains("stderr_tail"));
-    assert!(error.contains("Retry guidance"));
+    assert!(!error.contains("Retry guidance"));
     assert_eq!(result.output["exit_code"], 7);
     assert_eq!(result.output["stdout_tail"], "run-shell-out");
     assert_eq!(result.output["stderr_tail"], "run-shell-err");
@@ -1661,16 +1661,16 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
         .runner_registry
         .complete(RunnerResultPayload {
             result: RunnerResultRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id: request.request_id,
                 exit_code: Some(-1),
                 stdout: Some("partial output".to_string()),
                 stderr: Some("runner stopped the process at its deadline".to_string()),
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(1_000),
                 error: Some("runner timeout".to_string()),
+                ..runner_result_request(
+                    client_id.to_string(),
+                    "inst".to_string(),
+                    request.request_id,
+                )
             },
             command_execution_state: Some(ShellCommandExecutionState::TimedOut),
             mcp_gateway: None,
@@ -1796,12 +1796,12 @@ async fn model_facing_stop_job_requires_confirm_without_stopping_or_approving() 
     assert_eq!(result.output["command_started"], false);
     assert!(result.output.get("permission").is_none());
     let status = runtime
-        .job_status_for_auth(job_id, false, Some(&auth))
-        .await;
-    assert!(status.success, "{:?}", status.error);
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
     assert!(matches!(
-        status.output["status"].as_str(),
-        Some("queued" | "agent_queued")
+        status.job.status.as_str(),
+        "queued" | "agent_queued"
     ));
     let summary = runtime
         .sessions
@@ -1958,10 +1958,10 @@ async fn model_facing_stop_job_stops_agent_job_with_same_session() {
     assert_eq!(result.output["permission"]["status"], "auto_approved");
     assert_eq!(result.output["permission"]["risk"], "job");
     let status = runtime
-        .job_status_for_auth(job_id, false, Some(&auth))
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["status"], "stopped");
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(status.job.status, "stopped");
 }
 
 #[tokio::test]
@@ -2019,15 +2019,10 @@ async fn model_facing_stop_job_reports_requested_and_already_stop_requested() {
     assert_eq!(result.output["stop_effect"], "requested");
 
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["status"], "stop_requested");
-    assert_eq!(status.output["active"], true);
-    assert_eq!(status.output["blocking_active"], false);
-    assert_eq!(status.output["terminal"], false);
-    assert_eq!(status.output["terminal_pending"], true);
-    assert_eq!(status.output["command_preview_included"], false);
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(status.job.status, "stop_requested");
 
     let second = runtime
         .dispatch_with_auth(
@@ -2137,25 +2132,12 @@ pub(super) async fn register_job_agent_for_auth_with_reconciliation(
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
-                computer_session_availability: None,
-                process_started_at: None,
-                build: None,
                 job_concurrency_limit: Some(4),
                 job_inventory: reconciliation.then(|| crate::runner_protocol::ShellJobInventory {
                     active_complete: true,
                     jobs: Vec::new(),
                 }),
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                display_name: None,
-                owner: None,
-                hostname: None,
-                host_context: None,
-                capabilities: caps,
-                policy: None,
+                ..crate::test_support::runner_registration(client_id, "inst", caps)
             },
             Some(&crate::test_support::runner_access(auth)),
         )
@@ -2192,25 +2174,16 @@ async fn register_managed_job_agent(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
             job_concurrency_limit: Some(4),
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some(owner.to_string()),
-            hostname: None,
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(RunnerCapabilities {
-                async_shell_jobs: true,
-                ..Default::default()
-            }),
-            policy: None,
+            ..crate::test_support::runner_registration(
+                client_id,
+                "inst",
+                RunnerCapabilities {
+                    async_shell_jobs: true,
+                    ..Default::default()
+                },
+            )
         })
         .await
         .unwrap();
@@ -2266,25 +2239,15 @@ pub(super) async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            job_id: job_id.clone(),
             request_id: Some(request.request_id),
             update_seq: Some(1),
-            status: "running".to_string(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            log_snapshot: None,
-            exit_code: None,
-            duration_ms: None,
-            error: None,
-            command_execution_state: None,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
-            activity: None,
-            finished: false,
+            ..runner_job_update(
+                client_id.to_string(),
+                "inst".to_string(),
+                job_id.clone(),
+                "running".to_string(),
+                false,
+            )
         })
         .await
         .unwrap();
@@ -2393,10 +2356,10 @@ async fn managed_user_job_inventory_and_counts_do_not_cross_owner() {
     assert_eq!(listed_job_ids(&alice_list), vec![alice_job.clone()]);
     assert!(!alice_list.output.to_string().contains(&bob_job));
 
-    let hidden_bob_job = runtime
-        .job_status_for_auth(bob_job.clone(), false, Some(&alice))
-        .await;
-    assert_unknown_job(hidden_bob_job);
+    assert!(runtime
+        .query_job_status_for_auth(&bob_job, Some(&alice))
+        .await
+        .is_err());
 
     let alice_status = runtime
         .dispatch_with_auth(
@@ -2528,21 +2491,18 @@ async fn shared_key_runtime_job_tools_filter_agent_jobs_by_auth_group_body() {
     expected.sort();
     assert_eq!(bootstrap_ids, expected);
 
-    assert_unknown_job(
-        runtime
-            .job_status_for_auth(job_b.clone(), false, Some(&shared_a))
-            .await,
-    );
-    assert_unknown_job(
-        runtime
-            .job_status_for_auth(job_a.clone(), false, Some(&bridge_b))
-            .await,
-    );
-    assert_unknown_job(
-        runtime
-            .job_status_for_auth(job_b.clone(), false, Some(&bridge_a))
-            .await,
-    );
+    assert!(runtime
+        .query_job_status_for_auth(&job_b, Some(&shared_a))
+        .await
+        .is_err());
+    assert!(runtime
+        .query_job_status_for_auth(&job_a, Some(&bridge_b))
+        .await
+        .is_err());
+    assert!(runtime
+        .query_job_status_for_auth(&job_b, Some(&bridge_a))
+        .await
+        .is_err());
     assert_unknown_job(
         runtime
             .job_log_for_auth(job_b.clone(), None, None, Some(&shared_a), None, None)
@@ -2563,20 +2523,11 @@ async fn shared_key_runtime_job_tools_filter_agent_jobs_by_auth_group_body() {
     );
 
     let status_b = runtime
-        .job_status_for_auth(job_b.clone(), false, Some(&shared_b))
-        .await;
-    assert!(status_b.success, "{:?}", status_b.error);
-    assert_eq!(status_b.output["job_id"], job_b);
-    assert!(status_b.output.get("command_preview").is_none());
-
-    let status_b_debug = runtime
-        .job_status_for_auth(job_b.clone(), true, Some(&shared_b))
-        .await;
-    assert!(status_b_debug.success, "{:?}", status_b_debug.error);
-    assert!(status_b_debug.output["command_preview"]
-        .as_str()
-        .unwrap()
-        .contains("echo client-b"));
+        .query_job_status_for_auth(&job_b, Some(&shared_b))
+        .await
+        .unwrap();
+    assert_eq!(status_b.job.job_id, job_b);
+    assert!(status_b.job.command_preview.contains("echo client-b"));
 
     let log_b = runtime
         .job_log_for_auth(job_b.clone(), None, None, Some(&shared_b), None, None)
@@ -2853,9 +2804,10 @@ async fn list_jobs_filters_visible_jobs_by_project_session_and_status_before_lim
     assert!(ambiguous.get("active_job").is_none());
 
     let status = runtime
-        .job_status_for_auth(job_a1_running, false, Some(&auth_a))
-        .await;
-    assert_eq!(status.output["status"], "running");
+        .query_job_status_for_auth(&job_a1_running, Some(&auth_a))
+        .await
+        .unwrap();
+    assert_eq!(status.job.status, "running");
 }
 
 #[tokio::test]
@@ -2914,6 +2866,8 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
     let agents_a = runtime
         .dispatch_with_auth(
             ToolCall::ListRunners {
+                projects_offset: 0,
+                offset: 0,
                 query: None,
                 status: None,
                 limit: None,
@@ -3176,9 +3130,13 @@ fn job_handoff_model_projection_keeps_identity_and_exceptional_receipts() {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        ["continuation".to_string(), "execution_state".to_string(),]
-            .into_iter()
-            .collect()
+        [
+            "continuation".to_string(),
+            "execution_state".to_string(),
+            "stdout_truncated".to_string()
+        ]
+        .into_iter()
+        .collect()
     );
     assert_eq!(model.output["execution_state"], "pending");
     assert_observe_job_continuation(&model.output);
@@ -3190,7 +3148,6 @@ fn job_handoff_model_projection_keeps_identity_and_exceptional_receipts() {
         "async_handoff_available",
         "observation_token",
         "continuation_semantics",
-        "stdout_truncated",
         "stderr_truncated",
     ] {
         assert!(model.output.get(key).is_none(), "{key}");

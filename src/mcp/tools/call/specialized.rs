@@ -16,24 +16,27 @@ pub(super) async fn local_mcp(
         params, invocation, ..
     } = call;
     let ack_session_message_ids = invocation.metadata.ack_session_message_ids;
-    if let Some(outcome) = require_mcp_scope(auth, crate::auth::SCOPE_MCP_LOCAL) {
-        if let Some(lc) = lifecycle.as_deref() {
-            lc.dispatch_failed("forbidden");
-            lc.dispatch_finished(false, Some(false), "forbidden");
-        }
-        return outcome;
+    if require_mcp_scope(auth, crate::auth::SCOPE_MCP_LOCAL).is_some() {
+        return tool_scope_denied(
+            context,
+            lifecycle.as_deref(),
+            Some(crate::auth::SCOPE_MCP_LOCAL),
+            format!("missing required scope: {}", crate::auth::SCOPE_MCP_LOCAL),
+        );
     }
     if let Some(lc) = lifecycle.as_deref() {
         lc.capture_payload("effective_arguments", &params.arguments);
     }
     let mut result = crate::mcp_gateway::call(runtime, params.arguments, auth).await;
-    runtime.add_peer_collaboration_to_mcp_call_result(
-        &mut result,
-        auth,
-        window,
-        None,
-        &ack_session_message_ids,
-    );
+    if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+        runtime.add_peer_collaboration_to_mcp_call_result(
+            &mut result,
+            auth,
+            window,
+            None,
+            &ack_session_message_ids,
+        );
+    }
     let ok = result.get("isError").and_then(Value::as_bool) != Some(true);
     if let Some(lc) = lifecycle.as_deref() {
         lc.dispatch_finished(true, Some(ok), if ok { "success" } else { "tool_error" });
@@ -112,11 +115,12 @@ pub(super) async fn plugin(
             required_scope,
             description,
         }) => {
-            if let Some(lc) = lifecycle.as_deref() {
-                lc.dispatch_failed("forbidden");
-                lc.dispatch_finished(false, Some(false), "forbidden");
-            }
-            return scope_forbidden(auth, Some(required_scope), description);
+            return tool_scope_denied(
+                context,
+                lifecycle.as_deref(),
+                Some(required_scope),
+                description,
+            );
         }
         Err(SpecializedGovernanceDenial::Tool(result)) => {
             if let Some(lc) = lifecycle.as_deref() {
@@ -127,13 +131,15 @@ pub(super) async fn plugin(
             let project = recording_session_id
                 .as_deref()
                 .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
-            runtime.add_peer_collaboration_projection(
-                &mut result,
-                auth,
-                window,
-                project.as_deref(),
-                &ack_session_message_ids,
-            );
+            if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+                runtime.add_peer_collaboration_projection(
+                    &mut result,
+                    auth,
+                    window,
+                    project.as_deref(),
+                    &ack_session_message_ids,
+                );
+            }
 
             let result = mcp_runtime_tool_result_fallback(
                 result,
@@ -175,13 +181,15 @@ pub(super) async fn plugin(
         .as_deref()
         .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
     let mut result = invocation.to_mcp_result();
-    runtime.add_peer_collaboration_to_mcp_call_result(
-        &mut result,
-        auth,
-        window,
-        project.as_deref(),
-        &ack_session_message_ids,
-    );
+    if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+        runtime.add_peer_collaboration_to_mcp_call_result(
+            &mut result,
+            auth,
+            window,
+            project.as_deref(),
+            &ack_session_message_ids,
+        );
+    }
     return McpOutcome::Ok(rpc_result(
         id,
         if stateless_2026 {
@@ -236,13 +244,15 @@ pub(super) async fn ssh_resource(
             let mut result =
                 crate::ssh_resource_gateway::call(runtime, params.arguments, auth).await;
             let project = recorder_project();
-            runtime.add_peer_collaboration_to_mcp_call_result(
-                &mut result,
-                auth,
-                window,
-                project.as_deref(),
-                &ack_session_message_ids,
-            );
+            if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+                runtime.add_peer_collaboration_to_mcp_call_result(
+                    &mut result,
+                    auth,
+                    window,
+                    project.as_deref(),
+                    &ack_session_message_ids,
+                );
+            }
             let ok = result.get("isError").and_then(Value::as_bool) != Some(true);
             if let Some(lc) = lifecycle.as_deref() {
                 lc.dispatch_finished(true, Some(ok), if ok { "success" } else { "tool_error" });
@@ -270,13 +280,15 @@ pub(super) async fn ssh_resource(
             let mut result =
                 crate::ssh_resource_gateway::call(runtime, params.arguments, auth).await;
             let project = recorder_project();
-            runtime.add_peer_collaboration_to_mcp_call_result(
-                &mut result,
-                auth,
-                window,
-                project.as_deref(),
-                &ack_session_message_ids,
-            );
+            if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+                runtime.add_peer_collaboration_to_mcp_call_result(
+                    &mut result,
+                    auth,
+                    window,
+                    project.as_deref(),
+                    &ack_session_message_ids,
+                );
+            }
             let ok = result.get("isError").and_then(Value::as_bool) != Some(true);
             if let Some(lc) = lifecycle.as_deref() {
                 lc.dispatch_finished(true, Some(ok), if ok { "success" } else { "tool_error" });
@@ -317,10 +329,13 @@ pub(super) async fn ssh_resource(
         }) => {
             if let Some(lc) = lifecycle.as_deref() {
                 lc.capture_payload_lazy("specialized_governance", || policy.audit_projection());
-                lc.dispatch_failed("forbidden");
-                lc.dispatch_finished(false, Some(false), "forbidden");
             }
-            return scope_forbidden(auth, Some(required_scope), description);
+            return tool_scope_denied(
+                context,
+                lifecycle.as_deref(),
+                Some(required_scope),
+                description,
+            );
         }
         Err(SpecializedGovernanceDenial::Tool(result)) => {
             if let Some(lc) = lifecycle.as_deref() {
@@ -332,13 +347,15 @@ pub(super) async fn ssh_resource(
             let project = recording_session_id
                 .as_deref()
                 .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
-            runtime.add_peer_collaboration_projection(
-                &mut result,
-                auth,
-                window,
-                project.as_deref(),
-                &ack_session_message_ids,
-            );
+            if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+                runtime.add_peer_collaboration_projection(
+                    &mut result,
+                    auth,
+                    window,
+                    project.as_deref(),
+                    &ack_session_message_ids,
+                );
+            }
 
             let result = mcp_runtime_tool_result_fallback(
                 result,
@@ -383,13 +400,15 @@ pub(super) async fn ssh_resource(
         .as_deref()
         .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
     let mut result = invocation.to_mcp_result();
-    runtime.add_peer_collaboration_to_mcp_call_result(
-        &mut result,
-        auth,
-        window,
-        project.as_deref(),
-        &ack_session_message_ids,
-    );
+    if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+        runtime.add_peer_collaboration_to_mcp_call_result(
+            &mut result,
+            auth,
+            window,
+            project.as_deref(),
+            &ack_session_message_ids,
+        );
+    }
     return McpOutcome::Ok(rpc_result(
         id,
         if stateless_2026 {

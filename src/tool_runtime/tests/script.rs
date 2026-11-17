@@ -121,25 +121,20 @@ async fn update_script_job(
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            job_id: request.job_id.clone().expect("structured Job id"),
             request_id: Some(request.request_id.clone()),
-            update_seq: None,
-            status: status.to_string(),
             stdout_chunk: stdout.map(str::to_string),
             stderr_chunk: stderr.map(str::to_string),
-            log_snapshot: None,
             exit_code,
             duration_ms: state.map(|_| 25),
             error: error.map(str::to_string),
             command_execution_state: state,
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
-            activity: None,
-            finished: state.is_some(),
+            ..runner_job_update(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.job_id.clone().expect("structured Job id"),
+                status.to_string(),
+                state.is_some(),
+            )
         })
         .await
         .unwrap();
@@ -732,7 +727,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     .await;
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    let job_id = assert_sparse_pending_job_handoff(&handoff.output);
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 60);
     assert_eq!(request.job_id.as_deref(), Some(job_id));
 
     let job = runtime.runner_registry.get_job(job_id).await.unwrap();
@@ -785,6 +780,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
         .dispatch_with_auth(
             ToolCall::ObserveJobs {
                 items: vec![ObserveJobsItem {
+                    page: false,
                     job_id: job_id.to_string(),
                     after_observation_token: None,
                     observation_ref: None,
@@ -914,7 +910,7 @@ async fn python_script_handoff_keeps_one_job_and_redacts_payload() {
     .await;
     let result = task.await.unwrap();
     assert!(result.success, "{result:?}");
-    let job_id = assert_sparse_pending_job_handoff(&result.output);
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&result.output, 30);
     assert_eq!(request.job_id.as_deref(), Some(job_id));
     let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(
@@ -1011,7 +1007,7 @@ async fn typescript_slow_handoff_keeps_one_execution_and_safe_durable_metadata()
 
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    let job_id = assert_sparse_pending_job_handoff(&handoff.output);
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 60);
     assert_eq!(request.job_id.as_deref(), Some(job_id));
     let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(job.kind, "run_script");
@@ -1335,7 +1331,7 @@ async fn run_script_session_defaults_and_evidence_are_body_and_stdin_free() {
     .await;
     let result = task.await.unwrap();
     assert!(result.success);
-    assert!(result.output.get("cwd").is_none());
+    assert_eq!(result.output["cwd"], "frontend");
 
     let summary = runtime
         .sessions

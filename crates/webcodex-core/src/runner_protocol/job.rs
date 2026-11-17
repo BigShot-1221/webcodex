@@ -57,42 +57,6 @@ fn default_shell_job_kind() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobStatusRequest {
-    #[serde(default)]
-    pub client_id: Option<String>,
-    pub job_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobLogRequest {
-    #[serde(default)]
-    pub client_id: Option<String>,
-    pub job_id: String,
-    #[serde(default)]
-    pub tail_lines: Option<usize>,
-    #[serde(default)]
-    pub since_stdout_line: Option<usize>,
-    #[serde(default)]
-    pub since_stderr_line: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobStopRequest {
-    #[serde(default)]
-    pub client_id: Option<String>,
-    pub job_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobsListRequest {
-    pub client_id: String,
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerJobUpdateRequest {
     pub client_id: String,
     /// Active Runner process identity. Must match the instance that currently
@@ -171,33 +135,6 @@ pub struct ShellJobCodexMetadata {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runtime_secs: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShellJobOpRequest {
-    pub op: String,
-    #[serde(default)]
-    pub client_id: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default, skip_serializing_if = "super::is_false")]
-    pub login: bool,
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub job_id: Option<String>,
-    #[serde(default)]
-    pub since_stdout_line: Option<usize>,
-    #[serde(default)]
-    pub since_stderr_line: Option<usize>,
-    #[serde(default)]
-    pub tail_lines: Option<usize>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex: Option<ShellJobCodexMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,7 +244,7 @@ impl ShellJobValidationStep {
                     && args[1..args.len() - 3].iter().all(|a| {
                         !matches!(
                             *a,
-                            "--offline" | "--all-features" | "--no-default-features" | "--features"
+                            "--all-features" | "--no-default-features" | "--features"
                         )
                     })
                     && is_canonical_cargo_flags(
@@ -535,6 +472,34 @@ pub fn normalize_cargo_packages(
     Ok(Some(normalized))
 }
 
+/// Canonical exact package names used by Cargo workspace exclusions. Patterns,
+/// path specs and version-qualified package IDs are intentionally unavailable.
+pub fn normalize_cargo_excluded_packages(packages: &[String]) -> Result<Vec<String>, &'static str> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    if packages.len() > 8 {
+        return Err("exclude_packages must contain at most 8 items");
+    }
+    let mut normalized = packages
+        .iter()
+        .map(|package| {
+            let value = normalize_cargo_value(package)?
+                .ok_or("exclude_packages cannot contain an empty name")?;
+            if !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return Err("exclude_packages must use exact package names");
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 /// Normalize one bounded project-relative Go package scope.
 /// Omission preserves the canonical `./...` project scope; an explicit list
 /// must contain one to eight already-normalized project-relative patterns.
@@ -701,8 +666,28 @@ fn is_canonical_cargo_flags(
 ) -> bool {
     let mut seen = HashSet::new();
     let mut seen_packages = HashSet::new();
+    let mut seen_exclusions = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if *arg == "--exclude" {
+            if !allow_project_workspace {
+                return false;
+            }
+            let Some(value) = iter.next() else {
+                return false;
+            };
+            let Some(normalized) = normalize_cargo_excluded_packages(&[(*value).to_string()])
+                .ok()
+                .and_then(|mut values| values.pop())
+            else {
+                return false;
+            };
+            if normalized != **value || seen_exclusions.iter().any(|item| item == *value) {
+                return false;
+            }
+            seen_exclusions.push((*value).to_string());
+            continue;
+        }
         let key = match *arg {
             "--all-targets"
             | "--all-features"
@@ -749,6 +734,10 @@ fn is_canonical_cargo_flags(
         }
     }
     !(seen.contains("--workspace") && !seen_packages.is_empty())
+        && (seen_exclusions.is_empty()
+            || (seen.contains("--workspace")
+                && normalize_cargo_excluded_packages(&seen_exclusions)
+                    .is_ok_and(|normalized| normalized == seen_exclusions)))
 }
 
 fn node_script_allowed(kind: &str, script: &str) -> bool {
@@ -1511,90 +1500,4 @@ pub struct ShellJobInfo {
     pub stdout_log_truncated: bool,
     #[serde(default)]
     pub stderr_log_truncated: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShellJobOpResponse {
-    pub success: bool,
-    pub op: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub job: Option<ShellJobInfo>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub jobs: Vec<ShellJobInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stdout: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stderr: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_stdout_line: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_stderr_line: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobStatusResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub elapsed_secs: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<RunnerJobResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job: Option<ShellJobInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobLogResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stdout_tail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stderr_tail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_stdout_line: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_stderr_line: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job: Option<ShellJobInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobStopResponse {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job: Option<ShellJobInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerJobsListResponse {
-    pub success: bool,
-    pub client_id: String,
-    pub jobs: Vec<ShellJobInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }

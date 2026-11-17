@@ -433,6 +433,7 @@ fn observation_schemas_do_not_repeat_static_continuation_semantics() {
     for name in [
         "start_coding_agent",
         "observe_coding_agent",
+        "diagnose_coding_agent",
         "observe_session_messages",
     ] {
         let spec = spec_named(&specs, name);
@@ -452,13 +453,13 @@ fn observation_schemas_do_not_repeat_static_continuation_semantics() {
         .iter()
         .find(|variant| variant["properties"].get("suggested_call").is_some())
         .expect("observe_jobs full batch output");
-    // Both the full batch and model-facing sparse batch have closed wait
-    // objects, so newly emitted wait context must be described by both.
+    // Full canonical, all-success sparse and mixed projected batches each
+    // advertise the same closed shared-wait context.
     let wait_variants = variants
         .iter()
         .filter(|variant| variant["properties"].get("wait").is_some())
         .collect::<Vec<_>>();
-    assert_eq!(wait_variants.len(), 2);
+    assert_eq!(wait_variants.len(), 3);
     for variant in wait_variants {
         let wait_properties = &variant["properties"]["wait"]["properties"];
         for field in ["update_kind"] {
@@ -468,6 +469,17 @@ fn observation_schemas_do_not_repeat_static_continuation_semantics() {
             );
         }
     }
+    let projected = variants
+        .iter()
+        .find(|variant| variant["properties"]["items"]["items"]["anyOf"].is_array())
+        .expect("mixed observation batch projection");
+    let projected_items = projected["properties"]["items"]["items"]["anyOf"]
+        .as_array()
+        .expect("canonical and compact projected items");
+    assert_eq!(projected_items.len(), 2);
+    assert!(projected_items[1]["required"]
+        .as_array()
+        .is_some_and(|required| required.contains(&json!("index"))));
     let item_output = &full["properties"]["items"]["items"]["properties"]["output"]["anyOf"][0];
     assert!(
         item_output["properties"]
@@ -2005,7 +2017,12 @@ fn key_tool_output_schemas_include_expected_fields() {
         assert!(continuation["properties"]["arguments"]["required"]
             .as_array()
             .unwrap()
-            .contains(&serde_json::json!("wake_on")));
+            .contains(&serde_json::json!("items")));
+        assert_eq!(
+            continuation["properties"]["arguments"]["properties"]["items"]["items"]["properties"]
+                ["page"]["type"],
+            "boolean"
+        );
         assert!(!has_output_field(name, "pending_strategy"));
         assert!(
             has_output_field(name, "failure_kind"),
@@ -3708,7 +3725,11 @@ fn project_validate_schema_admits_canonical_planning_and_replan_failures() {
         });
     }
 
-    for failure_kind in ["validation_plan_stale", "validation_unavailable"] {
+    for failure_kind in [
+        "validation_plan_stale",
+        "validation_tool_unavailable",
+        "validation_unavailable",
+    ] {
         let result = json!({
             "success": false,
             "output": {

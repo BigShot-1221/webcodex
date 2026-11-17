@@ -10,7 +10,7 @@ const detail = {
   observed_job_ids: [], workflow_sessions: [{ workflow_session_id: session_id, project, relation: "recorded" }],
 };
 function activityRow(view) {
-  return view.nodes.windowActivity.children.find(row => row.children[0]?.children[0]?.children[0]?.textContent === "read_workspace_changes");
+  return view.nodes.windowActivity.children.find(row => row.children[0]?.children[0]?.children[0]?.textContent === "Reviewed changes");
 }
 async function pendingActivity() {
   const view = app("mcp_work_result_app.html");
@@ -160,6 +160,7 @@ test("explicit pin retains its code and pending diff even when current workspace
   const count = files(view).length;
   await observeWorkspace(view, { workspace: { ...baseState.workspace, clean: true, files: [], files_total: 0, additions: 0, deletions: 0 } });
   assert.equal(view.nodes.workspacePin.getAttribute("aria-pressed"), "true");
+  assert.equal(view.nodes.workspacePin.hidden, false, "pinned files retain the Follow changes action when current workspace is clean");
   assert.equal(view.nodes.workspaceFiles.children[0], row);
   assert.equal(view.nodes.workspaceStatus.textContent, "No uncommitted changes");
   assert.match(view.nodes.workspaceTracking.textContent, /Pinned for review/);

@@ -7,9 +7,8 @@ use webcodex_core::validation_identity::{
     StructuredValidationExecutionContext, ToolValidationIdentityKind,
 };
 use webcodex_validation::{
-    detect_validation_recipe, project_validation_operation, resolve_node_native_project_check,
-    resolve_node_native_project_lint, resolve_node_native_project_test,
-    validate_node_project_markers, RecipeId, SemanticCheck,
+    detect_validation_recipe, resolve_node_native_project_check, resolve_node_native_project_lint,
+    resolve_node_native_project_test, validate_node_project_markers, RecipeId, SemanticCheck,
 };
 
 pub(crate) fn plan(
@@ -71,6 +70,13 @@ pub(crate) fn plan(
         .as_ref()
         .and_then(ProjectValidationScope::explicit_packages)
         .map(<[String]>::to_vec);
+    let exclude_packages = request
+        .scope
+        .as_ref()
+        .map(ProjectValidationScope::normalized_exclude_packages)
+        .transpose()
+        .map_err(|_| unavailable("validation_scope_invalid", None))?
+        .unwrap_or_default();
     let all_packages = request
         .scope
         .as_ref()
@@ -81,13 +87,19 @@ pub(crate) fn plan(
         .and_then(|test| test.filter.as_deref());
     // The operation supplies semantic identity and normalization only. The
     // resolved recipe below is the sole authority for the executable step.
-    let operation = project_validation_operation(backend.as_str(), action, packages, all_packages)
-        .and_then(|operation| operation.with_dependency_policy(request.dependency_policy))
-        .and_then(|operation| {
-            operation.with_dependency_resolution_policy(request.dependency_resolution_policy)
-        })
-        .and_then(|operation| operation.with_test_filter(filter))
-        .map_err(|code| unavailable(code, Some(backend.as_str())))?;
+    let operation = webcodex_validation::project_validation_operation_with_excluded_packages(
+        backend.as_str(),
+        action,
+        packages,
+        all_packages,
+        exclude_packages.clone(),
+    )
+    .and_then(|operation| operation.with_dependency_policy(request.dependency_policy))
+    .and_then(|operation| {
+        operation.with_dependency_resolution_policy(request.dependency_resolution_policy)
+    })
+    .and_then(|operation| operation.with_test_filter(filter))
+    .map_err(|code| unavailable(code, Some(backend.as_str())))?;
     let profile = operation.compatibility_profile();
     let resolved = if backend == RecipeId::Node {
         if request.action == ProjectValidationAction::Lint {
@@ -98,7 +110,7 @@ pub(crate) fn plan(
             resolve_node_native_project_check(&root, request.cwd.as_deref())
         }
     } else {
-        webcodex_validation::resolve_project_validation_recipe_with_resolution_policy(
+        webcodex_validation::resolve_project_validation_recipe_with_scope_exclusions(
             &root,
             request.cwd.as_deref(),
             hint,
@@ -111,6 +123,7 @@ pub(crate) fn plan(
             all_packages,
             request.dependency_policy,
             request.dependency_resolution_policy,
+            &exclude_packages,
         )
     }
     .map_err(|e| unavailable(e.code, Some(backend.as_str())))?;

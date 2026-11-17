@@ -171,9 +171,6 @@ impl ValidationAdapter for RustValidationAdapter {
                 )
             }
             RustAdapterKind::Clippy => {
-                if options.dependency_resolution_policy.is_some() {
-                    return Err("dependency_resolution_policy_unsupported".into());
-                }
                 let mut options = options;
                 options.all_targets = Some(true);
                 let plan = cargo_check_plan(options)?;
@@ -219,6 +216,8 @@ fn cargo_check_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidat
         options.cargo_packages.as_deref(),
     )
     .map_err(|reason| format!("packages {reason}"))?;
+    let exclusions =
+        normalize_project_exclusions(options.all_packages, &options.cargo_exclude_packages)?;
     let mut args = vec![ValidationPlanArg::Literal("check")];
     if options.dependency_mode
         == Some(webcodex_core::project_validation::ProjectDependencyMode::Locked)
@@ -243,6 +242,10 @@ fn cargo_check_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidat
     }
     if options.all_packages {
         args.push(ValidationPlanArg::Literal("--workspace"));
+        for package in exclusions {
+            args.push(ValidationPlanArg::Literal("--exclude"));
+            args.push(ValidationPlanArg::Value(package));
+        }
     } else {
         for package in packages.into_iter().flatten() {
             args.push(ValidationPlanArg::Literal("-p"));
@@ -264,6 +267,8 @@ fn cargo_test_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidati
         options.cargo_packages.as_deref(),
     )
     .map_err(|reason| format!("packages {reason}"))?;
+    let exclusions =
+        normalize_project_exclusions(options.all_packages, &options.cargo_exclude_packages)?;
     let mut args = vec![ValidationPlanArg::Literal("test")];
     if let Some(filter) = filter {
         args.push(ValidationPlanArg::Value(filter));
@@ -294,6 +299,10 @@ fn cargo_test_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidati
     }
     if options.all_packages {
         args.push(ValidationPlanArg::Literal("--workspace"));
+        for package in exclusions {
+            args.push(ValidationPlanArg::Literal("--exclude"));
+            args.push(ValidationPlanArg::Value(package));
+        }
     } else {
         for package in packages.into_iter().flatten() {
             args.push(ValidationPlanArg::Literal("-p"));
@@ -304,6 +313,20 @@ fn cargo_test_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidati
         args.push(ValidationPlanArg::Literal("--no-run"));
     }
     read_only_validation_plan("test", "cargo", args)
+}
+
+fn normalize_project_exclusions(
+    all_packages: bool,
+    exclusions: &[String],
+) -> Result<Vec<String>, String> {
+    if exclusions.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !all_packages {
+        return Err("workspace exclusions require all_packages=true".into());
+    }
+    webcodex_core::runner_protocol::normalize_cargo_excluded_packages(exclusions)
+        .map_err(str::to_string)
 }
 
 /// Normalize one value-taking Cargo option before the adapter emits its single

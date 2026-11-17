@@ -198,6 +198,8 @@ WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES=2147483648
 
 `full` 可能包含源码、patch、command/script 输入输出、user message，以及本身就出现在 tool payload 中的 secret。应像保护其它敏感诊断数据一样保护 trace 目录，并设置有界 retention/budget。Trace capture 只用于诊断；trace 写入失败不会改变 tool execution。
 
+Store 连接等待或持有达到 100 ms 时，会在 INFO 级别记录有界诊断标签。Metadata Trace 区分响应交接与审计持久化后的 Handler 收尾。Trace 尽力采集：诊断界面会标记已知遗漏，单独存在完成事件不代表整条 Trace 完整。
+
 精确的 trace 文件布局、correlation id、model-facing forensic reader、queue/compression 与 payload validation 规则属于 implementation/maintainer detail，有意不放在这份部署指南中。
 
 ### 公网 HTTPS
@@ -375,7 +377,7 @@ max_output_bytes = 262144
 无效 candidate 保留旧 active snapshot/generation，`restart_required_fields` 明确列出仍需
 重启、且不会假装已经在线生效的 startup-only 变更。Unix service reload/SIGHUP 仍保留为
 调用同一 reload primitive 的兼容 trigger，但 first-class config control 不依赖它。身份、
-server/auth、项目来源、并发、能力与传输等字段在被报告为 restart-only 时仍需要重启。
+server/auth、项目来源、能力与传输等字段在被报告为 restart-only 时仍需要重启。
 
 `[instructions].files` 明确属于 hot-reloadable 字段：完成 check/reload 后，新 Project
 bootstrap 会立即使用新的路径列表，不需要重启 Runner。已配置 instruction 文件的内容

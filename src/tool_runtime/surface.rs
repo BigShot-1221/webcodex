@@ -508,38 +508,13 @@ fn tool_manifest_route(spec: &ToolDescriptor) -> (&'static str, Option<&'static 
 }
 
 fn tool_manifest_invocation_route(spec: &ToolDescriptor) -> Value {
-    let target = spec.name.as_str();
-    let (availability, gateway_tool) = tool_manifest_route(spec);
-    let primary = match (availability, gateway_tool) {
-        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT, None) => {
-            json!({"mode": "direct", "tool": target})
-        }
-        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(gateway)) => {
-            json!({"mode": "gateway", "tool": gateway, "target": target})
-        }
-        _ => json!({"mode": "unavailable", "tool": Value::Null, "target": target}),
-    };
-
-    let fallback = if availability == crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT
-        && target != crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
-    {
-        json!({
-            "mode": "gateway",
-            "tool": crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
-            "target": target,
-            "when": "direct_callable_unavailable",
-            "blocked_when_mcp_apps_enabled": crate::model_surface::tool_requires_direct_app_presentation(target),
-        })
-    } else {
-        Value::Null
-    };
-
-    json!({
-        "primary": primary,
-        "fallback": fallback,
-        "tool_manifest_registers_host_tool": false,
-        "discovery_effect": "none",
-    })
+    crate::model_surface::manifest_invocation_route(
+        &spec.name,
+        crate::model_surface::suggested_tool_call_route(
+            &spec.name,
+            !is_model_visible_tool_name(&spec.name),
+        ),
+    )
 }
 
 fn manifest_host_orchestration_projection(tool_name: &str) -> Option<Value> {
@@ -648,6 +623,7 @@ impl ToolRuntime {
     /// ResponseTooLargeError.
     pub(super) async fn tool_manifest(
         &self,
+        discovery_tools: Option<&std::collections::BTreeSet<String>>,
         auth: Option<&crate::auth::AuthContext>,
         tool_name: Option<String>,
         category: Option<String>,
@@ -668,6 +644,7 @@ impl ToolRuntime {
                 include_recommended_flows,
                 include_risk_summary,
                 protocol_capabilities,
+                discovery_tools,
             ) {
                 Ok(payload) => ToolResult::ok(payload),
                 Err(result) => result,
@@ -682,6 +659,7 @@ impl ToolRuntime {
             include_risk_summary,
             protocol_capabilities,
             query,
+            discovery_tools,
         ) {
             Ok(payload) => ToolResult::ok(payload),
             Err(result) => result,
@@ -695,6 +673,7 @@ impl ToolRuntime {
         include_recommended_flows: bool,
         include_risk_summary: bool,
         protocol_capabilities: ToolProtocolCapabilities,
+        discovery_tools: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<Value, ToolResult> {
         let tool_name = raw_tool_name.trim();
         if tool_name.is_empty() {
@@ -702,7 +681,6 @@ impl ToolRuntime {
         }
         let specs = tool_manifest_specs(protocol_capabilities, auth);
         let specialist_specs = exact_manifest_specialist_tool_descriptors();
-        let tool_count = specs.len();
         let Some(spec) = specs.iter().chain(specialist_specs.iter()).find(|spec| {
             spec.name == tool_name
                 && (auth.is_none()
@@ -710,6 +688,16 @@ impl ToolRuntime {
         }) else {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         };
+        if discovery_tools.is_some_and(|tools| !tools.contains(tool_name)) {
+            return Err(ToolResult::err_with_output(
+                format!("tool '{tool_name}' is unavailable on the current client surface"),
+                json!({"code":"tool_unavailable_on_surface", "tool_name":tool_name}),
+            ));
+        }
+        let tool_count = specs
+            .iter()
+            .filter(|spec| discovery_tools.is_none_or(|tools| tools.contains(&spec.name)))
+            .count();
         let category = runtime_tool_category(spec.name.as_str());
         let metadata = runtime_tool_metadata(spec.name.as_str());
         let (availability, gateway_tool) = tool_manifest_route(spec);
@@ -748,7 +736,7 @@ impl ToolRuntime {
             "requested_limit": Value::Null,
             "categories": Value::Object(exact_categories),
             "tools": [compact_manifest_tool_entry(spec)],
-            "routing_note": "read_tool_manifest only describes an existing route; it never dynamically registers a new Host tool. Follow route.primary when this MCP surface exposes that direct callable; otherwise use route.fallback (typically call_runtime_tool) only when admitted, authorized, and not blocked by MCP App direct-presentation requirements.",
+            "routing_note": "read_tool_manifest describes an existing route; it never dynamically registers a Host tool. Follow route.primary. A null route.fallback forbids gateway fallback. Otherwise fallback applies only to an unavailable direct callable, subject to App presentation requirements. Host refusal never permits a different route.",
         });
         if let Some(execution) = runtime_tool_execution_contract(spec.name.as_str()) {
             output["contract"]["execution"] = manifest_execution_projection(execution);
@@ -762,9 +750,15 @@ impl ToolRuntime {
         }
         if include_recommended_flows {
             output["recommended_flows"] =
-                Value::Array(tool_manifest_recommended_flows_for_visible_tools([spec
-                    .name
-                    .as_str()]));
+                Value::Array(tool_manifest_recommended_flows_for_visible_tools(
+                    [spec.name.as_str()],
+                    specs
+                        .iter()
+                        .filter(|spec| {
+                            discovery_tools.is_none_or(|tools| tools.contains(&spec.name))
+                        })
+                        .map(|spec| spec.name.as_str()),
+                ));
         }
         #[cfg(feature = "experimental-code-mode")]
         if let Some(stage) = code_mode_callable_stage_for_entry_tool(spec.name.as_str()) {
@@ -777,53 +771,7 @@ impl ToolRuntime {
         Ok(output)
     }
 
-    pub(crate) fn compact_tool_manifest_payload(&self) -> Value {
-        self.tool_manifest_payload(None, None, true, true, ToolProtocolCapabilities::default())
-            .expect("default read_tool_manifest payload without intent must succeed")
-    }
-
-    pub(crate) fn compact_tool_manifest_payload_bounded(
-        &self,
-        categories: Option<Vec<String>>,
-        intent: Option<String>,
-        limit: Option<usize>,
-    ) -> Result<Value, ToolResult> {
-        if categories.is_none() && intent.is_none() && limit.is_none() {
-            return Ok(self.compact_tool_manifest_payload());
-        }
-        self.tool_manifest_payload_for_categories(
-            None,
-            categories,
-            intent,
-            limit,
-            true,
-            true,
-            ToolProtocolCapabilities::default(),
-            None,
-        )
-    }
-
-    fn tool_manifest_payload(
-        &self,
-        category: Option<String>,
-        intent: Option<String>,
-        include_recommended_flows: bool,
-        include_risk_summary: bool,
-        protocol_capabilities: ToolProtocolCapabilities,
-    ) -> Result<Value, ToolResult> {
-        self.tool_manifest_payload_for_categories(
-            None,
-            category.map(|category| vec![category]),
-            intent,
-            None,
-            include_recommended_flows,
-            include_risk_summary,
-            protocol_capabilities,
-            None,
-        )
-    }
-
-    fn tool_manifest_payload_for_categories(
+    pub(super) fn tool_manifest_payload_for_categories(
         &self,
         auth: Option<&crate::auth::AuthContext>,
         categories: Option<Vec<String>>,
@@ -833,6 +781,7 @@ impl ToolRuntime {
         include_risk_summary: bool,
         protocol_capabilities: ToolProtocolCapabilities,
         query: Option<String>,
+        discovery_tools: Option<&std::collections::BTreeSet<String>>,
     ) -> Result<Value, ToolResult> {
         let resolved_intent = match intent {
             None => None,
@@ -844,7 +793,10 @@ impl ToolRuntime {
             },
         };
 
-        let specs = tool_manifest_specs(protocol_capabilities, auth);
+        let mut specs = tool_manifest_specs(protocol_capabilities, auth);
+        if let Some(tools) = discovery_tools {
+            specs.retain(|spec| tools.contains(&spec.name));
+        }
         let tool_count = specs.len();
         let categories_requested = normalize_tool_manifest_categories(categories);
         let category = categories_requested
@@ -921,13 +873,15 @@ impl ToolRuntime {
         }
 
         if include_recommended_flows {
-            output["recommended_flows"] = Value::Array(if filtered || auth.is_some() {
-                tool_manifest_recommended_flows_for_visible_tools(
-                    returned_specs.iter().map(|spec| spec.name.as_str()),
-                )
-            } else {
-                tool_manifest_recommended_flows()
-            });
+            output["recommended_flows"] =
+                Value::Array(if filtered || auth.is_some() || discovery_tools.is_some() {
+                    tool_manifest_recommended_flows_for_visible_tools(
+                        returned_specs.iter().map(|spec| spec.name.as_str()),
+                        specs.iter().map(|spec| spec.name.as_str()),
+                    )
+                } else {
+                    tool_manifest_recommended_flows()
+                });
         }
 
         Ok(output)
@@ -1465,14 +1419,16 @@ pub(super) fn tool_manifest_recommended_flows() -> Vec<Value> {
 /// manifest. Keeps original flow tool order, drops duplicates, and omits flows
 /// that project to an empty tool list. Unfiltered callers should use the full
 /// global flows instead.
-pub(super) fn tool_manifest_recommended_flows_for_visible_tools<'a, I>(
-    visible_tools: I,
-) -> Vec<Value>
-where
-    I: IntoIterator<Item = &'a str>,
-{
+fn tool_manifest_recommended_flows_for_visible_tools<'a>(
+    visible_tools: impl IntoIterator<Item = &'a str>,
+    callable_tools: impl IntoIterator<Item = &'a str>,
+) -> Vec<Value> {
     let visible: std::collections::HashSet<&str> = visible_tools.into_iter().collect();
+    let callable: std::collections::HashSet<&str> = callable_tools.into_iter().collect();
     model_visible_recommended_flows()
+        // A partial flow's prose still describes its omitted canonical members.
+        // Pagination may omit callable tools; authority/surface filtering may not.
+        .filter(|flow| flow.tools.iter().all(|tool| callable.contains(tool)))
         .filter_map(|flow| {
             let mut seen = std::collections::HashSet::new();
             let tools: Vec<&str> = flow

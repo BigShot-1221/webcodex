@@ -1061,6 +1061,173 @@ fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
 }
 
 #[test]
+fn late_first_chatgpt_mount_recovers_only_from_attaching_host_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&temp.path().join("late-first-chatgpt.db")).unwrap());
+    let runtime = runtime_with_db(db.clone());
+    let agent = create_agent(
+        &runtime,
+        "late-first-chatgpt",
+        "Late first ChatGPT mount",
+        "test only",
+        "continuation",
+        "late-first-agent",
+    );
+    let origin = crate::client_window::ClientWindow::from_opaque(
+        "openai-session",
+        "late-first-mount-chatgpt-session",
+    )
+    .unwrap();
+    let different = crate::client_window::ClientWindow::from_opaque(
+        "openai-session",
+        "a-different-chatgpt-session",
+    )
+    .unwrap();
+    let created = runtime.attach_agent_endpoint_for_window(
+        None,
+        Some(&origin),
+        webcodex_tool_contracts::RotateAgentContinuationEndpointInput {
+            agent_id: agent.clone(),
+            host: "ChatGPT".into(),
+            client_attachment_id: Some("late-first-view".into()),
+            idempotency_key: "late-first-endpoint".into(),
+        },
+    );
+    assert!(created.success, "{:?}", created.output);
+    assert_eq!(created.output["endpoint"]["wake_capable"], false);
+    let endpoint = created.output["endpoint"]["endpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let generation = created.output["endpoint"]["controller_generation"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(
+        endpoint_client_window_key(&db, &endpoint).as_deref(),
+        Some(origin.key()),
+    );
+    assert!(endpoint_recovery_fingerprint(&db, &endpoint).is_none());
+    let card =
+        runtime.present_agent_continuation(None, agent.clone(), endpoint.clone(), generation);
+    assert!(card.success, "{:?}", card.output);
+    assert_eq!(
+        card.output["agent_continuation"]["host_binding"]["bound"],
+        false
+    );
+    assert_eq!(
+        endpoint_recovery_fingerprint(&db, &endpoint),
+        None,
+        "presentation must not create a live binding or dispatch",
+    );
+
+    // The Host defers its very first iframe mount past the 120-second lease.
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_endpoints SET lease_expires_at_unix_ms = 0
+         WHERE endpoint_id = ?1",
+            [&endpoint],
+        )
+        .unwrap();
+    let foreign = runtime.agent_continuation_recover_endpoint_for_window(
+        None,
+        Some(&different),
+        agent.clone(),
+        endpoint.clone(),
+        generation,
+        "wc_host_binding_IiIiIiIiIiIiIiIiIiIiIg".into(),
+    );
+    assert!(!foreign.success);
+    assert_eq!(foreign.output["error_kind"], "host_binding_stale");
+    let recovered = runtime.agent_continuation_recover_endpoint_for_window(
+        None,
+        Some(&origin),
+        agent.clone(),
+        endpoint.clone(),
+        generation,
+        "wc_host_binding_MzMzMzMzMzMzMzMzMzMzMw".into(),
+    );
+    assert!(recovered.success, "{:?}", recovered.output);
+    assert_eq!(
+        recovered.output["endpoint_recovery"]["kind"],
+        "endpoint_replaced"
+    );
+    assert_eq!(recovered.output["state_changed"], true);
+    let successor = recovered.output["endpoint_recovery"]["replacement"]["endpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_generation = recovered.output["endpoint_recovery"]["replacement"]
+        ["controller_generation"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(next_generation, generation + 1);
+    assert_eq!(
+        recovered.output["agent_continuation"]["host_binding"]["bound"], false,
+        "recovery cannot register a Host carrier or wake a model",
+    );
+    assert_eq!(
+        endpoint_client_window_key(&db, &successor).as_deref(),
+        Some(origin.key()),
+    );
+
+    // Only the same canonical Window may mount the recovered Endpoint.
+    let denied = runtime.agent_continuation_bind_for_window(
+        None,
+        Some(&different),
+        agent.clone(),
+        successor.clone(),
+        next_generation,
+        "wc_host_binding_EREREREREREREREREREREQ".into(),
+    );
+    assert!(!denied.success);
+    assert_eq!(denied.output["error_kind"], "host_binding_stale");
+    let accepted = runtime.agent_continuation_bind_for_window(
+        None,
+        Some(&origin),
+        agent,
+        successor,
+        next_generation,
+        "wc_host_binding_EREREREREREREREREREREQ".into(),
+    );
+    assert!(accepted.success, "{:?}", accepted.output);
+    assert_eq!(
+        accepted.output["agent_continuation"]["host_binding"]["bound"],
+        true
+    );
+}
+
+#[test]
+fn non_chatgpt_window_at_attachment_keeps_inert_legacy_behavior() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&temp.path().join("non-host-window.db")).unwrap());
+    let runtime = runtime_with_db(db.clone());
+    let agent = create_agent(
+        &runtime,
+        "non-host-window",
+        "Non-host",
+        "test only",
+        "legacy",
+        "non-host-agent",
+    );
+    let arbitrary = crate::client_window::ClientWindow::for_test("not-chatgpt");
+    let result = runtime.attach_agent_endpoint_for_window(
+        None,
+        Some(&arbitrary),
+        webcodex_tool_contracts::RotateAgentContinuationEndpointInput {
+            agent_id: agent,
+            host: "Desktop".into(),
+            client_attachment_id: None,
+            idempotency_key: "non-host-attach".into(),
+        },
+    );
+    assert!(result.success, "{:?}", result.output);
+    let endpoint = result.output["endpoint"]["endpoint_id"].as_str().unwrap();
+    assert!(endpoint_client_window_key(&db, endpoint).is_none());
+    assert_eq!(result.output["endpoint"]["wake_capable"], false);
+}
+
+#[test]
 fn mcp_app_restart_recovery_fingerprint_fences_replaced_and_unbound_views() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("restart-view-fingerprint.db");

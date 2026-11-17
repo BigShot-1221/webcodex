@@ -129,6 +129,10 @@ fn managed_worktree_namespace_candidate(
     policy: &RunnerPolicy,
     source: &Path,
 ) -> Result<PathBuf, &'static str> {
+    if policy.managed_worktree_root.is_some() {
+        let root = validate_configured_managed_worktree_root(policy, Some(source))?;
+        return Ok(root);
+    }
     let mut roots =
         webcodex_runner_config::paths::canonicalize_usable_allowed_roots(&policy.allowed_roots);
     roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
@@ -136,6 +140,7 @@ fn managed_worktree_namespace_candidate(
         if !webcodex_runner_config::paths::path_is_within(source, &root) {
             continue;
         }
+
         let candidate = root.join(MANAGED_WORKTREE_NAMESPACE);
         if webcodex_runner_config::paths::path_is_within(&candidate, source) {
             continue;
@@ -153,6 +158,29 @@ fn managed_worktree_namespace_candidate(
     Err("managed_worktree_root_unavailable")
 }
 
+fn validate_configured_managed_worktree_root(
+    policy: &RunnerPolicy,
+    source: Option<&Path>,
+) -> Result<PathBuf, &'static str> {
+    let Some(configured) = policy.managed_worktree_root.as_ref() else {
+        return Err("managed_worktree_root_unavailable");
+    };
+    let metadata =
+        std::fs::symlink_metadata(configured).map_err(|_| "managed_worktree_root_unavailable")?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("managed_worktree_root_unsafe");
+    }
+    let root =
+        canonicalize_existing(configured).map_err(|_| "managed_worktree_root_unavailable")?;
+    if !paths_equal(&root, configured)
+        || source.is_some_and(|source| webcodex_runner_config::paths::path_is_within(&root, source))
+        || validate_project_path_policy(policy, &root).is_err()
+    {
+        return Err("managed_worktree_root_unsafe");
+    }
+    Ok(root)
+}
+
 /// Materialize the Runner-owned managed-worktree namespace inside the current
 /// Runner filesystem policy. The caller never selects this destination, but the
 /// resulting Project must remain usable by the ordinary file/shell/process paths,
@@ -161,6 +189,9 @@ fn ensure_managed_worktree_root(
     policy: &RunnerPolicy,
     source: &Path,
 ) -> Result<PathBuf, &'static str> {
+    if policy.managed_worktree_root.is_some() {
+        return managed_worktree_namespace_candidate(policy, source);
+    }
     let candidate = managed_worktree_namespace_candidate(policy, source)?;
     match std::fs::symlink_metadata(&candidate) {
         Ok(metadata) => {
@@ -254,6 +285,10 @@ fn managed_worktree_project_toml(
         true,
     );
     content.push_str("managed_worktree = true\n");
+    content.push_str(&format!(
+        "registration_incarnation = \"{}\"\n",
+        uuid::Uuid::new_v4()
+    ));
     content.push_str(&format!("managed_source = {}\n", toml_basic_string(source)));
     content.push_str(&format!(
         "managed_source_project_id = {}\n",
@@ -305,6 +340,7 @@ fn managed_worktree_success(
             "disabled": project.disabled,
             "revision": project_revision(project),
             "root_fingerprint": project_root_fingerprint(worktree),
+            "registration_incarnation": project.registration_incarnation,
             "lineage": project_lineage(project),
             "source": "managed_worktree",
             "outcome": outcome,
@@ -330,6 +366,18 @@ fn resume_managed_worktree(
     requested_base_ref: Option<&str>,
     resume_project_id: &str,
 ) -> CommandResult {
+    if policy.managed_worktree_root.is_some()
+        && validate_configured_managed_worktree_root(policy, Some(source_root)).is_err()
+    {
+        return managed_worktree_error(
+            start,
+            "managed_worktree_root_unsafe",
+            false,
+            requested_base_ref,
+            None,
+            Some(source_dirty),
+        );
+    }
     if validate_project_op_id(resume_project_id).is_err() {
         return managed_worktree_error(
             start,
@@ -543,7 +591,46 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
     else {
         return managed_worktree_error(start, "invalid_request", false, None, None, None);
     };
-    if !matches!(payload.len(), 4 | 6) {
+    // Optional project-share parent-root grant forwarded by the Server. It
+    // authorizes the *source* the worktree derives from, judged on the
+    // Runner's own canonical resolution before any side effect; the derived
+    // sibling destination is a Runner-owned namespace and is not required to
+    // live inside the grant. Ordinary credentials omit the field and keep the
+    // exact previous payload. Malformed scopes fail closed.
+    let granted_roots = match payload.get("project_root_scopes") {
+        None => None,
+        Some(serde_json::Value::Array(items)) => {
+            if items.is_empty() {
+                return managed_worktree_error(start, "invalid_request", false, None, None, None);
+            }
+            let mut roots = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(root) = item.as_str().filter(|root| {
+                    !root.is_empty() && !root.contains('\0') && Path::new(root).is_absolute()
+                }) else {
+                    return managed_worktree_error(
+                        start,
+                        "invalid_request",
+                        false,
+                        None,
+                        None,
+                        None,
+                    );
+                };
+                roots.push(PathBuf::from(root));
+            }
+            Some(roots)
+        }
+        Some(_) => {
+            return managed_worktree_error(start, "invalid_request", false, None, None, None)
+        }
+    };
+    let expected_field_counts = if granted_roots.is_some() {
+        [5usize, 7]
+    } else {
+        [4usize, 6]
+    };
+    if !expected_field_counts.contains(&payload.len()) {
         return managed_worktree_error(start, "invalid_request", false, None, None, None);
     }
     let Some(path) = payload
@@ -617,16 +704,6 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             )
         }
     };
-    if resume_project_id.is_some() && expected_source_identity.is_some() {
-        return managed_worktree_error(
-            start,
-            "invalid_request",
-            false,
-            Some(&base_ref),
-            None,
-            None,
-        );
-    }
     if validate_windows_project_root(Path::new(path)).is_err() {
         return managed_worktree_error(
             start,
@@ -667,6 +744,29 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             None,
         );
     }
+    if let Some(granted_roots) = &granted_roots {
+        // Share-grant admission is judged on the Runner's own canonical
+        // resolution of the source before any git invocation or registry
+        // write: a source that resolved inside the grant at Server-fence time
+        // but elsewhere here fails closed. Roots are compared in canonical form
+        // too, so unresolved text or a Windows verbatim prefix cannot decide it;
+        // an unresolvable root stays denied. The derived worktree destination is
+        // not part of this check; allowed_roots above still governs it.
+        let admitted = granted_roots.iter().any(|root| {
+            canonicalize_existing(root)
+                .is_ok_and(|root| webcodex_runner_config::paths::path_is_within(&source, &root))
+        });
+        if !admitted {
+            return managed_worktree_error(
+                start,
+                "project_path_outside_granted_roots",
+                false,
+                Some(&base_ref),
+                None,
+                None,
+            );
+        }
+    }
     let source_root = match managed_worktree_git_text(&source, &["rev-parse", "--show-toplevel"])
         .ok()
         .and_then(|root| canonicalize_existing(Path::new(&root)).ok())
@@ -696,18 +796,6 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
             )
         }
     };
-    if let Some(resume_project_id) = resume_project_id {
-        return resume_managed_worktree(
-            start,
-            policy,
-            project_registry_dir,
-            client_id,
-            &source_root,
-            source_dirty,
-            requested_base_ref.as_deref(),
-            resume_project_id,
-        );
-    }
     let source_projects = match load_project_files_for_path_resolution(project_registry_dir) {
         Ok(projects) => projects,
         Err(error) => {
@@ -735,6 +823,8 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                 )
             }
         };
+    // Validated before the resume short-circuit so a resume is anchored to the
+    // registered source identity too, not only to the stored source path.
     if expected_source_identity.is_some_and(|(expected_project_id, expected_root_fingerprint)| {
         expected_project_id != source_project_id
             || expected_root_fingerprint != source_root_fingerprint
@@ -749,6 +839,18 @@ pub(crate) fn handle_prepare_managed_worktree_operation(
                 "source_project_id": source_project_id,
                 "source_root_fingerprint": source_root_fingerprint,
             }),
+        );
+    }
+    if let Some(resume_project_id) = resume_project_id {
+        return resume_managed_worktree(
+            start,
+            policy,
+            project_registry_dir,
+            client_id,
+            &source_root,
+            source_dirty,
+            requested_base_ref.as_deref(),
+            resume_project_id,
         );
     }
     let base_sha = match exact_git_commit(&source_root, &base_ref) {

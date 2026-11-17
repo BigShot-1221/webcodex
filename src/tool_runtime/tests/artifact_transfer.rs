@@ -43,6 +43,8 @@ fn transfer_auth(username: &str) -> AuthContext {
         allowed_client_id: Some("transfer-test-client".to_string()),
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -209,6 +211,7 @@ async fn complete_destination_begin(
     let payload: Value = serde_json::from_str(request.content.as_deref().unwrap()).unwrap();
     assert_eq!(payload["path"], destination_path);
     assert_eq!(payload["expected_bytes"], bytes.len());
+    assert_eq!(payload["max_bytes"], bytes.len().max(1));
     assert_eq!(payload["expected_sha256"], sha256_hex(bytes));
     assert_eq!(payload["mime_type"], expected_mime);
     assert_eq!(payload["overwrite"], overwrite);

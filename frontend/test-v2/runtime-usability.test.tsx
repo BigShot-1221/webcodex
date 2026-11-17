@@ -52,7 +52,7 @@ describe("Runtime usability", () => {
     const openRecord = vi.fn();
     render(<WindowActivityFeed detail={detail} projects={[]} language="en" selectedSessionId="session-without-calls" onOpenSessionRecord={openRecord} />);
     fireEvent.click(screen.getByRole("button", { name: "View Session record" }));
-    expect(openRecord).toHaveBeenCalledWith("agent:runner:project", "session-without-calls");
+    expect(openRecord).toHaveBeenCalledWith("agent:runner:project", "session-without-calls", "window-a");
     fireEvent.click(screen.getByRole("combobox", { name: "Session filter" }));
     expect(screen.getByRole("option", { name: /Retained work/ })).toBeTruthy();
     expect(screen.getByText("This Session is linked to the Window but has no retained calls.")).toBeTruthy();
@@ -78,13 +78,15 @@ describe("Runtime usability", () => {
 
   it("shows effective configuration with readable labels and units", () => {
     const overview = runtimeOverview();
-    overview.effective_config = { auth: { shared_key_enabled: true, anonymous_enabled: false }, mcp_host: { profile: "default", host_budget_secs: 60, initial_job_handoff_secs: 2, max_sync_wait_secs: 10, continuation_wait_secs: 5 }, tool_request_trace_mode: "off" };
+    overview.effective_config = { auth: { shared_key_enabled: true, anonymous_enabled: false }, mcp_host: { profile: "default", host_budget_secs: 60, max_sync_wait_secs: 10, continuation_wait_secs: 5 }, tool_request_trace_mode: "off" };
     render(<RuntimeView client={{} as RuntimeV2Client} language="en" overview={overview} overviewAvailability="available" onOpenWork={vi.fn()} onUnauthorized={vi.fn()} />);
     expect(screen.getByText("Server configuration")).toBeTruthy();
     expect(screen.getByText("Shared key authentication")).toBeTruthy();
     expect(screen.getByText("60 seconds")).toBeTruthy();
-    expect(screen.getByText("Legacy handoff hint (unused)")).toBeTruthy();
-    expect(screen.queryByText("Initial job handoff wait")).toBeNull();
+    expect(screen.getByText("Maximum synchronous wait")).toBeTruthy();
+    expect(screen.getByText("10 seconds")).toBeTruthy();
+    expect(screen.getByText("Continuation wait")).toBeTruthy();
+    expect(screen.getByText("5 seconds")).toBeTruthy();
     expect(screen.getByText("Disabled")).toBeTruthy();
   });
 });

@@ -34,7 +34,7 @@ fail before provider process start.
 
 The P1 Run primitive exposes five model tools: `start_coding_agent`,
 `observe_coding_agent`, `cancel_coding_agent`, `respond_coding_agent_permission`,
-and `inspect_coding_agent_config` (bounded config discovery; conservative
+and `diagnose_coding_agent` (bounded config discovery; conservative
 Execute/JobRun + Standard `PermissionEvaluator` for the whole tool because
 `include_live_acp=true` spawns a bounded ephemeral provider probe; live probe
 is opt-in via `include_live_acp`). The managed AgentTask entry
@@ -520,7 +520,7 @@ advertised enum value (never arbitrary secret-like free text). Confirmed values
 reflect what ACP reported for that negotiation instant only; they do not prove
 billing tier, quota, or off-session provider policy.
 
-`inspect_coding_agent_config` reuses the typed Runner `Diagnose` operation:
+`diagnose_coding_agent` reuses the typed Runner `Diagnose` operation:
 without `include_live_acp` it returns env presence plus operator allowlist and
 forced-policy **key identities only** (no provider child); with
 `include_live_acp=true` it performs the same bounded `initialize` +

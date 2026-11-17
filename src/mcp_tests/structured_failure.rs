@@ -238,7 +238,7 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
 #[tokio::test]
 async fn gateway_and_app_canonical_failures_use_request_presentation() {
     let (_tmp, db) = test_db();
-    let runtime = test_runtime().with_communication_database(db);
+    let runtime = workflow_runtime().with_communication_database(db);
     let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
     auth.is_bootstrap = true;
     for call_params in [
@@ -299,6 +299,7 @@ async fn register_failure_runner_with_resource_links(
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 client_id: "failure-runner".into(),
                 runner_instance_id: "inst".into(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -340,6 +341,7 @@ async fn register_failure_runner_with_resource_links(
         "failure-runner",
         "inst",
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: "probe".into(),
             name: None,
             path: "/tmp/structured-failure-probe".into(),

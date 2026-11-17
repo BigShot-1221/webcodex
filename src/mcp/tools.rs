@@ -35,7 +35,7 @@ mod call;
 pub(super) use call::handle_call;
 mod invocation;
 use invocation::{
-    mcp_invocation_envelope_supported_fields, validate_mcp_invocation_envelope_for_target,
+    mcp_invocation_fields_for_surface, validate_mcp_invocation_envelope_for_target,
     MCP_INVOCATION_ENVELOPE_FIELD,
 };
 pub(super) use invocation::{parse_mcp_invocation_envelope, McpInvocationEnvelope};
@@ -45,7 +45,7 @@ pub(super) const WORK_RESULT_INPUT_META_KEY: &str = "webcodex/workResultInput";
 pub(super) const WORK_RESULT_THREAD_CONTEXT_META_KEY: &str = "webcodex/workResultThread";
 const WORK_RESULT_THREAD_ENTRYPOINT_TOOL_NAME: &str = "work_result_thread_panel";
 
-fn filter_descriptors_for_oauth(
+pub(super) fn filter_descriptors_for_oauth(
     mut specs: Vec<ToolDescriptor>,
     auth: Option<&AuthContext>,
 ) -> Vec<ToolDescriptor> {
@@ -113,10 +113,10 @@ fn stateless_advertised_operator_extension_descriptors_for_auth(
         .collect()
 }
 
-fn adaptive_runtime_gateway_tool_json(compact: bool) -> Value {
+pub(super) fn adaptive_runtime_gateway_tool_json(compact: bool) -> Value {
     mcp_tool_parts_json(
         ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME.to_string(),
-        "Invoke one admitted runtime tool when its direct callable is unavailable. Use read_tool_manifest for exact contracts/routes; if it is not directly callable, invoke this gateway with tool='read_tool_manifest'. Follow route.primary, or route.fallback only when authorized. Never guess names/fields or bypass OAuth/permission gates. With MCP Apps enabled, call App presentation tools directly for Host metadata. Retired wrapper failures do not imply ACP is absent.".to_string(),
+        "Call one runtime tool admitted by Adaptive Runtime through the generic gateway. Follow the exact tool manifest's allowed route. Operations requiring individual Host review cannot use this gateway even when their callable is unloaded or the Host refuses it; refresh tools/list and retain normal Host review. Ordinary direct tools may fall back here only when their callable is unavailable. Explicit MCP App presentation tools must use their direct callable while Apps are enabled so the Host receives App metadata. Canonical argument validation, OAuth scope, Project authority, permission gates, Runner capability, Session/context policy, host-file-import trust, protocol capability admission, and effects remain enforced.".to_string(),
         json!({
             "type": "object",
             "properties": {
@@ -124,7 +124,7 @@ fn adaptive_runtime_gateway_tool_json(compact: bool) -> Value {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 128,
-                    "description": "Exact runtime tool name already admitted by Adaptive Runtime. Discover the contract with read_tool_manifest before calling when it is not already known."
+                    "description": "Exact admitted runtime tool whose manifest permits gateway execution. Tools requiring individual Host review never allow fallback; App presentation is direct-only while Apps are enabled."
                 },
                 "arguments": {
                     "type": "object",
@@ -203,7 +203,10 @@ pub(crate) fn adaptive_runtime_gateway_target_admitted_for_test(
     )
 }
 
-fn mcp_suggested_tool_call_route(target: &str, stateless_2026: bool) -> SuggestedToolCallRoute {
+pub(super) fn mcp_suggested_tool_call_route(
+    target: &str,
+    stateless_2026: bool,
+) -> SuggestedToolCallRoute {
     if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
         return SuggestedToolCallRoute::Unavailable;
     }
@@ -213,13 +216,6 @@ fn mcp_suggested_tool_call_route(target: &str, stateless_2026: bool) -> Suggeste
     let operator_extension_admitted =
         stateless_2026 && runtime_tool_operator_extension_family(target).is_some();
     crate::model_surface::suggested_tool_call_route(target, operator_extension_admitted)
-}
-
-fn project_mcp_tool_spec_output_schema(mut spec: ToolSpec, stateless_2026: bool) -> ToolSpec {
-    project_suggested_tool_call_schema(&mut spec.output_schema, &|target| {
-        mcp_suggested_tool_call_route(target, stateless_2026)
-    });
-    spec
 }
 
 fn unwrap_adaptive_runtime_gateway_arguments(arguments: Value) -> Result<(String, Value), String> {
@@ -517,11 +513,32 @@ fn mcp_tools_list_payload_with_features(compact: bool, app_enabled: bool) -> Val
     mcp_tools_list_payload_with_features_for_auth(compact, app_enabled, false, None)
 }
 
+#[cfg(test)]
 pub(super) fn mcp_tools_list_payload_with_features_for_auth(
     compact: bool,
     app_enabled: bool,
     stateless_2026: bool,
     auth: Option<&AuthContext>,
+) -> Value {
+    mcp_tools_list_payload_with_exposure(
+        compact,
+        app_enabled,
+        stateless_2026,
+        auth,
+        super::tool_exposure::ToolExposure {
+            goals: true,
+            agent_continuation: true,
+            job_continuation: true,
+        },
+    )
+}
+
+fn mcp_tools_list_payload_with_exposure(
+    compact: bool,
+    app_enabled: bool,
+    stateless_2026: bool,
+    auth: Option<&AuthContext>,
+    exposure: super::tool_exposure::ToolExposure,
 ) -> Value {
     let mut specs = filter_descriptors_for_oauth(
         crate::model_surface::adaptive_runtime_direct_tool_descriptors(),
@@ -529,10 +546,11 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
     );
     specs
         .extend(stateless_advertised_operator_extension_descriptors_for_auth(stateless_2026, auth));
+    specs.retain(|spec| exposure.allows(&spec.name));
 
     let mut tools = specs
         .into_iter()
-        .map(|spec| mcp_tool_descriptor_json(spec, compact, app_enabled, Some(stateless_2026)))
+        .map(|spec| mcp_tool_descriptor_json(spec, compact, app_enabled))
         .collect::<Vec<_>>();
     if app_enabled && stateless_2026 {
         for name in super::workbench::CANONICAL_TOOLS {
@@ -550,7 +568,7 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
                         description: model.description.into(),
                         discovery_keywords: model.discovery_keywords,
                     };
-                    let mut value = mcp_tool_descriptor_json(spec, compact, false, None);
+                    let mut value = mcp_tool_descriptor_json(spec, compact, false);
                     attach_app_visibility(&mut value);
                     tools.push(value);
                 }
@@ -589,7 +607,7 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
                     discovery_keywords: definition.model_spec.unwrap().discovery_keywords,
                 };
                 for spec in filter_descriptors_for_oauth(vec![spec], auth) {
-                    let mut value = mcp_tool_descriptor_json(spec, compact, false, None);
+                    let mut value = mcp_tool_descriptor_json(spec, compact, false);
                     attach_app_visibility(&mut value);
                     tools.push(value);
                 }
@@ -617,12 +635,13 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
             auth,
         )
         .into_iter()
+        .filter(|spec| exposure.allows(&spec.name))
         .map(|spec| {
             let agent_continuation_tool = is_agent_continuation_app_tool_name(&spec.name);
             let job_terminal_continuation_tool =
                 is_job_terminal_continuation_app_tool_name(&spec.name);
             let goal_sync_tool = spec.name == "sync_goal_plan";
-            let mut value = mcp_tool_descriptor_json(spec, compact, false, None);
+            let mut value = mcp_tool_descriptor_json(spec, compact, false);
             attach_app_visibility(&mut value);
             if agent_continuation_tool || job_terminal_continuation_tool || goal_sync_tool {
                 // Bridge helpers return data to an existing View; they never
@@ -663,6 +682,19 @@ pub(super) fn mcp_tools_list_payload_with_features_for_auth(
                     .map(|scopes| json!({ "type": "oauth2", "scopes": scopes }))
                     .collect::<Vec<_>>());
             }
+        }
+    }
+    // Project once from canonical schemas. Re-projecting an already wrapped
+    // gateway SuggestedToolCall can mistake the gateway itself for its target.
+    for tool in &mut tools {
+        if let Some(schema) = tool.get_mut("outputSchema") {
+            project_suggested_tool_call_schema(schema, &|name| {
+                exposure.route(
+                    super::request_policy::McpSurface::Adaptive,
+                    name,
+                    stateless_2026,
+                )
+            });
         }
     }
     json!({ "tools": tools })
@@ -927,8 +959,8 @@ fn add_stateless_window_reply_output_schema(tool: &mut Value) {
 pub(super) const RECORDING_SESSION_SELECTOR_SCHEMA_PATTERN: &str =
     "^(~s[1-9][0-9]{0,19}|wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32}))$";
 
-fn stateless_invocation_envelope_schema(tool_name: &str) -> Value {
-    let allowed = mcp_invocation_envelope_supported_fields(tool_name);
+fn invocation_envelope_schema(tool_name: &str, full: bool) -> Value {
+    let allowed = mcp_invocation_fields_for_surface(tool_name, full);
     let mut properties = serde_json::Map::new();
     if allowed.contains(&"compact_execution") {
         properties.insert("compact_execution".to_string(), json!({
@@ -995,7 +1027,7 @@ fn stateless_invocation_envelope_schema(tool_name: &str) -> Value {
     if allowed.contains(&"control") {
         properties.insert(
             "control".to_string(),
-            crate::tool_runtime::control_sidecar::input_schema(tool_name),
+            invocation::mcp_control_sidecar_input_schema(tool_name),
         );
     }
     json!({
@@ -1004,6 +1036,45 @@ fn stateless_invocation_envelope_schema(tool_name: &str) -> Value {
         "description": "Optional untrusted model-supplied WebCodex invocation sidecars. Omit when unused. Never grants authority, changes the business target, or supplies Host/Window trust.",
         "properties": properties
     })
+}
+
+pub(super) fn add_invocation_envelope_input_schema(
+    tool_name: &str,
+    input_schema: &mut Value,
+    full: bool,
+) {
+    let envelope = invocation_envelope_schema(tool_name, full);
+    if envelope["properties"]
+        .as_object()
+        .is_none_or(|fields| fields.is_empty())
+    {
+        return;
+    }
+    if let Some(properties) = input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(MCP_INVOCATION_ENVELOPE_FIELD.to_string(), envelope);
+    }
+}
+
+fn add_collaboration_invocation_metadata(payload: &mut Value) {
+    let Some(tools) = payload.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        // App-only calls keep their own exact input contracts.
+        if tool.pointer("/_meta/ui/visibility") == Some(&json!(["app"])) {
+            continue;
+        }
+        let Some(name) = tool["name"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        add_invocation_envelope_input_schema(&name, &mut tool["inputSchema"], false);
+        if stateless_window_reply_supported(Some(&name)) {
+            add_stateless_window_reply_output_schema(tool);
+        }
+    }
 }
 
 pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
@@ -1042,7 +1113,7 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
         };
         properties.insert(
             MCP_INVOCATION_ENVELOPE_FIELD.to_string(),
-            stateless_invocation_envelope_schema(name),
+            invocation_envelope_schema(name, true),
         );
 
         if name == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
@@ -1066,6 +1137,9 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
                     }
                 }
             }
+        }
+        if name == "work_on_project" {
+            tool["description"] = json!(super::discovery::bootstrap_description(true));
         }
         add_stateless_context_projection_output_schema(tool);
         add_stateless_session_attention_output_schema(tool);
@@ -1187,7 +1261,7 @@ fn attach_app_visibility(value: &mut Value) {
     ui.insert("visibility".to_string(), json!(["app"]));
 }
 
-fn is_agent_continuation_app_tool_name(tool_name: &str) -> bool {
+pub(super) fn is_agent_continuation_app_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "bind_agent_continuation"
@@ -1201,7 +1275,7 @@ fn is_agent_continuation_app_tool_name(tool_name: &str) -> bool {
     )
 }
 
-fn is_job_terminal_continuation_app_tool_name(tool_name: &str) -> bool {
+pub(super) fn is_job_terminal_continuation_app_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "bind_job_terminal_continuation"
@@ -1573,6 +1647,15 @@ fn project_mcp_runtime_status_input_schema(input_schema: &mut Value) {
 fn project_mcp_model_default_input_schema(tool_name: &str, input_schema: &mut Value) {
     match tool_name {
         "get_runtime_status" => project_mcp_runtime_status_input_schema(input_schema),
+        "list_projects" => {
+            if let Some(summary) = input_schema
+                .pointer_mut("/properties/summary_only")
+                .and_then(Value::as_object_mut)
+            {
+                summary.insert("default".to_string(), json!(true));
+                summary.insert("description".to_string(), json!("MCP defaults to a Project identity/path/state summary. Set false for revision, shell, policy and smoke capabilities."));
+            }
+        }
         "observe_jobs" => {
             if let Some(summary) = input_schema
                 .pointer_mut("/properties/summary_only")
@@ -1581,12 +1664,19 @@ fn project_mcp_model_default_input_schema(tool_name: &str, input_schema: &mut Va
                 summary.insert("default".to_string(), json!(true));
                 summary.insert("description".to_string(), json!("MCP defaults to compact proven-success validation logs. Set false to expand retained logs from the original cursor. Failures, unknown results and ordinary commands keep full evidence."));
             }
+            if let Some(wake_on) = input_schema
+                .pointer_mut("/properties/wake_on")
+                .and_then(Value::as_object_mut)
+            {
+                wake_on.insert("default".to_string(), json!("meaningful_change"));
+                wake_on.insert("description".to_string(), json!("MCP defaults to meaningful_change (ignores pure heartbeats). Set change for all updates; terminal/all_terminal for completion. Missing tokens return an immediate baseline."));
+            }
         }
         _ => {}
     }
 }
 
-fn project_mcp_model_manifest_defaults(result: &mut ToolResult) {
+fn project_mcp_model_manifest_defaults(result: &mut ToolResult, context_sidecars: bool) {
     if !result.success {
         return;
     }
@@ -1596,6 +1686,13 @@ fn project_mcp_model_manifest_defaults(result: &mut ToolResult) {
         .to_string();
     if let Some(input_schema) = result.output.get_mut("input_schema") {
         project_mcp_model_default_input_schema(&tool_name, input_schema);
+        if !context_sidecars {
+            add_invocation_envelope_input_schema(&tool_name, input_schema, false);
+        }
+    }
+    if tool_name == "work_on_project" {
+        result.output["description"] =
+            json!(super::discovery::bootstrap_description(context_sidecars));
     }
 }
 
@@ -1604,7 +1701,7 @@ fn project_mcp_model_manifest_defaults(result: &mut ToolResult) {
 pub(super) fn project_mcp_model_argument_defaults(tool_name: &str, arguments: &mut Value) {
     let field = match tool_name {
         "get_runtime_status" => "compact",
-        "observe_jobs" => "summary_only",
+        "observe_jobs" | "list_projects" => "summary_only",
         _ => return,
     };
     if arguments.is_null() {
@@ -1612,20 +1709,21 @@ pub(super) fn project_mcp_model_argument_defaults(tool_name: &str, arguments: &m
     }
     if let Some(arguments) = arguments.as_object_mut() {
         arguments.entry(field).or_insert(json!(true));
+        if tool_name == "observe_jobs" {
+            arguments
+                .entry("wake_on")
+                .or_insert(json!("meaningful_change"));
+        }
     }
 }
 
-fn mcp_tool_descriptor_json(
+pub(super) fn mcp_tool_descriptor_json(
     descriptor: ToolDescriptor,
     compact: bool,
     app_enabled: bool,
-    stateless_output_projection: Option<bool>,
 ) -> Value {
     if !compact {
-        let mut spec = descriptor.into_spec();
-        if let Some(stateless) = stateless_output_projection {
-            spec = project_mcp_tool_spec_output_schema(spec, stateless);
-        }
+        let spec = descriptor.into_spec();
         return mcp_tool_spec_json(spec, false, app_enabled);
     }
     let input_schema = descriptor.input_schema();
@@ -1661,6 +1759,9 @@ fn mcp_tool_parts_json(
 ) -> Value {
     let compact = output_schema.is_none();
     let tool_name = name.clone();
+    if tool_name == "work_on_project" {
+        description = super::discovery::bootstrap_description(false);
+    }
     project_mcp_model_default_input_schema(&tool_name, &mut input_schema);
     if tool_name == "get_runtime_status" {
         description
@@ -1668,7 +1769,7 @@ fn mcp_tool_parts_json(
     }
 
     if tool_name == "observe_jobs" {
-        description.push_str(" MCP defaults summary_only=true; set false for full retained logs.");
+        description.push_str(" MCP defaults: wake_on=meaningful_change, summary_only=true.");
     }
 
     if matches!(tool_name.as_str(), "observe_computer" | "observe_browser") {
@@ -1772,6 +1873,10 @@ pub(super) async fn handle_list_with_runtime(
         stateless_2026,
         compact_schemas,
         app_enabled,
+        runtime
+            .runtime_info
+            .mcp_tool_exposure
+            .resolve(super::request_policy::McpSurface::Adaptive, auth),
     )
     .await
 }
@@ -1784,7 +1889,17 @@ pub(super) async fn handle_list(
     compact_schemas: bool,
     app_enabled: bool,
 ) -> McpOutcome {
-    handle_list_inner(None, id, auth, stateless_2026, compact_schemas, app_enabled).await
+    // Canonical all-enabled inventory fixture; request-policy tests use a runtime snapshot.
+    handle_list_inner(
+        None,
+        id,
+        auth,
+        stateless_2026,
+        compact_schemas,
+        app_enabled,
+        super::tool_exposure::ToolExposure::ALL,
+    )
+    .await
 }
 
 async fn handle_list_inner(
@@ -1794,12 +1909,14 @@ async fn handle_list_inner(
     stateless_2026: bool,
     compact_schemas: bool,
     app_enabled: bool,
+    exposure: super::tool_exposure::ToolExposure,
 ) -> McpOutcome {
-    let mut result = mcp_tools_list_payload_with_features_for_auth(
+    let mut result = mcp_tools_list_payload_with_exposure(
         compact_schemas,
         app_enabled,
         stateless_2026,
         auth,
+        exposure,
     );
     if let Some(runtime) = runtime.filter(|_| app_enabled) {
         let settings = runtime.workbench_settings(auth);
@@ -1819,21 +1936,17 @@ async fn handle_list_inner(
     }
     if stateless_2026 {
         add_stateless_workflow_recorder_metadata(&mut result);
+    } else {
+        add_collaboration_invocation_metadata(&mut result);
     }
     if crate::mcp_gateway::authorized(auth) {
         if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
             let mut spec = crate::mcp_gateway::tool_spec();
-            if stateless_2026 {
-                if let Some(properties) = spec
-                    .pointer_mut("/inputSchema/properties")
-                    .and_then(Value::as_object_mut)
-                {
-                    properties.insert(
-                        MCP_INVOCATION_ENVELOPE_FIELD.to_string(),
-                        stateless_invocation_envelope_schema(crate::mcp_gateway::MCP_TOOL_NAME),
-                    );
-                }
-            }
+            add_invocation_envelope_input_schema(
+                crate::mcp_gateway::MCP_TOOL_NAME,
+                &mut spec["inputSchema"],
+                stateless_2026,
+            );
             tools.push(spec);
         }
     }

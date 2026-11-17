@@ -8,6 +8,25 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Bind a manually seeded Session fixture to the Project root already
+/// registered by its Runner. This models the real Session creation boundary;
+/// an unknown Project stays unbound rather than guessing an identity.
+pub(crate) async fn registered_session_project_identity(
+    runtime: &crate::tool_runtime::ToolRuntime,
+    project: &str,
+    auth: Option<&crate::auth::AuthContext>,
+) -> Option<String> {
+    let resolved = runtime
+        .resolve_project_input_for_auth(project, auth)
+        .await
+        .ok()?;
+    crate::tool_runtime::workflow_project_identity(
+        resolved.root_fingerprint.as_deref(),
+        &resolved.config.path,
+        resolved.registration_incarnation.as_deref(),
+    )
+}
+
 /// Create a test temp directory on the Cargo build filesystem.
 ///
 /// Some hardened hosts mount the system temp directory with `noexec`. Tests
@@ -182,6 +201,7 @@ pub(crate) fn runner_registration(
 ) -> crate::runner_protocol::RunnerRegisterRequest {
     crate::runner_protocol::RunnerRegisterRequest {
         computer_session_availability: None,
+        computer_control_epoch: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,

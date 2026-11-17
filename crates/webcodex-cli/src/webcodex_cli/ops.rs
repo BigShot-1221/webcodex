@@ -25,6 +25,14 @@ pub(crate) struct OpsSmokePreflightOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpsDiagnoseProviderOptions {
+    pub(crate) common: OpsCommonOptions,
+    pub(crate) project: String,
+    pub(crate) provider: String,
+    pub(crate) include_live_acp: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpsWindowsOptions {
     pub(crate) common: OpsCommonOptions,
     pub(crate) project: String,
@@ -46,6 +54,7 @@ pub(crate) enum OpsCommand {
     Projects(OpsCommonOptions),
     Windows(OpsWindowsOptions),
     SmokePreflight(OpsSmokePreflightOptions),
+    DiagnoseProvider(OpsDiagnoseProviderOptions),
 }
 
 impl OpsCommand {
@@ -57,6 +66,7 @@ impl OpsCommand {
             OpsCommand::Runner(opts) => opts.common.strict,
             OpsCommand::Windows(opts) => opts.common.strict,
             OpsCommand::SmokePreflight(opts) => opts.common.strict,
+            OpsCommand::DiagnoseProvider(opts) => opts.common.strict,
         }
     }
 }
@@ -189,7 +199,9 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
         OpsCommand::Projects(opts) => {
             let token = resolve_ops_token(&opts)?;
             let report =
-                match fetch_projects(&opts.server_url, &opts.server_http, token.as_deref()).await {
+                match fetch_projects(&opts.server_url, &opts.server_http, token.as_deref(), None)
+                    .await
+                {
                     Ok(projects) => ops_projects_report(&opts.server_url, Some(&projects)),
                     Err(failure) => ops_http_failure_report(
                         &opts.server_url,
@@ -251,6 +263,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 &opts.common.server_url,
                 &opts.common.server_http,
                 token.as_deref(),
+                Some(&opts.project),
             )
             .await
             {
@@ -333,6 +346,37 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 hygiene.as_ref(),
             );
             render_ops_command_output(report, opts.common.json, render_ops_smoke_preflight)
+        }
+        OpsCommand::DiagnoseProvider(opts) => {
+            let token = resolve_ops_token(&opts.common)?;
+            let report = match call_runtime_tool(
+                &opts.common.server_url,
+                &opts.common.server_http,
+                token.as_deref(),
+                "diagnose_coding_agent",
+                json!({
+                    "project": opts.project,
+                    "provider_id": opts.provider,
+                    "include_live_acp": opts.include_live_acp,
+                }),
+            )
+            .await
+            {
+                Ok(output) => ops_diagnose_provider_report(
+                    &opts.common.server_url,
+                    &opts.project,
+                    &opts.provider,
+                    opts.include_live_acp,
+                    output.as_ref(),
+                ),
+                Err(failure) => ops_http_failure_report(
+                    &opts.common.server_url,
+                    "diagnose_coding_agent",
+                    failure,
+                    token.is_some(),
+                ),
+            };
+            render_ops_command_output(report, opts.common.json, render_ops_diagnose_provider)
         }
     }
 }
@@ -482,10 +526,56 @@ async fn fetch_projects(
     server_url: &str,
     server_http: &ServerHttpOptions,
     token: Option<&str>,
+    project: Option<&str>,
 ) -> Result<Value, OpsHttpFailure> {
-    call_runtime_tool(server_url, server_http, token, "list_projects", json!({}))
-        .await
-        .map(|output| output.unwrap_or(Value::Null))
+    // Operator fleet reports explicitly traverse bounded pages. Exact smoke
+    // targets never depend on their position in the global inventory.
+    let mut projects = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut offset = 0;
+    for page in 0..20 {
+        let mut arguments = json!({"limit":100,"offset":offset,"summary_only":false});
+        if let Some(project) = project {
+            arguments["project"] = json!(project);
+        }
+        let mut output =
+            call_runtime_tool(server_url, server_http, token, "list_projects", arguments)
+                .await?
+                .unwrap_or(Value::Null);
+        let Some(rows) = output.get("projects").and_then(Value::as_array) else {
+            return Err(OpsHttpFailure::from_transport_error(
+                "invalid project inventory page".into(),
+            ));
+        };
+        for row in rows {
+            let Some(id) = row["id"].as_str() else {
+                return Err(OpsHttpFailure::from_transport_error(
+                    "project inventory row omitted identity".into(),
+                ));
+            };
+            if seen.insert(id.to_string()) {
+                projects.push(row.clone());
+            }
+        }
+        let next = output["next_offset"].as_u64();
+        if project.is_some() || next.is_none() || page == 19 {
+            output["count"] = json!(projects.len());
+            output["projects"] = json!(projects);
+            output["offset"] = json!(0);
+            // Preserve an older Server's explicit truncation too; never claim
+            // complete inventory merely because it omitted a continuation.
+            output["truncated"] = json!(next.is_some() || output["truncated"] == true);
+            return Ok(output);
+        }
+        let next = next.unwrap();
+        if next <= offset {
+            return Err(OpsHttpFailure::from_transport_error(
+                "non-advancing project inventory page".into(),
+            ));
+        }
+        offset = next;
+    }
+    unreachable!("the final bounded page returns")
 }
 
 fn ops_http_failure_report(
@@ -842,6 +932,10 @@ pub(crate) fn ops_projects_report(server_url: &str, projects: Option<&Value>) ->
     let mut verdict = OpsVerdict::pass();
     let projects_list = project_entries(projects);
     let total = projects_list.len();
+    let truncated = projects.is_some_and(|value| value["truncated"] == true);
+    if truncated {
+        verdict.warn_reason("project_inventory_truncated", "the operator report reached its bounded inventory limit; use list_projects filters and next_offset for the remaining Projects");
+    }
     let online = projects_list
         .iter()
         .filter(|project| project_online(project))
@@ -902,6 +996,8 @@ pub(crate) fn ops_projects_report(server_url: &str, projects: Option<&Value>) ->
     }
     let summary = json!({
         "count": total,
+        "matched_count": projects.and_then(|value| value["matched_count"].as_u64()).unwrap_or(total as u64),
+        "truncated": truncated,
         "online_count": online,
         "disconnected_count": disconnected,
         "stale_count": stale,
@@ -1169,6 +1265,158 @@ pub(crate) fn render_ops_runner(report: &OpsReport, json_output: bool) -> Result
             "  {field}: {}\n",
             display_value(&report.summary["build"][field])
         ));
+    }
+    out.push_str(&render_reasons(report));
+    Ok(out)
+}
+
+/// Operator report for one `diagnose_coding_agent` call. Everything shown is
+/// already the bounded Server projection: presence booleans, safe provider
+/// inventory, and the optional live ACP diagnostic. No environment values,
+/// provider stderr, or credentials ever appear here.
+pub(crate) fn ops_diagnose_provider_report(
+    server_url: &str,
+    project: &str,
+    provider: &str,
+    include_live_acp: bool,
+    output: Option<&Value>,
+) -> OpsReport {
+    let mut verdict = OpsVerdict::pass();
+    let output = output.cloned().unwrap_or(Value::Null);
+    let summary = json!({
+        "server_url": server_url,
+        "project": project,
+        "provider_id": provider,
+        "include_live_acp": include_live_acp,
+        "env_presence": output["env_presence"],
+        "live_acp": output["live_acp"],
+        "error_kind": output.get("error_kind").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(error_kind) = output["error_kind"].as_str() {
+        verdict.fail_reason(
+            error_kind,
+            "fix the reported input/authority problem and re-run; the Server never retried the diagnostic",
+        );
+        return OpsReport {
+            verdict,
+            summary,
+            source: json!({
+                "server_url": server_url,
+                "tool": "diagnose_coding_agent",
+                "provider_id": provider,
+            }),
+        };
+    }
+    let mut absent: Vec<String> = Vec::new();
+    if let Some(map) = output["env_presence"].as_object() {
+        for (name, present) in map {
+            if present.as_bool() != Some(true) {
+                absent.push(name.clone());
+            }
+        }
+    }
+    if !absent.is_empty() {
+        absent.sort();
+        verdict.warn_reason(
+            "env_source_absent",
+            &format!(
+                "declared env_from_env sources absent from the running Runner process: {} (names only; values are never printed)",
+                absent.join(", ")
+            ),
+        );
+    }
+    if include_live_acp {
+        let live = &output["live_acp"];
+        let outcome = live["outcome"].as_str().unwrap_or("missing");
+        if outcome != "ok" {
+            let phase = live["phase"].as_str().unwrap_or("unknown");
+            verdict.fail_reason(
+                "live_acp_probe_failed",
+                &format!(
+                    "live ACP probe stopped at outcome={outcome} phase={phase}; re-observe the Runner provider inventory and fix the provider configuration"
+                ),
+            );
+        } else if live["options_truncated"] == true {
+            verdict.warn_reason(
+                "live_acp_options_truncated",
+                "the live option projection hit its bounded limit; unlisted options exist on the live session",
+            );
+        }
+    }
+    OpsReport {
+        verdict,
+        summary,
+        source: json!({
+            "server_url": server_url,
+            "tool": "diagnose_coding_agent",
+            "provider_id": provider,
+        }),
+    }
+}
+
+pub(crate) fn render_ops_diagnose_provider(
+    report: &OpsReport,
+    json_output: bool,
+) -> Result<String, String> {
+    if json_output {
+        return render_ops_json(report);
+    }
+    let summary = &report.summary;
+    let mut out = render_overall_header(report);
+    out.push_str(&render_http_failure(report));
+    out.push_str(&format!(
+        "Provider diagnose:\n  project={} provider_id={} include_live_acp={}\n",
+        display_value(&summary["project"]),
+        display_value(&summary["provider_id"]),
+        display_value(&summary["include_live_acp"]),
+    ));
+    out.push_str("Environment mappings:\n");
+    match summary["env_presence"].as_object() {
+        Some(map) if !map.is_empty() => {
+            for (name, present) in map {
+                out.push_str(&format!(
+                    "  {} {}\n",
+                    name,
+                    if present.as_bool() == Some(true) {
+                        "present"
+                    } else {
+                        "ABSENT"
+                    }
+                ));
+            }
+        }
+        _ => out.push_str("  (none declared)\n"),
+    }
+    let live = &summary["live_acp"];
+    if summary["include_live_acp"] == true {
+        out.push_str("Live ACP:\n");
+        if live.is_null() {
+            out.push_str("  (not reported)\n");
+        } else {
+            out.push_str(&format!(
+                "  outcome={} phase={} protocol_version={} options={} options_truncated={}\n",
+                display_value(&live["outcome"]),
+                display_value(&live["phase"]),
+                display_value(&live["protocol_version"]),
+                display_value(&json!(live["options"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or(0))),
+                display_value(&live["options_truncated"]),
+            ));
+            for option in live["options"].as_array().into_iter().flatten() {
+                out.push_str(&format!(
+                    "  {} kind={} choices={} current={}\n",
+                    display_value(&option["id"]),
+                    display_value(&option["kind"]),
+                    display_value(&json!(option["choices"]
+                        .as_array()
+                        .map(Vec::len)
+                        .unwrap_or(0))),
+                    display_value(&option["current"]),
+                ));
+            }
+        }
     }
     out.push_str(&render_reasons(report));
     Ok(out)

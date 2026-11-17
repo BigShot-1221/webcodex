@@ -34,6 +34,9 @@ fn fixture(marker: &str) -> (tempfile::TempDir, PathBuf, PathBuf, RunnerPolicy) 
 
 fn request() -> ProjectBuildRequest {
     ProjectBuildRequest {
+        profile: None,
+        targets: None,
+        artifact_policy: None,
         dependency_resolution_policy: None,
         project_id: "demo".into(),
         cwd: None,
@@ -41,6 +44,135 @@ fn request() -> ProjectBuildRequest {
         scope: None,
         dependency_policy: None,
     }
+}
+
+#[test]
+fn project_build_rust_options_preserve_provenance_and_reject_auto_other_backend() {
+    let (_temp, root, registry, policy) = fixture("Cargo.toml");
+    let mut selected = request();
+    selected.profile = Some("dogfood".into());
+    let (plan, cwd) = project_build::plan(&policy, &registry, &selected).unwrap();
+    assert_eq!(plan.process.args, ["build", "--profile", "dogfood"]);
+    let operation = start_build_operation(&plan, &cwd);
+    assert!(project_build::fence(&policy, &registry, &operation).is_ok());
+    fs::write(root.join("Cargo.toml"), "# profile source drift\n").unwrap();
+    assert!(project_build::fence(&policy, &registry, &operation)
+        .unwrap_err()
+        .contains("build_plan_stale"));
+    let (_temp, _root, registry, policy) = fixture("go.mod");
+    assert!(
+        matches!(project_build::plan(&policy,&registry,&selected),Err(ProjectBuildPlanningResult::Unavailable {code,..}) if code == "build_options_unsupported")
+    );
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real Cargo library/binary/custom profile output observation; no downloads"]
+fn runner_real_process_project_build_rust_options_observe_selected_cached_artifacts() {
+    use crate::webcodex_runner::config::ShellConfig;
+    use crate::webcodex_runner::shell::PreparedShellProfileCache;
+    use std::sync::atomic::AtomicBool;
+    let (_temp, root, registry, policy) = fixture("Cargo.toml");
+    fs::create_dir_all(root.join("src/bin")).unwrap();
+    fs::write(root.join("Cargo.toml"),"[package]\nname='bounded-artifact-demo'\nversion='0.1.0'\nedition='2021'\n[workspace]\nmembers=['excluded']\n[profile.dogfood]\ninherits='dev'\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn answer()->u32 {42}\n").unwrap();
+    fs::write(
+        root.join("src/bin/chosen.rs"),
+        "fn main(){println!(\"chosen\");}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/bin/unselected.rs"),
+        "compile_error!(\"unselected must not compile\");\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("excluded/src")).unwrap();
+    fs::write(
+        root.join("excluded/Cargo.toml"),
+        "[package]\nname='excluded'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("excluded/src/lib.rs"),
+        "compile_error!(\"excluded member must not compile\");\n",
+    )
+    .unwrap();
+    // Keep fixture outputs inside its Project even when the test invoker uses
+    // a shared Cargo target cache for compiling the Runner itself.
+    let mut shell = ShellConfig::default();
+    shell.env.insert(
+        "CARGO_TARGET_DIR".into(),
+        root.join("target").to_str().unwrap().into(),
+    );
+    let mut selected = request();
+    selected.profile = Some("dogfood".into());
+    selected.targets = Some(ProjectBuildTargets {
+        library: true,
+        binaries: vec!["chosen".into()],
+    });
+    selected.artifact_policy = Some(ProjectBuildArtifactPolicy::Observe);
+    selected.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
+    for index in 0..4 {
+        if index == 2 {
+            selected.scope = Some(ProjectBuildScope {
+                packages: Vec::new(),
+                all_packages: true,
+                exclude_packages: vec!["excluded".into()],
+            });
+        }
+        let (plan, cwd) = project_build::plan(&policy, &registry, &selected).unwrap();
+        let operation = start_build_operation(&plan, &cwd);
+        let (result, artifacts) = project_build::run_rust_build(
+            1,
+            &policy,
+            &shell,
+            &registry,
+            &PreparedShellProfileCache::default(),
+            &operation,
+            &AtomicBool::new(false),
+            &|| {},
+        );
+        assert_eq!(result.result.exit_code, Some(0), "{result:?}");
+        assert!(result.result.error.is_none(), "{result:?}");
+        let artifacts = artifacts.expect("verified Cargo outputs");
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.path.contains("chosen")),
+            "{artifacts:?}"
+        );
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with(".rlib")),
+            "{artifacts:?}"
+        );
+        for artifact in artifacts {
+            assert!(!artifact.path.contains("excluded"));
+            let bytes = fs::read(root.join(&artifact.path)).unwrap();
+            assert_eq!(artifact.bytes, bytes.len() as u64);
+            assert_eq!(
+                artifact.sha256,
+                format!("{:x}", sha2::Sha256::digest(&bytes))
+            );
+        }
+    }
+    assert!(!root.join("target/dogfood/unselected").exists());
+    let mut missing = selected;
+    missing.profile = Some("missing-profile".into());
+    let (plan, cwd) = project_build::plan(&policy, &registry, &missing).unwrap();
+    let (result, artifacts) = project_build::run_rust_build(
+        1,
+        &policy,
+        &shell,
+        &registry,
+        &PreparedShellProfileCache::default(),
+        &start_build_operation(&plan, &cwd),
+        &AtomicBool::new(false),
+        &|| {},
+    );
+    assert_ne!(result.result.exit_code, Some(0));
+    assert!(artifacts.is_none());
 }
 
 #[test]
@@ -90,6 +222,9 @@ fn project_build_runner_plans_locked_dependency_policy_for_rust_and_go() {
     ] {
         let (_tmp, _root, registry, policy) = fixture(marker);
         let request = ProjectBuildRequest {
+            profile: None,
+            targets: None,
+            artifact_policy: None,
             dependency_resolution_policy: None,
             project_id: "demo".into(),
             cwd: None,
@@ -178,6 +313,7 @@ fn project_build_package_scope_maps_to_bounded_backend_argv() {
     rust.scope = Some(ProjectBuildScope {
         packages: vec!["package-b".into(), "package-a".into(), "package-a".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     let (plan, _) = project_build::plan(&policy, &registry, &rust).unwrap();
     assert_eq!(
@@ -190,6 +326,7 @@ fn project_build_package_scope_maps_to_bounded_backend_argv() {
     go.scope = Some(ProjectBuildScope {
         packages: vec!["./cmd/...".into(), "./internal".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     let (plan, _) = project_build::plan(&policy, &registry, &go).unwrap();
     assert_eq!(plan.process.args, ["build", "./cmd/...", "./internal"]);
@@ -198,6 +335,7 @@ fn project_build_package_scope_maps_to_bounded_backend_argv() {
     invalid.scope = Some(ProjectBuildScope {
         packages: vec!["not-relative".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     assert!(matches!(
         project_build::plan(&policy, &registry, &invalid),
@@ -262,13 +400,19 @@ fn project_build_all_packages_member_manifest_change_fails_queue_fence() {
     let (_tmp, root, registry, policy) = fixture("Cargo.toml");
     fs::write(
         root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n",
+        "[workspace]\nmembers = [\"member\", \"other\"]\nresolver = \"2\"\n",
     )
     .unwrap();
     fs::create_dir_all(root.join("member/src")).unwrap();
     fs::write(
         root.join("member/Cargo.toml"),
         "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("other/src")).unwrap();
+    fs::write(
+        root.join("other/Cargo.toml"),
+        "[package]\nname = \"other\"\nversion = \"0.1.0\"\n",
     )
     .unwrap();
 
@@ -278,10 +422,14 @@ fn project_build_all_packages_member_manifest_change_fails_queue_fence() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: vec!["member".into()],
     });
 
     let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
-    assert_eq!(plan.process.args, ["build", "--workspace"]);
+    assert_eq!(
+        plan.process.args,
+        ["build", "--workspace", "--exclude", "member"]
+    );
     let operation = start_build_operation(&plan, &cwd);
     project_build::fence(&policy, &registry, &operation).unwrap();
 
@@ -293,6 +441,40 @@ fn project_build_all_packages_member_manifest_change_fails_queue_fence() {
     assert!(project_build::fence(&policy, &registry, &operation)
         .unwrap_err()
         .contains("build_plan_stale"));
+}
+
+#[test]
+fn project_build_workspace_exclusions_reject_unknown_or_all_members_before_plan() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for (path, name) in [("a", "alpha"), ("b", "beta")] {
+        fs::create_dir_all(root.join(path).join("src")).unwrap();
+        fs::write(
+            root.join(path).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+        )
+        .unwrap();
+    }
+    for excluded in [
+        vec!["missing".to_string()],
+        vec!["alpha".into(), "beta".into()],
+    ] {
+        let mut request = request();
+        request.scope = Some(ProjectBuildScope {
+            packages: Vec::new(),
+            all_packages: true,
+            exclude_packages: excluded,
+        });
+        let error = project_build::plan(&policy, &registry, &request).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("build_scope_invalid"),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]
@@ -344,6 +526,7 @@ fn project_build_all_packages_target_member_change_fails_queue_fence() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
     assert_eq!(plan.process.args, ["build", "--workspace"]);
@@ -386,6 +569,7 @@ fn project_build_all_packages_member_symlink_retarget_fails_queue_fence() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
     let operation = start_build_operation(&plan, &cwd);
@@ -412,6 +596,7 @@ fn project_build_all_packages_supports_single_rust_package() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
 
     let (plan, _) = project_build::plan(&policy, &registry, &req).unwrap();
@@ -441,6 +626,7 @@ fn project_build_all_packages_recursive_glob_cycle_fails_queue_fence() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
     let operation = start_build_operation(&plan, &cwd);
@@ -467,6 +653,7 @@ fn project_build_all_packages_parent_workspace_appearance_fails_queue_fence() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project_build::plan(&policy, &registry, &req).unwrap();
     let operation = start_build_operation(&plan, &cwd);
@@ -506,6 +693,7 @@ fn project_build_all_packages_rejects_excluded_recipe_cwd() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     assert!(
         matches!(project_build::plan(&policy, &registry, &req), Err(ProjectBuildPlanningResult::Unavailable { code, .. }) if code == "build_scope_unavailable")
@@ -548,6 +736,7 @@ fn python_packaging_plans_manifest_and_backend_input_fences() {
     req.scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     assert!(
         matches!(project_build::plan(&policy,&registry,&req),Err(ProjectBuildPlanningResult::Unavailable { code,.. }) if code == "build_scope_invalid")
@@ -754,6 +943,7 @@ fn node_build_manifest_script_manager_scope_and_stale_fence() {
     req.scope = Some(ProjectBuildScope {
         packages: vec![],
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     assert!(
         matches!(project_build::plan(&policy, &registry, &req), Err(ProjectBuildPlanningResult::Unavailable { code, .. }) if code == "build_scope_unsupported")

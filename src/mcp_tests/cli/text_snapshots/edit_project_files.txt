@@ -1,0 +1,2 @@
+Dry run; no files written.
+edit src/main.rs (1 edits, lines 1-1); read_revision 7

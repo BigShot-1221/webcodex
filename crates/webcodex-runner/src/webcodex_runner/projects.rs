@@ -24,6 +24,7 @@ mod lifecycle;
 mod managed_worktree;
 mod registration;
 
+pub(crate) use catalog::load_runner_project_metadata;
 pub(crate) use catalog::{
     find_project_shell_context, find_project_shell_context_by_id,
     load_runner_project_summaries_from_dir, project_root_fingerprint,
@@ -106,6 +107,8 @@ pub(crate) struct RunnerProjectFile {
     pub(crate) kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) registration_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) registration_incarnation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     #[serde(default)]
@@ -294,6 +297,7 @@ mod durability_tests {
             name: None,
             kind: None,
             registration_source: None,
+            registration_incarnation: None,
             description: None,
             disabled: false,
             hooks: HashMap::new(),

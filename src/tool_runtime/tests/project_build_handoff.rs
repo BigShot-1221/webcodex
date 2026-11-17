@@ -13,6 +13,10 @@ use webcodex_core::project_build::{
 const CLIENT: &str = "project-build";
 
 async fn setup(grace_ms: u64) -> ToolRuntime {
+    setup_with_workspace_exclusions(grace_ms, false).await
+}
+
+async fn setup_with_workspace_exclusions(grace_ms: u64, workspace_exclusions: bool) -> ToolRuntime {
     let runtime = runtime_with_agent_project(CLIENT)
         .with_structured_execution_sync_wait(std::time::Duration::from_millis(grace_ms));
     register_agent(
@@ -21,7 +25,10 @@ async fn setup(grace_ms: u64) -> ToolRuntime {
         None,
         RunnerCapabilities {
             project_build_v1: true,
+            project_build_rust_options_v1: true,
             project_build_python_v1: true,
+            project_all_packages_v1: true,
+            project_workspace_exclusions_v1: workspace_exclusions,
             ..Default::default()
         },
     )
@@ -29,8 +36,40 @@ async fn setup(grace_ms: u64) -> ToolRuntime {
     runtime
 }
 
+#[tokio::test]
+async fn rust_project_build_options_require_capability_before_plan() {
+    let runtime = runtime_with_agent_project(CLIENT);
+    register_agent(
+        &runtime,
+        CLIENT,
+        None,
+        RunnerCapabilities {
+            project_build_v1: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut input = call();
+    if let ToolCall::ProjectBuild { profile, .. } = &mut input {
+        *profile = Some("dogfood".into());
+    }
+    let result = runtime
+        .dispatch_with_auth(input, Some(&auth_context(None, true)))
+        .await;
+    assert!(!result.success);
+    assert!(result
+        .error
+        .unwrap()
+        .contains("project_build_rust_options_v1"));
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
 fn call() -> ToolCall {
     ToolCall::ProjectBuild {
+        profile: None,
+        targets: None,
+        artifact_policy: None,
         project: agent_test_project_id(CLIENT),
         session_id: None,
         cwd: None,
@@ -69,18 +108,13 @@ async fn reply_plan(runtime: &ToolRuntime) -> (crate::runner_protocol::RunnerReq
         .runner_registry
         .complete(RunnerResultPayload {
             result: RunnerResultRequest {
-                client_id: CLIENT.into(),
-                runner_instance_id: "inst".into(),
-                request_id: request.request_id,
                 exit_code: Some(0),
                 stdout: Some(
                     serde_json::to_string(&ProjectBuildPlanningResult::Ready { plan }).unwrap(),
                 ),
                 stderr: Some(String::new()),
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(5),
-                error: None,
+                ..runner_result_request(CLIENT.into(), "inst".into(), request.request_id)
             },
             command_execution_state: Some(ShellCommandExecutionState::Completed),
             mcp_gateway: None,
@@ -107,25 +141,18 @@ async fn finish_build_job(
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: CLIENT.into(),
-            runner_instance_id: "inst".into(),
-            update_seq: None,
-            job_id: job_id.into(),
             request_id: Some(request.request_id.clone()),
-            status: status.into(),
-            stdout_chunk: None,
             stderr_chunk: stderr.map(str::to_string),
-            log_snapshot: None,
             exit_code,
             duration_ms: Some(25),
-            error: None,
             command_execution_state: Some(state),
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
-            build_artifacts: None,
-            activity: None,
-            finished: true,
+            ..runner_job_update(
+                CLIENT.into(),
+                "inst".into(),
+                job_id.into(),
+                status.into(),
+                true,
+            )
         })
         .await
         .unwrap();
@@ -183,28 +210,140 @@ async fn project_build_fast_success_uses_typed_start_build_and_sparse_late_proje
 
 #[tokio::test]
 async fn project_build_pending_projection_returns_the_same_durable_job() {
-    let runtime = setup(1).await;
+    for with_options in [false, true] {
+        let runtime = setup(1).await;
+        let mut input = call();
+        if with_options {
+            if let ToolCall::ProjectBuild {
+                profile, targets, ..
+            } = &mut input
+            {
+                *profile = Some("dogfood".into());
+                *targets = Some(webcodex_core::project_build::ProjectBuildTargets {
+                    library: true,
+                    binaries: vec!["server".into()],
+                });
+            }
+        }
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .dispatch_with_auth(input, Some(&auth_context(None, true)))
+                    .await
+            }
+        });
+        let (request, job_id) = reply_plan(&runtime).await;
+        let result = task.await.unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["execution_state"], "pending");
+        assert!(
+            result.output.get("backend").is_none(),
+            "late pending projection must keep only recovery authority, not build details"
+        );
+        assert_eq!(
+            result.output["continuation"]["arguments"]["items"][0]["job_id"],
+            job_id
+        );
+
+        finish_build_job(
+            &runtime,
+            &request,
+            &job_id,
+            "completed",
+            ShellCommandExecutionState::Completed,
+            Some(0),
+            None,
+        )
+        .await;
+        let job = runtime.runner_registry.get_job(&job_id).await.unwrap();
+        assert_eq!(job.kind, "project_build");
+        assert_eq!(
+            request
+                .process
+                .as_ref()
+                .unwrap()
+                .args
+                .iter()
+                .any(|arg| arg == "dogfood"),
+            with_options
+        );
+    }
+}
+
+#[tokio::test]
+async fn project_build_workspace_exclusion_requires_additive_runner_capability() {
+    let runtime = runtime_with_agent_project(CLIENT);
+    register_agent(
+        &runtime,
+        CLIENT,
+        None,
+        RunnerCapabilities {
+            project_build_v1: true,
+            project_all_packages_v1: true,
+            project_workspace_exclusions_v1: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut scoped = call();
+    let ToolCall::ProjectBuild { scope, .. } = &mut scoped else {
+        unreachable!()
+    };
+    *scope = Some(ProjectBuildScope {
+        packages: Vec::new(),
+        all_packages: true,
+        exclude_packages: vec!["package-b".into()],
+    });
+
+    let result = runtime
+        .dispatch_with_auth(scoped, Some(&auth_context(None, true)))
+        .await;
+    assert!(!result.success);
+    assert!(result
+        .error
+        .unwrap()
+        .contains("project_workspace_exclusions_v1"));
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
+async fn project_build_workspace_exclusion_handoff_keeps_same_job() {
+    let runtime = setup_with_workspace_exclusions(1, true).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
+            let mut input = call();
+            if let ToolCall::ProjectBuild { scope, .. } = &mut input {
+                *scope = Some(ProjectBuildScope {
+                    packages: Vec::new(),
+                    all_packages: true,
+                    exclude_packages: vec!["package-b".into()],
+                });
+            }
             runtime
-                .dispatch_with_auth(call(), Some(&auth_context(None, true)))
+                .dispatch_with_auth(input, Some(&auth_context(None, true)))
                 .await
         }
     });
     let (request, job_id) = reply_plan(&runtime).await;
-    let result = task.await.unwrap();
-    assert!(result.success, "{result:?}");
-    assert_eq!(result.output["execution_state"], "pending");
-    assert!(
-        result.output.get("backend").is_none(),
-        "late pending projection must keep only recovery authority, not build details"
-    );
+    let operation = request.decode_operation().unwrap();
+    let webcodex_core::runner_operation::RunnerOperation::Job(
+        webcodex_core::runner_operation::RunnerJobOperation::StartBuild(build),
+    ) = operation
+    else {
+        panic!("expected typed StartBuild");
+    };
     assert_eq!(
-        result.output["continuation"]["arguments"]["items"][0]["job_id"],
+        build.process.args,
+        ["build", "--workspace", "--exclude", "package-b"]
+    );
+    let pending = task.await.unwrap();
+    assert_eq!(
+        pending.output["continuation"]["arguments"]["items"][0]["job_id"],
         job_id
     );
-
     finish_build_job(
         &runtime,
         &request,
@@ -215,8 +354,10 @@ async fn project_build_pending_projection_returns_the_same_durable_job() {
         None,
     )
     .await;
-    let job = runtime.runner_registry.get_job(&job_id).await.unwrap();
-    assert_eq!(job.kind, "project_build");
+    assert_eq!(
+        runtime.runner_registry.get_job(&job_id).await.unwrap().kind,
+        "project_build"
+    );
 }
 
 #[tokio::test]
@@ -277,6 +418,7 @@ async fn project_build_all_packages_requires_additive_runner_capability() {
         RunnerCapabilities {
             project_build_v1: true,
             project_all_packages_v1: false,
+            project_workspace_exclusions_v1: false,
             ..Default::default()
         },
     )
@@ -289,6 +431,7 @@ async fn project_build_all_packages_requires_additive_runner_capability() {
     *scope = Some(ProjectBuildScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
 
     let result = runtime
@@ -329,25 +472,18 @@ async fn python_project_build_success_projects_observed_artifacts_without_correc
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: CLIENT.into(),
-            runner_instance_id: "inst".into(),
-            update_seq: None,
-            job_id: job_id.clone(),
             request_id: Some(request.request_id),
-            status: "completed".into(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(25),
-            error: None,
             command_execution_state: Some(ShellCommandExecutionState::Completed),
-            validation_progress: None,
-            test_count_evidence: None,
-            format_mutation: None,
             build_artifacts: Some(artifacts.clone()),
-            activity: None,
-            finished: true,
+            ..runner_job_update(
+                CLIENT.into(),
+                "inst".into(),
+                job_id.clone(),
+                "completed".into(),
+                true,
+            )
         })
         .await
         .unwrap();

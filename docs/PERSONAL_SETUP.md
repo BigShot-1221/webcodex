@@ -167,7 +167,9 @@ If you chose regular HTTPS MCP, the `login --print-mcp-config` command above pri
 
 That output contains a user credential. Only you should enter it into ChatGPT; do not paste it into issues, logs, or chat messages. Create an App / MCP connection in ChatGPT using the MCP URL and authentication method printed by the CLI, then run **Scan Tools**.
 
-If you chose OpenAI Secure MCP Tunnel, login does not need `--print-mcp-config` for ChatGPT. ChatGPT normally uses Tunnel + No authentication while the local tunnel client injects the WebCodex credential. Follow the Tunnel guide instead of copying the local Bearer into ChatGPT.
+If you chose OpenAI Secure MCP Tunnel for a **personal, same-owner** setup, login does not need `--print-mcp-config` for ChatGPT. ChatGPT uses Tunnel + No authentication while the local tunnel client injects that Server's WebCodex credential; it is **not** a separate per-user login. Follow the [Desktop Tunnel guide](desktop-install.md) instead of copying the local Bearer into ChatGPT.
+
+**ChatGPT Team/Business workspace:** Team is now called Business. Only workspace owners/admins can create and publish custom MCP plugins for a Business workspace; members should use the approved team connector. **Do not share a personal Desktop-backed Tunnel + No Auth plugin as the normal team setup:** it forwards requests using the owner's bootstrap/admin WebCodex identity, so publishing it does not create per-member identities or project permissions. For multi-user use, independently deploy a centrally managed Server with its Runners and appropriately scoped per-user/delegated credentials (such as managed-user OAuth or PAT where supported). Keep the Server bootstrap credential private. See [Authentication](AUTH_MODEL.md), [Deployment](DEPLOYMENT.md), and [Business workspace prerequisites](desktop-install.md#chatgpt-business-formerly-team-workspaces).
 
 ## 8. Verify the full experience
 

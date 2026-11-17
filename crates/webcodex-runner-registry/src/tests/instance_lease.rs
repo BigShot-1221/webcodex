@@ -30,22 +30,13 @@ async fn lease_different_online_instance_takes_over_immediately_and_retires_old_
     // passive last_seen grace: it takes over immediately even while A is fresh.
     let view = registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "oe".to_string(),
-            runner_instance_id: "inst-b".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
-            capabilities: async_job_capabilities(),
-            policy: None,
+            ..runner_registration_request(
+                "oe".to_string(),
+                "inst-b".to_string(),
+                crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                async_job_capabilities(),
+            )
         }))
         .await
         .unwrap();
@@ -206,21 +197,10 @@ async fn lease_stale_instance_job_update_rejected() {
     register_with_instance(&registry, "oe", "inst-a").await;
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -357,21 +337,10 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
     // replaces A, before any disconnect runs.
     let old_job = registry
         .start_job(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -391,21 +360,10 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
     // B starts a fresh job of its own after the replacement.
     let b_job = registry
         .start_job(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -521,26 +479,12 @@ async fn lease_register_notifier_rejects_stale_instance() {
 async fn lease_register_rejects_empty_instance_id() {
     let registry = RunnerRegistry::default();
     let err = registry
-        .register(current_runner_registration(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "oe".to_string(),
-            runner_instance_id: "".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
-            owner: None,
-            hostname: None,
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(
-                RunnerCapabilities::default(),
-            ),
-            policy: None,
-        }))
+        .register(current_runner_registration(runner_registration_request(
+            "oe".to_string(),
+            "".to_string(),
+            crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            crate::test_support::current_runner_capabilities(RunnerCapabilities::default()),
+        )))
         .await
         .unwrap_err();
     assert!(err.contains("agent_instance_id"), "error was: {err}");
@@ -562,58 +506,48 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
     };
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
             job_inventory: Some(crate::runner_protocol::ShellJobInventory {
                 active_complete: true,
                 jobs: Vec::new(),
             }),
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "oe".to_string(),
-            runner_instance_id: "inst-a".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
-            capabilities: capabilities(),
-            policy: None,
+            ..runner_registration_request(
+                "oe".to_string(),
+                "inst-a".to_string(),
+                crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                capabilities(),
+            )
         }))
         .await
         .unwrap();
 
     let job = registry
-        .start_job_with_metadata(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
+        .start_job(
+            JobStartRequest {
                 cwd: Some("/tmp".to_string()),
-                command: Some(String::new()),
-                timeout_secs: Some(60),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
+                timeout_secs: 60,
+                context: JobStartContext {
+                    purpose: Some("test".to_string()),
+                    shell: Some("direct_argv".to_string()),
+                    ..Default::default()
+                },
+                ..JobStartRequest::new(
+                    "oe",
+                    JobStartExecution::DetachedProcess {
+                        process: crate::runner_protocol::ShellProcessArgv {
+                            executable: "/bin/sleep".to_string(),
+                            args: vec!["60".to_string()],
+                        },
+                        stdin: None,
+                        idempotency_key: "lease-detached-transfer".to_string(),
+                        validation_identity: None,
+                        validation_tool: None,
+                    },
+                )
             },
             "tester".to_string(),
-            ShellJobStartMetadata {
-                purpose: Some("test".to_string()),
-                shell: Some("direct_argv".to_string()),
-                structured_execution: Some(StructuredJobExecution::DetachedProcess(
-                    crate::runner_protocol::ShellProcessArgv {
-                        executable: "/bin/sleep".to_string(),
-                        args: vec!["60".to_string()],
-                    },
-                )),
-                detached_idempotency_key: Some("lease-detached-transfer".to_string()),
-                ..Default::default()
-            },
+            None,
+            Some(&DetachedInitiatorIdentity::internal()),
         )
         .await
         .unwrap();
@@ -696,25 +630,17 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
         .await;
     let view = registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
             job_inventory: Some(crate::runner_protocol::ShellJobInventory {
                 active_complete: true,
                 jobs: vec![snapshot.clone()],
             }),
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "oe".to_string(),
-            runner_instance_id: "inst-b".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
-            capabilities: capabilities(),
-            policy: None,
+            ..runner_registration_request(
+                "oe".to_string(),
+                "inst-b".to_string(),
+                crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                capabilities(),
+            )
         }))
         .await
         .expect("exact detached recovery inventory must transfer to replacement instance");

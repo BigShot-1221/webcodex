@@ -269,6 +269,7 @@
   "tray.stopQuickShare": "Arrêter Quick Share",
   "tray.cancelOperation": "Annuler l’opération en cours",
   "tray.launchAtLogin": "Lancer à la connexion",
+  "tray.hideDockIcon": "Masquer l’icône du Dock quand la fenêtre est fermée",
   "tray.quit": "Quitter WebCodex",
   "first.advanced": "Avancé",
   "first.serverOnlyTitle": "Server uniquement",
@@ -302,5 +303,18 @@
   "completion.copied": "Demande de lecture copiée",
   "completion.identityPending": "L’identité du Runner n’est pas encore disponible. Actualisez l’environnement avant la lecture.",
   "completion.runnerId": "ID du Runner",
-  "completion.projectId": "ID du projet"
+  "completion.projectId": "ID du projet",
+  "tray.computerUnavailable": "Computer : état indisponible",
+  "tray.computerPausing": "Computer : pause en cours, commande non terminée",
+  "tray.computerPausedObserving": "Computer : commandes suspendues, observation active",
+  "tray.computerPaused": "Computer : commandes suspendues",
+  "tray.computerControlling": "Computer : traitement d’une commande",
+  "tray.computerObserving": "Computer : observation en cours",
+  "tray.computerIdle": "Computer : inactif",
+  "tray.computerResume": "Reprendre Computer Control",
+  "tray.computerPause": "Suspendre Computer Control",
+  "tray.computerRecentControl": "Computer : commande récemment traitée",
+  "tray.computerRecentObservation": "Computer : observation récente",
+  "tray.computerPauseNotSaved": "Computer : entrées bloquées, pause non enregistrée ; le redémarrage peut réactiver le contrôle",
+  "tray.computerRetryPause": "Réessayer d’enregistrer la pause Computer Control"
 }

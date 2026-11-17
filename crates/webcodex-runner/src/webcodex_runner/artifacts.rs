@@ -556,6 +556,85 @@ pub(crate) fn observe_build_artifact(
     })
 }
 
+/// Only the selected, bounded Cargo message consumer calls this precise reader.
+/// Generic artifact tools retain their bulk-exclusion policy. Secrets, root
+/// escapes and redirected handles remain forbidden, including inside target/.
+pub(crate) fn observe_cargo_build_artifact(
+    root: &Path,
+    path: &str,
+    deadline: Instant,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<webcodex_core::project_build::ProjectBuildArtifact, String> {
+    use super::file_access::{file_identity, open_regular_file};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    let invalid = || "build_artifact_path_invalid".to_string();
+    if !webcodex_core::project_build::build_artifact_path_valid(path) {
+        return Err(invalid());
+    }
+    let target = root.join(path);
+    let canonical = target
+        .canonicalize()
+        .map_err(|_| "build_artifacts_missing".to_string())?;
+    let relative = canonical.strip_prefix(root).map_err(|_| invalid())?;
+    let relative = relative.to_str().ok_or_else(invalid)?;
+    #[cfg(windows)]
+    let relative = relative.replace('\\', "/");
+    if !webcodex_core::project_build::build_artifact_path_valid(&relative) {
+        return Err(invalid());
+    }
+    let mut file = open_regular_file(&target).map_err(|_| invalid())?;
+    let identity = file_identity(&file).map_err(|_| invalid())?;
+    let initial = file.metadata().map_err(|_| invalid())?;
+    if initial.len() > MAX_ARTIFACT_EXPORT_BYTES as u64 {
+        return Err("build_artifacts_limit_exceeded".into());
+    }
+    let mut digest = Sha256::new();
+    let mut bytes = 0u64;
+    let mut prefix = Vec::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err("build_stopped".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("build_timeout".into());
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "build_artifact_read_failed".to_string())?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or("build_artifacts_limit_exceeded")?;
+        if bytes > MAX_ARTIFACT_EXPORT_BYTES as u64 {
+            return Err("build_artifacts_limit_exceeded".into());
+        }
+        if prefix.len() < 32 {
+            prefix.extend_from_slice(&buffer[..read.min(32 - prefix.len())]);
+        }
+        digest.update(&buffer[..read]);
+    }
+    let final_metadata = file.metadata().map_err(|_| invalid())?;
+    let current = open_regular_file(&target).map_err(|_| invalid())?;
+    if bytes != initial.len()
+        || bytes != final_metadata.len()
+        || initial.modified().ok() != final_metadata.modified().ok()
+        || file_identity(&current).map_err(|_| invalid())? != identity
+    {
+        return Err("build_artifact_changed".into());
+    }
+    Ok(webcodex_core::project_build::ProjectBuildArtifact {
+        path: path.into(),
+        bytes,
+        sha256: format!("{:x}", digest.finalize()),
+        mime_type: artifact_mime(path, &prefix, false),
+    })
+}
+
 fn handle_read_project_artifact_metadata(
     request: &RunnerFilePayload,
     resolved: &Path,
@@ -1064,6 +1143,7 @@ mod tests {
 
     fn artifact_request(root: &Path, kind: &str, path: &str, payload: Value) -> RunnerRequest {
         RunnerRequest {
+            computer_control_epoch: None,
             login: false,
             shell: None,
             request_id: format!("req-{kind}"),
@@ -1165,6 +1245,64 @@ mod tests {
         let (part, sidecar) = upload_paths(parent, upload_id);
         std::fs::write(&part, bytes).unwrap();
         write_upload_state(&sidecar, &test_upload_state(path)).unwrap();
+    }
+
+    #[test]
+    fn artifact_upload_concurrent_admission_and_completion_preserve_project_quota() {
+        for expected in [Some(8192), None] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("project");
+            let store = tmp.path().join("registry");
+            std::fs::create_dir(&root).unwrap();
+            let count = 16;
+            let barrier = std::sync::Barrier::new(count);
+            let uploads = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..count).map(|index| {
+                    let (root, store, barrier) = (&root, &store, &barrier);
+                    scope.spawn(move || {
+                        let path = format!("set-{index}/file.bin");
+                        barrier.wait();
+                        let result = run_artifact_request_with_store(root, store,
+                            "file_artifact_upload_begin", &path,
+                            json!({"expected_bytes": expected, "max_bytes": MAX_ARTIFACT_UPLOAD_BYTES}));
+                        (path, result)
+                    })
+                }).collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let accepted = uploads
+                .iter()
+                .filter(|(_, result)| result.get("error").is_none())
+                .count();
+            assert_eq!(accepted, if expected.is_some() { count } else { 2 });
+            assert_eq!(reservation_file_count(&store), accepted);
+            std::thread::scope(|scope| {
+                for (path, begin) in &uploads {
+                    let Some(id) = begin["upload_id"].as_str() else {
+                        assert!(begin["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("reserved byte quota exceeded"));
+                        continue;
+                    };
+                    let (root, store) = (&root, &store);
+                    scope.spawn(move || {
+                        let chunk = run_artifact_request_with_store(root, store,
+                            "file_artifact_upload_chunk", path,
+                            json!({"upload_id": id, "offset": 0,
+                                "content_base64": general_purpose::STANDARD.encode(vec![b'x'; 8192])}));
+                        assert_eq!(chunk["received_bytes"], 8192, "{chunk}");
+                        let finish = run_artifact_request_with_store(root, store,
+                            "file_artifact_upload_finish", path, json!({"upload_id": id}));
+                        assert_eq!(finish["committed"], true, "{finish}");
+                    });
+                }
+            });
+            assert_eq!(reservation_file_count(&store), 0);
+        }
     }
 
     #[test]

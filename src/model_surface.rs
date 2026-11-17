@@ -8,7 +8,7 @@
 
 use crate::tool_runtime::tool_definition::{
     adaptive_runtime_direct_tool_definitions, is_adaptive_runtime_direct_tool,
-    is_model_visible_tool_name,
+    is_model_visible_tool_name, lookup_tool_definition,
 };
 use crate::tool_runtime::ToolResult;
 #[cfg(test)]
@@ -22,23 +22,23 @@ pub(crate) const TOOL_SURFACE_AVAILABILITY_DIRECT: &str = "direct";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_GATEWAY: &str = "gateway";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_UNAVAILABLE: &str = "unavailable";
 
+pub(crate) fn tool_requires_individual_host_review(tool_name: &str) -> bool {
+    lookup_tool_definition(tool_name)
+        .is_some_and(|definition| definition.requires_individual_host_review())
+}
+
 pub(crate) fn tool_requires_direct_app_presentation(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "present_work_result"
-            | "present_pdf"
-            | "present_docx"
-            | "present_spreadsheet"
-            | "present_goal_plan"
-            | "present_agent_continuation"
-            | "present_job_terminal_continuation"
-    )
+    // The read-only workbench deliberately supports a non-App resource fallback.
+    // Other presentation tools need their own Host descriptor to render a card.
+    tool_name != "open_webcodex_workbench"
+        && lookup_tool_definition(tool_name).is_some_and(|definition| definition.presents_app())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdaptiveRuntimeGatewayTargetRoute {
     Gateway,
     Direct,
+    DirectOnly,
     Recursive,
     Unknown,
 }
@@ -84,6 +84,9 @@ pub(crate) fn adaptive_runtime_gateway_target_route(
     if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
         return AdaptiveRuntimeGatewayTargetRoute::Recursive;
     }
+    if tool_requires_individual_host_review(target) {
+        return AdaptiveRuntimeGatewayTargetRoute::DirectOnly;
+    }
     match adaptive_runtime_tool_invocation_route(target) {
         (TOOL_SURFACE_AVAILABILITY_DIRECT, None) => AdaptiveRuntimeGatewayTargetRoute::Direct,
         (TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)) => {
@@ -118,6 +121,31 @@ pub(crate) fn suggested_tool_call_route(
         }
         _ => SuggestedToolCallRoute::Unavailable,
     }
+}
+
+/// Exact manifest route for canonical or adapter-projected discovery. A Host
+/// review requirement is never converted into a generic fallback.
+pub(crate) fn manifest_invocation_route(target: &str, route: SuggestedToolCallRoute) -> Value {
+    let primary = match route {
+        SuggestedToolCallRoute::Direct => json!({"mode":"direct", "tool":target}),
+        SuggestedToolCallRoute::Gateway(via) => {
+            json!({"mode":"gateway", "tool":via, "target":target})
+        }
+        SuggestedToolCallRoute::Unavailable => {
+            json!({"mode":"unavailable", "tool":Value::Null, "target":target})
+        }
+    };
+    let fallback = if route == SuggestedToolCallRoute::Direct
+        && target != ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+        && !tool_requires_individual_host_review(target)
+    {
+        json!({"mode":"gateway", "tool":ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME, "target":target,
+            "when":"direct_callable_unavailable",
+            "blocked_when_mcp_apps_enabled":tool_requires_direct_app_presentation(target)})
+    } else {
+        Value::Null
+    };
+    json!({"primary":primary, "fallback":fallback, "tool_manifest_registers_host_tool":false, "discovery_effect":"none"})
 }
 
 /// Project formally declared SuggestedToolCall schemas to the callable shape of
@@ -515,23 +543,36 @@ mod tests {
     }
 
     #[test]
-    fn direct_app_presentation_requirement_is_closed_and_explicit() {
-        for tool in [
-            "present_work_result",
-            "present_pdf",
-            "present_spreadsheet",
-            "present_goal_plan",
-            "present_agent_continuation",
-            "present_job_terminal_continuation",
-        ] {
-            assert!(tool_requires_direct_app_presentation(tool), "{tool}");
-        }
-        for ordinary in ["run_shell", "run_script", "read_workspace_changes"] {
-            assert!(
-                !tool_requires_direct_app_presentation(ordinary),
-                "{ordinary}"
+    fn direct_app_presentation_requirement_is_definition_derived_with_workbench_fallback() {
+        for definition in webcodex_tool_contracts::tool_definitions() {
+            let requires_direct =
+                definition.presents_app() && definition.name != "open_webcodex_workbench";
+            assert_eq!(
+                tool_requires_direct_app_presentation(definition.name),
+                requires_direct,
+                "{}",
+                definition.name
             );
+            if definition.presents_app() {
+                let route =
+                    manifest_invocation_route(definition.name, SuggestedToolCallRoute::Direct);
+                assert_eq!(
+                    route["fallback"]["blocked_when_mcp_apps_enabled"], requires_direct,
+                    "{}",
+                    definition.name
+                );
+            }
         }
+        // CLI suppresses every App presentation definition, including the
+        // workbench whose Adaptive surface has a read-only non-App fallback.
+        let workbench = lookup_tool_definition("open_webcodex_workbench").unwrap();
+        assert!(workbench.presents_app());
+        assert!(!tool_requires_direct_app_presentation(workbench.name));
+        let route = manifest_invocation_route(workbench.name, SuggestedToolCallRoute::Direct);
+        assert_eq!(route["fallback"]["mode"], "gateway");
+        assert_eq!(route["fallback"]["target"], workbench.name);
+        assert_eq!(route["fallback"]["blocked_when_mcp_apps_enabled"], false);
+        assert!(!tool_requires_direct_app_presentation("unknown_tool"));
     }
 
     #[test]
@@ -582,6 +623,27 @@ mod tests {
             assert_eq!(
                 adaptive_runtime_gateway_target_route(tool_name),
                 AdaptiveRuntimeGatewayTargetRoute::Direct
+            );
+        }
+    }
+
+    #[test]
+    fn individually_reviewed_tools_are_direct_without_gateway_replay() {
+        for definition in adaptive_runtime_direct_tool_definitions()
+            .into_iter()
+            .filter(|definition| definition.requires_individual_host_review())
+        {
+            assert_eq!(
+                adaptive_runtime_tool_invocation_route(definition.name),
+                (TOOL_SURFACE_AVAILABILITY_DIRECT, None)
+            );
+            assert_eq!(
+                adaptive_runtime_gateway_target_route(definition.name),
+                AdaptiveRuntimeGatewayTargetRoute::DirectOnly
+            );
+            assert_eq!(
+                suggested_tool_call_route(definition.name, false),
+                SuggestedToolCallRoute::Direct
             );
         }
     }

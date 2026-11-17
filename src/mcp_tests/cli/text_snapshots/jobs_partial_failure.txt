@@ -1,0 +1,4 @@
+job_id: missing
+error: Job unavailable
+error_kind: unknown_job
+recovery_kind: reobserve

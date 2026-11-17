@@ -236,7 +236,8 @@ pub(crate) fn parse_options(
 pub(crate) fn usage() -> &'static str {
     "Usage: webcodex share [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
                      [--tunnel cloudflare|openai|none] [--auth bearer|query-token|oauth]\n\
-                     [--oauth-redirect-uri URL] [--public-url URL] [--no-copy-url]\n\
+                     [--oauth-redirect-uri URL] [--oauth-persist-on-restart] [--public-url URL] [--no-copy-url]\n\
+                     [--project-roots DIR]... [--no-project-roots]\n\
                      [--stop-on-stdin-eof]\n\
        webcodex status [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
        webcodex doctor [--root PATH] [--profile NAME] [--state-dir PATH] [--json]\n\
@@ -258,6 +259,11 @@ starting services. `run` is the explicit foreground local runtime step. Its opti
 `--console-assets-dir` enables loopback-only development assets for that run.\n\
 `--auth query-token` is a temporary share-only convenience for MCP clients that\n\
 cannot configure a Bearer header; `--auth oauth` adds project-bound OAuth.\n\
+Repeatable `--project-roots DIR` (up to 8) lets this share's own project-share\n\
+OAuth subjects admit new Projects from existing directories under those\n\
+canonical parent roots; `--no-project-roots` clears the saved list.\n\
+`--oauth-persist-on-restart` keeps the validated share OAuth client and its\n\
+unexpired, unrevoked grants across ordinary restarts of the same share.\n\
 On Windows, explicit `webcodex share` is supported. Managed Cloudflare acquisition is available on Windows x64; Windows ARM64 requires a trusted explicit/PATH cloudflared because the pinned upstream release has no official ARM64 artifact. Native OpenAI Tunnel supports Windows x64/arm64.\n"
 }
 
@@ -674,6 +680,9 @@ pub(crate) fn render_error(error: &ProductError, json: bool) -> String {
 pub(super) struct ProjectShareOAuthRuntimeOptions {
     pub(super) project_grant_id: String,
     pub(super) session_id: String,
+    /// Canonical parent-root grant handed to the spawned Server through
+    /// `WEBCODEX_OAUTH2_PROJECT_SHARE_ROOTS`. Empty keeps the exact-path fence.
+    pub(super) project_roots: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -859,12 +868,27 @@ pub(super) async fn start_local_runtime(
                 oauth.project_grant_id,
             )
             .env("WEBCODEX_OAUTH2_PROJECT_SHARE_SESSION_ID", oauth.session_id);
+        if oauth.project_roots.is_empty() {
+            server_command.env_remove("WEBCODEX_OAUTH2_PROJECT_SHARE_ROOTS");
+        } else {
+            // One canonical path per share; the OS path-list separator keeps
+            // multi-root grants unambiguous on every supported platform.
+            let roots = std::env::join_paths(&oauth.project_roots).map_err(|error| {
+                ProductError::new(
+                    "project_registration_invalid",
+                    format!("could not encode project share roots: {error}"),
+                    Some("Use parent directories without the platform path separator."),
+                )
+            })?;
+            server_command.env("WEBCODEX_OAUTH2_PROJECT_SHARE_ROOTS", roots);
+        }
     } else {
         server_command
             .env("WEBCODEX_OAUTH2_ENABLED", "false")
             .env_remove("WEBCODEX_OAUTH2_ISSUER")
             .env_remove("WEBCODEX_OAUTH2_PROJECT_SHARE_GRANT_ID")
-            .env_remove("WEBCODEX_OAUTH2_PROJECT_SHARE_SESSION_ID");
+            .env_remove("WEBCODEX_OAUTH2_PROJECT_SHARE_SESSION_ID")
+            .env_remove("WEBCODEX_OAUTH2_PROJECT_SHARE_ROOTS");
     }
     configure_console_assets_environment(&mut server_command, console_assets_dir.as_deref());
     let mut server = server_command.spawn().map_err(|_| {

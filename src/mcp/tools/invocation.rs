@@ -8,6 +8,31 @@ use serde_json::Value;
 
 pub(super) const MCP_INVOCATION_ENVELOPE_FIELD: &str = "_wc";
 
+pub(super) fn mcp_control_sidecar_input_schema(tool: &str) -> Value {
+    let mut schema = crate::tool_runtime::control_sidecar::input_schema(tool);
+    // Project the same canonical exposure policy used by ordinary dispatch.
+    // A reviewed operation cannot be hidden inside another tool's sidecar.
+    for path in [
+        "/properties/before/properties",
+        "/properties/after_success/properties",
+        "/properties/communication/properties/before/items/properties",
+        "/properties/communication/properties/after_success/items/properties",
+    ] {
+        if let Some(properties) = schema.pointer_mut(path).and_then(Value::as_object_mut) {
+            properties.retain(|kind, _| {
+                !crate::model_surface::tool_requires_individual_host_review(
+                    crate::tool_runtime::control_sidecar::canonical_tool(kind),
+                )
+            });
+        }
+    }
+    schema["description"] = Value::String(
+        "Optional control sidecars: at most one mutation per phase plus two replay-safe communication messages total. Operations requiring individual Host review must use their own callable, never a sidecar. Before mutation failure prevents main; communication failure is reported independently. After-success controls require known success; Session close requires finish_coding_task. Each operation retains its own authority and replay checks. session_context_update currently fails closed. Omit when unused."
+            .into(),
+    );
+    schema
+}
+
 #[derive(Debug, Default)]
 pub(in crate::mcp) struct McpInvocationEnvelope {
     pub(in crate::mcp) recording_session_selector: Option<String>,
@@ -54,6 +79,16 @@ pub(super) fn mcp_invocation_envelope_supported_fields(tool: &str) -> Vec<&'stat
         || crate::tool_runtime::control_sidecar::supports_control_sidecars(tool)
     {
         fields.push("control");
+    }
+    fields
+}
+
+pub(super) fn mcp_invocation_fields_for_surface(tool: &str, full: bool) -> Vec<&'static str> {
+    let mut fields = mcp_invocation_envelope_supported_fields(tool);
+    if !full {
+        // CLI and older MCP retain only communication acknowledgements/replies.
+        // Neither field selects a Workflow Session or dispatches control work.
+        fields.retain(|field| matches!(*field, "ack" | "reply"));
     }
     fields
 }
@@ -105,15 +140,12 @@ pub(super) fn validate_mcp_invocation_envelope_for_target(
 pub(in crate::mcp) fn parse_mcp_invocation_envelope(
     tool_name: &str,
     arguments: &mut Value,
-    stateless_2026: bool,
+    full_invocation: bool,
 ) -> Result<McpInvocationEnvelope, String> {
     let Some(object) = arguments.as_object_mut() else {
         return Ok(McpInvocationEnvelope::default());
     };
-    if !stateless_2026 {
-        if object.contains_key(MCP_INVOCATION_ENVELOPE_FIELD) {
-            return Err("field '_wc' is unavailable on this MCP protocol surface".to_string());
-        }
+    if !full_invocation && !object.contains_key(MCP_INVOCATION_ENVELOPE_FIELD) {
         return Ok(McpInvocationEnvelope::default());
     }
 
@@ -140,7 +172,7 @@ pub(in crate::mcp) fn parse_mcp_invocation_envelope(
     let Value::Object(mut envelope) = value else {
         return Err("field '_wc' must be a closed invocation metadata object".to_string());
     };
-    let allowed = mcp_invocation_envelope_supported_fields(tool_name);
+    let allowed = mcp_invocation_fields_for_surface(tool_name, full_invocation);
     if let Some(key) = envelope.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(unsupported_invocation_field(key, tool_name, &allowed));
     }
@@ -155,6 +187,15 @@ pub(in crate::mcp) fn parse_mcp_invocation_envelope(
         .map_err(|error| format!("_wc.control {}", error.description()))?,
         None => None,
     };
+    if let Some(reviewed_tool) = control.as_ref().and_then(|sidecars| {
+        sidecars
+            .canonical_tools()
+            .find(|name| crate::model_surface::tool_requires_individual_host_review(name))
+    }) {
+        return Err(format!(
+            "direct_host_review_required: '{reviewed_tool}' requires its own Host-reviewed callable; _wc.control cannot invoke it. Host refusal never permits a different route."
+        ));
+    }
     let compact_execution = match envelope.remove("compact_execution") {
         None => false,
         Some(Value::Bool(value)) => value,
@@ -164,6 +205,7 @@ pub(in crate::mcp) fn parse_mcp_invocation_envelope(
         recording_session_selector: parse_record(envelope.remove("record"))?,
         metadata: ToolInvocationMetadata {
             compact_execution,
+            discovery_tools: None,
             control,
             ack_session_message_ids: parse_ack(envelope.remove("ack"))?,
             ack_ref: parse_ack_ref(envelope.remove("ack_ref"))?,

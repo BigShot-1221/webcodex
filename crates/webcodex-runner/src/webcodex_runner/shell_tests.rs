@@ -70,19 +70,17 @@ fn run_direct_process(
     timeout_secs: u64,
 ) -> ShellCommandResult {
     let project_registry_dir = tempfile::tempdir().unwrap();
-    run_process_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &ShellConfig::default(),
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.to_string_lossy().as_ref()),
-        &executable.to_string_lossy(),
-        args,
-        stdin,
+    (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &ShellConfig::default(),
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.to_string_lossy().as_ref()),
         timeout_secs,
-        None,
-    )
+        stop_requested: None,
+    })
+    .run_process(&executable.to_string_lossy(), args, stdin, &[], None, None)
 }
 
 fn run_direct_script(
@@ -94,20 +92,23 @@ fn run_direct_script(
     timeout_secs: u64,
 ) -> ShellCommandResult {
     let project_registry_dir = tempfile::tempdir().unwrap();
-    run_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &ShellConfig::default(),
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.to_string_lossy().as_ref()),
+    (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &ShellConfig::default(),
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.to_string_lossy().as_ref()),
+        timeout_secs,
+        stop_requested: None,
+    })
+    .run_script(
         &ShellScriptPayload {
             language,
             script,
             args,
         },
         stdin,
-        timeout_secs,
         None,
     )
 }
@@ -116,6 +117,74 @@ fn unrestricted_policy() -> RunnerPolicy {
     RunnerPolicy {
         allow_cwd_anywhere: true,
         ..RunnerPolicy::default()
+    }
+}
+
+#[test]
+fn process_preparation_fence_controls_effects_and_start_notification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = unrestricted_policy();
+    let shell = ShellConfig::default();
+    let cache = PreparedShellProfileCache::default();
+    let context = ShellExecutionContext {
+        generation: 1,
+        policy: &policy,
+        shell: &shell,
+        project_registry_dir: tmp.path(),
+        cache: &cache,
+        cwd: tmp.path().to_str(),
+        timeout_secs: 5,
+        stop_requested: None,
+    };
+    for admitted in [false, true] {
+        let marker = tmp.path().join(format!("effects-{admitted}"));
+        let events = Mutex::new(Vec::new());
+        let on_prepared = || {
+            assert!(!marker.exists(), "payload ran before the preparation fence");
+            events.lock().unwrap().push("prepared");
+            if admitted {
+                Ok(())
+            } else {
+                Err("fixture_stale_build".into())
+            }
+        };
+        let on_started = || events.lock().unwrap().push("started");
+        let result = context.run_process(
+            process_argv_helper().to_str().unwrap(),
+            &["fixture-argument".into()],
+            None,
+            &[
+                (
+                    "WEBCODEX_TEST_CAPTURE_GO_MODULE_ENV",
+                    marker.to_str().unwrap(),
+                ),
+                ("GOWORK", "off"),
+                ("GO111MODULE", "on"),
+            ],
+            Some(&on_started),
+            Some(&on_prepared),
+        );
+        if admitted {
+            assert_eq!(
+                result.execution_state,
+                ShellCommandExecutionState::Completed
+            );
+            assert_eq!(result.result.exit_code, Some(0));
+            assert!(result.result.error.is_none(), "{result:?}");
+            assert_eq!(*events.lock().unwrap(), ["prepared", "started"]);
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "GOWORK=off\nGO111MODULE=on\nARGV=fixture-argument\n"
+            );
+        } else {
+            assert_eq!(
+                result.execution_state,
+                ShellCommandExecutionState::NotStarted
+            );
+            assert_eq!(result.result.error.as_deref(), Some("fixture_stale_build"));
+            assert_eq!(*events.lock().unwrap(), ["prepared"]);
+            assert!(!marker.exists());
+        }
     }
 }
 
@@ -275,17 +344,17 @@ fn runner_real_process_native_search_preserves_modes_and_fallback() {
         })
     };
     let run = |payload: &serde_json::Value| {
-        run_windows_native_search_with_profiles(
-            1,
-            &policy,
-            &shell,
-            root.path(),
-            &cache,
-            Some(project.to_str().unwrap()),
-            Some(&payload.to_string()),
-            10,
-            None,
-        )
+        (ShellExecutionContext {
+            generation: 1,
+            policy: &policy,
+            shell: &shell,
+            project_registry_dir: root.path(),
+            cache: &cache,
+            cwd: Some(project.to_str().unwrap()),
+            timeout_secs: 10,
+            stop_requested: None,
+        })
+        .run_windows_native_search(Some(&payload.to_string()))
     };
     for (mode, expected) in [
         (
@@ -443,17 +512,17 @@ fn runner_real_process_native_search_directory_globs_and_bounds() {
                shell: &ShellConfig,
                payload: &serde_json::Value,
                stopped: Option<&AtomicBool>| {
-        run_windows_native_search_with_profiles(
-            1,
+        (ShellExecutionContext {
+            generation: 1,
             policy,
             shell,
-            root.path(),
-            &cache,
-            Some(project.to_str().unwrap()),
-            Some(&payload.to_string()),
-            10,
-            stopped,
-        )
+            project_registry_dir: root.path(),
+            cache: &cache,
+            cwd: Some(project.to_str().unwrap()),
+            timeout_secs: 10,
+            stop_requested: stopped,
+        })
+        .run_windows_native_search(Some(&payload.to_string()))
     };
     let mut payload = serde_json::json!({"pattern": "needle\\.literal", "path": ".", "limit": 20, "context_before": 0, "context_after": 0, "include_globs": ["**/*.rs"], "exclude_globs": ["**/skip.rs"], "result_mode": "matches"});
     for mode in ["matches", "files_with_matches", "count"] {
@@ -481,21 +550,21 @@ fn runner_real_process_native_search_directory_globs_and_bounds() {
             .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
             .collect::<Vec<_>>()
             .join(" ");
-        let fallback = run_internal_search_script_with_profiles_and_execution_state(
-            1,
-            &policy,
-            &shell,
-            root.path(),
-            &cache,
-            Some(project.to_str().unwrap()),
-            &format!(
-                "set -o pipefail\nrg {argv} | head -n {} | head -c {}",
-                spec.line_limit,
-                PROJECT_TEXT_SEARCH_OUTPUT_BYTE_BUDGET + 1
-            ),
-            10,
-            None,
-        );
+        let fallback = (ShellExecutionContext {
+            generation: 1,
+            policy: &policy,
+            shell: &shell,
+            project_registry_dir: root.path(),
+            cache: &cache,
+            cwd: Some(project.to_str().unwrap()),
+            timeout_secs: 10,
+            stop_requested: None,
+        })
+        .run_internal_search_script(&format!(
+            "set -o pipefail\nrg {argv} | head -n {} | head -c {}",
+            spec.line_limit,
+            PROJECT_TEXT_SEARCH_OUTPUT_BYTE_BUDGET + 1
+        ));
         assert_eq!(
             fallback.execution_state,
             ShellCommandExecutionState::Completed,
@@ -598,6 +667,63 @@ fn runner_real_process_native_search_directory_globs_and_bounds() {
 }
 
 #[test]
+fn structured_process_expired_deadline_never_spawns() {
+    let cwd = tempfile::tempdir().unwrap();
+    let started = AtomicBool::new(false);
+    let now = Instant::now();
+    let result = super::execution::execute_configured_command_with_output(
+        &unrestricted_policy(),
+        Command::new(cwd.path().join("must-not-be-spawned")),
+        cwd.path(),
+        None,
+        60,
+        None,
+        now,
+        "spawn attempted",
+        Some(&|| started.store(true, Ordering::SeqCst)),
+        false,
+        Some(now - Duration::from_millis(1)),
+    );
+    assert_eq!(result.execution_state, ShellCommandExecutionState::TimedOut);
+    assert_eq!(result.result.exit_code, None);
+    assert!(!started.load(Ordering::SeqCst));
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real process deadline and cleanup; run explicitly with runner-real-process-tests"]
+fn runner_real_process_structured_process_preserves_fractional_shared_deadline() {
+    let cwd = tempfile::tempdir().unwrap();
+    let mut command = Command::new(process_argv_helper());
+    command.args(["sleep", "2000"]);
+    let started = AtomicBool::new(false);
+    let now = Instant::now();
+    let result = super::execution::execute_configured_command_with_output(
+        &unrestricted_policy(),
+        command,
+        cwd.path(),
+        None,
+        60,
+        None,
+        now,
+        "failed to spawn deadline fixture",
+        Some(&|| started.store(true, Ordering::SeqCst)),
+        false,
+        Some(now + Duration::from_millis(100)),
+    );
+    assert!(
+        started.load(Ordering::SeqCst),
+        "a positive subsecond budget must allow execution"
+    );
+    assert_eq!(result.execution_state, ShellCommandExecutionState::TimedOut);
+    assert_eq!(result.result.exit_code, Some(-1));
+    assert!(
+        now.elapsed() < Duration::from_secs(1),
+        "the shared deadline must not round up or reset"
+    );
+}
+
+#[test]
 fn exact_utf8_nonzero_child_exit_after_closed_stdin_is_known_failure() {
     let cwd = tempfile::tempdir().unwrap();
     let mut command = Command::new(process_argv_helper());
@@ -615,6 +741,7 @@ fn exact_utf8_nonzero_child_exit_after_closed_stdin_is_known_failure() {
         "failed to spawn format fixture",
         None,
         true,
+        None,
     );
     assert_eq!(
         result.execution_state,
@@ -642,6 +769,7 @@ fn exact_utf8_early_zero_exit_without_complete_stdin_fails_closed() {
         "failed to spawn format fixture",
         None,
         true,
+        None,
     );
     assert_eq!(
         result.execution_state,
@@ -719,17 +847,17 @@ fn internal_posix_runtime_uses_git_bash_stdin_with_powershell_configured() {
         .insert("PATH".to_string(), git_cmd.to_string_lossy().into_owned());
     let script =
         "n=0\nwhile [ \"$n\" -lt 1 ]; do n=$((n + 1)); done\nprintf 'internal-posix-ok\\n'\n";
-    let result = run_internal_posix_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &shell,
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
-        script,
-        10,
-        None,
-    );
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &shell,
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_internal_posix_script(script);
 
     assert_eq!(
         result.execution_state,
@@ -761,17 +889,17 @@ fn internal_posix_runtime_ignores_configured_shell_on_posix_hosts() {
         ..Default::default()
     };
     let script = "printf 'internal-posix-ok\\n'\n";
-    let result = run_internal_posix_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &shell,
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
-        script,
-        10,
-        None,
-    );
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &shell,
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_internal_posix_script(script);
 
     assert_eq!(
         result.execution_state,
@@ -1251,17 +1379,22 @@ fn structured_process_continuously_drains_large_stdout_and_stderr() {
     let project_registry_dir = tempfile::tempdir().unwrap();
     let mut policy = unrestricted_policy();
     policy.max_output_bytes = 16 * 1024;
-    let result = run_process_with_profiles_and_execution_state(
-        1,
-        &policy,
-        &ShellConfig::default(),
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &policy,
+        shell: &ShellConfig::default(),
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_process(
         &process_argv_helper().to_string_lossy(),
         &["chatty".to_string(), "512".to_string()],
         None,
-        10,
+        &[],
+        None,
         None,
     );
 
@@ -1315,20 +1448,23 @@ fn structured_script_continuously_drains_large_stdout_and_stderr() {
             "out='{stdout_payload}'\nerr='{stderr_payload}'\ni=0\nwhile [ \"$i\" -lt 512 ]; do\n  printf '%s' \"$out\"\n  printf '%s' \"$err\" >&2\n  i=$((i + 1))\ndone\n"
         ),
     );
-    let result = run_script_with_profiles_and_execution_state(
-        1,
-        &policy,
-        &ShellConfig::default(),
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &policy,
+        shell: &ShellConfig::default(),
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 30,
+        stop_requested: None,
+    })
+    .run_script(
         &ShellScriptPayload {
             language,
             script,
             args: Vec::new(),
         },
         None,
-        30,
         None,
     );
 
@@ -1632,20 +1768,23 @@ fn missing_script_interpreter_is_prestart_and_does_not_run_script() {
         ..Default::default()
     };
     shell.env.insert("PATH".to_string(), String::new());
-    let result = run_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &shell,
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &shell,
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_script(
         &ShellScriptPayload {
             language: ShellScriptLanguage::Bash,
             script: "touch marker".to_string(),
             args: Vec::new(),
         },
         None,
-        10,
         None,
     );
     assert_eq!(
@@ -1672,13 +1811,17 @@ fn missing_javascript_interpreter_is_prestart_and_does_not_run_script() {
         ..Default::default()
     };
     shell.env.insert("PATH".to_string(), String::new());
-    let result = run_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &shell,
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &shell,
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_script(
         &ShellScriptPayload {
             language: ShellScriptLanguage::Javascript,
             script: "import { writeFileSync } from 'node:fs'; writeFileSync('marker', 'ran');"
@@ -1686,7 +1829,6 @@ fn missing_javascript_interpreter_is_prestart_and_does_not_run_script() {
             args: Vec::new(),
         },
         None,
-        10,
         None,
     );
     assert_eq!(
@@ -1710,20 +1852,23 @@ fn missing_typescript_interpreter_is_prestart_and_does_not_run_script() {
         ..Default::default()
     };
     shell.env.insert("PATH".to_string(), String::new());
-    let result = run_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &shell,
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &shell,
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_script(
         &ShellScriptPayload {
             language: ShellScriptLanguage::Typescript,
             script: "const marker: string = 'ran';\nvoid marker;".to_string(),
             args: Vec::new(),
         },
         None,
-        10,
         None,
     );
     assert_eq!(
@@ -1858,20 +2003,23 @@ fn arbitrary_configured_shell_is_not_treated_as_a_script_language() {
         ..Default::default()
     };
     shell.env.insert("PATH".to_string(), String::new());
-    let result = run_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &shell,
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &unrestricted_policy(),
+        shell: &shell,
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_script(
         &ShellScriptPayload {
             language: ShellScriptLanguage::Bash,
             script: "true".to_string(),
             args: Vec::new(),
         },
         None,
-        10,
         None,
     );
 
@@ -2438,22 +2586,25 @@ fn powershell_runtime_executes_from_file_when_available() {
     {
         return;
     }
-    let result = run_script_with_profiles_and_execution_state(
-        1,
-        &unrestricted_policy(),
-        &ShellConfig::default(),
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let result = (ShellExecutionContext {
+generation: 1,
+policy: &unrestricted_policy(),
+shell: &ShellConfig::default(),
+project_registry_dir: project_registry_dir.path(),
+cache: &PreparedShellProfileCache::default(),
+cwd: Some(cwd.path().to_string_lossy().as_ref()),
+timeout_secs: // This smoke validates external PowerShell file execution, not timeout
+        // behavior. Allow cold pwsh startup under a loaded CI runner.
+        30,
+stop_requested: None,
+})
+    .run_script(
         &ShellScriptPayload {
             language: ShellScriptLanguage::Powershell,
             script: "param([string]$Value)\nWrite-Output $Value".to_string(),
             args: vec!["two words".to_string()],
         },
         None,
-        // This smoke validates external PowerShell file execution, not timeout
-        // behavior. Allow cold pwsh startup under a loaded CI runner.
-        30,
         None,
     );
     assert_eq!(
@@ -2535,13 +2686,17 @@ fn phase_f_windows_native_oem_stdout_stderr_use_active_oem_page() {
     let project_registry_dir = tempfile::tempdir().unwrap();
     let mut policy = unrestricted_policy();
     policy.max_output_bytes = 64;
-    let bounded = run_process_with_profiles_and_execution_state(
-        1,
-        &policy,
-        &ShellConfig::default(),
-        project_registry_dir.path(),
-        &PreparedShellProfileCache::default(),
-        Some(cwd.path().to_string_lossy().as_ref()),
+    let bounded = (ShellExecutionContext {
+        generation: 1,
+        policy: &policy,
+        shell: &ShellConfig::default(),
+        project_registry_dir: project_registry_dir.path(),
+        cache: &PreparedShellProfileCache::default(),
+        cwd: Some(cwd.path().to_string_lossy().as_ref()),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_process(
         &process_argv_helper().to_string_lossy(),
         &[
             "windows-oem-output".to_string(),
@@ -2549,7 +2704,8 @@ fn phase_f_windows_native_oem_stdout_stderr_use_active_oem_page() {
             "1000".to_string(),
         ],
         None,
-        10,
+        &[],
+        None,
         None,
     );
     for output in [bounded.result.stdout, bounded.result.stderr] {
@@ -3363,64 +3519,125 @@ fn runner_real_process_rust_clippy_warnings_pass_and_correctness_fails() {
             .to_vec(),
         env: vec![],
     };
-    for (source, success, diagnostic) in [
-        (
-            "pub fn warning() -> i32 { return 1; }\n",
-            true,
-            "clippy::needless_return",
-        ),
-        (
-            "pub fn broken(x: i32) -> bool { x > 1 && x < 0 }\n",
-            false,
-            "clippy::impossible_comparisons",
-        ),
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("src")).unwrap();
-        std::fs::write(
-            temp.path().join("Cargo.toml"),
-            "[package]\nname='clippy_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
-        )
-        .unwrap();
-        std::fs::write(temp.path().join("src/lib.rs"), source).unwrap();
-        let cargo_home = temp.path().join("cargo-home");
-        std::fs::create_dir(&cargo_home).unwrap();
-        // Cover global and project aliases, including a command with an effect.
-        let (config_dir, alias) = if success {
-            (cargo_home.clone(), "version")
-        } else {
-            let config_dir = temp.path().join(".cargo");
-            std::fs::create_dir(&config_dir).unwrap();
-            (config_dir, "!echo alias-executed > alias-side-effect")
-        };
-        std::fs::write(
-            config_dir.join("config.toml"),
-            format!("[alias]\nclippy = '{alias}'\n"),
-        )
-        .unwrap();
-        let mut shell = ShellConfig::default();
-        shell.env.insert(
-            "CARGO_HOME".into(),
-            cargo_home.to_string_lossy().into_owned(),
-        );
-        shell.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
-        shell.env.insert(
-            "CARGO_TARGET_DIR".into(),
-            temp.path().join("target").to_string_lossy().into_owned(),
-        );
-        let mut command = configured_clippy_job_command(&shell, None, &step, temp.path(), None)
-            .expect("Clippy must be installed for explicit real-process evidence");
-        command.env("CARGO_TERM_COLOR", "never");
-        let (status, stdout, stderr) =
-            run_prepare_command(command, Duration::from_secs(30), None).unwrap();
-        let output = format!(
-            "{}{}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
-        );
-        assert_eq!(status.success(), success, "{output}");
-        assert!(output.contains(diagnostic), "{output}");
-        assert!(stdout.is_empty(), "{output}");
-        assert!(!temp.path().join("alias-side-effect").exists());
+    for offline in [false, true] {
+        let mut step = step.clone();
+        if offline {
+            step.args.insert(1, "--offline".into());
+        }
+        for (source, success, diagnostic) in [
+            (
+                "pub fn warning() -> i32 { return 1; }\n",
+                true,
+                "clippy::needless_return",
+            ),
+            (
+                "pub fn broken(x: i32) -> bool { x > 1 && x < 0 }\n",
+                false,
+                "clippy::impossible_comparisons",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("src")).unwrap();
+            std::fs::write(
+                temp.path().join("Cargo.toml"),
+                "[package]\nname='clippy_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+            )
+            .unwrap();
+            std::fs::write(temp.path().join("src/lib.rs"), source).unwrap();
+            let cargo_home = temp.path().join("cargo-home");
+            std::fs::create_dir(&cargo_home).unwrap();
+            // Cover global and project aliases, including a command with an effect.
+            let (config_dir, alias) = if success {
+                (cargo_home.clone(), "version")
+            } else {
+                let config_dir = temp.path().join(".cargo");
+                std::fs::create_dir(&config_dir).unwrap();
+                (config_dir, "!echo alias-executed > alias-side-effect")
+            };
+            std::fs::write(
+                config_dir.join("config.toml"),
+                format!("[alias]\nclippy = '{alias}'\n"),
+            )
+            .unwrap();
+            let mut shell = ShellConfig::default();
+            shell.env.insert(
+                "CARGO_HOME".into(),
+                cargo_home.to_string_lossy().into_owned(),
+            );
+            shell.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+            shell.env.insert(
+                "CARGO_TARGET_DIR".into(),
+                temp.path().join("target").to_string_lossy().into_owned(),
+            );
+            let mut command = configured_clippy_job_command(&shell, None, &step, temp.path(), None)
+                .expect("Clippy must be installed for explicit real-process evidence");
+            command.env("CARGO_TERM_COLOR", "never");
+            let (status, stdout, stderr) =
+                run_prepare_command(command, Duration::from_secs(30), None).unwrap();
+            let output = format!(
+                "{}{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+            assert_eq!(status.success(), success, "{output}");
+            assert!(output.contains(diagnostic), "{output}");
+            assert!(stdout.is_empty(), "{output}");
+            assert!(!temp.path().join("alias-side-effect").exists());
+        }
     }
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "requires installed Cargo Clippy; run explicitly with --ignored"]
+fn runner_real_process_rust_clippy_offline_missing_cache_fails_without_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname='clippy_offline_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n[dependencies]\nserde='=1.0.228'\n").unwrap();
+    let cargo_home = temp.path().join("cargo-home");
+    std::fs::create_dir(&cargo_home).unwrap();
+    let mut shell = ShellConfig::default();
+    shell.env.insert(
+        "CARGO_HOME".into(),
+        cargo_home.to_string_lossy().into_owned(),
+    );
+    shell.env.insert(
+        "CARGO_TARGET_DIR".into(),
+        temp.path().join("target").to_string_lossy().into_owned(),
+    );
+    let step = webcodex_core::runner_protocol::ShellJobValidationStep {
+        name: "lint".into(),
+        program: "cargo".into(),
+        args: [
+            "clippy",
+            "--offline",
+            "--all-targets",
+            "--",
+            "-D",
+            "clippy::correctness",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        env: vec![],
+    };
+    assert!(step.is_canonical());
+    let mut command = configured_clippy_job_command(&shell, None, &step, temp.path(), None)
+        .expect("Clippy must be installed for explicit real-process evidence");
+    command.env("CARGO_TERM_COLOR", "never");
+    let (status, stdout, stderr) =
+        run_prepare_command(command, Duration::from_secs(30), None).unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(!status.success(), "{output}");
+    assert!(output.contains("serde"), "{output}");
+    assert!(output.contains("offline"), "{output}");
+    assert!(!temp.path().join("Cargo.lock").exists());
 }

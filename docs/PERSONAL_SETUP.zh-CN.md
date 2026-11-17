@@ -167,7 +167,9 @@ Runner 运行后，WebCodex 才真正拥有调用本机文件、Git、编译器�
 
 这段输出包含用户凭据，只应由你本人填入 ChatGPT，不要粘贴到 issue、日志或聊天消息中。在 ChatGPT 的 App / MCP 设置中创建连接，使用 CLI 打印的 MCP URL 与认证方式，然后 **Scan Tools**。
 
-如果你选择 OpenAI Secure MCP Tunnel，登录时不需要 `--print-mcp-config` 给 ChatGPT 使用；ChatGPT 侧通常选择 Tunnel + No authentication，由本机 tunnel client 注入 WebCodex 凭据。按对应 Tunnel 指南操作，不要把本地 Bearer 复制给 ChatGPT。
+如果你为**个人、同一所有者**使用 OpenAI Secure MCP Tunnel，登录时不需要用 `--print-mcp-config` 为 ChatGPT 打印配置；ChatGPT 侧选择 Tunnel + No authentication，由本机 tunnel client 注入该 Server 的 WebCodex 凭据。这**不是**按用户独立登录。请按 [Desktop Tunnel 指南](desktop-install.zh-CN.md)操作，不要把本地 Bearer 复制到 ChatGPT。
+
+**ChatGPT Team/Business 工作空间：**Team 现已更名为 Business。仅 Owner/Admin 能在 Business 工作空间创建、发布自定义 MCP 插件；普通成员应使用已批准的团队连接。**不要把个人 Desktop 的 Tunnel + No Auth 插件当作常规团队共享方案：**它以所有者的 bootstrap/admin WebCodex 身份转发请求，发布插件不会为成员创建独立身份或项目权限。多人使用应独立部署集中管理的 Server 及其 Runners，并按实际连接方式设置适当范围的用户独立/委托凭据（例如支持时使用 managed-user OAuth 或 PAT）；切勿分发 Server bootstrap 凭据。详见[认证与凭据](AUTH_MODEL.zh-CN.md)、[部署指南](DEPLOYMENT.zh-CN.md)和 [Business 工作空间接入前提](desktop-install.zh-CN.md#chatgpt-business原-team工作空间接入前提)。
 
 ## 8. 验证完整体验
 

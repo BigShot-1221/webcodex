@@ -10,6 +10,22 @@ use super::tools::RECORDING_SESSION_SELECTOR_SCHEMA_PATTERN;
 pub(super) const TOOL_DESCRIPTION_MAX_CHARS: usize = 420;
 pub(super) const INPUT_DESCRIPTION_MAX_CHARS: usize = 180;
 
+/// Keep the operational bootstrap facts in ToolDefinition. Only the route for
+/// obtaining model context changes with the advertised MCP envelope.
+pub(super) fn bootstrap_description(context_sidecars: bool) -> String {
+    let canonical = webcodex_tool_contracts::lookup_tool_definition("work_on_project")
+        .expect("registered bootstrap")
+        .model_spec
+        .expect("model-visible bootstrap")
+        .description;
+    let context = if context_sidecars {
+        "Fresh/uncertain context: request _wc.context=[\"project.instructions\",\"webcodex.workflow\"]. project.instructions includes AGENTS.md/CLAUDE.md; reuse complete current context."
+    } else {
+        "Read applicable AGENTS.md/CLAUDE.md with read_files and follow this surface's workflow instructions."
+    };
+    format!("{canonical} {context}")
+}
+
 pub(super) fn compact_tool(tool: &mut Value) {
     let name = tool["name"].as_str().unwrap_or_default().to_string();
     let workbench_app_only = tool.pointer("/_meta/ui/visibility")
@@ -30,15 +46,24 @@ pub(super) fn compact_tool(tool: &mut Value) {
             "reconcile_agent_task_coding_run" if workbench_app_only => "Reconcile an owned exact Task/Attempt with its original coding run. Never starts or retries execution.",
             "work_on_project" if tool.pointer("/inputSchema/properties/_wc").is_none() => "Start file, data, diagnostic or coding work in a Project; Git optional. Omit session_id for a fresh Session; supply exact session_id to resume. Read applicable AGENTS.md/CLAUDE.md with read_files. Reuse workspace branch/HEAD/status and sufficient catalogs; refresh stale/incomplete facts before dependent work.",
             "work_on_project" => "File/data/diagnostic/coding work; Git optional. Fresh: omit session_id; exact resumes. Fresh/uncertain: _wc.context=[\"project.instructions\",\"webcodex.workflow\"]; project.instructions includes AGENTS.md/CLAUDE.md. Reuse complete instructions, branch/HEAD/status, semantic navigation, sufficient catalogs; refresh stale/incomplete.",
-            "present_pdf" => "View one authorized project PDF; use present_work_result for coding progress. Supply project and relative path; unchanged/untracked files supported, no Git/Session required. Pins size/SHA (20 MiB max); private reads fail on version changes. Reopen to select a new version. Requires MCP Apps Host.",
+            "present_pdf" => "View one authorized project PDF in a dedicated reader. Use for PDF viewing, present_work_result for coding progress. Supply project and relative path; unchanged/untracked files supported, no Git/Session required. Pins size/SHA (20 MiB max); private App reads fail on version changes. Explicitly reopen to select a new version. Requires MCP Apps Host.",
             "get_work_result_state" => "App-only Work Result read; reauthorizes exact Project/Session; no attention, Session recording or snapshot mutation. files: advertised immutable paths; diff, UTF-8 (32 KiB/page, 256 KiB/file), or PDF (128 KiB/page, 20 MiB/file). PDF bytes use private App metadata.",
             "plugin_tool" => "Use Runner-owned Plugins via opaque bindings. Catalog selects; describe when schema/binding is missing. Reuse retained exact binding for the same Project; reconcile unknown outcomes.",
-            "call_runtime_tool" => "Call one admitted runtime tool with exact arguments; read_tool_manifest supplies its contract. Prefer its direct callable; ordinary tools may fall back here, but MCP App presentation requires a direct callable while Apps are enabled. Target validation and authority checks still apply.",
+            "call_runtime_tool" => "Call one admitted runtime tool with exact arguments; read_tool_manifest supplies its contract and allowed route. Individually reviewed tools cannot use this gateway, even if unloaded or refused by the Host. MCP App presentation needs its direct callable while Apps are enabled. Ordinary fallback retains target validation and authority checks.",
+            "create_agent_identity" => "Store one caller-owned durable Agent metadata record on this Server. Starts no model/process; creates no Endpoint, credential or Host binding. First continuation setup step; then rotate_agent_continuation_endpoint and present_agent_continuation. Same key+input replays the original identity; changed reuse conflicts. Requires its own Host-reviewed callable; no gateway fallback.",
+            "rotate_agent_continuation_endpoint" => "Create/replace an owned Agent's server-local Endpoint and advance its controller generation; older generations become stale. Exact keyed replay retains the same Endpoint. Use its pinned ref for present_agent_continuation. No Host binding or readiness is established. Requires its own Host-reviewed callable; no gateway fallback.",
+            "list_agent_identities" => "Read owned Agent cards or one exact Agent. production_auto_resume_available reflects the exact live Endpoint/Host binding, not scheduling or execution authority. A pinned continuation ref grants no authority. Requires its own Host-reviewed callable; no gateway fallback.",
+            "prepare_goal_workflow" => "Atomically create a durable Goal correlated to one independently authorized exact Workflow Session and optional owned controller Agent. Keyed replay returns the same Goal. Host-neutral: no Endpoint, binding, Wake or readiness is created. Present the Goal separately. Requires its own Host-reviewed callable; no gateway fallback.",
+            "get_goal" => "Read one exact caller-owned durable Goal and optional controller identity. Unauthorized and missing ids are existence-hidden. Correlations grant no Project, Session or execution authority. Requires its own Host-reviewed callable; no gateway fallback.",
+            "checkpoint_goal" => "Checkpoint an exact owned active Goal with current revision and idempotency key: complete selected stable steps, select at most one current step, record a bounded summary. Validate atomically; completed progress never regresses. Same keyed input replays; changed reuse conflicts. Requires its own Host-reviewed callable; no gateway fallback.",
+            "update_goal" => "Update an owned Goal's bounded metadata/controller or explicitly complete/cancel it using exact revision and idempotency key. Authorize the exact replacement controller independently. Finish all plan steps and verify evidence before completion; terminal state is immutable. Requires its own Host-reviewed callable; no gateway fallback.",
+            "bootstrap_agent_conversation" => "Verify exact Agent/Endpoint generation; return bounded turn context without Message bodies. Only an explicit activation_idempotency_key activates an eligible pending Inbox Wake in this turn; omit it for already-dispatched Task/attention/wait Wakes. Never requests a new turn or consumes a Wake. Requires its own Host-reviewed callable; no gateway fallback.",
+            "consume_agent_wake" => "Consume one exact durable Wake after accepting its resumed model turn. Match wake_id, consume_token, endpoint_id and controller generation; stale attachments fail. Exact replay returns already_consumed without another effect. No Inbox deliveries or execution authority are consumed/granted. Requires its own Host-reviewed callable; no gateway fallback.",
             "search_file_context" => "Search project text and read bounded context around matches. Use query xor queries (1..8 independent); max_reads is shared. Returns revision-fenced ranges and per-query failures. Use search_project_texts for discovery/count/files-only; follow reads.suggested_call to continue.",
             "search_project_texts" => "Search project text with 1..8 independent queries and bounded results. Use regex by default, literal for exact text. Use search_file_context to read matched source; tracked-file tools for filenames. Follow suggested_call; narrow truncated queries.",
-            "edit_project_files" => "Read with read_files; send one change per file. Existing edit/delete/rename require expected_read_revision; create needs content. Exact edits fail closed on ambiguity; replace_range uses 1-based inclusive lines from that snapshot. Batches preflight transactionally; Runner rechecks source. Stale: read_files recovery. outcome_unknown: observe before another write. Review and use task-appropriate validation.",
-            "project_validate" => "Validate Rust/Go/Python/Node; lint requires scripts.lint (no fallback); no installs. Only structured evidence proves counts. Vitest/Jest require project_validation_node_json_v1. Scripts may write/use network. Pending: same Job; observe_jobs, never retry. Scope/filter/policy: read_tool_manifest.",
-            "project_build" => "Build Rust/Go/Python/Node via Runner argv; no installs. Rust/Go: packages/all_packages, locked. Rust dependency_resolution_policy=offline adds Cargo --offline (not OS sandbox); others reject. Python: pyproject.toml, -m build --no-isolation; no scope. Node: declared script; no scope/policy; hooks may write/network. Artifacts don't prove correctness. Pending: same durable Job; observe_jobs, never retry/redispatch.",
+            "edit_project_files" => "Edit Project-relative or in-root absolute paths; one change per file. Default edit/replace_exact. Unique exact replace/delete can omit revision; write/delete/rename and positional/bulk edits need expected_read_revision from read_files. Supplied revisions reject stale content. Batch preflight; Runner rechecks source. Ambiguity fails closed. Stale: read_files recovery. Unknown effects: inspect before writing.",
+            "project_validate" => "Validate Rust/Go/Python/Node; no installs. Rust scope.exclude_packages needs all_packages=true, 1–8 exact Cargo members and project_workspace_exclusions_v1. Lint requires scripts.lint (no fallback); Vitest/Jest need project_validation_node_json_v1. Structured evidence proves counts. Scripts may write/network. Pending same Job; observe_jobs, never retry. Other scope/filter/policy: read_tool_manifest.",
+            "project_build" => "Build Rust/Go/Python/Node; no installs. Rust profile/targets/artifact_policy=observe: no creation/correctness/freshness proof. Rust scope.exclude_packages needs all_packages=true + project_workspace_exclusions_v1. Rust dependency_resolution_policy=offline: Cargo only, not OS sandbox. Other scope/policy: read_tool_manifest. Scripts may write/network. Pending same Job: observe_jobs, never retry/redispatch.",
             "run_process" => "Run native executable literal argv. run_shell: shell grammar/short chains; run_script: scripts. Pending: same Job/continuation; never redispatch. Do independent work; when blocked: wait_for_job_readiness. Logs/details/recovery: observe_jobs. Diagnose failures; validate; outcome_unknown requires observation.",
             "run_shell" => "Run shell grammar/a short related command chain. run_process: literal argv; run_script: scripts. Pending: same Job/continuation; never redispatch. Do independent work; when blocked: wait_for_job_readiness. Logs/details/recovery: observe_jobs. Diagnose failures; validate; outcome_unknown requires observation.",
             "run_script" => "Run typed sh/bash/PowerShell/Python/JS/TS script data; prefer structured source editors. run_process: literal argv; run_shell: shell grammar. Pending: same Job/continuation; never redispatch. Do independent work; when blocked: wait_for_job_readiness. Logs/details/recovery: observe_jobs. Diagnose failures; validate; outcome_unknown requires observation.",
@@ -53,8 +78,14 @@ pub(super) fn compact_tool(tool: &mut Value) {
             "start_agent_task_endpoint_continuation" => "Select the Endpoint continuation for one exact live AgentTaskAttempt. Pass attempt_ref or task, attempt, assignee, fence, and controller generation. Does not choose an Endpoint or grant CodingAgent authority. A stale ref fails closed and is not rewritten onto a later attempt or generation.",
             _ => description,
         };
-        tool["description"] =
-            Value::String(bound_description(selection, TOOL_DESCRIPTION_MAX_CHARS));
+        // Bootstrap carries Project/Session authority and uncertain-startup
+        // recovery. Keep its canonical operational contract intact on discovery;
+        // surface-specific context/defaults are projected separately.
+        tool["description"] = Value::String(if name == "work_on_project" {
+            selection.to_owned()
+        } else {
+            bound_description(selection, TOOL_DESCRIPTION_MAX_CHARS)
+        });
     }
     if let Some(schema) = tool.get_mut("inputSchema") {
         compact_input_descriptions(schema);
@@ -107,7 +138,7 @@ fn compact_primary_editor_schema(schema: &mut Value) {
     }
 }
 
-fn strip_schema_descriptions(schema: &mut Value) {
+pub(super) fn strip_schema_descriptions(schema: &mut Value) {
     let Some(object) = schema.as_object_mut() else {
         return;
     };

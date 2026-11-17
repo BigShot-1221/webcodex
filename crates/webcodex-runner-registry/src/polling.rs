@@ -4,9 +4,12 @@ use super::jobs::{
     replace_log_limited, request_preview, retain_ordinary_result_stream_with_evidence,
     retain_result_stream_to_with_evidence,
 };
-use super::requests::{remove_pending_request_locked, take_pending_request_locked};
+use super::requests::{
+    record_sync_request_cancellation, remove_pending_request_locked, take_pending_request_locked,
+};
 use super::state::JobLifecycleState;
 use super::validation::{validate_id, validate_runner_instance_id};
+use super::RunnerRequestCancellationReason;
 use super::{now_ts, RunnerFeature, RunnerRegistry};
 use webcodex_core::coding_agent::{
     validate_response_for_request as validate_coding_agent_response, CodingAgentDispatchState,
@@ -95,6 +98,28 @@ impl RunnerRegistry {
             let Some(request_id) = request_id else {
                 return Ok(None);
             };
+            // The exact synchronous Computer caller has stopped waiting. Retire
+            // only work not yet dispatched; this says nothing about a Host turn
+            // or an already dispatched native operation.
+            let abandoned_computer = inner.pending_by_id.get(&request_id).is_some_and(|pending| {
+                matches!(&pending.operation, RunnerOperation::Computer(_))
+                    && pending.job_id.is_none()
+                    && !pending.dispatched
+                    && pending
+                        .waiter
+                        .as_ref()
+                        .is_some_and(tokio::sync::oneshot::Sender::is_closed)
+            });
+            if abandoned_computer {
+                if let Some(pending) = take_pending_request_locked(&mut inner, &request_id) {
+                    record_sync_request_cancellation(
+                        self.telemetry.as_ref(),
+                        &pending,
+                        RunnerRequestCancellationReason::WaiterClosed,
+                    );
+                }
+                continue;
+            }
             let stale_input = inner.pending_by_id.get(&request_id).and_then(|pending| {
                 super::job_input::dispatch_rejection(&inner, &pending.operation, &body.client_id)
             });

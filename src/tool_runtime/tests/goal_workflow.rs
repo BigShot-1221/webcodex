@@ -37,6 +37,7 @@ impl Workflow {
         .await;
         let session_id =
             start_goal_activity_session(&runtime, &auth, &project, "Current Goal workflow")
+                .await
                 .session_id;
         let agent = runtime.create_agent_identity(
             Some(&auth),
@@ -934,6 +935,38 @@ async fn goal_workflow_unobserved_or_stale_card_never_wakes_even_when_attention_
 }
 
 #[tokio::test]
+async fn goal_workflow_delayed_hidden_card_requires_new_observation_without_new_epoch() {
+    for gap in [75_001, 180_000] {
+        let fixture = Workflow::new(true).await;
+        let observed_at = T0 + THRESHOLD - 1;
+        fixture.poll(observed_at);
+        let resumed_at = observed_at + gap;
+        assert_no_attention(&fixture.recheck(resumed_at).await);
+        assert_eq!(
+            fixture.counts(),
+            (0, 0),
+            "elapsed cards cannot create attention"
+        );
+
+        // A delayed callback can renew observation, but it cannot create a new
+        // meaningful-work epoch or bypass the ordinary server eligibility checks.
+        fixture.poll(resumed_at);
+        let attention = fixture.recheck(resumed_at).await;
+        assert!(attention.success, "{:?}", attention.output);
+        assert_eq!(attention.output["state_changed"], true);
+        let wake_id = attention.output["attention"]["wake_id"].clone();
+        for offset in [1, 15_000, 30_000, 60_000] {
+            fixture.poll(resumed_at + offset);
+            let replay = fixture.recheck(resumed_at + offset).await;
+            assert!(replay.success, "{:?}", replay.output);
+            assert_eq!(replay.output["state_changed"], false);
+            assert_eq!(replay.output["attention"]["wake_id"], wake_id);
+        }
+        assert_eq!(fixture.counts(), (1, 1));
+    }
+}
+
+#[tokio::test]
 async fn goal_workflow_partial_window_coverage_never_commits_attention() {
     let fixture = Workflow::new(true).await;
     for index in 0..16 {
@@ -996,6 +1029,7 @@ async fn goal_workflow_exact_business_session_evidence_covers_only_its_own_recor
         &different.project,
         "Different business Session",
     )
+    .await
     .session_id;
     let different_work = T0 + 3_000;
     different.recorder_gap_work(different_work, Some(&other_session), None);
@@ -1196,7 +1230,8 @@ async fn goal_workflow_revoked_correlated_project_is_partial_even_with_older_wor
         &fixture.auth,
         &other_project,
         "Earlier explicitly correlated work",
-    );
+    )
+    .await;
     link_goal_activity_session(
         &fixture.runtime,
         &fixture.auth,
@@ -1286,7 +1321,8 @@ async fn goal_workflow_requires_current_unambiguous_active_session_not_historica
                     &fixture.auth,
                     &fixture.project,
                     "Different current work",
-                );
+                )
+                .await;
                 record_goal_window_event(
                     &fixture.db,
                     &fixture.auth,
@@ -1860,7 +1896,8 @@ async fn goal_workflow_checkpoint_card_and_closeout_are_sparse_canonical_and_own
         &fixture.auth,
         &fixture.project,
         "Same Project is not Goal correlation",
-    );
+    )
+    .await;
     assert!(fixture
         .runtime
         .active_goal_context_for_session(Some(&fixture.auth), &other.session_id)
@@ -2255,7 +2292,8 @@ async fn goal_workflow_old_work_imported_through_new_correlation_does_not_manufa
         &fixture.auth,
         &fixture.project,
         "Already-existing prior work",
-    );
+    )
+    .await;
     record_goal_window_event(
         &fixture.db,
         &fixture.auth,

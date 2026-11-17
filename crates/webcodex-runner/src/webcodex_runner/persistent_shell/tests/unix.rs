@@ -4,6 +4,7 @@ use webcodex_core::runner_protocol::RunnerRequest;
 
 fn request(action: &str, shell_id: &str, command: Option<&str>) -> RunnerRequest {
     RunnerRequest {
+        computer_control_epoch: None,
         login: false,
         request_id: format!("req-{action}"),
         client_id: "agent-1".to_string(),
@@ -62,6 +63,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, RunnerPolicy) {
         allow_raw_shell: true,
         allow_cwd_anywhere: false,
         allowed_roots: vec![project.clone()],
+        managed_worktree_root: None,
         max_timeout_secs: 30,
         max_output_bytes: 16 * 1024,
     };

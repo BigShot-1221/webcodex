@@ -17,7 +17,7 @@ impl ToolRuntime {
             ToolCall::UpdateAgentIdentity(input) => self.update_agent_identity(auth, input),
 
             ToolCall::RotateAgentContinuationEndpoint(input) => {
-                self.attach_agent_endpoint(auth, input)
+                self.attach_agent_endpoint_for_window(auth, window, input)
             }
 
             ToolCall::PresentAgentContinuation {

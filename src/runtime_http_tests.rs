@@ -257,6 +257,7 @@ async fn register_import_agent_with_capabilities(
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -281,6 +282,7 @@ async fn register_import_agent_with_capabilities(
         "importer",
         "inst-import",
         vec![RunnerProjectSummary {
+            registration_incarnation: Some(uuid::Uuid::new_v4().to_string()),
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: root.to_string_lossy().to_string(),
@@ -586,6 +588,7 @@ fn http_runtime_status_after_runner_registration_fits_default_worker_stack() {
             let mut registration =
                 crate::test_support::current_runner_registration(RunnerRegisterRequest {
                     computer_session_availability: None,
+                    computer_control_epoch: None,
                     process_started_at: Some(1),
                     build: Some(RunnerBuildInfo {
                         version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -630,6 +633,7 @@ fn http_runtime_status_after_runner_registration_fits_default_worker_stack() {
                 "status-stack-runner",
                 "status-stack-instance",
                 vec![RunnerProjectSummary {
+                    registration_incarnation: Some(uuid::Uuid::new_v4().to_string()),
                     id: "smoke-proj".to_string(),
                     name: Some("Smoke Project".to_string()),
                     path: "/tmp/status-stack-project".to_string(),

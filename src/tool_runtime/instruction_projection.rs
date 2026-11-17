@@ -16,8 +16,7 @@ pub(super) fn project_instructions_context_projection(
     current: &ProjectInstructionsSnapshot,
     max_bytes: usize,
 ) -> Value {
-    // Sidecar requests observe current sources without Session retention. Its
-    // shared envelope is smaller than startup, especially with 16 global files.
+    // Explicit sidecars retain their existing shared content/envelope budgets.
     let mut projection = instructions_projection(current, None, true, true, false);
     if serialized_len(&projection) <= max_bytes {
         return projection;

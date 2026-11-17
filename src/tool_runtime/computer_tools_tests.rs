@@ -1,5 +1,242 @@
 use super::responses::{validate_computer_response, ComputerResponseContext};
 use super::*;
+use crate::tool_runtime::RuntimeInfo;
+
+#[test]
+fn computer_local_pause_errors_preserve_pre_effect_and_local_user_recovery() {
+    for kind in [
+        "computer_control_paused",
+        "computer_control_changed",
+        "computer_control_unavailable",
+    ] {
+        let message = format!("{kind}: local control is unavailable");
+        assert_eq!(effects::classify_runner_error(&message), kind);
+        let result = effects::computer_error(kind, &message);
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], kind);
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert_eq!(result.output["recovery_kind"], "user_action");
+    }
+}
+
+#[tokio::test]
+async fn computer_targets_expose_authoritative_key_capabilities() {
+    use crate::runner_protocol::RunnerCapabilities;
+    use std::sync::Arc;
+
+    let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
+    for (id, base, letters, chords) in [
+        ("navigation", true, false, false),
+        ("legacy", true, true, false),
+        ("general", true, false, true),
+        ("unusable", false, false, true),
+    ] {
+        registry
+            .register(crate::test_support::runner_registration(
+                id,
+                "instance",
+                RunnerCapabilities {
+                    computer_key_input: base,
+                    computer_letter_shortcuts: letters,
+                    computer_key_chords: chords,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let runtime = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
+    let mut auth = AuthContext::new(crate::auth::AuthKind::Bootstrap);
+    auth.is_bootstrap = true;
+    let result = runtime.computer_list_targets(Some(&auth)).await;
+    assert!(result.success, "{result:?}");
+    assert_eq!(result.output["count"], 3);
+    let schema = webcodex_tool_contracts::output_schema_for_tool("observe_computer");
+    webcodex_tool_contracts::test_support::validate_schema_instance(
+        &serde_json::to_value(&result).unwrap(),
+        &schema,
+    )
+    .unwrap();
+    let targets = result.output["targets"].as_array().unwrap();
+    for (id, letters, chords) in [
+        ("navigation", false, false),
+        ("legacy", true, false),
+        ("general", false, true),
+    ] {
+        let target = targets
+            .iter()
+            .find(|target| target["client_id"] == id)
+            .unwrap();
+        assert_eq!(target["capabilities"]["computer_key_input"], true);
+        assert_eq!(target["capabilities"]["computer_letter_shortcuts"], letters);
+        assert_eq!(target["capabilities"]["computer_key_chords"], chords);
+    }
+}
+
+#[tokio::test]
+async fn computer_general_key_admission_rejections_are_not_started() {
+    use crate::runner_protocol::{RunnerCapabilities, RunnerPollRequest};
+    use std::sync::Arc;
+
+    for replaced in [false, true] {
+        for (key, modifiers) in [
+            ("a", vec!["control"]),
+            ("p", vec!["shift", "control"]),
+            ("tab", vec!["shift"]),
+        ] {
+            // Navigation is used only for the instance fence; it needs no new bit.
+            if !replaced && key == "tab" {
+                continue;
+            }
+            let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
+            registry
+                .register(crate::test_support::runner_registration(
+                    "computer",
+                    "current",
+                    RunnerCapabilities {
+                        computer_key_input: true,
+                        computer_letter_shortcuts: true,
+                        computer_key_chords: replaced,
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap();
+            let runtime = ToolRuntime::new(registry.clone(), Arc::new(RuntimeInfo::default()));
+            let mut auth = AuthContext::new(crate::auth::AuthKind::Bootstrap);
+            auth.is_bootstrap = true;
+            let result = runtime
+                .dispatch_computer_request_for_instance(
+                    "computer",
+                    "computer_key_input",
+                    json!({"surface_id":"surface_test", "key":key,
+                    "modifiers":modifiers}),
+                    Some(&auth),
+                    None,
+                    Some("surface_test"),
+                    None,
+                    Some(if replaced { "previous" } else { "current" }),
+                )
+                .await;
+            assert!(!result.success, "{key}: {result:?}");
+            assert_eq!(result.output["execution_state"], "not_started");
+            assert_eq!(result.output["state_changed"], false);
+            assert!(
+                result.error.as_deref().unwrap().contains(if replaced {
+                    "runner_replaced:"
+                } else {
+                    "computer_key_chords"
+                }),
+                "{result:?}"
+            );
+            assert!(registry
+                .poll(RunnerPollRequest {
+                    client_id: "computer".into(),
+                    runner_instance_id: "current".into()
+                })
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn computer_post_observation_admission_rejection_preserves_not_started() {
+    use crate::runner_protocol::{RunnerCapabilities, RunnerPollRequest};
+    use std::sync::Arc;
+
+    // These are the admission-time states after the composing caller captured
+    // its Runner identity and capabilities. No native operation has been queued.
+    for replaced in [true, false] {
+        for kind in ["computer_control", "computer_input_text"] {
+            let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
+            registry
+                .register(crate::test_support::runner_registration(
+                    "computer",
+                    "current",
+                    RunnerCapabilities {
+                        computer_control: true,
+                        computer_text_input: true,
+                        computer_accessibility_observe: replaced,
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap();
+            let runtime = ToolRuntime::new(
+                registry.clone(),
+                Arc::new(crate::tool_runtime::RuntimeInfo::default()),
+            );
+            let mut auth = AuthContext::new(crate::auth::AuthKind::Bootstrap);
+            auth.is_bootstrap = true;
+            let result = runtime
+                .dispatch_computer_request_for_instance(
+                    "computer",
+                    kind,
+                    json!({"surface_id":"surface_test","element_id":"element_test",
+                        "action":"press","text":"hello"}),
+                    Some(&auth),
+                    None,
+                    Some("surface_test"),
+                    None,
+                    Some(if replaced { "previous" } else { "current" }),
+                )
+                .await;
+            assert!(!result.success, "{kind}: {result:?}");
+            assert_eq!(
+                result.output["execution_state"], "not_started",
+                "{kind}: {result:?}"
+            );
+            assert_eq!(result.output["state_changed"], false);
+            assert!(result.output.get("post_observation").is_none());
+            assert!(
+                result.error.as_deref().unwrap().contains(if replaced {
+                    "runner_replaced:"
+                } else {
+                    "capability_unavailable:"
+                }),
+                "{kind}: {result:?}"
+            );
+            assert!(registry
+                .poll(RunnerPollRequest {
+                    client_id: "computer".into(),
+                    runner_instance_id: "current".into(),
+                })
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[test]
+fn computer_post_observation_governance_requires_read_and_control() {
+    for action in ["press", "input_text", "scroll"] {
+        let mut args = json!({"action":action,
+            "client_id":"mini","surface_id":"surface_test","element_id":"element_test",
+            "observe_after":{"action":"accessibility_tree"}});
+        if action == "input_text" {
+            args["text"] = json!("hello");
+        }
+        if action == "scroll" {
+            args["direction"] = json!("down");
+        }
+        let call: ComputerControlToolCall = serde_json::from_value(args).unwrap();
+        let policy = computer_control_policy(&call);
+        let mut auth = computer_auth(&[]);
+        auth.scopes = vec![SCOPE_COMPUTER_CONTROL.into()];
+        assert_eq!(
+            policy.authority.first_missing(Some(&auth)),
+            Some(SCOPE_COMPUTER_READ)
+        );
+        auth.scopes = vec![SCOPE_COMPUTER_READ.into()];
+        assert_eq!(
+            policy.authority.first_missing(Some(&auth)),
+            Some(SCOPE_COMPUTER_CONTROL)
+        );
+    }
+}
 use crate::tool_runtime::specialized::SpecializedAuthorityRequirement;
 
 fn surface(id: &str) -> Value {
@@ -83,6 +320,7 @@ fn response_context(kind: &'static str) -> ComputerResponseContext<'static> {
         expected_action: Some("focus".to_string()),
         expected_key: None,
         expected_key_modifiers: json!([]),
+        scroll_input: None,
         expected_text_bytes: None,
         snapshot_advanced: false,
         expected_snapshot_region: None,
@@ -1394,7 +1632,7 @@ fn computer_key_input_normalizes_closed_vocabulary_and_modifiers() {
         .unwrap(),
         vec!["shift".to_string(), "command".to_string()]
     );
-    assert!(normalize_computer_key_input("a", None).is_err());
+    assert!(normalize_computer_key_input("unknown", None).is_err());
     assert!(normalize_computer_key_input(
         "enter",
         Some(vec!["shift".to_string(), "shift".to_string()]),
@@ -1402,6 +1640,28 @@ fn computer_key_input_normalizes_closed_vocabulary_and_modifiers() {
     .is_err());
     assert!(normalize_computer_key_input("enter", Some(vec!["caps_lock".to_string()]),).is_err());
     assert!(normalize_computer_key_input("tab", Some(vec!["shift".to_string(); 5])).is_err());
+}
+
+#[test]
+fn computer_key_input_general_chords_use_canonical_keys_and_modifiers() {
+    for key in webcodex_core::computer_input_contract::computer_key_input_keys() {
+        assert_eq!(
+            normalize_computer_key_input(key, Some(vec!["control".into()])).unwrap(),
+            vec!["control"]
+        );
+        for modifiers in [
+            None,
+            Some(vec![]),
+            Some(vec!["shift".into()]),
+            Some(vec!["control".into(), "option".into()]),
+            Some(vec!["control".into(), "shift".into()]),
+        ] {
+            assert!(normalize_computer_key_input(key, modifiers).is_ok());
+        }
+    }
+    for key in ["unknown", "P", "Ctrl+P", "0x50", "j p"] {
+        assert!(normalize_computer_key_input(key, Some(vec!["control".into()])).is_err());
+    }
 }
 
 #[test]
@@ -1448,20 +1708,35 @@ fn computer_key_input_validator_is_exact_and_post_dispatch_mismatch_is_unknown()
 
 #[test]
 fn computer_key_input_validator_accepts_closed_windows_metadata() {
-    let expected_modifiers = json!(["shift"]);
-    let valid = validate_computer_key_input(
-        json!({
-            "platform": "windows",
-            "surface_id": "surface_test",
-            "key": "tab",
-            "modifiers": ["shift"],
-            "success": true
-        }),
-        "surface_test",
-        "tab",
-        &expected_modifiers,
-    );
-    assert!(valid.success, "{:?}", valid.output);
+    for key in webcodex_core::computer_input_contract::computer_key_input_keys() {
+        let expected_modifiers = json!(["shift"]);
+        let valid = validate_computer_key_input(
+            json!({
+                "platform": "windows",
+                "surface_id": "surface_test",
+                "key": key,
+                "modifiers": ["shift"],
+                "success": true
+            }),
+            "surface_test",
+            key,
+            &expected_modifiers,
+        );
+        assert!(valid.success, "{:?}", valid.output);
+        let schema = webcodex_tool_contracts::output_schema_for_tool("control_computer");
+        webcodex_tool_contracts::test_support::validate_schema_instance(
+            &serde_json::to_value(&valid).unwrap(),
+            &schema,
+        )
+        .unwrap();
+        let mut receipt = valid.output;
+        receipt["key"] = json!(if key == "a" { "p" } else { "a" });
+        let invalid =
+            validate_computer_key_input(receipt, "surface_test", key, &expected_modifiers);
+        assert!(!invalid.success, "{key}");
+        let unknown = computer_effect_validated_result(invalid, "observe before retrying");
+        assert_eq!(unknown.output["execution_state"], "outcome_unknown");
+    }
 }
 
 #[test]
@@ -1558,6 +1833,7 @@ fn computer_input_text_utf8_byte_bound_rejects_empty_nul_and_oversize() {
     assert_eq!(validate_input_text(valid).unwrap(), valid.len());
     let encoded = serde_json::to_value(ToolCall::ComputerControl(
         ComputerControlToolCall::InputText {
+            observe_after: None,
             client_id: "mini".to_string(),
             surface_id: "surface_test".to_string(),
             element_id: "element_test".to_string(),
@@ -1996,4 +2272,51 @@ fn computer_snapshot_validator_attaches_exact_client_id() {
     );
     assert!(result.success);
     assert_eq!(result.output["client_id"], "msi");
+}
+
+#[test]
+fn computer_selection_state_preserves_unknown_and_rejects_inconsistent_facts() {
+    let old = json!({"platform":"windows", "surface_id":"surface_test", "element_id":"element_test",
+        "observation_generation":1,"enabled":true,"focused":false,"protected":false,
+        "value_empty":null,"can_press":false,"can_focus":false,"can_input_text":false});
+    let result = validate_computer_element_state(old.clone(), "surface_test", "element_test");
+    assert!(result.success);
+    assert!(result.output.get("can_select").is_none());
+    assert!(result.output.get("selected").is_none());
+    let mut current = old;
+    current["can_select"] = json!(true);
+    current["selected"] = json!(false);
+    assert!(
+        validate_computer_element_state(current.clone(), "surface_test", "element_test").success
+    );
+    for (field, value) in [
+        ("enabled", json!(false)),
+        ("protected", json!(true)),
+        ("selected", json!(null)),
+        ("can_select", json!("true")),
+        ("platform", json!("macos")),
+    ] {
+        let mut invalid = current.clone();
+        invalid[field] = value;
+        assert!(!validate_computer_element_state(invalid, "surface_test", "element_test").success);
+    }
+    current.as_object_mut().unwrap().remove("selected");
+    assert!(!validate_computer_element_state(current, "surface_test", "element_test").success);
+}
+
+#[test]
+fn computer_selection_uses_control_authority_without_implicit_read_or_launch() {
+    let call = ComputerControlToolCall::Select {
+        client_id: "runner".into(),
+        surface_id: "surface_test".into(),
+        element_id: "element_test".into(),
+    };
+    let policy = computer_control_policy(&call);
+    let read = computer_auth(&[SCOPE_COMPUTER_READ]);
+    assert_eq!(
+        policy.authority.first_missing(Some(&read)),
+        Some(SCOPE_COMPUTER_CONTROL)
+    );
+    let control = computer_auth(&[SCOPE_COMPUTER_CONTROL]);
+    assert_eq!(policy.authority.first_missing(Some(&control)), None);
 }

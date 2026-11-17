@@ -61,24 +61,25 @@ export function useWindowCollaboration(client: RuntimeV2Client, windowKey: strin
           // may leave this bounded DOM window, but remain accessible via Latest.
           replace({ ...page, messages: messages.slice(0, MAX_VISIBLE_MESSAGES) });
           history.current = true; setBrowsingHistory(true);
-        } else if (previous && previous.history_scope === page.history_scope) {
+        } else if (previous && previous.history_scope === page.history_scope && (!page.truncated
+            || page.messages.some(row => previous.messages.some(cached => cached.message_id === row.message_id)))) {
           const rows = new Map([...previous.messages, ...page.messages].map(row => [row.message_id, row]));
           const messages = [...rows.values()].sort((a, b) => a.created_at_ms - b.created_at_ms || (a.message_id < b.message_id ? -1 : a.message_id > b.message_id ? 1 : 0));
           const clipped = messages.length > MAX_VISIBLE_MESSAGES;
           const visible = messages.slice(-MAX_VISIBLE_MESSAGES);
           const truncated = clipped || previous.truncated || page.truncated;
-          // A head refresh may skip an entire page while this view was hidden.
-          // Keep the unvisited coverage edge, not simply the oldest cached row.
-          const previousIds = new Set(previous.messages.map(row => row.message_id));
-          const overlaps = page.messages.some(row => previousIds.has(row.message_id));
-          const boundary = !overlaps || clipped ? page.next_before || page.messages[0]?.message_id
-            : previous.next_before || visible[0]?.message_id;
+          const boundary = clipped ? visible[0]?.message_id : previous.next_before || visible[0]?.message_id;
           replace({ ...page, messages: visible, truncated,
             next_before: truncated ? boundary : null });
-        } else replace(page);
+        } else {
+          // A truncated head page that does not reach the cached rows skipped
+          // messages (for example, while the tab was inactive). Never splice
+          // across that gap; earlier history stays reachable through the cursor.
+          replace(page);
+        }
         setReadError(null);
       } else {
-        setReadError(response?.status === 403 ? "access" : response?.status === 404 ? "unavailable" : "failed");
+        setReadError(response?.status === 403 ? "access" : response?.status === 404 || response?.data?.available === false ? "unavailable" : "failed");
         if ([401, 403, 404].includes(response?.status || 0) || response?.data?.available === false) replace(null);
       }
     } catch { if (alive.current && !controller.signal.aborted && target.current === requestTarget) setReadError("failed"); }

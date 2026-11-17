@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
 use super::continuation_feedback::EXPLORATION_CONTINUITY_ACTION;
-use super::guidance::{core_guidance, tool_strategy_guidance};
+use super::guidance::{core_guidance, tool_strategy_guidance, CODING_GUIDANCE_CONTEXT_KEY};
 #[cfg(test)]
 use super::project_instructions::INSTRUCTION_CANDIDATE_PATHS;
 use super::project_instructions::{
@@ -58,12 +58,9 @@ pub(crate) use webcodex_core::runtime_contract::{
     BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEM_CHARS,
 };
 
-/// Stable model-facing coding/review semantics owned by WebCodex itself.
-///
-/// This is intentionally not a project instruction source and is never stored
-/// as Session mode, capability, permission, or execution authority. Ordinary
-/// implementation uses the default guidance; task text may explicitly request
-/// the independent review role, whose name only selects review behavior.
+/// Shared project workflow, separate from project instructions and authority.
+/// Coding and review conventions are an explicitly requested context chapter;
+/// neither its task roles nor the tool strategy are persisted Session modes.
 pub(crate) fn builtin_coding_workflow_projection(profile: CodingGuidanceProfile) -> Value {
     builtin_coding_workflow_projection_with_policy(profile, Default::default())
 }
@@ -78,13 +75,11 @@ pub(crate) fn builtin_coding_workflow_projection_with_policy(
         "contract": BUILTIN_CODING_WORKFLOW_CONTRACT,
         "version": BUILTIN_CODING_WORKFLOW_VERSION,
         "authority": "model_guidance_only",
-        "role_selection": "Ordinary implementation uses default guidance. Use independent_review only for an explicit independent review pass. Roles never grant authority.",
         "guidance": core_guidance(),
         "tool_strategy": tool_strategy_projection(profile),
         "model_protocol": {
+            "coding_guidance": format!("For code implementation or an explicit code review on an MCP surface with _wc context sidecars, request _wc.context=[\"{CODING_GUIDANCE_CONTEXT_KEY}\"] and select the applicable task role. Other project tasks do not need the chapter. Reuse complete guidance; project instructions own language and repository conventions."),
             "goal_workflow": policy.goal_selection_guidance(),
-            "goal_continuation": policy.mcp_app_resume.guidance(),
-            "goal_checkpoint": policy.goal_checkpoint_guidance(),
             "handoff_recovery": "Use handoff only after task-context loss/compaction/restart, explicit transfer or user recovery. Never use it for routine progress/baselines; timeout alone is not Session loss. Missing exact session_id: original Window _wc.context=[\"workflow.resume\"]; else list_sessions(project). Choose authorized candidate; read read_session_handoff and check basis completeness/truncation. Snapshot changed: re-read exact handoff for latest instructions/decisions/progress/validation before dependent work. Active: work_on_project(session_id=..., instruction=...) reauthorizes bound Project; reuse project_ref. Closed: history only. Notes are reports; check stale facts. Dirty files alone don't prove external changes.",
             "session_recording": "When work_on_project creates or resumes, prefer its returned session_ref as _wc.record on each ordinary call for that Session's recorder provenance only; canonical wc_sess_* remains valid. business session_id may target another Session but does not select a recorder; _wc.record grants no authority. Recorder is request-scoped, never sticky; omitted calls are not backfilled. Save agreed decisions/progress/remaining work via post_session_message(kind=decision/progress) on explicit business Session at recovery boundaries/before switching; stable delivery_key for uncertain same-payload retries. Chat/private reasoning is not auto-recorded. No credentials in notes. Delegated reports are not native validation proof.",
             "session_message_ack": "For any retained collaboration message with requires_ack=true projected in session_attention, peer_messages, or operator_messages, attach _wc.ack=[<wc_msg_*>] on the next ordinary model-visible call. Compact _wc.ack_ref remains Session-only. ACK proves model-context retention only; it never resolves messages, grants authority, or gates execution.",
@@ -93,20 +88,11 @@ pub(crate) fn builtin_coding_workflow_projection_with_policy(
             "control_sidecars": "_wc.control is optional and only for an established workflow: piggyback a known transition on an already-needed call; otherwise omit it or use its standalone tool. Never create a Goal/Agent just to use a sidecar. Follow the canonical control schema and load webcodex.goal_workflow for Goal transitions. One mutation per phase, independently authorized; no automatic transitions. Post failure preserves main success. session_context_update remains fail-closed pending CAS/replay support.",
             "context_sidecar": "_wc.context is an optional post-result context request; it never authorizes. jobs.attention is Project-level, not Session/control; workflow.resume is Window/principal-scoped recovery evidence only and never selects or resumes a Session. Recover project.instructions by observation call before dependent mutation.",
             "bootstrap_reuse": "Fresh model context: first suitable work_on_project requests _wc.context=[\"project.instructions\",\"webcodex.workflow\"]. First entry to another Project: request project.instructions; reuse retained webcodex.workflow. With complete/current context retained, omit both context keys on later tasks/Sessions and return visits. Session/ClientWindow continuity does not prove retention. Refresh after compaction/context loss, changed fingerprints/revisions, incomplete/truncated/missing bodies, stale workflow, or user request. status=loaded means observed only; content_included=true and complete means read. Follow read_more for missing bodies; read_files for exact ranges. Context refresh never authorizes.",
-            "bootstrap_observations": "work_on_project.workspace is the initial branch/HEAD/status observation; refresh after mutation/stale state and for mutation fences. semantic_navigation available=true works without get_lsp_status; diagnose probe_timeout/probe_failed/unavailable. Fresh/first Project: include_extension_catalog=true/default. Set false only while that Project's complete/sufficient catalog is retained; refresh for changed catalog revision/runtime, truncated discovery, missing relevant metadata, context loss, or user request. If one Skill description materially matches the task, load_skill; Do not load unrelated Skills. Reuse retained same-Project Skill bodies/revisions; catalog metadata alone is not a loaded Skill. Plugin catalog is selection metadata: reuse its applicable retained schema/binding; Never carry a projectBound binding to another Project or recover by replaying uncertain effects. Skill guidance grants no authority.",
+            "bootstrap_observations": "work_on_project.workspace observes branch/HEAD/status; refresh after mutation, stale state or for mutation fences. semantic_navigation: available=true needs no extra probe; only index_readiness=ready confirms indexing. Navigation waits are bounded; diagnose probe failures. Fresh/first Project: include_extension_catalog=true/default. Set false only while that Project's complete/sufficient catalog is retained; refresh for changed catalog revision/runtime, truncated discovery, missing relevant metadata, context loss, or user request. If one Skill description materially matches the task, load_skill; Do not load unrelated Skills. Reuse retained same-Project Skill bodies/revisions; catalog metadata alone is not a loaded Skill. Plugin catalog is selection metadata: reuse its applicable retained schema/binding; Never carry a projectBound binding to another Project or recover by replaying uncertain effects. Skill guidance grants no authority.",
             "runner_targeting": "For exact Runner client_id, use get_runtime_status(client_id=...) or list_projects(client_id=...) before treating it as absent.",
             "persistent_shell": "Local: run_process=literal argv; run_shell=shell grammar/short chains; run_script=program-like scripts; specialize for added semantics. Persistent shell only for repeated named-SSH state or local same-process state.",
             "work_result_presentation": "PDF: present_pdf(project, path) opens a dedicated reader. For substantial coding work in a stable client Window, call present_work_result(project) exactly once immediately after the first successful project-scoped WebCodex action. Do not wait for work_on_project, Session, edits, validation or closeout. Card refreshes the same Window ActionAudit activity as WebUI: observe/diagnostic actions; optional linked Session collaboration and final changes may appear later. Never repeat presentation or model-poll it in this Window. Tiny one-step/read-only lookups may skip it; finish suggests a fallback if no card was presented.",
             "normal_closeout": "Source/validation/open evidence: finish_coding_task(summary_only=true). Artifact tasks: pass outputs after task-appropriate count/content/format checks; read-only tasks without deliverables omit outputs. No established Goal means no Goal closeout. For goal_follow_up, load webcodex.goal_workflow and preserve unresolved obligations; preference changes never complete a Goal. Read/planning/artifact: finalize directly; close established Goals only after verified completion."
-        },
-        "roles": {
-            "independent_review": {
-                "purpose": "Review independently within task scope.",
-                "guidance": [
-                    "Challenge authority, bounds, malformed data, privacy, replay/races, timeouts, fail-closed behavior.",
-                    "For review-only tasks, report concrete file/line findings and impact; do not edit. Fix only when the task authorizes corrections, with focused regression validation."
-                ]
-            }
         }
     })
 }
@@ -288,21 +274,6 @@ pub(crate) fn build_startup_brief(input: StartupBriefInput<'_>) -> Value {
     brief
 }
 
-/// Return the already-built shared core from any successful startup detail.
-/// Standard/minimal are the core itself; full embeds the same core alongside
-/// diagnostics. No transport is allowed to reassemble these fields.
-pub(crate) fn startup_brief_from_output(output: &Value) -> Option<&Value> {
-    if output.get("detail").and_then(Value::as_str) == Some("full") {
-        output
-            .get("startup_brief")
-            .filter(|value| value.is_object())
-    } else if output.is_object() {
-        Some(output)
-    } else {
-        None
-    }
-}
-
 fn workspace_projection(git: &Value) -> Value {
     let counts = git.get("counts").unwrap_or(&Value::Null);
     let git_available = git.get("available").and_then(Value::as_bool);
@@ -417,6 +388,7 @@ fn semantic_navigation_projection(value: &Value) -> Value {
             .filter(|available| available.is_boolean() || available.is_null())
             .cloned()
             .unwrap_or(Value::Null),
+        "index_readiness": value.get("index_readiness").cloned().unwrap_or_else(|| json!("unknown")),
         "provider": value.get("server").cloned().unwrap_or(Value::Null),
         "capability": if value
             .get("supported")
@@ -1918,6 +1890,7 @@ mod tests {
                 allow_patch: true,
             },
             root_fingerprint: None,
+            registration_incarnation: None,
             knowledge_association: None,
         };
         let instructions = instruction_snapshot();

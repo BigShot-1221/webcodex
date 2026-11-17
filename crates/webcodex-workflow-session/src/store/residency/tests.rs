@@ -138,7 +138,6 @@ fn active_residency_capacity_keeps_identity_and_queries_do_not_promote() {
     assert!(store.hot_payload_entry_count_for_test(&ids[0]).is_some());
     assert_eq!(store.status().hot_sessions, 2);
     assert_eq!(store.status().retained_sessions, 12);
-    assert_eq!(store.status().capacity_evictions, 0);
 }
 
 #[test]
@@ -204,8 +203,8 @@ fn active_residency_is_lossless_not_a_second_disk_sanitization() {
     assert_eq!(store.guard_state(&id).unwrap().0, SessionMode::ReadOnly);
 }
 
-#[test]
-fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
+#[tokio::test]
+async fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&path, 1, 20);
@@ -216,6 +215,7 @@ fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
     };
     let first = store
         .post_message_with_ack_and_delivery(message(&id), true, Some(delivery.clone()))
+        .await
         .unwrap();
     churn(&store);
     let ack = store.observe_message_acks(&id, &[first.message.message_id.clone()]);
@@ -224,12 +224,13 @@ fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
     assert!(
         store
             .post_message_with_ack_and_delivery(message(&id), true, Some(delivery.clone()))
+            .await
             .unwrap()
             .replayed
     );
     store.flush_persistence();
     drop(store);
-    let bytes = std::fs::read(&path).unwrap();
+    let bytes = crate::test_storage::read_ledger_bytes(&path).unwrap();
     let reopened = SessionStore::with_persistence(&path, 1, 20);
     assert_eq!(reopened.status().hot_sessions, 0);
     assert_eq!(reopened.status().active_sessions, 3);
@@ -237,12 +238,13 @@ fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
     reopened.summary(&id, None).unwrap();
     assert_eq!(reopened.status().hot_sessions, 0);
     assert_eq!(
-        std::fs::read(&path).unwrap(),
+        crate::test_storage::read_ledger_bytes(&path).unwrap(),
         bytes,
         "restore/query cannot rewrite the ledger"
     );
     let replay = reopened
         .post_message_with_ack_and_delivery(message(&id), true, Some(delivery))
+        .await
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.message.message_id, first.message.message_id);
@@ -301,16 +303,18 @@ fn active_residency_inflight_call_keeps_terminal_and_sticky_edit_evidence() {
 #[test]
 fn active_residency_zero_target_and_failed_persistence_never_discard_dirty_state() {
     let dir = tempfile::tempdir().unwrap();
-    let blocker = dir.path().join("not-a-directory");
-    std::fs::write(&blocker, "block").unwrap();
-    let store = SessionStore::with_persistence(blocker.join("sessions.json"), 0, 20);
+    let store = SessionStore::with_persistence(dir.path().join("sessions.json"), 0, 20);
+    crate::test_storage::fail_writes(&store, true);
     let id = store.start_session(None, Some("dirty".into())).session_id;
     let first = store.post_message(message(&id)).unwrap();
     churn(&store);
     store.flush_persistence();
     assert!(store.status().last_persist_error.is_some());
-    assert_eq!(store.status().hot_sessions, 1);
-    assert_eq!(store.status().capacity_evictions, 0);
+    assert_eq!(
+        store.status().hot_sessions,
+        2,
+        "dirty records cannot be evicted to an older disk image"
+    );
     assert_eq!(
         encoded(&store, &id)["messages"][0]["message_id"],
         first.message_id
@@ -318,18 +322,19 @@ fn active_residency_zero_target_and_failed_persistence_never_discard_dirty_state
     assert!(store.post_message(message(&id)).is_ok());
 }
 
-#[test]
-fn active_residency_assignment_fences_and_exact_completion_replay_survive_churn() {
+#[tokio::test]
+async fn active_residency_assignment_fences_and_exact_completion_replay_survive_churn() {
     let store = SessionStore::new(1, 20);
     let id = store.start_session(None, None).session_id;
     let mut input = message(&id);
     input.kind = SessionMessageKind::Todo;
     let todo = store.post_message(input).unwrap();
-    let assignment = store.get_assignment(&id, &todo.message_id).unwrap();
+    let assignment = store.get_assignment(&id, &todo.message_id).await.unwrap();
     churn(&store);
     assert_eq!(
         store
             .get_assignment(&id, &todo.message_id)
+            .await
             .unwrap()
             .assignment_fence,
         assignment.assignment_fence
@@ -344,10 +349,10 @@ fn active_residency_assignment_fences_and_exact_completion_replay_survive_churn(
         author_session_id: None,
         expected_assignment_fence: assignment.assignment_fence,
     };
-    let first = store.complete_message(completion.clone()).unwrap();
+    let first = store.complete_message(completion.clone()).await.unwrap();
     assert!(!first.replayed);
     churn(&store);
-    let replay = store.complete_message(completion).unwrap();
+    let replay = store.complete_message(completion).await.unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.answer.message_id, first.answer.message_id);
     assert_eq!(
@@ -381,7 +386,6 @@ fn active_residency_parallel_mutation_and_churn_preserve_every_message() {
     assert_eq!(texts.len(), 32);
     assert_eq!(store.status().active_sessions, 33);
     assert_eq!(store.status().hot_sessions, 1);
-    assert_eq!(store.status().capacity_evictions, 0);
 }
 
 #[test]
@@ -400,7 +404,6 @@ fn active_residency_corrupt_payload_fails_closed_without_replacing_identity() {
     assert!(store.post_message(message(&id)).is_err());
     assert!(store.contains_session(&id));
     assert_eq!(store.lifecycle_state(&id), Some(SessionLifecycle::Active));
-    assert_eq!(store.status().capacity_evictions, 0);
 }
 
 #[test]

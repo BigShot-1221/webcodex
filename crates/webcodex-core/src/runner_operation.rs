@@ -197,6 +197,21 @@ impl RunnerJobOperation {
         }
     }
 
+    pub fn context_mut(&mut self) -> Option<&mut ShellJobContext> {
+        match self {
+            Self::StartShell(operation) => Some(&mut operation.context),
+            Self::StartValidation(operation) => Some(&mut operation.context),
+            Self::StartBuild(operation) => Some(&mut operation.context),
+            Self::StartFormat(operation) => Some(&mut operation.context),
+            Self::StartProcess(operation)
+            | Self::StartInteractiveProcess(operation)
+            | Self::StartDetachedProcess(operation) => Some(&mut operation.context),
+            Self::StartScript(operation) => Some(&mut operation.context),
+            Self::StartSkillResource(operation) => Some(&mut operation.context),
+            Self::Stop { .. } => None,
+        }
+    }
+
     pub fn cwd(&self) -> Option<&str> {
         match self {
             Self::StartShell(operation) => operation.cwd.as_deref(),
@@ -452,6 +467,7 @@ pub enum RunnerProjectOperationKind {
     LifecycleEnable,
     LifecycleDisable,
     LifecycleUnregister,
+    UpdateAllowPatch,
 }
 
 impl RunnerProjectOperationKind {
@@ -464,6 +480,7 @@ impl RunnerProjectOperationKind {
             Self::LifecycleEnable => "project_lifecycle_enable",
             Self::LifecycleDisable => "project_lifecycle_disable",
             Self::LifecycleUnregister => "project_lifecycle_unregister",
+            Self::UpdateAllowPatch => "project_update_allow_patch",
         }
     }
 
@@ -476,6 +493,7 @@ impl RunnerProjectOperationKind {
             "project_lifecycle_enable" => Self::LifecycleEnable,
             "project_lifecycle_disable" => Self::LifecycleDisable,
             "project_lifecycle_unregister" => Self::LifecycleUnregister,
+            "project_update_allow_patch" => Self::UpdateAllowPatch,
             _ => return None,
         })
     }
@@ -511,11 +529,36 @@ pub enum RunnerComputerOperationKind {
     ActivateWindow,
     Control,
     ScrollToElement,
+    Scroll,
     KeyInput,
     InputText,
 }
 
 impl RunnerComputerOperationKind {
+    pub fn is_effect(self) -> bool {
+        match self {
+            Self::LaunchApplication
+            | Self::WriteClipboard
+            | Self::PointerMove
+            | Self::PointerClick
+            | Self::ActivateWindow
+            | Self::Control
+            | Self::ScrollToElement
+            | Self::Scroll
+            | Self::KeyInput
+            | Self::InputText => true,
+            Self::ListWindows
+            | Self::ListApplications
+            | Self::ListDisplays
+            | Self::SnapshotDisplay
+            | Self::ReadClipboard
+            | Self::Snapshot
+            | Self::SnapshotRegion
+            | Self::AccessibilityStatus
+            | Self::AccessibilityTree
+            | Self::ElementState => false,
+        }
+    }
     pub fn wire_kind(self) -> &'static str {
         match self {
             Self::ListWindows => "computer_list_windows",
@@ -535,6 +578,7 @@ impl RunnerComputerOperationKind {
             Self::ActivateWindow => "computer_activate_window",
             Self::Control => "computer_control",
             Self::ScrollToElement => "computer_scroll_to_element",
+            Self::Scroll => "computer_scroll",
             Self::KeyInput => "computer_key_input",
             Self::InputText => "computer_input_text",
         }
@@ -559,6 +603,7 @@ impl RunnerComputerOperationKind {
             "computer_activate_window" => Self::ActivateWindow,
             "computer_control" => Self::Control,
             "computer_scroll_to_element" => Self::ScrollToElement,
+            "computer_scroll" => Self::Scroll,
             "computer_key_input" => Self::KeyInput,
             "computer_input_text" => Self::InputText,
             _ => return None,
@@ -575,10 +620,23 @@ impl RunnerComputerOperationKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerComputerOperation {
+    pub control_epoch: Option<String>,
     pub kind: RunnerComputerOperationKind,
     /// Existing bounded JSON payload carried in `stdin`.
     pub payload: String,
     pub timeout_secs: u64,
+}
+
+/// Bounded UUID-shaped local gate identity shared by registration and dispatch.
+pub fn valid_computer_control_epoch(epoch: &str) -> bool {
+    epoch.len() == 36
+        && epoch.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -878,6 +936,7 @@ impl RunnerInvocation {
 
 fn empty_wire(metadata: RunnerInvocationMetadata, kind: &str, timeout_secs: u64) -> RunnerRequest {
     RunnerRequest {
+        computer_control_epoch: None,
         request_id: metadata.request_id,
         client_id: metadata.client_id,
         kind: kind.to_string(),
@@ -1001,6 +1060,7 @@ fn encode_operation(
             wire.timeout_secs = 30;
         }
         RunnerOperation::Computer(operation) => {
+            wire.computer_control_epoch = operation.control_epoch;
             validate_computer_payload(operation.kind, &operation.payload)?;
             wire.kind = operation.kind.wire_kind().to_string();
             wire.stdin = Some(operation.payload);
@@ -1289,6 +1349,13 @@ fn encode_job_operation(
 }
 
 fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
+    if let Some(epoch) = &wire.computer_control_epoch {
+        if !RunnerComputerOperationKind::from_wire(&wire.kind).is_some_and(|kind| kind.is_effect())
+            || !valid_computer_control_epoch(epoch)
+        {
+            return Err("invalid Computer control epoch or operation".into());
+        }
+    }
     if wire.login
         && (!matches!(wire.kind.as_str(), "run_shell" | "start_job")
             || wire.shell != Some(crate::workflow_session_contract::ExecutionShell::Bash))
@@ -1496,6 +1563,7 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
                 .ok_or_else(|| "computer operation requires JSON payload".to_string())?;
             validate_computer_payload(operation_kind, &payload)?;
             Ok(RunnerOperation::Computer(RunnerComputerOperation {
+                control_epoch: wire.computer_control_epoch.clone(),
                 kind: operation_kind,
                 payload,
                 timeout_secs: wire.timeout_secs,
@@ -2418,6 +2486,45 @@ fn ensure_empty_generic_execution_fields(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn computer_control_epoch_roundtrips_only_on_effects_and_is_omitted_for_legacy_requests() {
+        let metadata = RunnerInvocationMetadata {
+            request_id: "request".into(),
+            client_id: "runner".into(),
+            requested_by: "user".into(),
+            created_at: 0,
+        };
+        let operation = RunnerOperation::Computer(RunnerComputerOperation {
+            kind: RunnerComputerOperationKind::WriteClipboard,
+            payload: r#"{"text":"fixture"}"#.into(),
+            timeout_secs: 1,
+            control_epoch: Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into()),
+        });
+        let wire = encode_operation(metadata, operation.clone()).unwrap();
+        let RunnerOperation::Computer(decoded) = wire.decode_operation().unwrap() else {
+            panic!("Computer operation expected");
+        };
+        let RunnerOperation::Computer(expected) = operation else {
+            unreachable!();
+        };
+        assert_eq!(decoded, expected);
+        let mut wire = wire;
+        for invalid in ["-".repeat(36), "a".repeat(36), "a".repeat(4096)] {
+            wire.computer_control_epoch = Some(invalid);
+            assert!(wire.decode_operation().is_err());
+        }
+        wire.computer_control_epoch = Some("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into());
+        wire.kind = "computer_read_clipboard".into();
+        assert!(wire.decode_operation().is_err());
+        wire.kind = "run_shell".into();
+        assert!(wire.decode_operation().is_err());
+        wire.computer_control_epoch = None;
+        assert!(serde_json::to_value(wire)
+            .unwrap()
+            .get("computer_control_epoch")
+            .is_none());
+    }
+
+    #[test]
     fn computer_snapshot_kinds_share_the_native_image_response_budget() {
         for kind in [
             RunnerComputerOperationKind::Snapshot,
@@ -2426,6 +2533,7 @@ mod tests {
         ] {
             assert!(kind.is_large_image(), "{kind:?}");
             assert!(RunnerOperation::Computer(RunnerComputerOperation {
+                control_epoch: None,
                 kind,
                 payload: "{}".to_string(),
                 timeout_secs: 30
@@ -2975,6 +3083,7 @@ mod tests {
                     scope: Some(ProjectValidationScope {
                         packages: Vec::new(),
                         all_packages: true,
+                        exclude_packages: Vec::new(),
                     }),
                     dependency_policy: None,
                     dependency_resolution_policy: None,
@@ -3077,6 +3186,9 @@ mod tests {
         let mut validation_context = job_context(Some("/repo"));
         validation_context.validation_steps = vec!["check".to_string()];
         let build_request = crate::project_build::ProjectBuildRequest {
+            profile: None,
+            targets: None,
+            artifact_policy: None,
             dependency_resolution_policy: None,
             project_id: "demo".to_string(),
             cwd: None,
@@ -3342,6 +3454,7 @@ mod tests {
             RunnerProjectOperationKind::LifecycleEnable,
             RunnerProjectOperationKind::LifecycleDisable,
             RunnerProjectOperationKind::LifecycleUnregister,
+            RunnerProjectOperationKind::UpdateAllowPatch,
         ] {
             operations.push(RunnerOperation::Project(RunnerProjectOperation {
                 kind,
@@ -3367,10 +3480,12 @@ mod tests {
             RunnerComputerOperationKind::ActivateWindow,
             RunnerComputerOperationKind::Control,
             RunnerComputerOperationKind::ScrollToElement,
+            RunnerComputerOperationKind::Scroll,
             RunnerComputerOperationKind::KeyInput,
             RunnerComputerOperationKind::InputText,
         ] {
             operations.push(RunnerOperation::Computer(RunnerComputerOperation {
+                control_epoch: None,
                 kind,
                 payload: "{}".to_string(),
                 timeout_secs: 30,
@@ -3419,6 +3534,7 @@ mod tests {
             "project_lifecycle_enable",
             "project_lifecycle_disable",
             "project_lifecycle_unregister",
+            "project_update_allow_patch",
             "computer_list_windows",
             "computer_list_applications",
             "computer_launch_application",
@@ -3436,6 +3552,7 @@ mod tests {
             "computer_activate_window",
             "computer_control",
             "computer_scroll_to_element",
+            "computer_scroll",
             "computer_key_input",
             "computer_input_text",
             crate::validation_bridge::AGENT_VALIDATION_REQUEST_KIND,

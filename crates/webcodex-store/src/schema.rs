@@ -77,6 +77,66 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Batched variant of [`Self::purge_stale_auth_rows`] for long-running
+    /// operation: identical predicates, but each table loses at most
+    /// `per_table_limit` rows per call, so a large backlog shrinks over
+    /// consecutive calls without any single unbounded bulk delete holding the
+    /// writer connection. Every denied row is rejected on presentation whether
+    /// its row is present (revoked/expired classification) or already purged
+    /// (unknown token), so the cleanup does not weaken the auth contract.
+    /// Returns the number of rows deleted in this call.
+    pub fn purge_stale_auth_rows_batch(
+        &self,
+        now: i64,
+        per_table_limit: i64,
+    ) -> anyhow::Result<usize> {
+        // Inline the (validated, positive) limit: DELETE .. LIMIT needs a
+        // compile-time SQLite option, the rowid subquery form does not.
+        let limit = per_table_limit.max(1);
+        let conn = self.lock_connection(crate::StoreDomain::Core);
+        let mut deleted = 0usize;
+        let tables: [(&str, &str, bool); 6] = [
+            (
+                "oauth_authorization_codes",
+                "expires_at <= ?1 OR used_at IS NOT NULL OR revoked_at IS NOT NULL",
+                true,
+            ),
+            (
+                "oauth_access_tokens",
+                "expires_at <= ?1 OR revoked_at IS NOT NULL",
+                true,
+            ),
+            (
+                "oauth_refresh_tokens",
+                "expires_at <= ?1 OR revoked_at IS NOT NULL",
+                true,
+            ),
+            (
+                "pairing_codes",
+                "expires_at <= ?1 OR used_at IS NOT NULL",
+                true,
+            ),
+            (
+                "api_keys",
+                "revoked_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?1)",
+                true,
+            ),
+            ("account_credentials", "revoked_at IS NOT NULL", false),
+        ];
+        for (table, predicate, binds_now) in tables {
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN
+                 (SELECT rowid FROM {table} WHERE ({predicate}) LIMIT {limit})"
+            );
+            deleted += if binds_now {
+                conn.execute(&sql, rusqlite::params![now])?
+            } else {
+                conn.execute(&sql, [])?
+            };
+        }
+        Ok(deleted)
+    }
+
     fn init_tables(&self) -> anyhow::Result<()> {
         let mut conn = self.lock_connection(crate::StoreDomain::Schema);
         conn.execute_batch(
@@ -556,6 +616,16 @@ impl Database {
                 ON action_events(principal_correlation_kind, principal_correlation_id,
                     project, window_ended_at_ms DESC, client_window_key, client_window_source)
                 WHERE window_meaningful = 1 AND client_window_key IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS window_labels (
+                principal_kind TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                window_key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (principal_kind, principal_id, window_key)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_window_labels_window ON window_labels(window_key);
 
             CREATE TABLE IF NOT EXISTS window_operator_messages (
                 message_id TEXT PRIMARY KEY,

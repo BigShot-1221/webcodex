@@ -17,6 +17,7 @@ async fn mcp_export_runtime_inner(
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -41,6 +42,7 @@ async fn mcp_export_runtime_inner(
         "exporter",
         "inst-export",
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: root.to_string_lossy().into_owned(),
@@ -2444,7 +2446,7 @@ fn present_spreadsheet_descriptor_has_an_independent_capability_scoped_app() {
             .unwrap();
         assert_eq!(
             descriptor["_meta"]["ui"]["resourceUri"],
-            "ui://webcodex/spreadsheet/v4"
+            "ui://webcodex/spreadsheet/v5"
         );
         let disabled = crate::mcp::tools::mcp_tools_list_payload_with_features_for_auth(
             compact, false, true, None,

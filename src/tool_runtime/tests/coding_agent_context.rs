@@ -1,6 +1,6 @@
 use super::support::*;
 use crate::auth::AuthContext;
-use crate::runner_protocol::{RunnerResultPayload, RunnerResultRequest};
+use crate::runner_protocol::RunnerResultPayload;
 use crate::tool_runtime::session_context::workflow_session_authority_fingerprint;
 use crate::tool_runtime::sessions::{
     PostSessionMessageInput, SessionCreateOptions, SessionMessageKind, SessionMessagePriority,
@@ -13,7 +13,14 @@ use webcodex_core::coding_agent::{
     CodingAgentResponsePayload, CodingAgentRunSnapshot, CodingAgentRunState,
 };
 
-fn seed(runtime: &ToolRuntime, project: Option<&str>, auth: &AuthContext) -> String {
+async fn seed(runtime: &ToolRuntime, project: Option<&str>, auth: &AuthContext) -> String {
+    let project_identity = match project {
+        Some(project) => {
+            crate::test_support::registered_session_project_identity(runtime, project, Some(auth))
+                .await
+        }
+        None => None,
+    };
     let id = runtime
         .sessions
         .start_session_with_options(
@@ -25,7 +32,8 @@ fn seed(runtime: &ToolRuntime, project: Option<&str>, auth: &AuthContext) -> Str
             )
             .with_owner_authority_fingerprint(Some(
                 workflow_session_authority_fingerprint(Some(auth)).unwrap(),
-            )),
+            ))
+            .with_project_identity(project_identity),
         )
         .unwrap()
         .session_id;
@@ -72,7 +80,7 @@ async fn coding_agent_context_recovers_exact_closed_history_without_resuming_or_
     ));
     let project = register_runner_project_at_path(&runtime, "context", "demo", root.path()).await;
     let auth = bootstrap_auth_context();
-    let id = seed(&runtime, Some(&project), &auth);
+    let id = seed(&runtime, Some(&project), &auth).await;
     runtime.sessions.close_session(&id).unwrap();
     let listed = runtime
         .dispatch_with_auth(
@@ -132,12 +140,13 @@ async fn coding_agent_context_rejects_foreign_owner_wrong_project_missing_scope_
     let project = register_runner_project_at_path(&runtime, "context", "demo", root.path()).await;
     let other = register_runner_project_at_path(&runtime, "other", "demo", root.path()).await;
     let auth = bootstrap_auth_context();
-    let id = seed(&runtime, Some(&project), &auth);
+    let id = seed(&runtime, Some(&project), &auth).await;
     let foreign = seed(
         &runtime,
         Some(&project),
         &shared_key_auth_context("different-owner"),
-    );
+    )
+    .await;
     for (source, target) in [(&foreign, &project), (&id, &other)] {
         let error = runtime
             .coding_agent_context_instruction(target, source, "Review", Some(&auth))
@@ -149,7 +158,7 @@ async fn coding_agent_context_rejects_foreign_owner_wrong_project_missing_scope_
             .to_string()
             .contains("existing database schema"));
     }
-    let unscoped = seed(&runtime, None, &auth);
+    let unscoped = seed(&runtime, None, &auth).await;
     let error = runtime
         .coding_agent_context_instruction(&project, &unscoped, "Review", Some(&auth))
         .await
@@ -200,7 +209,7 @@ async fn coding_agent_context_is_frozen_in_dispatched_intent_and_changed_retry_c
     )
     .await;
     let auth = bootstrap_auth_context();
-    let id = seed(&runtime, Some(&project), &auth);
+    let id = seed(&runtime, Some(&project), &auth).await;
     let call = || ToolCall::CodingAgentStart {
         project: project.clone(),
         provider_id: "review".into(),
@@ -249,18 +258,7 @@ async fn coding_agent_context_is_frozen_in_dispatched_intent_and_changed_retry_c
     runtime
         .runner_registry
         .complete(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: "context".into(),
-                runner_instance_id: "inst".into(),
-                request_id: request.request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                stdout_truncated: false,
-                stderr_truncated: false,
-                duration_ms: None,
-                error: None,
-            },
+            result: runner_result_request("context".into(), "inst".into(), request.request_id),
             command_execution_state: None,
             mcp_gateway: None,
             plugin_gateway: None,
@@ -291,7 +289,7 @@ async fn coding_agent_context_is_frozen_in_dispatched_intent_and_changed_retry_c
 }
 
 #[tokio::test]
-async fn coding_agent_context_expired_selectors_stop_before_dispatch() {
+async fn coding_agent_context_closed_selectors_survive_cache_capacity_without_dispatch() {
     let root = tempfile::tempdir().unwrap();
     let mut runtime = ToolRuntime::new_for_tests().with_project_reference_database(Arc::new(
         crate::Database::open(&root.path().join("refs.db")).unwrap(),
@@ -310,64 +308,52 @@ async fn coding_agent_context_expired_selectors_stop_before_dispatch() {
     )
     .await;
     let auth = bootstrap_auth_context();
-    let expired = seed(&runtime, Some(&project), &auth);
+    let closed = seed(&runtime, Some(&project), &auth).await;
     let session_ref = runtime
-        .session_reference_for_id(&expired, Some(&auth))
+        .session_reference_for_id(&closed, Some(&auth))
         .expect("live session issues a ref");
-    runtime.sessions.close_session(&expired).unwrap();
-    let retained = seed(&runtime, Some(&project), &auth);
+    runtime.sessions.close_session(&closed).unwrap();
+    let retained = seed(&runtime, Some(&project), &auth).await;
     runtime.sessions.close_session(&retained).unwrap();
+    assert!(runtime.sessions.contains_session(&closed));
+    assert!(runtime.sessions.contains_session(&retained));
     assert!(runtime
         .sessions
-        .retention_tombstone_for_test(&expired)
-        .is_some());
+        .retention_tombstone_for_test(&closed)
+        .is_none());
+    assert_eq!(runtime.sessions.status().retained_sessions, 2);
     let runs_before = runtime.sessions.status().active_sessions;
 
-    for (key, selector) in [
-        ("expired-canonical", expired.as_str()),
-        ("expired-ref", session_ref.as_str()),
-    ] {
-        let started = runtime
-            .dispatch_with_auth(
-                ToolCall::CodingAgentStart {
-                    project: project.clone(),
-                    provider_id: "review".into(),
-                    idempotency_key: key.into(),
-                    instruction: "Review accessibility".into(),
-                    context_session_id: Some(selector.to_string()),
-                    config: None,
-                    timeout_secs: Some(60),
-                    recording_session_id: None,
-                },
+    for selector in [closed.as_str(), session_ref.as_str()] {
+        let prompt = runtime
+            .coding_agent_context_instruction(
+                &project,
+                selector,
+                "Review accessibility",
                 Some(&auth),
             )
-            .await;
-        assert!(!started.success, "{key}: {:?}", started.error);
-        assert_eq!(started.output["error_kind"], "session_retention_expired");
-        assert_eq!(started.output["recovery_kind"], "none");
-        assert_eq!(started.output["state_changed"], false);
-        assert_eq!(started.output["session_id"], expired);
-        assert_eq!(started.output["execution_state"], "not_started");
-        let encoded = started.output.to_string();
-        assert!(!encoded.contains("Keep the existing database schema"));
-        assert!(!encoded.contains("fingerprint"));
-        assert!(!encoded.contains("expiry_ordinal"));
-        assert!(
-            probe_agent_request_for_instance(&runtime, "retention-context", "inst")
-                .await
-                .is_none(),
-            "{key} must not dispatch a CodingAgentRun"
-        );
+            .await
+            .expect("owned Closed Session history must remain addressable");
+        assert!(prompt.starts_with("Review accessibility\n"));
+        assert!(prompt.contains("Keep the existing database schema"));
+        assert!(!prompt.contains("private-test-secret"));
     }
     assert_eq!(runtime.sessions.status().active_sessions, runs_before);
-    assert!(!runtime.sessions.contains_session(&expired));
+    assert!(runtime.sessions.contains_session(&closed));
+    assert!(
+        probe_agent_request_for_instance(&runtime, "retention-context", "inst")
+            .await
+            .is_none(),
+        "a context read must not dispatch a CodingAgentRun"
+    );
 
     let foreign = shared_key_auth_context("different-owner");
     let foreign_canonical = runtime
-        .coding_agent_context_instruction(&project, &expired, "Review", Some(&foreign))
+        .coding_agent_context_instruction(&project, &closed, "Review", Some(&foreign))
         .await
         .unwrap_err();
-    assert_eq!(foreign_canonical.output["error_kind"], "unknown_session_id");
+    // A foreign principal has no project visibility; do not disclose the retained Session.
+    assert_eq!(foreign_canonical.output["error_kind"], "unknown_project");
     let foreign_ref = runtime
         .coding_agent_context_instruction(&project, &session_ref, "Review", Some(&foreign))
         .await

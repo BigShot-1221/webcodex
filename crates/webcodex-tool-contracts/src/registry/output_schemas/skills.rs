@@ -93,6 +93,25 @@ fn skill_versions_recovery_call_schema() -> Value {
     )
 }
 
+fn skill_read_continuation_schema() -> Value {
+    let mut arguments = crate::input_schema_for_tool("read_skill_file");
+    arguments["required"] = json!([
+        "project",
+        "skill_id",
+        "path",
+        "start_line",
+        "limit",
+        "expected_definition_revision",
+        "expected_resource_sha256"
+    ]);
+    suggested_tool_call_schema(
+        webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
+        "read_skill_file",
+        arguments,
+        "Exact next page of the same Skill resource, fenced by its full SHA-256 and definition/package revisions. Advisory only; the adapter projects the call through its existing admitted route and grants no authority.",
+    )
+}
+
 fn apply_skill_recovery_contract(name: &str, schema: &mut Value) {
     let mutation = matches!(
         name,
@@ -102,6 +121,12 @@ fn apply_skill_recovery_contract(name: &str, schema: &mut Value) {
         let properties = schema["properties"]["output"]["properties"]
             .as_object_mut()
             .expect("wrapped Skill output properties");
+        if matches!(name, "load_skill" | "read_skill_file") {
+            properties.insert(
+                "suggested_call".to_string(),
+                skill_read_continuation_schema(),
+            );
+        }
         if mutation {
             properties.insert(
                 "suggested_call".to_string(),
@@ -151,6 +176,33 @@ fn apply_skill_recovery_contract(name: &str, schema: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_continuation_schema_uses_the_canonical_read_input_and_resource_fence() {
+        for tool in ["load_skill", "read_skill_file"] {
+            let schema = output_schema_for_tool(tool).unwrap();
+            let call = &schema["properties"]["output"]["properties"]["suggested_call"];
+            assert_eq!(call["properties"]["tool"]["const"], "read_skill_file");
+            assert_eq!(
+                call["properties"]["follow_up_kind"]["const"],
+                "mechanically_followable"
+            );
+            let arguments = &call["properties"]["arguments"];
+            assert_eq!(arguments["additionalProperties"], false);
+            assert_eq!(
+                arguments["properties"],
+                crate::input_schema_for_tool("read_skill_file")["properties"]
+            );
+            assert!(arguments["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("expected_resource_sha256")));
+            assert!(!arguments["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session_id")));
+        }
+    }
 
     #[test]
     fn descriptor_trust_distinguishes_configured_and_managed_runner_guidance() {
@@ -357,7 +409,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "package_revision",
                 nullable_schema(
                     "string",
-                    "Active immutable whole-package revision for runner-installed Skills; null for project Skills.",
+                    "Active immutable whole-package revision for runner-installed Skills; null for project/configured Skills.",
                 ),
             ),
             (

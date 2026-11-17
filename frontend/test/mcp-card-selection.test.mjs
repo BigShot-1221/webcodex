@@ -96,3 +96,48 @@ test('Workbench retains the saved local mode and flows Home/Goals without submit
     assert.equal(sent.filter(request => request.method === 'tools/call').length, 0);
   } finally { dom.window.close(); }
 });
+
+for (const name of ['work_result', 'spreadsheet']) {
+  test(`${name} appearance panel bounds, nested selection, dismissal and teardown`, async () => {
+    const { dom, win, doc, errors } = card(name);
+    try {
+      await flush();
+      const preference = doc.getElementById('selectionPreference');
+      const details = preference.closest('details');
+      const panel = details.querySelector('.card-selection-preference');
+      const summary = details.querySelector('summary');
+      const trigger = details.querySelector('.ui-select-trigger');
+      Object.defineProperty(win, 'innerWidth', { configurable: true, value: 320 });
+      summary.getBoundingClientRect = () => ({ left: 10, right: 90, top: 10, bottom: 42, width: 80, height: 32 });
+      details.open = true;
+      await flush();
+      assert.equal(panel.style.left, '8px');
+      assert.equal(panel.style.top, '48px');
+      trigger.click();
+      const menu = doc.getElementById(trigger.getAttribute('aria-controls'));
+      menu.dispatchEvent(new win.MouseEvent('pointerdown', { bubbles: true }));
+      assert.equal(details.open, true, 'nested portaled list belongs to Appearance');
+      doc.body.dispatchEvent(new win.MouseEvent('pointerdown', { bubbles: true }));
+      assert.equal(details.open, false);
+      trigger.dispatchEvent(new win.Event('blur'));
+      details.open = true;
+      summary.focus();
+      summary.dispatchEvent(new win.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      assert.equal(details.open, false);
+      assert.equal(doc.activeElement, summary);
+      details.open = true;
+      summary.getBoundingClientRect = () => ({ left: 300, right: 380, top: 10, bottom: 42, width: 80, height: 32 });
+      win.dispatchEvent(new win.Event('resize'));
+      assert.equal(panel.style.left, '112px', 'right edge clamps after resize');
+      win.dispatchEvent(new win.PageTransitionEvent('pagehide'));
+      assert.equal(details.open, false);
+      const previous = panel.style.left;
+      details.open = true;
+      summary.getBoundingClientRect = () => ({ left: 10, right: 90, top: 10, bottom: 42, width: 80, height: 32 });
+      win.dispatchEvent(new win.Event('resize'));
+      await flush();
+      assert.equal(panel.style.left, previous, 'disposed controls no longer reposition');
+      assert.deepEqual(errors, []);
+    } finally { dom.window.close(); }
+  });
+}

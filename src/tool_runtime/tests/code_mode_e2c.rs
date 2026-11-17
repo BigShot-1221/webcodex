@@ -634,7 +634,15 @@ async fn e2c_job_handoff_has_exact_continuation_and_later_write_invalidates_term
     assert!(listed_job["validation"]["source_state"]
         .get("start_fence")
         .is_none());
-    assert!(listed_job.get("command_summary").is_none());
+    let command_summary = listed_job["command_summary"]
+        .as_str()
+        .expect("listed Job must include a command preview");
+    assert!(!command_summary.is_empty());
+    assert!(
+        command_summary.chars().count()
+            <= webcodex_core::audit_preview::COMMAND_PREVIEW_MAX_CHARS + 1,
+        "Job command preview must be bounded: {command_summary:?}"
+    );
     assert!(listed_job.get("stdout_tail").is_none());
     let active = runtime
         .active_jobs_summary(Some(&project), Some(&session), None, 20)
@@ -675,12 +683,14 @@ async fn e2c_job_handoff_has_exact_continuation_and_later_write_invalidates_term
     )
     .await;
     let terminal = runtime
-        .job_status_for_auth(job_id.to_string(), false, None)
-        .await;
-    assert_eq!(terminal.output["validation"]["passed"], true);
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    let terminal_validation = terminal.validation.unwrap().into_value();
+    assert_eq!(terminal_validation["passed"], true);
     assert_eq!(
-        terminal.output["validation"]["source_state"]["freshness"], "stale",
-        "{terminal:?}"
+        terminal_validation["source_state"]["freshness"], "stale",
+        "{terminal_validation:?}"
     );
     let listed_stale = runtime
         .list_jobs_for_auth_with_filters(

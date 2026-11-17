@@ -6,6 +6,7 @@ fn project(name: &'static str, result: &mut ToolResult) {
         Box::new(execution::ExecutionProjection {
             tool_name: name,
             validation_policy: ValidationSuccessPolicy::default(),
+            default_execution_context: false,
         }),
         result,
     );
@@ -162,7 +163,6 @@ fn shell_success_preserves_selected_context_output_loss_and_sidecars() {
     project("run_shell", &mut result);
     assert_shell_schema(&result);
     for key in [
-        "command_summary",
         "cwd",
         "shell",
         "manage_ssh_resource",
@@ -171,7 +171,6 @@ fn shell_success_preserves_selected_context_output_loss_and_sidecars() {
         "stdout_lines",
         "stderr_lines",
         "stdout_truncated",
-        "purpose",
     ] {
         assert_eq!(result.output[key], before[key], "{key}");
     }
@@ -266,15 +265,12 @@ fn shell_sparse_schema_rejects_lifecycle_fragments() {
     project("run_shell", &mut result);
     assert_shell_schema(&result);
     let schema = crate::tool_runtime::registry::output_schema_for_tool("run_shell");
-    for key in ["shell", "cwd", "command_summary"] {
-        let mut wire = serde_json::to_value(&result).unwrap();
-        wire["output"].as_object_mut().unwrap().remove(key);
-        assert!(
-            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&wire, &schema)
-                .is_err(),
-            "{key}"
-        );
-    }
+    assert_eq!(result.output["shell"], "bash");
+    assert!(
+        result.output.get("cwd").is_some(),
+        "retain actual resolved cwd"
+    );
+    assert!(result.output.get("command_summary").is_none());
     for (key, value) in [
         ("exit_code", json!(1)),
         ("duration_ms", json!(1)),
@@ -341,5 +337,163 @@ fn shell_pending_and_terminal_failures_keep_their_existing_model_contracts() {
         project("run_shell", &mut result);
         assert_eq!(serde_json::to_value(&result).unwrap(), before);
         assert_shell_schema(&result);
+    }
+}
+
+#[test]
+fn execution_tail_bound_keeps_failure_and_loss_evidence_without_duplicate_full_logs() {
+    let stdout = (0..210)
+        .map(|i| format!("stdout-{i:03}\n"))
+        .collect::<String>();
+    let stderr = (0..205)
+        .map(|i| format!("stderr-{i:03}\n"))
+        .collect::<String>();
+    for name in ["run_shell", "run_process", "run_script"] {
+        let mut result = ToolResult::err_with_output(
+            crate::tool_runtime::helpers::command_failed_message(Some(9), &stdout, &stderr),
+            json!({"execution_state":"completed","command_started":true,"command_completed":true,
+                "failure_kind":"command_exit_nonzero","exit_code":9,"stdout_tail":stdout,"stderr_tail":stderr}),
+        );
+        project(name, &mut result);
+        for stream in ["stdout", "stderr"] {
+            assert_eq!(
+                result.output[format!("{stream}_tail")]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .count(),
+                200
+            );
+            assert_eq!(result.output[format!("{stream}_truncated")], true);
+            let tail = result.output[format!("{stream}_tail")].as_str().unwrap();
+            assert!(
+                tail.contains(&format!("{stream}-000")),
+                "keep the first diagnostic"
+            );
+            assert!(tail.contains("output omitted"));
+            assert!(
+                !result
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains(&format!("{stream}-100")),
+                "do not duplicate omitted middle logs in the error"
+            );
+        }
+        assert_eq!(result.output["exit_code"], 9);
+        assert!(result
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Command exited with status 9"));
+    }
+}
+
+#[test]
+fn ordinary_shell_failure_omits_timing_but_keeps_outcome_and_schema() {
+    let mut result = terminal_shell_result();
+    result.success = false;
+    result.error = Some("Command exited with status 9.".into());
+    result.output["exit_code"] = json!(9);
+    result.output["command_ok"] = json!(false);
+    result.output["failure_kind"] = json!("command_exit_nonzero");
+    let canonical = result.output.clone();
+    sparsify_failure_model_result_metadata("run_shell", &mut result);
+    for omitted in [
+        "async_handoff_available",
+        "effective_timeout_secs",
+        "sync_wait_secs",
+        "command_summary",
+        "terminal",
+    ] {
+        assert!(result.output.get(omitted).is_none(), "{omitted}");
+    }
+    // MCP's failure-log projection consumes the explicit tool-failure flag and
+    // both stream strings before the CLI renderer formats this model result.
+    for retained in [
+        "execution_state",
+        "command_started",
+        "command_completed",
+        "exit_code",
+        "failure_kind",
+        "tool_failure",
+        "stdout_tail",
+        "stderr_tail",
+    ] {
+        assert_eq!(result.output[retained], canonical[retained], "{retained}");
+    }
+    assert_shell_schema(&result);
+}
+
+#[test]
+fn started_job_projection_keeps_ownership_and_exact_recovery_without_sync_handoff() {
+    let call =
+        ToolCall::from_tool_name("run_job", json!({"project":"p","command":"worker"})).unwrap();
+    assert!(
+        execution::capture(&call).is_none(),
+        "Job start must not use synchronous handoff projection"
+    );
+    for (target, token, cursor) in [
+        ("job-exact", "token-exact", "token-exact"),
+        ("job-other", "token-exact", "token-exact"),
+        ("job-exact", "token-other", "token-exact"),
+        ("job-exact", "token-exact", ""),
+    ] {
+        let continuation = json!({"tool":"observe_jobs","arguments":{
+            "items":[{"job_id":target,"after_observation_token":cursor}],
+            "wait_secs":37,"wake_on":"terminal"},"follow_up_kind":"fallback_recovery"});
+        let mut result = ToolResult::ok(json!({
+            "job_id":"job-exact","status":"queued","execution_state":"queued",
+            "command_started":false,"execution_lifetime":"runner",
+            "requested_timeout_secs":7200,"effective_timeout_secs":null,
+            "timeout_limit_source":"runner_policy_unknown", "cwd":"subdir", "shell":"bash",
+            "observation_token":token, "continuation":continuation,
+            "continuation_semantics":webcodex_core::runtime_contract::ContinuationSemantics::new(
+                webcodex_core::runtime_contract::ContinuationKind::Observe,
+                webcodex_core::runtime_contract::ContinuationCarrier::ObservationToken,
+            ).to_value(),
+            "stdout_tail":"","stdout_lines":0,"ssh_resource":null,
+            "execution_source":"run_job","purpose":"other","future_evidence":{"unknown":null}
+        }));
+        let canonical = result.output.clone();
+        ModelFacingProjectionPlan::capture(&call).project(&mut result);
+        sparsify_success_model_result_metadata("run_job", &mut result);
+        assert_eq!(result.output["continuation"], continuation);
+        assert_eq!(
+            result.output.get("observation_token").is_none(),
+            target == "job-exact" && token == cursor
+        );
+        assert_eq!(
+            result.output.get("continuation_semantics").is_none(),
+            target == "job-exact" && !cursor.is_empty()
+        );
+        for key in [
+            "job_id",
+            "status",
+            "execution_state",
+            "command_started",
+            "execution_lifetime",
+            "requested_timeout_secs",
+            "effective_timeout_secs",
+            "timeout_limit_source",
+            "cwd",
+            "shell",
+            "future_evidence",
+        ] {
+            assert_eq!(result.output[key], canonical[key], "{key}");
+        }
+        for omitted in [
+            "stdout_lines",
+            "ssh_resource",
+            "execution_source",
+            "purpose",
+        ] {
+            assert!(result.output.get(omitted).is_none(), "{omitted}");
+        }
+        let mut failed = ToolResult::err_with_output("uncertain", canonical.clone());
+        failed.output["execution_state"] = json!("outcome_unknown");
+        let expected = failed.output.clone();
+        sparsify_success_model_result_metadata("run_job", &mut failed);
+        assert_eq!(failed.output, expected);
     }
 }

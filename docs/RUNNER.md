@@ -65,13 +65,15 @@ When upgrading an older installation across the 0.4 boundary, upgrade the first-
 
 The exact protocol-generation field names, baseline capability list, registration grammar, and compatibility-test matrix are maintainer/wire-contract details and are intentionally omitted from this operations guide.
 
-Streaming Runners register before gathering project Git metadata. The initial
-project catalog is scanned in one process-owned background worker, then sent
-through the usual acknowledged inventory pages. Registration, keepalive and
-shutdown remain responsive while a large or slow catalog is being inspected;
-project inventory can still be pending just after the Runner connects. Reconnects
-reuse an in-flight scan, and process shutdown cancels its Git probes through the
-existing owned-tree cleanup path.
+Streaming Runners register before gathering project Git metadata. One
+process-owned background worker first publishes the validated project catalog
+through the usual acknowledged inventory pages, then replaces it once Git details
+are known. Until then a Project's `git_branch`, `git_head` and `git_dirty` are
+absent, which means unknown, not clean. Registration, keepalive and shutdown
+remain responsive while a large or slow catalog is being inspected. A Project
+mutation republishes the catalog immediately and restarts enrichment, so an older
+result is never published. Reconnects reuse an in-flight scan, and process
+shutdown cancels its Git probes through the existing owned-tree cleanup path.
 
 A ChatGPT Host message that the current conversation does not support developer
 MCPs is not a Runner heartbeat or reconnect result. If ChatGPT cannot dispatch
@@ -118,19 +120,39 @@ or created:
 [policy]
 allow_cwd_anywhere = false
 allowed_roots = ["/root/git"]
+# Optional central namespace for newly created managed worktrees.
+managed_worktree_root = "/srv/webcodex-worktrees"
 ```
 
 Managed-worktree bootstrap uses the same boundary. The Runner may derive a
 private managed namespace so the model never supplies a destination path, but
 that namespace and the resulting Project still have to fit the effective
-`allowed_roots` policy (unless `allow_cwd_anywhere=true`). A Project selector or
-Project ref does not widen this filesystem authority.
+`allowed_roots` policy (unless `allow_cwd_anywhere=true`). To centralize new
+worktrees across multiple allowed roots, set `managed_worktree_root` to an
+absolute, existing, non-symbolic-link directory inside the effective
+`allowed_roots` and outside each source checkout. Invalid values reject config
+check/reload and never fall back to the derived namespace. The value is
+hot-reloadable; it affects only future creation and revalidates on creation and
+resume. Existing managed worktrees are never moved or retargeted. A Project
+selector or Project ref does not widen this filesystem authority.
 
 ### Registering projects at runtime
 
 The runtime tools `register_project` and `create_project` let a client register
 an existing directory or create a new one on an online Runner, subject to the
 Runner's `allowed_roots` policy.
+
+The admin `POST /api/admin/projects/register` and
+`POST /api/admin/projects/create` routes use the same cross-platform path
+validation as these tools. Supply an absolute path on the selected Runner,
+regardless of the Server's OS: for example `/srv/projects/demo`,
+`D:\projects\demo` or `D:/projects/demo`. In JSON, escape backslashes:
+`"path": "D:\\projects\\demo"`. Windows verbatim paths are not required.
+Empty, relative, drive-relative (`D:demo`), NUL-containing and over-4096-byte
+paths are rejected by the admin API. The Runner still owns native path
+validation, canonicalization and `allowed_roots` enforcement. On Windows,
+existing UNC/verbatim-UNC directories can be registered only under already
+authorized roots; creating Projects on network shares remains unsupported.
 
 ## Skill sources
 
@@ -583,17 +605,60 @@ tails, and can be stopped. Structured execution (`run_process`,
 outlives the synchronous grace period; the same process continues — it is never
 restarted.
 
-The Runner executes up to `max_concurrent_jobs` Jobs at once (default 4, valid
+The Runner executes up to `max_concurrent_jobs` Jobs at once (default 32, valid
 range 1..64). Values outside that range are rejected as configuration errors.
-This is an operational tuning control, not a security boundary, and requires a
-Runner restart to change:
+This operational tuning control supports `check_runner_config` followed by
+`reload_runner_config` (or Unix SIGHUP), without restarting:
 
 ```toml
-max_concurrent_jobs = 4
+max_concurrent_jobs = 32
 ```
+
+Increasing the limit immediately schedules existing queued Jobs. Decreasing it
+leaves running Jobs intact; new starts wait until occupied slots fall below the
+new limit. Running may temporarily exceed the limit. Registration and runtime
+metadata report the applied capacity with a config-generation fence, including
+after reconnect. Older Servers retain startup-only capacity observations.
 
 When all slots are occupied, an accepted Job remains the same queryable Job
 with the same `job_id` and reports `agent_queued`.
+
+
+### Execution budgets and lifetime ownership
+
+| Entry | Default | Tool/admission ceiling |
+|---|---:|---:|
+| `run_shell` | 60 s | 3600 s (1 hour) |
+| `run_job` | 3600 s | 86400 s (24 hours) |
+| `run_process`, `run_script`, `run_detached_process` | 60 s | 604800 s (7 days) |
+
+Positive oversized tool budgets are clamped. The Runner additionally enforces
+`policy.max_timeout_secs` (default 3600 s); a longer tool ceiling does not raise
+that policy. `run_job` reports `requested_timeout_secs`,
+`effective_timeout_secs`, and `timeout_limit_source` (`request`, `tool_limit`,
+`runner_policy`, or `runner_policy_unknown`). `timeout_policy_basis` and a short
+notice identify the last-registered-policy evidence boundary: the Runner still
+enforces its policy at execution admission. When a legacy Runner has not reported
+its policy, `effective_timeout_secs=null` and `dispatched_timeout_secs` is only the
+known Server budget; the actual Runner budget may be lower. Acceptance is not a
+guarantee that a process will run until the reported dispatch deadline.
+
+The initial `run_job` receipt retains its Job id and exact `observe_jobs`
+continuation. A queued receipt has `command_started=false`: that observation
+proves admission, not native process start. Ordinary Jobs are Runner-owned;
+Runner replacement does not inherit them. Choose `run_detached_process` from
+the start only when a native executable and explicit argv need supervisor
+ownership across Runner replacement. It does not accept an arbitrary shell
+command or guarantee survival across host reboot.
+
+Terminal Job records and detached replay keys have a separate bounded
+24-hour retention window after completion; this does not limit an active
+process to 24 hours. Count limits can shorten ordinary terminal retention.
+Job output is a bounded tail, so training should write full logs, checkpoints,
+and artifacts to project files. Those files are not deleted when a Job receipt
+expires. A timeout or unknown outcome never authorizes automatic re-execution
+and does not prove that every side effect ended. Observe the original Job and
+inspect the target state before deciding whether another attempt is safe.
 
 ## Transports in more detail
 
@@ -630,9 +695,11 @@ not use proxy settings.
 
 ## Reconnect and recovery
 
-A Runner disconnect is a liveness fact, not a lost-work fact. Accepted active
-Jobs enter a bounded `recovering` state (default grace 120 seconds) and are
-restored from the Runner's inventory when the same Runner instance reconnects.
+A Runner disconnect is a liveness fact, not a lost-work fact. With
+`job_state_reconciliation` support, accepted active Jobs enter a bounded
+`recovering` state (default grace 120 seconds) and can be restored from the
+complete inventory of the same Runner instance. Without that capability, or
+when the recovery deadline expires, ordinary Jobs become `lost`.
 Ordinary Jobs remain owned by that exact Runner process: a replacement instance
 does not inherit their child processes, so they become `lost`. Explicit
 `run_detached_process` Jobs are different: after a one-shot durable ownership
@@ -643,13 +710,15 @@ control state. This does not make ordinary process execution detachable, and it
 does not promise survival across a machine reboot.
 
 Completed caller-visible ordinary Jobs have a separate Server-owned SQLite
-receipt. Within the original 15-minute terminal retention window, up to 64
+receipt. Within the original 24-hour terminal retention window, up to 64
 receipts per logical Runner survive a coordinated Server/Runner restart and
 remain available through `list_jobs`, `observe_jobs`, and bounded log reads.
 Receipts preserve the Job id, terminal result, retained log cursors and tails,
 and original authorization partition/owner; Runner registration is not required
-to observe them. Restarts and receipt replay do not renew their deadlines.
-Storage failure degrades restart observability without changing execution success.
+to observe them. Restarts and receipt replay do not renew their deadlines. Receipts written by
+an older build with a 15-minute deadline retain that shorter deadline; upgrade
+does not extend them. Storage failure degrades restart observability without
+changing ordinary execution success.
 
 These receipts are read-only evidence. They contain no command input, stdin,
 environment, validation argv, replay intent, process handle, or execution lease.
@@ -862,7 +931,7 @@ of finding its PID or sending signals manually:
 
 `reload_runner_config` never writes `runner.toml`; it only activates the candidate
 already on disk. Hot-reloadable policy, shell, configured Skill roots, configured
-instruction files, Native Plugin, and static SSH-resource changes can become active
+instruction files, Job capacity, Native Plugin, and static SSH-resource changes can become active
 immediately, while fields reported in `restart_required_fields`
 remain startup-only until the Runner restarts. Invalid candidates leave the active
 snapshot and generation unchanged. Managed `manage_ssh_resource` mutations are different:

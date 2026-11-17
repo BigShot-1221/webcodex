@@ -1,0 +1,6 @@
+ERROR: failed
+error_kind: stale_read_revision
+expected_read_revision: 7
+state_changed: false
+execution_state: not_started
+next: read_files items=[{"path":"a.rs"}] project="p"

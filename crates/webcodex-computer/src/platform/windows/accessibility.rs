@@ -1,6 +1,13 @@
 use super::*;
 
 #[cfg(windows)]
+mod scroll;
+#[cfg(windows)]
+mod selection;
+#[cfg(windows)]
+pub(crate) use scroll::scroll;
+
+#[cfg(windows)]
 const UIA_CONNECTION_TIMEOUT_MS: u32 = 2_000;
 #[cfg(windows)]
 const UIA_TRANSACTION_TIMEOUT_MS: u32 = 2_000;
@@ -866,6 +873,8 @@ pub(crate) fn element_state(
     observation_generation: u32,
     surface: &SurfaceRecord,
     element: &ElementRecord,
+    include_selection: bool,
+    include_scroll: bool,
 ) -> Result<Value, String> {
     let target = element.target_fingerprint().ok_or_else(|| {
         "stale_element: UIA element correlation lineage is incomplete".to_string()
@@ -904,6 +913,16 @@ pub(crate) fn element_state(
         optional_uia_pattern::<IUIAutomationInvokePattern>(&context, &current, UIA_InvokePatternId)?
             .is_some()
     };
+    let selection = if protected || !include_selection {
+        None
+    } else {
+        selection::target(&context, &current, surface, element)?
+    };
+    let selected = selection
+        .as_ref()
+        .map(|target| target.selected(&context))
+        .transpose()?;
+    let can_select = enabled && selection.is_some();
     let can_focus =
         if protected || !enabled || !surface_foreground || !uia_semantic_focus_role(&target.role) {
             false
@@ -923,7 +942,7 @@ pub(crate) fn element_state(
         && value_writable
         && value_empty == Some(true);
 
-    Ok(json!({
+    let mut output = json!({
         "platform": "windows",
         "surface_id": surface_id,
         "element_id": element_id,
@@ -935,7 +954,19 @@ pub(crate) fn element_state(
         "can_press": can_press,
         "can_focus": can_focus,
         "can_input_text": can_input_text,
-    }))
+    });
+    if include_scroll {
+        output["scroll"] = json!(if protected {
+            None
+        } else {
+            scroll::state(&context, &current)?
+        });
+    }
+    if include_selection {
+        output["can_select"] = json!(can_select);
+        output["selected"] = json!(selected);
+    }
+    Ok(output)
 }
 
 #[cfg(windows)]
@@ -960,7 +991,32 @@ pub(crate) fn windows_scroll_attempt_error(operation: &str) -> String {
 }
 
 #[cfg(windows)]
-pub(crate) fn activate_window(surface_id: &str, surface: &SurfaceRecord) -> Result<Value, String> {
+fn wait_for_window_activation(
+    expires_at: Instant,
+    mut observe: impl FnMut() -> (Instant, bool),
+    mut wait: impl FnMut(Duration),
+) -> Result<(), String> {
+    loop {
+        let (now, foreground) = observe();
+        let remaining = expires_at.saturating_duration_since(now);
+        if remaining.is_zero() {
+            return Err(windows_window_activation_attempt_error(
+                "IUIAutomationElement::SetFocus postcondition timeout",
+            ));
+        }
+        if foreground {
+            return Ok(());
+        }
+        wait(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn activate_window(
+    surface_id: &str,
+    surface: &SurfaceRecord,
+    control: &local_control::ActivityGuard,
+) -> Result<Value, String> {
     // Resolve the exact xcap identity immediately before the first native
     // effect. This never falls back to an application name, PID, or title.
     let _window = resolve_surface_window(surface)?;
@@ -995,7 +1051,7 @@ pub(crate) fn activate_window(surface_id: &str, surface: &SurfaceRecord) -> Resu
         // then observe only the local window-state predicate for a bounded
         // interval before proceeding.
         let restore_expires_at = Instant::now() + Duration::from_secs(2);
-        let _ = unsafe { ShowWindowAsync(hwnd, SW_RESTORE) };
+        let _ = control.commit(|| unsafe { ShowWindowAsync(hwnd, SW_RESTORE) })?;
         prior_effect = true;
         while unsafe { IsIconic(hwnd).as_bool() } {
             if let Err(error) = context.deadline.ensure_remaining() {
@@ -1012,30 +1068,112 @@ pub(crate) fn activate_window(surface_id: &str, surface: &SurfaceRecord) -> Resu
 
     // A background Runner is normally denied by SetForegroundWindow.
     // UI Automation's exact SetFocus is the native automation primitive;
-    // once attempted, any error or mismatched postcondition is uncertain.
+    // once attempted, any error or unconfirmed postcondition is uncertain.
     if let Err(error) = context.deadline.ensure_remaining() {
         if prior_effect {
             return Err(windows_window_activation_attempt_error(&error));
         }
         return Err(error);
     }
-    if let Err(error) = unsafe { root.SetFocus() } {
+    let focus_result = if prior_effect {
+        unsafe { root.SetFocus() }
+    } else {
+        control.commit(|| unsafe { root.SetFocus() })?
+    };
+    if let Err(error) = focus_result {
         return Err(windows_window_activation_attempt_error(&format!(
             "IUIAutomationElement::SetFocus HRESULT(0x{:08X})",
             error.code().0 as u32
         )));
     }
-    if unsafe { GetForegroundWindow() != hwnd } {
-        return Err(windows_window_activation_attempt_error(
-            "IUIAutomationElement::SetFocus postcondition",
-        ));
-    }
+    // The provider may return before the foreground transition is visible.
+    // Observe the same exact HWND/PID without repeating focus or another effect.
+    // The confirmation interval also remains inside the shared UIA deadline.
+    wait_for_window_activation(
+        context
+            .deadline
+            .expires_at
+            .min(Instant::now() + Duration::from_secs(1)),
+        || {
+            let mut pid = 0;
+            let foreground = unsafe {
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                pid == surface.pid && GetForegroundWindow() == hwnd
+            };
+            (Instant::now(), foreground)
+        },
+        std::thread::sleep,
+    )?;
 
     Ok(json!({
         "platform": "windows",
         "surface_id": surface_id,
         "success": true,
     }))
+}
+
+#[cfg(all(test, windows))]
+mod window_activation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn window_activation_confirms_delayed_foreground_without_another_effect() {
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let observations = Cell::new(0);
+        wait_for_window_activation(
+            start + Duration::from_secs(1),
+            || {
+                observations.set(observations.get() + 1);
+                (now.get(), now.get() >= start + Duration::from_millis(30))
+            },
+            |delay| now.set(now.get() + delay),
+        )
+        .unwrap();
+        assert_eq!(observations.get(), 4);
+        assert_eq!(now.get() - start, Duration::from_millis(30));
+    }
+
+    #[test]
+    fn window_activation_requires_exact_foreground_within_the_bound() {
+        let start = Instant::now();
+        let now = Cell::new(start);
+        // Also exercise a final partial polling interval.
+        let bound = Duration::from_millis(25);
+        let error = wait_for_window_activation(
+            start + bound,
+            || (now.get(), false),
+            |delay| now.set(now.get() + delay),
+        )
+        .unwrap_err();
+        assert_eq!(now.get() - start, bound);
+        assert!(error.starts_with("outcome_unknown:"), "{error}");
+        assert!(error.contains("postcondition timeout"), "{error}");
+    }
+
+    #[test]
+    fn window_activation_confirmation_respects_an_expired_shared_deadline() {
+        let now = Instant::now();
+        let error = wait_for_window_activation(
+            now,
+            || (now, true),
+            |_| panic!("an expired confirmation must not wait"),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("outcome_unknown:"), "{error}");
+    }
+
+    #[test]
+    fn window_activation_already_confirmed_does_not_wait() {
+        let now = Instant::now();
+        wait_for_window_activation(
+            now + Duration::from_secs(1),
+            || (now, true),
+            |_| panic!("a confirmed foreground must not wait"),
+        )
+        .unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -1045,6 +1183,7 @@ pub(crate) fn control(
     surface: &SurfaceRecord,
     element: &ElementRecord,
     action: ComputerAction,
+    control: &local_control::ActivityGuard,
 ) -> Result<Value, String> {
     let target = element.target_fingerprint().ok_or_else(|| {
         "stale_element: UIA element correlation lineage is incomplete".to_string()
@@ -1073,6 +1212,7 @@ pub(crate) fn control(
     }
 
     match action {
+        ComputerAction::Select => selection::select(&context, &current, surface, element, control)?,
         ComputerAction::Press => {
             let pattern = optional_uia_pattern::<IUIAutomationInvokePattern>(
                 &context,
@@ -1083,7 +1223,7 @@ pub(crate) fn control(
                 "control_failed: UI Automation element does not support InvokePattern".to_string()
             })?;
             context.deadline.ensure_remaining()?;
-            if let Err(error) = unsafe { pattern.Invoke() } {
+            if let Err(error) = control.commit(|| unsafe { pattern.Invoke() })? {
                 return Err(windows_control_attempt_error(&format!(
                     "IUIAutomationInvokePattern::Invoke HRESULT(0x{:08X})",
                     error.code().0 as u32
@@ -1118,7 +1258,7 @@ pub(crate) fn control(
             let already_focused = uia_element_has_exact_focus(&context, &current)?;
             if !already_focused {
                 context.deadline.ensure_remaining()?;
-                if let Err(error) = unsafe { current.SetFocus() } {
+                if let Err(error) = control.commit(|| unsafe { current.SetFocus() })? {
                     return Err(windows_control_attempt_error(&format!(
                         "IUIAutomationElement::SetFocus HRESULT(0x{:08X})",
                         error.code().0 as u32
@@ -1162,6 +1302,7 @@ pub(crate) fn scroll_to_element(
     element_id: &str,
     surface: &SurfaceRecord,
     element: &ElementRecord,
+    control: &local_control::ActivityGuard,
 ) -> Result<Value, String> {
     let target = element.target_fingerprint().ok_or_else(|| {
         "stale_element: UIA element correlation lineage is incomplete".to_string()
@@ -1192,7 +1333,7 @@ pub(crate) fn scroll_to_element(
         "scroll_failed: UI Automation element does not support ScrollItemPattern".to_string()
     })?;
     context.deadline.ensure_remaining()?;
-    if let Err(error) = unsafe { pattern.ScrollIntoView() } {
+    if let Err(error) = control.commit(|| unsafe { pattern.ScrollIntoView() })? {
         return Err(windows_scroll_attempt_error(&format!(
             "IUIAutomationScrollItemPattern::ScrollIntoView HRESULT(0x{:08X})",
             error.code().0 as u32

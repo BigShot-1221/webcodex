@@ -480,13 +480,15 @@ mod tests {
     use super::*;
     use crate::runner_protocol::{
         RunnerCapabilities, RunnerJobUpdateRequest, RunnerProtocolGenerationNumber,
-        RunnerRegisterRequest, RunnerResultRequest, ShellJobOpRequest, ShellRunRequest,
-        RUNNER_PROTOCOL_GENERATION_V2, RUNNER_QUIC_ALPN_V1,
+        RunnerRegisterRequest, RunnerResultRequest, ShellRunRequest, RUNNER_PROTOCOL_GENERATION_V2,
+        RUNNER_QUIC_ALPN_V1,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use webcodex_runner_registry::JobStartRequest;
 
     /// ALPN used by the QUIC integration tests.
     const TEST_ALPN: &str = RUNNER_QUIC_ALPN_V1;
+    const TEST_BOOTSTRAP_TOKEN: &str = "quic-test-bootstrap-secret";
 
     async fn wait_for_quic_client_connected(
         registry: &RunnerRegistry,
@@ -567,7 +569,12 @@ mod tests {
     }
 
     fn register_envelope(client_id: &str, instance: &str) -> QuicRegisterFrame {
-        register_envelope_with_generation(client_id, instance, RUNNER_PROTOCOL_GENERATION_V2, None)
+        register_envelope_with_generation(
+            client_id,
+            instance,
+            RUNNER_PROTOCOL_GENERATION_V2,
+            Some(TEST_BOOTSTRAP_TOKEN.to_string()),
+        )
     }
 
     fn register_envelope_with_generation(
@@ -652,7 +659,7 @@ mod tests {
         let server_crypto = server_crypto(cert_der.clone(), key_der);
         let (endpoint, addr) = bind_server(server_crypto);
         let registry = Arc::new(RunnerRegistry::default());
-        let config = test_config(None);
+        let config = test_config(Some(TEST_BOOTSTRAP_TOKEN));
 
         let server_task = tokio::spawn(async move {
             let incoming = endpoint.accept().await.expect("accept incoming quic");
@@ -696,7 +703,7 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
-            test_config(None),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
             cert_der.clone(),
             key_der,
         )
@@ -740,7 +747,7 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
-            test_config(None),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
             cert_der.clone(),
             key_der,
         )
@@ -751,7 +758,7 @@ mod tests {
             "quic-unsupported-generation",
             "inst-unsupported",
             RunnerProtocolGenerationNumber::new(3),
-            None,
+            Some(TEST_BOOTSTRAP_TOKEN.to_string()),
         );
         write_quic_register_frame(&mut send, &register)
             .await
@@ -782,12 +789,10 @@ mod tests {
         let server_crypto = server_crypto(cert_der.clone(), key_der);
         let (endpoint, addr) = bind_server(server_crypto);
 
-        // Auth disabled -> bootstrap, so no token is required. This mirrors
-        // the WebSocket integration tests which run without AuthMiddleware.
         let config = Arc::new(Config {
             addr: "0.0.0.0:8080".to_string(),
             data_dir: std::path::PathBuf::from("./data"),
-            token: None,
+            token: Some(TEST_BOOTSTRAP_TOKEN.to_string()),
             max_text_size: 2 * 1024 * 1024,
             oauth2: crate::OAuth2Config::default(),
         });
@@ -893,12 +898,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quic_capacity_metadata_and_reconnect_preserve_effective_generation() {
+        use crate::runner_protocol::{RunnerJobCapacity, RunnerPolicySummary, ToolProvidersStatus};
+        let (cert, key) = self_signed_cert();
+        let registry = Arc::new(RunnerRegistry::default());
+        let addr = start_quic_server(
+            registry.clone(),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
+            cert.clone(),
+            key,
+        )
+        .await;
+        let status = |generation| {
+            let mut status = ToolProvidersStatus {
+                strategy: "native".into(),
+                claude_code: crate::runner_protocol::ClaudeCodeProviderStatus {
+                    enabled: false,
+                    version: None,
+                    available: false,
+                    process_state: "not_started".into(),
+                    discovered_tool_names: Vec::new(),
+                    capabilities: Default::default(),
+                    last_error_code: None,
+                    last_call: None,
+                },
+                config_reload: Default::default(),
+            };
+            status.config_reload.generation = generation;
+            status
+        };
+        for (generation, limit) in [(1, 2), (2, 6)] {
+            let (endpoint, conn, mut send, mut recv) = connect_quic_client(&cert, addr).await;
+            let mut register = register_envelope("quic-capacity", "same-instance");
+            register.payload_mut().job_concurrency_limit = Some(limit);
+            register.payload_mut().policy = Some(RunnerPolicySummary {
+                tool_providers: Some(status(generation)),
+                ..Default::default()
+            });
+            write_quic_register_frame(&mut send, &register)
+                .await
+                .unwrap();
+            let ack = tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                ack,
+                RunnerEnvelope::Registered { success: true, .. }
+            ));
+            assert_eq!(
+                registry
+                    .get_runner_view("quic-capacity")
+                    .await
+                    .unwrap()
+                    .job_concurrency_limit,
+                Some(limit)
+            );
+            for (update_generation, update_limit, expected) in [(2, 6, 6), (1, 32, 6)] {
+                write_quic_frame(
+                    &mut send,
+                    &RunnerEnvelope::RuntimeMetadata {
+                        job_capacity: Some(RunnerJobCapacity {
+                            generation: update_generation,
+                            limit: update_limit,
+                        }),
+                        tool_providers: status(update_generation),
+                        mcp_gateway_providers: None,
+                        computer_session_availability: None,
+                        computer_control_epoch: None,
+                    },
+                )
+                .await
+                .unwrap();
+                // Ordered Ping/Pong is a processing barrier, not a timing guess.
+                write_quic_frame(&mut send, &RunnerEnvelope::Ping { ts: 99 })
+                    .await
+                    .unwrap();
+                loop {
+                    let envelope =
+                        tokio::time::timeout(Duration::from_secs(5), read_quic_frame(&mut recv))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    if matches!(envelope, RunnerEnvelope::Pong { ts: 99 }) {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    registry
+                        .get_runner_view("quic-capacity")
+                        .await
+                        .unwrap()
+                        .job_concurrency_limit,
+                    Some(expected)
+                );
+            }
+            send.finish().unwrap();
+            wait_for_quic_client_connected(&registry, "quic-capacity", false).await;
+            conn.close(quinn::VarInt::from_u32(0), b"done");
+            endpoint.close(quinn::VarInt::from_u32(0), b"done");
+        }
+    }
+
+    #[tokio::test]
     async fn quic_request_result_roundtrip() {
         let (cert_der, key_der) = self_signed_cert();
         let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
-            test_config(None),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
             cert_der.clone(),
             key_der,
         )
@@ -912,7 +1020,7 @@ mod tests {
                 "quic-gen2-rt",
                 "inst-v2",
                 RUNNER_PROTOCOL_GENERATION_V2,
-                None,
+                Some(TEST_BOOTSTRAP_TOKEN.to_string()),
             ),
         )
         .await
@@ -1021,7 +1129,7 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
-            test_config(None),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
             cert_der.clone(),
             key_der,
         )
@@ -1035,7 +1143,7 @@ mod tests {
                 "quic-job",
                 "inst-job",
                 RUNNER_PROTOCOL_GENERATION_V2,
-                None,
+                Some(TEST_BOOTSTRAP_TOKEN.to_string()),
             ),
         )
         .await
@@ -1047,21 +1155,13 @@ mod tests {
 
         let job = registry
             .start_job(
-                ShellJobOpRequest {
-                    login: false,
-                    op: "start".to_string(),
-                    client_id: Some("quic-job".to_string()),
-                    cwd: None,
-                    command: Some("printf hi".to_string()),
-                    timeout_secs: Some(5),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
-                    codex: None,
+                JobStartRequest {
+                    timeout_secs: 5,
+                    ..JobStartRequest::shell("quic-job".to_string(), "printf hi".to_string())
                 },
                 "tester".to_string(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1127,7 +1227,7 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
-            test_config(None),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
             cert_der.clone(),
             key_der,
         )
@@ -1141,7 +1241,7 @@ mod tests {
                 "quic-disc",
                 "inst-disc",
                 RUNNER_PROTOCOL_GENERATION_V2,
-                None,
+                Some(TEST_BOOTSTRAP_TOKEN.to_string()),
             ),
         )
         .await
@@ -1153,21 +1253,13 @@ mod tests {
 
         let job = registry
             .start_job(
-                ShellJobOpRequest {
-                    login: false,
-                    op: "start".to_string(),
-                    client_id: Some("quic-disc".to_string()),
-                    cwd: None,
-                    command: Some("sleep 10".to_string()),
-                    timeout_secs: Some(10),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
-                    codex: None,
+                JobStartRequest {
+                    timeout_secs: 10,
+                    ..JobStartRequest::shell("quic-disc".to_string(), "sleep 10".to_string())
                 },
                 "tester".to_string(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1238,7 +1330,7 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
-            test_config(None),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
             cert_der.clone(),
             key_der,
         )
@@ -1252,7 +1344,7 @@ mod tests {
                 "quic-goodbye",
                 "inst-a",
                 RUNNER_PROTOCOL_GENERATION_V2,
-                None,
+                Some(TEST_BOOTSTRAP_TOKEN.to_string()),
             ),
         )
         .await
@@ -1294,7 +1386,7 @@ mod tests {
                 "quic-goodbye",
                 "inst-b",
                 RUNNER_PROTOCOL_GENERATION_V2,
-                None,
+                Some(TEST_BOOTSTRAP_TOKEN.to_string()),
             ),
         )
         .await
@@ -1479,7 +1571,7 @@ mod tests {
         let config = Arc::new(Config {
             addr: "0.0.0.0:8080".to_string(),
             data_dir: std::path::PathBuf::from("./data"),
-            token: None,
+            token: Some(TEST_BOOTSTRAP_TOKEN.to_string()),
             max_text_size: 2 * 1024 * 1024,
             oauth2: crate::OAuth2Config::default(),
         });
@@ -1540,7 +1632,7 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let addr = start_quic_server(
             registry.clone(),
-            test_config(None),
+            test_config(Some(TEST_BOOTSTRAP_TOKEN)),
             cert_der.clone(),
             key_der,
         )

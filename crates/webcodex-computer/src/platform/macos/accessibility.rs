@@ -20,6 +20,47 @@ fn accessibility_error(operation: &str, error: AXError) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn accessibility_attribute_error(
+    operation: &str,
+    attribute: &'static str,
+    error: AXError,
+) -> String {
+    let message = accessibility_error(operation, error);
+    if error == AXError::APIDisabled {
+        return message;
+    }
+    // The name is a fixed native AX attribute, not its value or window content.
+    // It identifies the failing provider boundary without exposing UI data.
+    format!("{message} (attribute={attribute})")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod accessibility_attribute_error_tests {
+    use super::*;
+
+    #[test]
+    fn ax_failure_identifies_fixed_attribute_without_changing_permission_class() {
+        let error = accessibility_attribute_error(
+            "AXUIElementCopyAttributeValue",
+            "AXProtectedContent",
+            AXError::Failure,
+        );
+        assert_eq!(
+            error,
+            "accessibility_failed: AXUIElementCopyAttributeValue failed with AXError(-25200) (attribute=AXProtectedContent)"
+        );
+        assert_eq!(
+            accessibility_attribute_error(
+                "AXUIElementCopyAttributeValue",
+                "AXProtectedContent",
+                AXError::APIDisabled,
+            ),
+            "permission_denied: macOS Accessibility permission is not granted"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub(super) fn checked_surface_pid(surface: &SurfaceRecord) -> Result<libc::pid_t, String> {
     libc::pid_t::try_from(surface.pid)
         .map_err(|_| "stale_surface: surface PID exceeds native range".to_string())
@@ -145,12 +186,202 @@ pub(super) fn prepare_ax_call(
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AxValueReadPolicy {
+    Strict,
+    AllowOptionalDescriptionFailure,
+}
+
+#[cfg(target_os = "macos")]
+fn missing_optional_ax_value(
+    attribute_name: &'static str,
+    error: AXError,
+    policy: AxValueReadPolicy,
+) -> bool {
+    matches!(error, AXError::AttributeUnsupported | AXError::NoValue)
+        || (policy == AxValueReadPolicy::AllowOptionalDescriptionFailure
+            && attribute_name == "AXDescription"
+            && error == AXError::Failure)
+}
+
+#[cfg(target_os = "macos")]
+fn description_read_policy(role: &str, protected: bool) -> AxValueReadPolicy {
+    if !protected && matches!(role, "AXTextArea" | "AXRadioButton") {
+        AxValueReadPolicy::AllowOptionalDescriptionFailure
+    } else {
+        AxValueReadPolicy::Strict
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod ax_textedit_description_policy_tests {
+    use super::*;
+
+    #[test]
+    fn optional_description_policy_excludes_protected_and_unrelated_roles() {
+        use AxValueReadPolicy::{AllowOptionalDescriptionFailure, Strict};
+        for role in ["AXTextArea", "AXRadioButton"] {
+            assert_eq!(
+                description_read_policy(role, false),
+                AllowOptionalDescriptionFailure
+            );
+            assert_eq!(description_read_policy(role, true), Strict);
+        }
+        for role in ["AXTextField", "AXSecureTextField", "AXButton", "AXGroup"] {
+            assert_eq!(description_read_policy(role, false), Strict);
+        }
+    }
+
+    #[test]
+    fn generic_provider_failure_is_optional_only_for_exact_typed_description_policy() {
+        use AxValueReadPolicy::{AllowOptionalDescriptionFailure, Strict};
+
+        assert!(missing_optional_ax_value(
+            "AXDescription",
+            AXError::Failure,
+            AllowOptionalDescriptionFailure,
+        ));
+        for (attribute, error, policy) in [
+            ("AXDescription", AXError::Failure, Strict),
+            ("AXTitle", AXError::Failure, AllowOptionalDescriptionFailure),
+            ("AXValue", AXError::Failure, AllowOptionalDescriptionFailure),
+            (
+                "AXProtectedContent",
+                AXError::Failure,
+                AllowOptionalDescriptionFailure,
+            ),
+            (
+                "AXDescription",
+                AXError::CannotComplete,
+                AllowOptionalDescriptionFailure,
+            ),
+            (
+                "AXDescription",
+                AXError::InvalidUIElement,
+                AllowOptionalDescriptionFailure,
+            ),
+            (
+                "AXDescription",
+                AXError::APIDisabled,
+                AllowOptionalDescriptionFailure,
+            ),
+        ] {
+            assert!(
+                !missing_optional_ax_value(attribute, error, policy),
+                "must preserve {attribute} / {error:?} / {policy:?}",
+            );
+        }
+        for error in [AXError::NoValue, AXError::AttributeUnsupported] {
+            assert!(missing_optional_ax_value("AXDescription", error, Strict));
+        }
+    }
+
+    // Runs only when explicitly requested. Never calls AXValue or the full
+    // accessibility_tree: the user's document contents must not be fetched.
+    #[test]
+    #[ignore = "requires unlocked macOS desktop, visible TextEdit and Accessibility trust"]
+    fn unlocked_textedit_fingerprints_without_document_value_reads() {
+        assert!(
+            unsafe { AXIsProcessTrusted() },
+            "test process has no Accessibility trust"
+        );
+        let candidate = crate::platform::list_windows(crate::MAX_WINDOWS)
+            .expect("enumerate live macOS windows")
+            .into_iter()
+            .find(|window| window.application.eq_ignore_ascii_case("TextEdit"))
+            .expect("visible TextEdit window required");
+        let surface = SurfaceRecord {
+            native_id: candidate.native_id,
+            pid: candidate.pid,
+            identity_hash: candidate.identity_hash,
+            application: bounded_text(&candidate.application),
+            title: bounded_text(&candidate.title),
+            width: candidate.width,
+            height: candidate.height,
+        };
+        let deadline = AxObservationDeadline::new();
+        let window = exact_ax_window(&surface, &deadline).expect("exact TextEdit AXWindow");
+        let count = ax_array_count(&deadline, &window, "AXChildren")
+            .expect("bounded TextEdit root child count")
+            .min(16);
+        let children = ax_elements(&deadline, &window, "AXChildren", count)
+            .expect("bounded TextEdit root children");
+        let mut text_areas = 0usize;
+        let mut radio_buttons = 0usize;
+        let mut observed_native_description_failures = 0usize;
+        for child in children {
+            let child_count = ax_array_count(&deadline, &child, "AXChildren")
+                .expect("bounded child count")
+                .min(12);
+            for element in ax_elements(&deadline, &child, "AXChildren", child_count)
+                .expect("bounded descendant elements")
+            {
+                let role =
+                    optional_ax_string(&deadline, &element, "AXRole").expect("read role only");
+                if !matches!(role.as_deref(), Some("AXTextArea" | "AXRadioButton")) {
+                    continue;
+                }
+                // element_fingerprint only reads role, protection, subrole and
+                // identity metadata. It never reads the AXValue document body.
+                let fingerprint = element_fingerprint(&deadline, &element, false)
+                    .expect("safe TextEdit element fingerprint");
+                assert_eq!(role.as_deref(), Some(fingerprint.role.as_str()));
+                if !fingerprint.protected {
+                    // Confirm the native provider actually returned Failure
+                    // for the attribute our typed policy handles. Never log
+                    // or inspect its value, and never request AXValue.
+                    let attribute = CFString::from_static_str("AXDescription");
+                    let mut raw: *const CFType = std::ptr::null();
+                    prepare_ax_call(&deadline, &element).expect("AX deadline");
+                    let error = unsafe {
+                        element.copy_attribute_value(&attribute, NonNull::from(&mut raw))
+                    };
+                    deadline.ensure_remaining().expect("AX deadline");
+                    if error == AXError::Failure {
+                        observed_native_description_failures += 1;
+                    }
+                    if let Some(nonnull) = NonNull::new(raw.cast_mut()) {
+                        drop(unsafe { CFRetained::<CFType>::from_raw(nonnull) });
+                    }
+                    if fingerprint.role == "AXTextArea" {
+                        text_areas += 1;
+                    } else {
+                        radio_buttons += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            text_areas > 0,
+            "no verified, unprotected TextEdit AXTextArea"
+        );
+        assert!(
+            observed_native_description_failures > 0,
+            "no native AXDescription Failure occurred; regression was not exercised"
+        );
+        println!(
+            "read-only TextEdit fingerprint smoke passed: text_area={text_areas}, radio_button={radio_buttons}, native_AXDescription_failures={observed_native_description_failures}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn optional_ax_value(
     deadline: &AxObservationDeadline,
     element: &AXUIElement,
-    attribute: &'static str,
+    attribute_name: &'static str,
 ) -> Result<Option<CFRetained<CFType>>, String> {
-    let attribute = CFString::from_static_str(attribute);
+    optional_ax_value_with_policy(deadline, element, attribute_name, AxValueReadPolicy::Strict)
+}
+
+#[cfg(target_os = "macos")]
+fn optional_ax_value_with_policy(
+    deadline: &AxObservationDeadline,
+    element: &AXUIElement,
+    attribute_name: &'static str,
+    policy: AxValueReadPolicy,
+) -> Result<Option<CFRetained<CFType>>, String> {
+    let attribute = CFString::from_static_str(attribute_name);
     let mut raw: *const CFType = std::ptr::null();
     prepare_ax_call(deadline, element)?;
     let error = unsafe { element.copy_attribute_value(&attribute, NonNull::from(&mut raw)) };
@@ -162,8 +393,12 @@ fn optional_ax_value(
             })?;
             Ok(Some(unsafe { CFRetained::from_raw(raw) }))
         }
-        AXError::AttributeUnsupported | AXError::NoValue => Ok(None),
-        error => Err(accessibility_error("AXUIElementCopyAttributeValue", error)),
+        error if missing_optional_ax_value(attribute_name, error, policy) => Ok(None),
+        error => Err(accessibility_attribute_error(
+            "AXUIElementCopyAttributeValue",
+            attribute_name,
+            error,
+        )),
     }
 }
 
@@ -173,13 +408,128 @@ pub(super) fn optional_ax_string(
     element: &AXUIElement,
     attribute: &'static str,
 ) -> Result<Option<String>, String> {
-    let Some(value) = optional_ax_value(deadline, element, attribute)? else {
+    optional_ax_string_with_policy(deadline, element, attribute, AxValueReadPolicy::Strict)
+}
+
+#[cfg(target_os = "macos")]
+fn optional_ax_string_with_policy(
+    deadline: &AxObservationDeadline,
+    element: &AXUIElement,
+    attribute: &'static str,
+    policy: AxValueReadPolicy,
+) -> Result<Option<String>, String> {
+    let Some(value) = optional_ax_value_with_policy(deadline, element, attribute, policy)? else {
         return Ok(None);
     };
     Ok(value
         .downcast::<CFString>()
         .ok()
         .map(|value| bounded_text(&value.to_string())))
+}
+
+#[cfg(target_os = "macos")]
+fn handle_ax_subrole_failure(error: AXError) -> Result<bool, String> {
+    if error == AXError::Failure {
+        // A provider-level failure does not prove that the subrole is absent.
+        // It may hide a secure text subrole, so the subtree must be protected.
+        Ok(true)
+    } else {
+        Err(accessibility_attribute_error(
+            "AXUIElementCopyAttributeValue",
+            "AXSubrole",
+            error,
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn classify_ax_subrole_value(value: CFRetained<CFType>) -> (Option<String>, bool) {
+    match value.downcast::<CFString>() {
+        Ok(subrole) => (Some(bounded_text(&subrole.to_string())), false),
+        // A successful AX read with an unexpected value type does not prove
+        // that the element is non-secure. Preserve fail-closed protection.
+        Err(_) => (None, true),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn optional_ax_subrole(
+    deadline: &AxObservationDeadline,
+    element: &AXUIElement,
+) -> Result<(Option<String>, bool), String> {
+    let attribute = CFString::from_static_str("AXSubrole");
+    let mut raw: *const CFType = std::ptr::null();
+    prepare_ax_call(deadline, element)?;
+    let error = unsafe { element.copy_attribute_value(&attribute, NonNull::from(&mut raw)) };
+    deadline.ensure_remaining()?;
+    match error {
+        AXError::Success => {
+            let raw = NonNull::new(raw.cast_mut()).ok_or_else(|| {
+                "accessibility_failed: AX attribute succeeded with null value".to_string()
+            })?;
+            let value: CFRetained<CFType> = unsafe { CFRetained::from_raw(raw) };
+            Ok(classify_ax_subrole_value(value))
+        }
+        AXError::AttributeUnsupported | AXError::NoValue => Ok((None, false)),
+        error => {
+            handle_ax_subrole_failure(error)?;
+            Ok((None, true))
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod ax_subrole_failure_tests {
+    use super::*;
+
+    #[test]
+    fn unexpected_successful_subrole_value_type_remains_protected() {
+        let valid: CFRetained<CFType> = CFString::from_static_str("AXSecureTextField").into();
+        assert_eq!(
+            classify_ax_subrole_value(valid),
+            (Some("AXSecureTextField".into()), false)
+        );
+
+        let invalid: CFRetained<CFType> = CFBoolean::new(true).into();
+        let (subrole, unverified) = classify_ax_subrole_value(invalid);
+        assert!(subrole.is_none());
+        assert!(unverified);
+
+        let fingerprint = finish_ax_fingerprint(
+            ElementFingerprint {
+                role: "AXTextField".into(),
+                subrole,
+                identifier: None,
+                title: None,
+                description: None,
+                placeholder: None,
+                protected: unverified,
+            },
+            |_| panic!("unverified subrole must not permit text disclosure"),
+        )
+        .expect("protected fingerprint");
+        assert!(fingerprint.protected);
+        assert!(!fingerprint.has_positive_evidence());
+        assert_eq!(
+            ax_observed_value(&fingerprint, || panic!("must not read AXValue"))
+                .expect("protected AXValue"),
+            None
+        );
+    }
+
+    #[test]
+    fn generic_subrole_failure_is_protected_but_other_errors_fail_closed() {
+        assert_eq!(handle_ax_subrole_failure(AXError::Failure), Ok(true));
+        for error in [AXError::CannotComplete, AXError::InvalidUIElement] {
+            let message = handle_ax_subrole_failure(error).unwrap_err();
+            assert!(message.starts_with("accessibility_failed:"), "{message}");
+            assert!(message.contains("attribute=AXSubrole"), "{message}");
+        }
+        assert_eq!(
+            handle_ax_subrole_failure(AXError::APIDisabled).unwrap_err(),
+            "permission_denied: macOS Accessibility permission is not granted"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -190,19 +540,38 @@ fn element_fingerprint(
 ) -> Result<ElementFingerprint, String> {
     let role = optional_ax_string(deadline, element, "AXRole")?
         .ok_or_else(|| "accessibility_failed: AX element is missing a string role".to_string())?;
-    let protected = inherited_protected
-        || optional_ax_bool(deadline, element, "AXProtectedContent")?.unwrap_or(false);
+    let native_protected =
+        optional_ax_bool(deadline, element, "AXProtectedContent")?.unwrap_or(false);
+    let (subrole, unverified_subrole) = optional_ax_subrole(deadline, element)?;
+    let protected = inherited_protected || native_protected || unverified_subrole;
+    // Do not assign identifying metadata to an element whose secure subrole
+    // could not be established. Its descendants inherit the protective marker.
+    let identifier = if unverified_subrole {
+        None
+    } else {
+        optional_ax_string(deadline, element, "AXIdentifier")?
+    };
+    // Do not loosen AXDescription reads until after protection and subrole
+    // checks. The policy applies only to the two observed unprotected roles.
+    let description_policy = description_read_policy(&role, protected);
     finish_ax_fingerprint(
         ElementFingerprint {
             role,
-            subrole: optional_ax_string(deadline, element, "AXSubrole")?,
-            identifier: optional_ax_string(deadline, element, "AXIdentifier")?,
+            subrole,
+            identifier,
             title: None,
             description: None,
             placeholder: None,
             protected,
         },
-        |attribute| optional_ax_string(deadline, element, attribute),
+        |attribute| {
+            let policy = if attribute == "AXDescription" {
+                description_policy
+            } else {
+                AxValueReadPolicy::Strict
+            };
+            optional_ax_string_with_policy(deadline, element, attribute, policy)
+        },
     )
 }
 
@@ -722,6 +1091,8 @@ pub(crate) fn element_state(
     observation_generation: u32,
     surface: &SurfaceRecord,
     element: &ElementRecord,
+    _include_selection: bool,
+    _include_scroll: bool,
 ) -> Result<Value, String> {
     if !unsafe { AXIsProcessTrusted() } {
         return Err("permission_denied: macOS Accessibility permission is not granted".to_string());
@@ -769,7 +1140,11 @@ pub(crate) fn element_state(
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn activate_window(surface_id: &str, surface: &SurfaceRecord) -> Result<Value, String> {
+pub(crate) fn activate_window(
+    surface_id: &str,
+    surface: &SurfaceRecord,
+    control: &local_control::ActivityGuard,
+) -> Result<Value, String> {
     if !unsafe { AXIsProcessTrusted() } {
         return Err("permission_denied: macOS Accessibility permission is not granted".to_string());
     }
@@ -795,12 +1170,12 @@ pub(crate) fn activate_window(surface_id: &str, surface: &SurfaceRecord) -> Resu
     prepare_ax_call(&deadline, &window)?;
     let mut application_activated = false;
     if frontmost != Some(true) {
-        let error = unsafe {
+        let error = control.commit(|| unsafe {
             application.set_attribute_value(
                 &CFString::from_static_str("AXFrontmost"),
                 CFBoolean::new(true),
             )
-        };
+        })?;
         if error != AXError::Success {
             return Err(window_activation_attempt_error(
                 "AXUIElementSetAttributeValue(AXFrontmost)",
@@ -811,7 +1186,12 @@ pub(crate) fn activate_window(surface_id: &str, surface: &SurfaceRecord) -> Resu
         application_activated = true;
     }
 
-    let error = unsafe { window.perform_action(&CFString::from_static_str("AXRaise")) };
+    let error = if application_activated {
+        unsafe { window.perform_action(&CFString::from_static_str("AXRaise")) }
+    } else {
+        control
+            .commit(|| unsafe { window.perform_action(&CFString::from_static_str("AXRaise")) })?
+    };
     if error != AXError::Success {
         return Err(window_activation_attempt_error(
             "AXUIElementPerformAction(AXRaise)",
@@ -833,6 +1213,7 @@ pub(crate) fn control(
     surface: &SurfaceRecord,
     element: &ElementRecord,
     action: ComputerAction,
+    control: &local_control::ActivityGuard,
 ) -> Result<Value, String> {
     if !unsafe { AXIsProcessTrusted() } {
         return Err("permission_denied: macOS Accessibility permission is not granted".to_string());
@@ -870,19 +1251,22 @@ pub(crate) fn control(
 
     prepare_ax_call(&deadline, &current)?;
     let error = match action {
-        ComputerAction::Press => unsafe {
-            current.perform_action(&CFString::from_static_str("AXPress"))
-        },
-        ComputerAction::Focus => unsafe {
+        ComputerAction::Select => {
+            return Err("unsupported_platform: native selection is Windows-only".into())
+        }
+        ComputerAction::Press => control
+            .commit(|| unsafe { current.perform_action(&CFString::from_static_str("AXPress")) })?,
+        ComputerAction::Focus => control.commit(|| unsafe {
             current.set_attribute_value(
                 &CFString::from_static_str("AXFocused"),
                 CFBoolean::new(true),
             )
-        },
+        })?,
     };
     if error != AXError::Success {
         return Err(control_attempt_error(
             match action {
+                ComputerAction::Select => unreachable!("selection rejected before native effect"),
                 ComputerAction::Press => "AXUIElementPerformAction(AXPress)",
                 ComputerAction::Focus => "AXUIElementSetAttributeValue(AXFocused)",
             },
@@ -904,6 +1288,7 @@ pub(crate) fn scroll_to_element(
     element_id: &str,
     surface: &SurfaceRecord,
     element: &ElementRecord,
+    control: &local_control::ActivityGuard,
 ) -> Result<Value, String> {
     if !unsafe { AXIsProcessTrusted() } {
         return Err("permission_denied: macOS Accessibility permission is not granted".to_string());
@@ -931,7 +1316,9 @@ pub(crate) fn scroll_to_element(
         );
     }
     prepare_ax_call(&deadline, &current)?;
-    let error = unsafe { current.perform_action(&CFString::from_static_str("AXScrollToVisible")) };
+    let error = control.commit(|| unsafe {
+        current.perform_action(&CFString::from_static_str("AXScrollToVisible"))
+    })?;
     if error != AXError::Success {
         return Err(scroll_attempt_error(
             "AXUIElementPerformAction(AXScrollToVisible)",

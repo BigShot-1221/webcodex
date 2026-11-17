@@ -5,8 +5,7 @@ use super::http_client::{
 };
 use crate::webcodex_runner;
 use crate::webcodex_runner::config::{
-    hostname, max_concurrent_jobs, HotRunnerConfig, ReloadableRunnerConfig, RunnerConfig,
-    ShellConfig,
+    hostname, HotRunnerConfig, ReloadableRunnerConfig, RunnerConfig, ShellConfig,
 };
 use crate::webcodex_runner::job_manager::JobManager;
 use crate::webcodex_runner::projects::RunnerProjectCache;
@@ -193,6 +192,7 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     // Deterministic whole-line range replacement is an additive rolling-upgrade
     // capability and must never be inferred from generic line_scope support.
     capabilities.set(RunnerCapabilityId::ApplyTextEditRange, true);
+    capabilities.set(RunnerCapabilityId::ApplyFileWrite, true);
     // This binary proves explicit all-match cardinality before any file write.
     capabilities.set(RunnerCapabilityId::ApplyTextEditExpectedMatchCount, true);
     // Codex Patch is an additive request kind with Runner-authoritative parsing and
@@ -246,6 +246,7 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     capabilities.set(RunnerCapabilityId::StructuredGoTestJson, true);
     capabilities.set(RunnerCapabilityId::ProjectValidation, true);
     capabilities.set(RunnerCapabilityId::ProjectBuild, true);
+    capabilities.set(RunnerCapabilityId::ProjectBuildRustOptions, true);
     capabilities.set(RunnerCapabilityId::ProjectBuildNode, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationNodeJson, true);
     capabilities.set(RunnerCapabilityId::ProjectBuildPython, true);
@@ -268,12 +269,14 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
     // Server/Runner deployments fail closed before sending the expanded request.
     capabilities.set(RunnerCapabilityId::ProjectValidationPackageScope, true);
     capabilities.set(RunnerCapabilityId::ProjectAllPackages, true);
+    capabilities.set(RunnerCapabilityId::ProjectWorkspaceExclusions, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationTestOptions, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationPythonPytest, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationPythonRuff, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationNodeScriptCheck, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationNodeTap, true);
     capabilities.set(RunnerCapabilityId::ProjectValidationRustClippy, true);
+    capabilities.set(RunnerCapabilityId::ProjectValidationRustClippyOffline, true);
     // This binary also understands the first-class go_test durable metadata
     // identity. Keep this independent from JSON parsing so an old Runner that
     // supported Connector Go evidence cannot be mistaken for a first-class
@@ -304,6 +307,7 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
         cfg!(any(target_os = "linux", target_os = "macos", windows)),
     );
     capabilities.set(RunnerCapabilityId::ProjectLifecycle, true);
+    capabilities.set(RunnerCapabilityId::ProjectSettingsUpdate, true);
     // This binary implements resolve_or_register_project; do not trust config to
     // advertise a capability that the binary does not implement.
     capabilities.set(RunnerCapabilityId::ProjectPathRegistration, true);
@@ -453,6 +457,10 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
         RunnerCapabilityId::ComputerKeyInput,
         cfg!(any(target_os = "macos", windows)),
     );
+    capabilities.set(RunnerCapabilityId::ComputerLetterShortcuts, cfg!(windows));
+    capabilities.set(RunnerCapabilityId::ComputerSelection, cfg!(windows));
+    capabilities.set(RunnerCapabilityId::ComputerScroll, cfg!(windows));
+    capabilities.set(RunnerCapabilityId::ComputerKeyChords, cfg!(windows));
     // Exact window activation is a separate effect/wire capability. It is
     // independently advertised by native macOS and Windows implementations.
     capabilities.set(
@@ -513,6 +521,7 @@ pub(crate) fn build_register_request_with_provider_status(
     webcodex_runner::computer_session::set_server_availability_contract(false);
     let hot = runtime.snapshot();
     let mut capabilities = runner_register_capabilities(cfg);
+    capabilities.set(RunnerCapabilityId::ComputerLocalControl, cfg!(windows));
     let coding_agent_providers = runtime
         .coding_agents()
         .map(|manager| manager.providers())
@@ -535,6 +544,7 @@ pub(crate) fn build_register_request_with_provider_status(
             host_context: cfg.host_context.clone(),
             capabilities,
             computer_session_availability: webcodex_runner::computer_session::availability(),
+            computer_control_epoch: webcodex_runner::computer_session::control_epoch(),
             policy: Some(register_policy_summary(
                 &hot,
                 prepared_cache_count,
@@ -543,7 +553,7 @@ pub(crate) fn build_register_request_with_provider_status(
             )),
             process_started_at: Some(process_started_at()),
             build: Some(runner_build_info()),
-            job_concurrency_limit: Some(max_concurrent_jobs(cfg)),
+            job_concurrency_limit: Some(hot.max_concurrent_jobs),
             // A Runner with reconciliation disabled for E2E must not send a job
             // inventory: the server rejects inventory without the capability and
             // vice-versa.

@@ -1,4 +1,3 @@
-use super::super::context_projection::ContextMaterialCapabilities;
 use super::super::kernel::{
     HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
     ToolProtocolCapabilities, ToolTransport,
@@ -8,7 +7,9 @@ use super::super::sessions::{SessionTransport, ToolCallRecorderMetadata};
 use super::super::{ToolCall, ToolResult, ToolRuntime};
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerResultRequest};
+use crate::tool_runtime::dispatch::DispatchContext;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -99,17 +100,17 @@ async fn dispatch_with_context_and_local_agent(
         let runtime = runtime.clone();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+                .dispatch_with_context(
                     call,
-                    Some(&auth),
-                    SessionTransport::Mcp,
-                    recorder_metadata,
-                    None,
-                    true,
-                    context_request,
-                    ContextMaterialCapabilities {
-                        skill_runtime: true,
-                        memory_surface: false,
+                    DispatchContext {
+                        recorder: recorder_metadata,
+                        context_request: context_request,
+                        capabilities: crate::tool_runtime::kernel::ToolProtocolCapabilities {
+                            skill_runtime: true,
+                            memory_surface: false,
+                            ..Default::default()
+                        },
+                        ..DispatchContext::internal(Some(&auth), SessionTransport::Mcp, None)
                     },
                 )
                 .await
@@ -347,6 +348,46 @@ fn managed_descriptor(state: &FakeManagedSkillState) -> RunnerSkillDescriptor {
     }
 }
 
+fn fake_skill_read_response(
+    skill: RunnerSkillDescriptor,
+    path: String,
+    full_text: String,
+    start_line: usize,
+    limit: usize,
+) -> RunnerSkillReadResponse {
+    let sha256 = if path == "SKILL.md" {
+        skill.definition_revision().to_string()
+    } else {
+        format!("{:x}", Sha256::digest(full_text.as_bytes()))
+    };
+    let lines: Vec<_> = full_text.lines().collect();
+    let mut selected = Vec::new();
+    let mut bytes = 0;
+    for line in lines.iter().skip(start_line - 1).take(limit) {
+        let added = line.len() + usize::from(!selected.is_empty());
+        if bytes + added > 48 * 1024 {
+            break;
+        }
+        selected.push(*line);
+        bytes += added;
+    }
+    let returned_lines = selected.len();
+    let next = start_line + returned_lines;
+    let has_more = next <= lines.len();
+    RunnerSkillReadResponse {
+        format: RUNNER_SKILL_RESPONSE_FORMAT.to_string(),
+        skill,
+        path,
+        sha256,
+        text: selected.join("\n"),
+        start_line,
+        end_line: (returned_lines > 0).then_some(next - 1),
+        returned_lines,
+        has_more,
+        next_start_line: has_more.then_some(next),
+    }
+}
+
 async fn call_kernel_with_fake_operator_store(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -517,31 +558,17 @@ async fn call_kernel_with_fake_operator_store(
                                             } else {
                                                 configured.resource_text.clone()
                                             };
-                                            let sha256 = if path == "SKILL.md" {
-                                                configured.definition_revision.clone()
-                                            } else {
-                                                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-                                                    .to_string()
-                                            };
                                             (
                                                 Some(0),
                                                 Some(
                                                     serde_json::to_string(
-                                                        &RunnerSkillReadResponse {
-                                                            format: RUNNER_SKILL_RESPONSE_FORMAT
-                                                                .to_string(),
-                                                            skill: configured_descriptor(
-                                                                configured,
-                                                            ),
+                                                        &fake_skill_read_response(
+                                                            configured_descriptor(configured),
                                                             path,
-                                                            sha256,
                                                             text,
                                                             start_line,
-                                                            end_line: Some(start_line),
-                                                            returned_lines: limit.min(1),
-                                                            has_more: false,
-                                                            next_start_line: None,
-                                                        },
+                                                            limit,
+                                                        ),
                                                     )
                                                     .unwrap(),
                                                 ),
@@ -582,29 +609,17 @@ async fn call_kernel_with_fake_operator_store(
                                             } else {
                                                 managed.resource_text.clone()
                                             };
-                                            let sha256 = if definition_read {
-                                                managed.definition_revision.clone()
-                                            } else {
-                                                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-                                                    .to_string()
-                                            };
                                             (
                                                 Some(0),
                                                 Some(
                                                     serde_json::to_string(
-                                                        &RunnerSkillReadResponse {
-                                                            format: RUNNER_SKILL_RESPONSE_FORMAT
-                                                                .to_string(),
-                                                            skill: managed_descriptor(managed),
+                                                        &fake_skill_read_response(
+                                                            managed_descriptor(managed),
                                                             path,
-                                                            sha256,
                                                             text,
                                                             start_line,
-                                                            end_line: Some(start_line),
-                                                            returned_lines: limit.min(1),
-                                                            has_more: false,
-                                                            next_start_line: None,
-                                                        },
+                                                            limit,
+                                                        ),
                                                     )
                                                     .unwrap(),
                                                 ),
@@ -622,16 +637,16 @@ async fn call_kernel_with_fake_operator_store(
                 runtime
                     .runner_registry
                     .complete(RunnerResultRequest {
-                        client_id: client_id.to_string(),
-                        runner_instance_id: "inst".to_string(),
-                        request_id: request.request_id,
                         exit_code,
                         stdout,
                         stderr: Some(String::new()),
-                        stdout_truncated: false,
-                        stderr_truncated: false,
                         duration_ms: Some(1),
                         error,
+                        ..runner_result_request(
+                            client_id.to_string(),
+                            "inst".to_string(),
+                            request.request_id,
+                        )
                     })
                     .await
                     .unwrap();
@@ -2380,7 +2395,10 @@ async fn configured_skill_resource_executes_without_model_source_roundtrip_and_f
     assert!(result.output["skill_package_revision"].is_null());
     assert_eq!(
         result.output["skill_sha256"],
-        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        format!(
+            "{:x}",
+            Sha256::digest(b"import sys\nprint('skill-ok:' + sys.argv[1])\n")
+        )
     );
     assert!(kinds.iter().any(|kind| kind == "skill:resolve"));
     assert!(kinds.iter().any(|kind| kind == "skill:read"));
@@ -2535,4 +2553,497 @@ async fn run_skill_resource_denies_project_content_and_requires_managed_package_
     );
     assert_eq!(missing_package.output["command_started"], false);
     assert!(!missing_kinds.iter().any(|kind| kind == "skill:read"));
+}
+
+fn skill_continuation(result: &ToolResult, project: &str, expected_limit: usize) -> Value {
+    assert!(result.success, "{:?}: {}", result.error, result.output);
+    assert!(serde_json::to_vec(&result.output).unwrap().len() <= 64 * 1024);
+    let suggested = &result.output["suggested_call"];
+    assert_eq!(suggested["tool"], "read_skill_file");
+    assert_eq!(suggested["follow_up_kind"], "mechanically_followable");
+    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(suggested)
+        .expect("Skill continuation must satisfy the registered input schema");
+    ToolCall::from_tool_name("read_skill_file", suggested["arguments"].clone())
+        .expect("generated Skill continuation must parse");
+    let arguments = &suggested["arguments"];
+    assert_eq!(arguments["project"], project);
+    assert_eq!(arguments["skill_id"], result.output["skill_id"]);
+    assert_eq!(arguments["path"], result.output["skill_path"]);
+    assert_eq!(arguments["start_line"], result.output["next_start_line"]);
+    assert_eq!(arguments["limit"], expected_limit);
+    assert_eq!(
+        arguments["expected_definition_revision"],
+        result.output["definition_revision"]
+    );
+    assert_eq!(
+        arguments["expected_resource_sha256"],
+        result.output["sha256"]
+    );
+    assert!(arguments.get("session_id").is_none());
+    arguments.clone()
+}
+
+#[tokio::test]
+async fn skill_safe_continuation_executes_load_and_read_pages_without_gaps() {
+    let root = tempfile::tempdir().unwrap();
+    let body = (0..805)
+        .map(|n| format!("guidance-{n}\n"))
+        .collect::<String>();
+    write_skill(root.path(), "paged", "paged", "Paged guidance", &body);
+    let resource = (0..407)
+        .map(|n| format!("reference-{n}\n"))
+        .collect::<String>();
+    let directory = root.path().join(".agents/skills/paged/references");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("guide.md"), &resource).unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_runner_project_at_path(&runtime, "skill-pages", "demo", root.path()).await;
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let (mut page, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-pages",
+        "load_skill",
+        json!({"project": project, "name": "paged", "session_id": session.session_id}),
+        true,
+    )
+    .await;
+    let skill_id = page.output["skill_id"].clone();
+    let definition = fs::read_to_string(root.path().join(".agents/skills/paged/SKILL.md")).unwrap();
+    let mut actual = Vec::new();
+    let mut page_count = 0;
+    loop {
+        assert!(page.success, "{:?}", page.error);
+        actual.extend(
+            page.output["text"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .map(str::to_string),
+        );
+        page_count += 1;
+        if page.output["has_more"] != true {
+            assert!(page.output.get("suggested_call").is_none());
+            break;
+        }
+        let arguments = skill_continuation(&page, &project, 400);
+        assert!(arguments.get("expected_package_revision").is_none());
+        (page, _) = call_kernel_with_local_agent(
+            &runtime,
+            "skill-pages",
+            "read_skill_file",
+            arguments,
+            true,
+        )
+        .await;
+        assert!(page_count < 5);
+    }
+    assert_eq!(page_count, 3);
+    assert_eq!(
+        actual,
+        definition.lines().map(str::to_string).collect::<Vec<_>>()
+    );
+
+    let (mut page, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-pages",
+        "read_skill_file",
+        json!({"project": project, "skill_id": skill_id, "path": "references/guide.md"}),
+        true,
+    )
+    .await;
+    let mut actual = Vec::new();
+    let mut page_count = 0;
+    loop {
+        assert!(page.success, "{:?}", page.error);
+        actual.extend(
+            page.output["text"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .map(str::to_string),
+        );
+        page_count += 1;
+        if page.output["has_more"] != true {
+            assert!(page.output.get("suggested_call").is_none());
+            break;
+        }
+        let arguments = skill_continuation(&page, &project, 200);
+        (page, _) = call_kernel_with_local_agent(
+            &runtime,
+            "skill-pages",
+            "read_skill_file",
+            arguments,
+            true,
+        )
+        .await;
+        assert!(page_count < 5);
+    }
+    assert_eq!(page_count, 3);
+    assert_eq!(
+        actual,
+        resource.lines().map(str::to_string).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn skill_safe_continuation_respects_text_budget_and_rejects_changed_project_resource() {
+    let root = tempfile::tempdir().unwrap();
+    write_skill(root.path(), "paged", "paged", "Byte bounded", "body\n");
+    let definition_body = (0..60)
+        .map(|n| format!("{n:03}:{}\n", "界".repeat(340)))
+        .collect::<String>();
+    write_skill(
+        root.path(),
+        "definition-bytes",
+        "definition-bytes",
+        "Byte-bounded definition",
+        &definition_body,
+    );
+    let path = root.path().join(".agents/skills/paged/guide.md");
+    let content = (0..80)
+        .map(|n| format!("{n:03}:{}\n", "界".repeat(340)))
+        .collect::<String>();
+    fs::write(&path, &content).unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_runner_project_at_path(&runtime, "skill-byte-pages", "demo", root.path()).await;
+    let (loaded, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-byte-pages",
+        "load_skill",
+        json!({"project": project, "name": "paged"}),
+        true,
+    )
+    .await;
+    let skill_id = loaded.output["skill_id"].clone();
+    let (definition_page, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-byte-pages",
+        "load_skill",
+        json!({"project": project, "name": "definition-bytes"}),
+        true,
+    )
+    .await;
+    let definition_next = skill_continuation(&definition_page, &project, 400);
+    assert!(definition_page.output["returned_lines"].as_u64().unwrap() < 64);
+    let (definition_last, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-byte-pages",
+        "read_skill_file",
+        definition_next,
+        true,
+    )
+    .await;
+    assert!(
+        definition_last.success,
+        "{:?}: {}",
+        definition_last.error, definition_last.output
+    );
+    assert_eq!(definition_last.output["has_more"], false);
+    assert!(definition_last.output.get("suggested_call").is_none());
+    assert_eq!(
+        definition_last.output["sha256"],
+        definition_page.output["sha256"]
+    );
+    assert_eq!(
+        format!(
+            "{}\n{}",
+            definition_page.output["text"].as_str().unwrap(),
+            definition_last.output["text"].as_str().unwrap()
+        ),
+        fs::read_to_string(root.path().join(".agents/skills/definition-bytes/SKILL.md"))
+            .unwrap()
+            .trim_end_matches('\n')
+    );
+    let (first, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-byte-pages",
+        "read_skill_file",
+        json!({"project": project, "skill_id": skill_id, "path": "guide.md", "limit": 100}),
+        true,
+    )
+    .await;
+    assert!(first.success, "{:?}: {}", first.error, first.output);
+    assert!(first.output["text"].as_str().unwrap().len() <= 48 * 1024);
+    assert!(first.output["returned_lines"].as_u64().unwrap() < 80);
+    let arguments = skill_continuation(&first, &project, 100);
+    let (last, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-byte-pages",
+        "read_skill_file",
+        arguments.clone(),
+        true,
+    )
+    .await;
+    assert!(last.success, "{:?}", last.error);
+    assert_eq!(last.output["has_more"], false);
+    assert!(last.output.get("suggested_call").is_none());
+    let actual = format!(
+        "{}\n{}",
+        first.output["text"].as_str().unwrap(),
+        last.output["text"].as_str().unwrap()
+    );
+    assert_eq!(actual, content.trim_end_matches('\n'));
+    assert!(serde_json::to_vec(&last.output).unwrap().len() <= 64 * 1024);
+
+    fs::write(&path, content.replace("界", "NEW-RESOURCE-BODY")).unwrap();
+    let (changed, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-byte-pages",
+        "read_skill_file",
+        arguments,
+        true,
+    )
+    .await;
+    assert!(!changed.success);
+    assert_eq!(changed.output["error_kind"], "skill_resource_changed");
+    assert_eq!(changed.output["state_changed"], false);
+    assert!(changed.output.get("text").is_none());
+    assert!(!changed.output.to_string().contains("NEW-RESOURCE-BODY"));
+    let (legacy, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-byte-pages",
+        "read_skill_file",
+        json!({"project": project, "skill_id": skill_id, "path": "guide.md", "limit": 1}),
+        true,
+    )
+    .await;
+    assert!(
+        legacy.success,
+        "legacy omission retains ordinary fresh reads"
+    );
+    assert_eq!(
+        legacy.output["definition_revision"],
+        loaded.output["definition_revision"]
+    );
+}
+
+#[tokio::test]
+async fn skill_safe_continuation_fences_configured_and_managed_resource_pages() {
+    for managed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ToolRuntime::new_for_tests();
+        let client_id = if managed {
+            "skill-managed-pages"
+        } else {
+            "skill-configured-pages"
+        };
+        register_agent_with_projects(
+            &runtime,
+            client_id,
+            None,
+            RunnerCapabilities {
+                file_read: true,
+                skill_runtime: true,
+                ..Default::default()
+            },
+            vec![registered_project(
+                "project",
+                root.path().to_string_lossy().as_ref(),
+            )],
+        )
+        .await;
+        let project = crate::tool_runtime::runner_project_runtime_id(client_id, "project");
+        let skill_id = "wc_skill_MzMzMzMzMzMzMzMzMzMzMw";
+        let revision = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let package = "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo";
+        let text = "first\nsecond\nthird\n";
+        let sources = Arc::new(Mutex::new(FakeOperatorSkillState {
+            configured: (!managed).then(|| FakeConfiguredSkillState {
+                skill_id: skill_id.to_string(),
+                name: "paged".to_string(),
+                description: "Paged configured".to_string(),
+                definition_revision: revision.to_string(),
+                definition_text: "definition".to_string(),
+                resource_text: text.to_string(),
+                read_error: None,
+                next_definition_revision_after_probe: None,
+            }),
+            managed: managed.then(|| FakeManagedSkillState {
+                skill_id: skill_id.to_string(),
+                skill_key: "paged".to_string(),
+                name: "paged".to_string(),
+                description: "Paged managed".to_string(),
+                package_revision: package.to_string(),
+                definition_revision: revision.to_string(),
+                resource_text: text.to_string(),
+            }),
+        }));
+        let (first, _) = call_kernel_with_fake_operator_store(&runtime, client_id, "read_skill_file", json!({"project": project, "skill_id": skill_id, "path": "references/guide.md", "limit": 2}), sources.clone()).await;
+        let arguments = skill_continuation(&first, &project, 2);
+        if managed {
+            assert_eq!(arguments["expected_package_revision"], package);
+        } else {
+            assert!(arguments.get("expected_package_revision").is_none());
+        }
+        let (last, _) = call_kernel_with_fake_operator_store(
+            &runtime,
+            client_id,
+            "read_skill_file",
+            arguments.clone(),
+            sources.clone(),
+        )
+        .await;
+        assert!(last.success, "{:?}", last.error);
+        assert_eq!(last.output["text"], "third");
+        assert!(last.output.get("suggested_call").is_none());
+        {
+            let mut state = sources.lock().unwrap();
+            if let Some(skill) = state.configured.as_mut() {
+                skill.resource_text = "first\nsecond\nPRIVATE-CHANGED-RESOURCE\n".to_string();
+            }
+            if let Some(skill) = state.managed.as_mut() {
+                skill.resource_text = "first\nsecond\nPRIVATE-CHANGED-RESOURCE\n".to_string();
+            }
+        }
+        let (changed, _) = call_kernel_with_fake_operator_store(
+            &runtime,
+            client_id,
+            "read_skill_file",
+            arguments,
+            sources.clone(),
+        )
+        .await;
+        assert!(!changed.success);
+        assert_eq!(changed.output["error_kind"], "skill_resource_changed");
+        assert_eq!(changed.output["state_changed"], false);
+        assert!(changed.output.get("text").is_none());
+        assert!(!changed
+            .output
+            .to_string()
+            .contains("PRIVATE-CHANGED-RESOURCE"));
+        let (legacy, _) = call_kernel_with_fake_operator_store(
+            &runtime,
+            client_id,
+            "read_skill_file",
+            json!({"project": project, "skill_id": skill_id, "path": "references/guide.md"}),
+            sources,
+        )
+        .await;
+        assert!(legacy.success);
+        assert_eq!(legacy.output["definition_revision"], revision);
+    }
+}
+
+#[tokio::test]
+async fn skill_safe_continuation_preserves_hash_project_and_path_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let other_root = tempfile::tempdir().unwrap();
+    write_skill(
+        root.path(),
+        "paged",
+        "paged",
+        "Scoped continuation",
+        "one\ntwo\n",
+    );
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_runner_project_at_path(&runtime, "skill-page-guards", "demo", root.path()).await;
+    let other_project =
+        register_runner_project_at_path(&runtime, "skill-page-other", "demo", other_root.path())
+            .await;
+    let (loaded, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-page-guards",
+        "load_skill",
+        json!({"project": project, "name": "paged"}),
+        true,
+    )
+    .await;
+    let skill_id = loaded.output["skill_id"].clone();
+    for invalid in [
+        String::new(),
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+    ] {
+        let (rejected, kinds) = call_kernel_with_local_agent(
+            &runtime,
+            "skill-page-guards",
+            "read_skill_file",
+            json!({"project": project, "skill_id": skill_id, "expected_resource_sha256": invalid}),
+            true,
+        )
+        .await;
+        assert!(!rejected.success);
+        assert_eq!(
+            rejected.output["error_kind"],
+            "skill_resource_sha256_invalid"
+        );
+        assert!(rejected.output.get("text").is_none());
+        assert!(
+            kinds.is_empty(),
+            "invalid hash must fail before Runner dispatch"
+        );
+    }
+    let (first, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-page-guards",
+        "read_skill_file",
+        json!({"project": project, "skill_id": skill_id, "limit": 2}),
+        true,
+    )
+    .await;
+    let no_read_scope = crate::auth::AuthContext {
+        scopes: vec![crate::auth::SCOPE_RUNTIME_READ.to_string()],
+        ..crate::auth::AuthContext::new(crate::auth::AuthKind::ApiToken)
+    };
+    let denied = runtime
+        .call_tool_with_context_protocol_capability(
+            ToolCallRequest {
+                tool_name: "read_skill_file".to_string(),
+                arguments: skill_continuation(&first, &project, 2),
+            },
+            ToolCallContext {
+                transport: ToolTransport::Mcp,
+                session_id: None,
+                auth: Some(&no_read_scope),
+                window: None,
+                record_oauth_scope_denials: false,
+                host_file_import_trust: HostFileImportTrust::Untrusted,
+            },
+            true,
+        )
+        .await;
+    assert!(matches!(
+        denied.error_status,
+        Some(
+            super::super::kernel::ToolCallErrorStatus::InsufficientScope {
+                required_scope: Some(crate::auth::SCOPE_PROJECT_READ),
+                ..
+            }
+        )
+    ));
+    assert!(denied
+        .result
+        .as_ref()
+        .and_then(|result| result.output.get("text"))
+        .is_none());
+    let mut wrong_project = skill_continuation(&first, &project, 2);
+    wrong_project["project"] = json!(other_project);
+    let (rejected, _) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-page-other",
+        "read_skill_file",
+        wrong_project,
+        true,
+    )
+    .await;
+    assert!(!rejected.success);
+    assert_eq!(rejected.output["error_kind"], "skill_not_found");
+    let mut invalid_path = skill_continuation(&first, &project, 2);
+    invalid_path["path"] = json!("../outside.txt");
+    let (rejected, kinds) = call_kernel_with_local_agent(
+        &runtime,
+        "skill-page-guards",
+        "read_skill_file",
+        invalid_path,
+        true,
+    )
+    .await;
+    assert!(!rejected.success);
+    assert_eq!(rejected.output["error_kind"], "skill_resource_path_invalid");
+    assert!(kinds.is_empty());
 }

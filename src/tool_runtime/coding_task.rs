@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::continuation_feedback::{
-    continuation_feedback_value, continuation_projection_hooks, continuation_validation_snapshot,
-    not_applicable_continuation_feedback_value, ContinuationFeedbackInput,
+    continuation_feedback_value, continuation_projection_hooks,
+    not_applicable_continuation_feedback_value, ContinuationFeedbackInput, ContinuationJobSnapshot,
     ContinuationToolFailureSnapshot,
 };
 use super::git_review_snapshot::{
@@ -19,36 +19,29 @@ use super::git_review_snapshot::{
     GitReviewSnapshot,
 };
 use super::handoff::{
-    closeout_work_projection, compact_jobs, compact_review_evidence, compact_tool_failures,
-    compact_validation, reconcile_closeout_evidence, review_evidence_summary_for_session,
+    closeout_work_projection, compact_jobs, compact_tool_failures, compact_validation,
     validation_has_cargo_test_zero_tests,
 };
 use super::handoff_brief::{build_handoff_brief, HandoffBriefInput};
-use super::permissions::{
-    authority_profile_payload, permission_summary_from_events, PermissionDecision,
-};
-use super::project_instructions::{ProjectInstructionFile, ProjectInstructionsSnapshot};
+use super::permissions::{permission_summary_from_events, PermissionDecision};
+use super::project_instructions::ProjectInstructionsSnapshot;
 use super::project_resolution::ResolvedProject;
-use super::runtime_info::compact_runtime_status;
 use super::session_context::{
     absent_workflow_session_result, session_project_mismatch_result,
-    session_retention_expired_result, workflow_session_authority_fingerprint,
-    SessionProjectMismatch,
+    session_retention_expired_result, workflow_project_identity,
+    workflow_session_authority_fingerprint, SessionProjectMismatch,
 };
-use super::sessions::tool_failure_summary_from_events;
-use super::sessions::{self, SessionTransport, TOOL_CALL_RECORDING_SESSION_ID_FIELD};
+use super::sessions::{self, SessionTransport};
 use super::startup_brief::{
-    build_startup_brief, builtin_coding_workflow_projection, startup_brief_from_output,
-    StartupBriefInput, REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON,
+    build_startup_brief, builtin_coding_workflow_projection, StartupBriefInput,
+    REPOSITORY_OVERVIEW_NOT_REQUESTED_REASON,
 };
 use super::startup_catalog::{
     bounded_extension_description, StartupExtensions, StartupPluginEntry, StartupPluginsCatalog,
 };
-use super::tool_catalog::model_visible_recommended_flows;
 use super::tool_inputs::{CodingGuidanceProfile, SessionMode, StartupDetail};
 use super::tool_result::{RecoveryKind, ToolResult};
 use super::unknown_session_result;
-use super::validation_events::skipped_validation_summary;
 use super::window_activity::{
     ToolCallCorrelation, WorkflowSessionCorrelation, WorkflowSessionCorrelationRelation,
 };
@@ -57,7 +50,6 @@ use crate::auth::AuthContext;
 use crate::runner_protocol::{
     ShellFileOpRequest, RUNNER_CAPABILITY_FILE_READ, RUNNER_CAPABILITY_GIT, RUNNER_CAPABILITY_SHELL,
 };
-use std::collections::HashSet;
 use std::time::Duration;
 
 /// Short startup probe budget for the repository overview, much tighter than

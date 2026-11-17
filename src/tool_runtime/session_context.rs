@@ -49,6 +49,12 @@ pub(crate) fn absent_workflow_session_result(
 ) -> ToolResult {
     if let Ok(owner) = workflow_session_authority_fingerprint(auth) {
         if sessions
+            .session_target_authority(session_id)
+            .is_some_and(|(_, stored)| stored == owner)
+        {
+            return super::session_tools::session_storage_unavailable_result();
+        }
+        if sessions
             .owned_retention_incarnation(session_id, &owner)
             .is_some()
         {
@@ -609,6 +615,26 @@ pub(crate) fn workflow_session_authority_fingerprint(
         b"webcodex.workflow-session-authority.v1\0",
         authority_kind,
         &authority_id,
+    ))
+}
+
+/// Scope a Project-bound Session to a single persisted Runner registration.
+/// A root path alone cannot prove continuity after unregister/re-register.
+pub(crate) fn workflow_project_identity(
+    root_fingerprint: Option<&str>,
+    registered_path: &str,
+    registration_incarnation: Option<&str>,
+) -> Option<String> {
+    let incarnation = registration_incarnation.filter(|value| !value.is_empty())?;
+    let root = root_fingerprint.filter(|fp| !fp.trim().is_empty());
+    Some(hash_authority_identity(
+        b"webcodex.workflow-project-registration.v2\0",
+        if root.is_some() {
+            "canonical-root"
+        } else {
+            "registered-path"
+        },
+        &format!("{}\0{}", incarnation, root.unwrap_or(registered_path)),
     ))
 }
 

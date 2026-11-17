@@ -99,110 +99,86 @@ authorization; users should not copy or expose that credential. Independent/netw
 accessible Servers remain off by default and must not use this as a substitute for
 OAuth.
 
+
+When a loopback-only Desktop Server is behind a local HTTP proxy and OpenAI
+attachment domains resolve to a proxy-managed fake IP, direct TLS connections
+may fail even after the trusted tunnel's fake-IP admission succeeds. Operators
+may opt in to the **OpenAI host-file import only** proxy by setting
+`WEBCODEX_OPENAI_FILE_IMPORT_PROXY=http://127.0.0.1:PORT` in the Server
+environment and restarting the Server. IPv6 `http://[::1]:PORT` is also
+accepted. The setting defaults to off and is ignored for ordinary trusted MCP
+URLs and remote authenticated imports; it requires an explicitly trusted
+loopback MCP source and an allowlisted OpenAI attachment hostname. TLS server
+certificate verification and redirect rejection remain enabled. The HTTP
+CONNECT proxy chooses the upstream address instead of WebCodex's directly
+pinned DNS addresses, so use only a proxy you control and trust; no remote
+proxy endpoints, credentials, or hostnames are accepted as proxy settings.
+
 For a regular independent Windows Server + Runner reached through OpenAI Tunnel, or to troubleshoot a case where local MCP is healthy but ChatGPT Connector creation still fails, see the [Windows + OpenAI Secure MCP Tunnel deep dive](WINDOWS_OPENAI_TUNNEL.md). It is advanced setup/troubleshooting material, not required reading for a first-time user.
 
 ## Result cards
 
-On Stateless MCP 2026 requests that advertise MCP Apps HTML support, clients can display a
-small set of read-only milestone cards for `list_jobs`, `read_validation_summary`, and
-`read_git_review_summary`. The Job card shows only active or attention-requiring Jobs;
-routine successful terminal Jobs stay out of the foreground. Aggregate validation
-and committed-range review cards remain bounded and do not embed raw logs, diffs,
-or hunks.
+On Stateless MCP 2026 requests advertising MCP Apps HTML support, `list_jobs`,
+`read_validation_summary` and `read_git_review_summary` can show bounded,
+read-only milestone cards. The Job card foregrounds active or attention-requiring
+Jobs; validation and committed-review cards omit raw logs and diffs. These static
+cards do not poll, retry or invoke tools. High-frequency observation and validation
+calls retain native tool presentation. `WEBCODEX_MCP_APPS_ENABLED=false` removes
+App metadata/resources without disabling the underlying ordinary tools.
 
-High-frequency calls such as `observe_jobs`, `cargo_check`, `cargo_test`, `go_test`,
-and `read_workspace_changes` intentionally keep the Host's native tool presentation instead
-of creating an extra custom App card for every call. Cards do not poll, retry, or
-invoke tools; the canonical tool result remains available independently.
-`WEBCODEX_MCP_APPS_ENABLED=false` disables App metadata and resources without
-disabling the underlying tools.
-
-The current Result App is intentionally static. September 2026 Host experiments proved that a separately designed MCP App controller can poll server-owned state and request later ChatGPT model turns, including a bounded foreground autonomous multi-turn loop, but background-tab model-turn scheduling is not an immediate guarantee. Those findings and the production design constraints are recorded in [`agent/mcp-app-continuation-experiments.md`](agent/mcp-app-continuation-experiments.md); they do not change the current Result App contract.
+The live Work Result card and dedicated document readers have their own explicit
+App read paths. Historical [Host continuation experiments](agent/mcp-app-continuation-experiments.md)
+do not turn a milestone card into an automatic continuation controller.
 
 ### Dedicated DOCX reader
 
-`present_docx(project, path)` opens one authorized `.docx` in a dedicated read-only
-MCP App. It supports unchanged/untracked files without Git or a Workflow Session,
-pins size/SHA-256 (10 MiB maximum), and privately reads version-fenced segments.
-The reader offers fit width, zoom, optional fullscreen and original DOCX download.
-Common document styles are supported; layout/pagination may differ from Word.
-Legacy `.doc`, encrypted packages and editing are unsupported. A changed file
-requires explicit reopening; repeated presentation may create another Host card.
-The reader reuses the hidden format-neutral `read_app_artifact_chunk` bridge; no DOCX-specific binary transport is added.
-See [DOCX architecture and bounds](architecture/docx-document-viewer.md).
+`present_docx(project, path)` presents an authorized unchanged/untracked `.docx`
+without Git or a Workflow Session. It pins size/SHA-256 (10 MiB maximum) and
+privately reads version-fenced segments. Common styles, fit width, zoom and supported
+fullscreen are available; original download requires the Host's download capability.
+Word-equivalent pagination, legacy `.doc`, encrypted packages and editing are
+unsupported. Changed content requires explicit reopening. See the
+[DOCX reader contract](architecture/docx-document-viewer.md) for transfer,
+sanitization, expansion limits and verification.
 
 ### Live Work Result card
 
-`present_work_result` opens the separate Window work card with Activity, Results,
-and Collaboration tabs. Results shows the current Project's uncommitted files,
-rename paths, staging state, and available line counts while work is in progress.
-The bounded workspace snapshot can include changes from other work; partial file
-lists and missing line counts are labelled. A clean workspace is not task success.
-Linked Session check/review evidence appears when available.
+Call `present_work_result` once near the first successful Project action. Its
+Activity / Results / Collaboration tabs show Window activity, linked Session
+evidence, current uncommitted files and sealed final changes. A workspace snapshot
+can include other work; partial file lists and missing counts are labelled, and a
+clean workspace is not proof of task success. Results loads diffs only on demand.
 
-Hosts supporting conversation thread panels can open the public rendering
-`work_result_thread_panel` entrypoint with an empty argument object. It resolves
-the latest successful `present_work_result` in the same authenticated Host Window,
-including that presentation's explicit business Session when supplied. Other
-actions and failed presentations cannot retarget the panel. Presentation records
-this durable binding without starting live Window activity; the thread entrypoint
-and App refresh calls also stay outside live Window activity. The model still
-calls `present_work_result` once near the first successful Project action.
+A Host may open `work_result_thread_panel({})` to recover the latest successful
+presentation in the same authenticated Host Window, including its explicit
+business Session. Failed presentations and unrelated actions cannot retarget it.
+An open card retains its exact Project/Session on refresh; Window-linked evidence
+does not grant refresh authority or select a Session. Missing binding/Window
+identity fails closed. Reopen to select a newer successful presentation.
 
-The thread panel opens Review first: Changed files and lazy diffs, Session checks,
-then sealed Final Changes. Activity and Collaboration remain secondary tabs;
-Project, Window and Session identifiers are folded under Diagnostics. The inline
-card retains its Activity-first layout. Opening Review does not eagerly load diffs.
+Changed-file text follows fresh observations by default; **Pin snapshot for
+review** holds the inspected version, and **Follow changes** resumes updates.
+Each read remains bound to an exact working-tree snapshot. Final files use the
+sealed final tree even after later edits. Only advertised paths may be read,
+in explicit 32 KiB pages up to 256 KiB per file, with partial content/caps labelled.
+Deleted files have no final version. Binary, non-UTF-8, symlink and submodule
+content is unavailable; failed or expired reads never fall back to a live path.
+Every read still reauthorizes its target.
 
-An open panel retains its exact Project and explicit Session selection on refresh.
-Window-linked Session evidence never becomes refresh authority. Reopen the panel
-to select a newer successful presentation; missing Window identity or binding
-fails closed. Current authorization and snapshot fences still apply on every read.
-Changed files and Final Changes offer lazy Full text previews only for advertised
-paths. Changed files follow fresh workspace observations by default, renewing
-only a previously inspected view and keeping each read bound to an exact
-working-tree snapshot. Pin snapshot for review keeps that code stable while
-activity and workspace status refresh; Follow changes resumes updates. Final
-files always use the sealed final tree, even after later workspace edits.
-Snapshot retention and expiry remain bounded; failed reads never retarget code.
-Content loads in explicit
-32 KiB pages up to 256 KiB per file; the card labels partial content and the cap.
-A deleted file has no final version. Binary, non-UTF-8, symlink and submodule
-contents are unavailable; failed or expired reads never fall back to a live path.
-Markdown is enabled for `.md`/`.markdown` only after the complete file is loaded.
-The bundled markdown-it parser supports standard Markdown, tables and
-strikethrough, without promising every GFM extension. Rendering uses DOM node and
-attribute allowlists: raw HTML remains text, unsafe URLs are rejected, links stay
-inert and external images show a placeholder instead of loading resources.
-Line/selection-to-chat interactions remain deferred.
+Complete `.md` / `.markdown` files can render with the bundled Markdown parser.
+Raw HTML remains text, DOM nodes/attributes are allowlisted, unsafe URLs are
+rejected, links stay inert and external images are not fetched. Line/selection
+transfer to chat remains deferred. Automatic App refresh pauses while hidden;
+presentation and private refresh do not create live Window work activity.
 
-The Markdown bundle is checked into the single-script App resource, so Rust-only
-builds need no npm toolchain. After `npm ci --prefix frontend`, regenerate with
-`npm --prefix frontend run build:work-result`; `node frontend/scripts/build-work-result-markdown.mjs --check`
-checks deterministic output and also runs under `check:dist`.
-
-Rendering entrypoints retain the default model/App visibility. App-only bridge
-helpers return data without `ui.resourceUri`: ChatGPT rejects private tools that
-declare a rendering resource when refreshing the connected App. After updating
-the Server's tool descriptors, refresh tools for the existing App in ChatGPT's
-plugin settings before testing the new entrypoint.
-
-After closeout, Results also shows the sealed final task changes with on-demand
-per-file diffs. Those diffs keep their original snapshot identity even if the live
-workspace changes. Refresh uses the existing App-only observation path; opening
-Results adds no tool calls. Automatic refresh pauses while the App document is
-hidden and uses a bounded visible cadence so background cards do not continuously
-exercise the Host tool bridge. Discuss these changes opens the existing composer
-without sending a message. Window activity calls are compact, collapsed by default,
-and fetch their sanitized trace/timing details only when expanded. The inline card
-shows the canonical hashed Window key used by the Window activity ledger; the
-thread panel puts the same identity under Diagnostics, making
-support traces attributable without exposing the Host's raw Window identifier.
-New cards use the Work Result resource URI advertised by the current descriptor,
-owned by the [canonical App registry](../src/mcp/app_registry/builtin.rs). Refresh
-Host schemas and reopen cached readers to load the current thread-panel, lazy-detail
-and canonical tool-name contract.
-Retired resource URIs fail closed instead of serving a new template under an old cache key.
+The [card navigation](ui/work-result/README.md),
+[read ownership and invalidation](architecture/work-result-read-lifetimes.md), and
+[renderer/build boundaries](architecture/work-result-sections.md) own UI details.
+The [App registry](../src/mcp/app_registry/builtin.rs) owns current resource identity;
+retired URIs never alias new templates. Refresh Host schemas and reopen cached
+cards after descriptor changes. Rendering entrypoints retain model/App visibility;
+private bridge tools return data without `ui.resourceUri`, as required by the
+[App presentation contract](architecture/mcp-presentation-families.md).
 
 ## Existing Server
 
@@ -228,7 +204,65 @@ advanced identity flow.
 
 ### Adaptive Runtime routing
 
-There is one model-facing MCP runtime contract: **Adaptive Runtime**. Canonical `ToolDefinition` rank decides the direct tools; ordinary model-visible long-tail tools are invoked through `call_runtime_tool`; server-owned protocol capabilities and MCP App admission may add hidden extensions for the relevant protocol request. There is no startup model-surface selector. `read_tool_manifest(tool_name=...)` is discovery only: it never dynamically registers a new Host tool. Its exact `route.primary` describes the preferred callable, and a normal direct tool also exposes `route.fallback` through `call_runtime_tool` for the case where that direct callable is not present; explicit MCP App presentation tools mark that fallback as blocked while Apps are enabled. Direct versus gateway routing changes presentation only and never bypasses the target tool's authentication, Project authority, permission, Runner capability, Session, or safety checks.
+One canonical ToolRuntime serves both MCP projections. **Adaptive Runtime** remains the default, including ChatGPT: canonical `ToolDefinition` rank decides the direct tools; ordinary model-visible long-tail tools are invoked through `call_runtime_tool`; server-owned protocol capabilities and MCP App admission may add hidden extensions for the relevant protocol request. An explicit request-local CLI surface changes discovery and presentation only, as described below. `read_tool_manifest(tool_name=...)` is discovery only: it never dynamically registers a new Host tool. Its exact `route.primary` describes the preferred callable, and a normal direct tool also exposes `route.fallback` through `call_runtime_tool` for the case where that direct callable is not present; explicit MCP App presentation tools mark that fallback as blocked while Apps are enabled. Direct versus gateway routing changes presentation only and never bypasses the target tool's authentication, Project authority, permission, Runner capability, Session, or safety checks.
+
+When their workflow group is enabled, nine durable Agent and Goal operations have a stricter Host exposure contract: `create_agent_identity`, `rotate_agent_continuation_endpoint`, `list_agent_identities`, `prepare_goal_workflow`, `get_goal`, `checkpoint_goal`, `update_goal`, `bootstrap_agent_conversation`, and `consume_agent_wake` are independently exposed with their canonical input schemas, accurate effect annotations and applicable OAuth requirements. They require normal Host tool review before a new trial. If a Host does not load or rejects one of these dedicated descriptors, WebCodex does not substitute `call_runtime_tool`; that generic route is not a fallback for these operations. Their `_wc.control` forms for Goal checkpoints, Wake consumption and Goal completion are also rejected before any main or sidecar effect; use the standalone canonical tools. This bounded stage does not claim compliance for unrelated Plugin operations. This exposure policy does not grant authority or guarantee Host acceptance, and does not alter each operation's existing authentication, OAuth scopes, permissions, ownership, lifecycle, replay-safety, or effect checks. The cause of a prior Host refusal remains unknown; this contract does not claim to resolve it. Other ordinary direct tools retain their existing gateway fallback, and hidden App methods remain hidden.
+
+### Optional workflow tools per client
+
+Adaptive Runtime (including ChatGPT) keeps model-facing Goal, Agent continuation
+and Job continuation tools opt-in. The execution-only CLI surface excludes them;
+legacy CLI configuration fields remain readable but cannot reopen workflow routes. Configure the Server's `WEBCODEX_MCP_TOOL_EXPOSURE` as closed JSON:
+
+```json
+{
+  "adaptive": {"goals": false, "agent_continuation": false, "job_continuation": false},
+  "cli": {"goals": false, "agent_continuation": false, "job_continuation": false},
+  "oauth_clients": [
+    {
+      "client_id": "YOUR_REGISTERED_CHATGPT_OAUTH_CLIENT_ID",
+      "adaptive": {"goals": true, "agent_continuation": true, "job_continuation": true}
+    }
+  ]
+}
+```
+
+For example, place the compact JSON value in the existing Server environment
+configuration. The value is read and validated once before the Server starts;
+restart the Server and refresh/reconnect the Host's tool catalog after an operator
+changes it. This example enables the full workflow surface only for the exact
+authenticated OAuth client, so online ChatGPT needs no custom request headers.
+`X-WebCodex-MCP-Surface: cli` still selects the CLI surface on each request.
+An omitted client surface inherits its deployment surface; a supplied surface is
+a complete replacement, with omitted booleans defaulting to false. Client names,
+`clientInfo`, client windows, Sessions and previous requests never select an override.
+
+| Setting | Model tools controlled |
+|---|---|
+| `goals` | The canonical Goal category, including preparation, reads, checkpoints, updates and `present_goal_plan`. |
+| `agent_continuation` | Agent identity/setup, Endpoint rotation/detach, bootstrap/Wake consumption, `wait_for_agent_events`, Task Endpoint continuation and the Agent continuation card/bridge. |
+| `job_continuation` | `wait_for_job_terminal` and its Job continuation card/bridge. Ordinary same-Job readiness and observation remain available. |
+
+The switches are independent. Enable both `goals` and `agent_continuation` for
+Goal-driven automatic continuation. Enabled individually reviewed operations
+receive canonical standalone descriptors on Adaptive. CLI remains execution-only. Disabling a group removes its model descriptors
+and optional App resources/bridge helpers. Exact manifests report unavailable
+routes, generated follow-ups omit unavailable targets, and direct/gateway calls
+cannot enable the omitted group. The Workbench independently retains its existing
+App-only Goal read/create/update controls: those remain `ui.visibility=["app"]`,
+are not model routes and do not become gateway fallbacks. This MCP exposure policy
+is not a credential scope or a global feature-disable switch for Runtime API/UI.
+
+Configuration is limited to 16 KiB and 64 unique OAuth client entries; client ids
+are non-empty, at most 256 UTF-8 bytes, without whitespace/control characters.
+Unknown fields, duplicate clients, malformed JSON and wrong types fail startup;
+diagnostics omit input values and client ids. Operator status reports surface
+defaults and the override count. Scope filtering, canonical business schemas,
+ownership, generation/revision fences, effect checks and the independent Host
+review requirement still apply. `WEBCODEX_MCP_COMPACT_SCHEMAS` controls schema
+detail, and `WEBCODEX_MCP_APPS_ENABLED` separately controls App admission; neither
+implicitly enables workflow tools. Exposure is also separate from
+`WEBCODEX_GOAL_WORKFLOW` preference and `WEBCODEX_MCP_APP_RESUME_MODE` readiness policy.
 
 ### Request-local client policy
 
@@ -252,8 +286,9 @@ Server defaulting to `host_code_mode`, ordinary clients must explicitly select
 The optional positive-integer budget header can only **reduce** the deployment's
 resolved `WEBCODEX_MCP_HOST_BUDGET_SECS` budget. Return waits preserve the existing
 five-second guard (and the existing one-second floor for tiny budgets). A Direct
-request on a Server budget of 55 seconds therefore defaults to a ten-second
-execution handoff, with a 50-second synchronous/observation ceiling; Host Code
+request on a Server budget of 55 seconds has a 50-second synchronous/observation
+ceiling. CLI defaults to that ceiling; Adaptive retains its ten-second execution
+handoff; Host Code
 Mode retains its five-second handoff/observation slices. `wait_for_job_readiness`
 uses up to 45 seconds, further capped by the selected budget minus the guard,
 not by the five-second handoff slice. Header omission leaves deployment behavior
@@ -268,8 +303,13 @@ are unchanged. Explicit `work_on_project.guidance_profile` still selects guidanc
 only; it does not override transport timing. Subsequent context refreshes use the
 policy of their own request. `/api/tools/call`, result-text compatibility,
 `tools/list`, Apps admission and standard error semantics are unaffected.
-`runtime_status.effective_config.mcp_host` remains the deployment snapshot, not a
-claim about every connected client's policy.
+`get_runtime_status.mcp_host.profile` reports the profile effective for this
+request in both sparse and full responses. `deployment_profile` identifies the
+immutable Server default, and `profile_source` is `deployment` or
+`request_header`, including an explicit header equal to the default. Omitted
+headers never inherit another client's selection. The full response's
+`effective_config.mcp_host` remains the deployment timing snapshot; request-local
+profile diagnostics do not change execution policy or that operator evidence.
 
 Metadata/full trace records the actual selection as `mcp_request_policy_selected`:
 `selection.effective`, separate profile/budget sources, parsed requested budget
@@ -285,9 +325,222 @@ assume a new model turn will start. `wait_for_job_terminal` is optional durable
 attention for an explicitly established continuation workflow, not a blocking
 wait or a prerequisite for ordinary MCP.
 
+### Direct connections from Claude Code and Codex
+
+For a CLI client connecting directly to a local or hosted Server, add
+`X-WebCodex-MCP-Surface: cli` to **every request**, including discovery. Omission
+(or `adaptive`) keeps the existing ChatGPT surface. This is independent of the
+`direct` / `host_code_mode` waiting strategy and does not enable permissions,
+change authentication, or remember a Project/Session between calls. Reconnect or
+refresh tools after changing connection headers. Empty, unknown or repeated
+preference headers fail before dispatch without echoing their values.
+
+The CLI surface is execution-only: the local agent owns planning, repository
+instructions and conversation state. It does not bootstrap a Workflow Session,
+fetch guidance/Skills, deliver collaboration messages, or attach passive Job
+attention. `_wc` sidecars are rejected, including empty envelopes and nested
+gateway envelopes. Canonical audit evidence and existing history remain intact.
+
+- With a default Project, the direct catalog has eight tools: `run_shell`,
+  `observe_jobs`, `stop_job`, `read_files`, `edit_project_files`,
+  `search_project_texts`, `read_tool_manifest` and `call_runtime_tool`.
+  Without a default Project, it also exposes `list_projects` to select a target.
+  Find filenames and check Git state with `run_shell`, for example `git ls-files`
+  and `git status --short`. `list_project_files`, `list_project_tracked_files`
+  and `read_workspace_changes` remain available through manifest + gateway;
+  `list_projects` uses that route too when a default is configured.
+- Direct schemas are selection subsets, never Server validators. The editor
+  shows `path`, `kind`, `edits[].old_text/new_text`, `content`,
+  `expected_read_revision` and `to_path`. Exact manifests retain occurrence,
+  range, match-count, line-edit and dry-run options. Direct observation hides
+  `observation_ref` and `summary_only`; direct search shows common query fields.
+  Canonical advanced fields still work when supplied in direct calls, through
+  the same parser, revision guards, permissions and capabilities. Session-era
+  fields such as workspace `session_event_limit` are not advertised by CLI.
+  Discovery budgets are 10,000 bytes with a default Project and 12,000 without,
+  measured as the compact `tools/list` result in the local-agent acceptance.
+- `run_shell` is the default command entry. `observe_jobs` combines bounded
+  waiting with result/log retrieval for the original Job; `stop_job` requests
+  cancellation. Exact argv, scripts, interactive stdin, LSP
+  navigation, build and validation remain canonical specialized tools, discovered
+  through the manifest and called through the gateway. Process lifetime, cancellation and uncertain-effect authority remain unchanged.
+- Workflow Sessions, Goals, durable Agent orchestration, Skills, Memory,
+  communication and Apps are unavailable through discovery **and** dispatch.
+  CLI workflow exposure flags cannot reopen these routes. Manifest workflow
+  recipes are disabled (`include_recommended_flows=true` is rejected).
+- WebCodex results are text without duplicate `structuredContent`, using standard
+  `isError`. Source/read revisions, partial failures, unknown effects, Job
+  identities, limits and fenced recovery remain visible. Native image/resource
+  blocks and third-party provider passthrough retain their contracts.
+- `initialize.instructions` / `server/discover` contain only the execution
+  boundary and recovery contract. Read repository instructions explicitly as
+  files when needed; there is no automatic instruction injection.
+
+CLI command and file behavior:
+
+- `run_shell` waits up to 50 seconds by default under Direct timing. Set
+  `sync_wait_secs` for an earlier handoff; Server/Host caps can only shorten it.
+  Pending output includes the available tail and the same Job continuation.
+  CLI process lifetime defaults to 600 seconds (`timeout_secs`), subject to Runner
+  limits; expiration terminates the process tree, independently of handoff timing.
+- `observe_jobs(items=[{job_id}], wait_secs=50)` waits for terminal without a
+  prior token. `wake_on` defaults to `terminal`; explicitly select `change` or
+  `meaningful_change` for update waits, which still require a baseline token.
+  A token returns the **latest incremental tail**, including terminal diagnostics.
+  Only explicit `page=true` items read forward from the token for log recovery;
+  generated continuations request 200 lines per page. Storage gaps/epoch changes
+  report reset. A first observation without a token reads the current tail.
+- Truncated command previews keep the beginning and end. A synchronous truncated
+  result retains its original Job under existing bounded retention and offers a
+  log continuation. For each stream, CLI starts that page after the complete
+  lines already shown at the beginning; a partly shown line is read again.
+  Never rerun an effectful command to recover its output.
+- A `next:` line carries executable arguments and replaces separate `job_id` /
+  `observation_token` lines. Without a continuation those selectors remain.
+  Equivalent CLI defaults such as `wake_on="terminal"` are omitted from `next:`.
+  Per-stream reset flags replace the redundant aggregate reset message.
+- Workspace text shows `diff_status` / `diff_stat_status` only for failed
+  inspections, not an unrequested diff. `??` rows replace duplicate
+  `untracked_file` warnings; other warnings remain. A refused creation through
+  a symlink explains that the resolved path is outside the Project/allowed roots
+  or is protected (for example `deps -> node_modules`), without exposing the
+  resolved outside path. These presentation changes are CLI-only;
+  Adaptive results and canonical execution contracts are unchanged.
+- File reads, searches, directory/filename listing, LSP paths and transactional
+  edits accept absolute paths inside the resolved Project root. Runner path and
+  symlink protections still apply; paths outside that root are rejected.
+- `edit_project_files` has one canonical flat change schema. `kind` defaults to
+  `edit`, and an edit's `kind` defaults to `replace_exact`. `write` overwrites an
+  existing file using `content` plus `expected_read_revision`; it requires the
+  additive Runner capability `apply_file_write`. Unique, unscoped
+  `replace_exact`/`delete_exact` can omit revision: Runner checks every old-text
+  match against the same source snapshot before committing the transaction.
+  This checks the edited text, not whether unrelated file content changed.
+  Supplied revisions always apply; whole-file writes/deletes/renames, insertions,
+  occurrence/range/scope selectors and bulk replacements still require revision.
+- CLI rejects `session_id`, and `run_shell` recording-only fields `purpose`,
+  `assertion_name`, `result_expectation`. Calling CLI `stop_job` explicitly
+  requests cancellation; there is no additional `confirm=true` step. Client
+  approval and canonical Job/Project ownership checks remain in force.
+- Direct execution/read/edit/search/status text uses explicit content fields;
+  telemetry additions no longer automatically appear. Failures, uncertain
+  effects, retained-log loss and exact follow-up arguments remain visible.
+  Unfiltered manifests start with coding tools; exact or filtered lookup can
+  still discover other admitted execution tools.
+- `read_files`/`search_project_texts` default to a 45,000-byte canonical result budget, preserving
+  revision-fenced paging. CLI descriptors request Claude `anthropic/alwaysLoad`
+  and `anthropic/maxResultSizeChars=70000`; these are client presentation hints,
+  not larger Server output budgets. The initialization hint asks clients to read
+  remote AGENTS.md / CLAUDE.md; WebCodex does not inject their contents or plan
+  the task. Client behavior should be checked with the acceptance harness.
+
+Images already have a gateway route: discover `read_project_artifact_chunk`, then
+call it with a Project-relative ordinary image path and `as_image=true`. The file
+does not need to be registered as an artifact. Existing path protection, PNG/JPEG/
+WebP validation and the 4 MiB image limit apply; image reads cannot be combined
+with chunk offsets/lengths. CLI preserves the MCP `image` content block beside
+text, rather than converting it into text or discarding it. A text-only consumer
+must handle that block to display the image. An isolated Server/Runner probe
+verified an ordinary PNG and the preserved image block; model-side visual
+interpretation was not tested. The current option is manifest + gateway; a future
+explicit CLI image entry could reduce discovery calls, but is not implemented.
+
+For the optional native-tool comparison, local Claude Code 2.1.319 accepts
+`--tools ""`, leaving the MCP tools and no native executable tools (its provider
+request still includes `DeferredToolPlaceholder`). Local Codex 0.166.0 accepts
+`--disable shell_tool`, removing `exec_command` / `write_stdin` while retaining
+`apply_patch`, `view_image` and other native tools. These are client controls,
+not WebCodex authority. The acceptance harness records the actual remaining
+inventory with loopback protocol fixtures, using no real model. See
+[local-agent acceptance and metric limits](TESTING.md) for the
+three comparison arms and token accounting.
+
+Generate connection configuration without reading a token or changing files:
+
+```bash
+webcodex mcp-config --client claude --url http://127.0.0.1:8080/mcp --project agent:dev:repo
+webcodex mcp-config --client codex --url http://127.0.0.1:8080/mcp --project agent:dev:repo
+```
+
+Set `WEBCODEX_TOKEN` separately, or select its name with `--token-env`. Output is
+Claude MCP JSON (including `alwaysLoad`) or a Codex TOML fragment with a 65-second
+client timeout and explicit approval settings for edit, shell, stop and gateway.
+Codex defaults these to `prompt`; `--approve-execution` deliberately selects
+`approve`. Claude permissions remain in its client settings. The command does
+not install configuration or grant Server permissions. See the official
+[Claude MCP loading/result-size contract](https://code.claude.com/docs/en/mcp) and
+[Codex configuration reference](https://developers.openai.com/codex/config-reference/).
+
+**Migration from v0.5.0:** this intentionally replaces the previous CLI workflow
+bootstrap and `_wc.ack/reply` behavior. Reconnect/refresh `tools/list` and stop
+sending CLI sidecars. Clients needing WebCodex-managed workflows or collaboration
+can explicitly choose `adaptive`, whose workflow behavior is preserved. Shared canonical editing and log contracts
+apply to both surfaces. No persisted
+Session, message, credential or Job is migrated or removed.
+
+Optionally set `X-WebCodex-MCP-Project` to a server-issued `project_ref` (for
+example `~p17`) or full `agent:<runner>:<project>` ID. A reference retains its
+principal/root binding and fails closed if stale; a full ID has the same resolver
+semantics as that explicit tool argument. Short names are rejected. This supplies
+an omitted required `project`, including inside the gateway. Explicit project
+values win; registration retains its own explicit source rules. Optional filters such as `list_jobs.project` are not filled.
+The header requires the CLI surface, is bounded to 512 bytes, and is never
+persisted as connection authority. Select the target deliberately; the default
+is not an authorization grant.
+
+Claude Code `.mcp.json` example (replace the URL with the reported endpoint):
+
+```json
+{
+  "mcpServers": {
+    "webcodex-cli": {
+      "type": "http",
+      "alwaysLoad": true,
+      "url": "${WEBCODEX_MCP_URL}",
+      "headers": {
+        "Authorization": "Bearer ${WEBCODEX_MCP_TOKEN}",
+        "X-WebCodex-MCP-Surface": "cli",
+        "X-WebCodex-MCP-Profile": "direct",
+        "X-WebCodex-MCP-Budget-Secs": "55"
+      }
+    }
+  }
+}
+```
+
+Keep credentials in the environment, not the configuration file. Claude Code's
+[HTTP headers and variable expansion](https://code.claude.com/docs/en/mcp#environment-variable-expansion-in-mcp-json)
+provide this connection shape. For OAuth, omit the Authorization entry and use
+the client's normal OAuth flow.
+
+Codex `config.toml` example (replace the example URL):
+
+```toml
+[mcp_servers.webcodex_cli]
+url = "http://127.0.0.1:8080/mcp"
+bearer_token_env_var = "WEBCODEX_MCP_TOKEN"
+tool_timeout_sec = 60
+http_headers = { "X-WebCodex-MCP-Surface" = "cli", "X-WebCodex-MCP-Profile" = "direct", "X-WebCodex-MCP-Budget-Secs" = "55" }
+```
+
+The [Codex MCP configuration reference](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+documents `http_headers`, `bearer_token_env_var` and `tool_timeout_sec`. The 55-second
+Host budget leaves margin below this client's 60-second timeout, but is not a
+universal RPC deadline. A timeout is not permission to retry a write or redispatch
+a Job. These examples do not depend on either client's structured-content priority
+or tool-loading strategy.
+
+For a repository on another machine, a local `CLAUDE.md` / `AGENTS.md` note can say:
+
+```text
+This task targets WebCodex Project agent:dev:repo on Runner dev.
+Use the webcodex-cli MCP tools for that repository's files, Git and commands.
+The local shell/filesystem belongs to the client machine, not necessarily that Project.
+```
+
 ### Tool result framing
 
-Machine-readable MCP tool results are returned in `structuredContent`; `content` is a concise human-readable/protocol-native fallback. Clients that need fields should consume `structuredContent` rather than parse text.
+On the default Adaptive surface, machine-readable MCP tool results are returned in `structuredContent`; `content` is a concise human-readable/protocol-native fallback. Clients that need fields should consume `structuredContent` rather than parse text.
 
 For standard-client command failures (`isError=true`, `tool_failure=false`, and `failure_kind=command_exit_nonzero` or `timeout`), `content[0].text` also includes available stdout/stderr tails so hosts that hide structured errors can still diagnose the command. Each stream reuses the command tail limit of 12,000 Unicode characters (at most 48,000 UTF-8 bytes), plus a small label; `[truncated]` marks either upstream or presentation truncation. Empty, untruncated streams are omitted. This text-only projection preserves the compact structured error, execution state, retry guidance and successful receipts. OpenAI structured-failure compatibility keeps its existing presentation, and text JSON compatibility emits its JSON copy without additional log sections.
 
@@ -430,17 +683,22 @@ work_on_project
 
 For intentional Go source formatting, `project_format` accepts `adapter="go"` or `auto` with 1–8 explicit `.go` paths under one nearest unambiguous `go.mod` recipe. It requires `project:write`, `job:run`, `project_format_v1` and the additive `project_format_go_v1` Runner capability. Installed `gofmt` reads private source bytes on stdin with no arguments and returns candidates on stdout; the Runner owns guarded writes and durable `state_changed` evidence. No workspace traversal, `-w`/rewrite/simplification flags, goimports, module loading, installs or automatic retries are introduced. `go.mod` is a bounded UTF-8 scope/identity witness, not parsed module semantics; native stdin fragments are accepted and formatting is not compilation. Missing tooling fails closed. Pending or uncertain work must be observed by its original Job, not redispatched. See [bounded project formatting](implementation/project-format-lifecycle.md).
 
-For ordinary bounded project validation, prefer `project_validate`; project-authored scripts and tests may modify files or use network. It accepts only a closed `format_check` / `check` / `lint` / `test` intent plus an optional `auto` / `rust` / `go` / `python` / `node` adapter hint; the Runner resolves the nearest unambiguous recipe on its own registered filesystem and then starts the existing structured validation Job. Rust maps to `cargo fmt -- --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D clippy::correctness`, or `cargo test`; Go maps to `go vet ./...` or `go test -json ./...`. Go project validation runs in Runner-owned single-module mode with `GO111MODULE=on` and `GOWORK=off`, so ambient module mode or parent `go.work` selection cannot silently change the gateway's workspace semantics. Its validation target identity is domain-separated from ambient Go specialist evidence, so success under different workspace semantics cannot reconcile a gateway failure. The standalone `go_test` specialist keeps its existing environment behavior. Optional `scope` selects exactly one portable package intent: bounded `packages` (1..8 entries) narrows Rust check/lint/test through repeated Cargo `-p` selectors and Go check/test through project-relative package patterns, while `all_packages=true` selects the complete project unit. Rust all-packages maps to Cargo `--workspace` only when the Runner proves the effective Cargo workspace root is exactly the registered Project root and binds the in-Project Cargo manifest graph into the existing re-plan fence; Go all-packages keeps the canonical `./...` single-module scope. Scoped formatting fails closed. Python uses existing configured/profile/PATH Python 3 for pytest test (`python -m pytest --color=no -rA`) and project-local Ruff check/format_check (explicit target-version, no fixes, cache or bytecode). Python scope and dependency policy fail closed. Node supports Runner-owned native script-based `check` through `node --run <check|typecheck|lint>` (see #995), plus a separate, opt-in native TAP `test` profile when `package.json` declares exactly `node --test` (or `node --test --test-reporter=tap`). The native test executes fixed Runner argv, parses only complete TAP v13 summaries, and requires the distinct `project_validation_node_tap_v1` capability. Direct `scripts.test` values `vitest`, `vitest run`, and `jest` also support native tests through the installed local framework CLI. The Runner adds fixed official JSON reporter flags and a fresh private per-Job output file, bounded to 1 MiB. Only a complete consistent file supplies executed counts; stdout/stderr never do. Reports are removed after aggregate evidence is retained. Missing/oversized/invalid reports, timeout and cancellation cannot prove counts. JSON admission requires `project_validation_node_json_v1`; compound/custom scripts return `structured_test_report_unavailable` and remain usable through ordinary recipes. Node scope and filters remain unsupported. See [Node native TAP validation](implementation/node-native-tap-project-validation.md). Python test planning and Job admission require `project_validation_python_pytest_v1`, while Ruff check/format_check require the separate `project_validation_python_ruff_v1` capability. Missing selected tooling is a definite not-started failure with no automatic installation or fallback. See [Python/pytest validation](implementation/python-pytest-project-validation.md) for environment selection, evidence and same-Job behavior. The request never carries arbitrary executable, argv, shell grammar, installation or an explicit source-mutation intent; project-authored scripts and tests can still cause effects. Existing `cargo_*` / `go_test` tools remain available for ecosystem-specific advanced options. `project_validate` requires the additive `project_validation_v1` Runner capability; explicit `packages` additionally require `project_validation_package_scope_v1`, while `all_packages=true` requires `project_all_packages_v1`. Go project-validation Job admission additionally requires `project_go_single_module_v1`, so a Server cannot hand a Go gateway plan to an older Runner that may inherit ambient workspace state.
+For ordinary bounded project validation, prefer `project_validate`; project-authored scripts and tests may modify files or use network. It accepts only a closed `format_check` / `check` / `lint` / `test` intent plus an optional `auto` / `rust` / `go` / `python` / `node` adapter hint; the Runner resolves the nearest unambiguous recipe on its own registered filesystem and then starts the existing structured validation Job. Rust maps to `cargo fmt -- --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D clippy::correctness`, or `cargo test`; Go maps to `go vet ./...` or `go test -json ./...`. Go project validation runs in Runner-owned single-module mode with `GO111MODULE=on` and `GOWORK=off`, so ambient module mode or parent `go.work` selection cannot silently change the gateway's workspace semantics. Its validation target identity is domain-separated from ambient Go specialist evidence, so success under different workspace semantics cannot reconcile a gateway failure. The standalone `go_test` specialist keeps its existing environment behavior. Optional `scope` selects exactly one portable package intent: bounded `packages` (1..8 entries) narrows Rust check/lint/test through repeated Cargo `-p` selectors and Go check/test through project-relative package patterns, while `all_packages=true` selects the complete project unit. Rust all-packages may add `exclude_packages` with 1–8 exact Cargo workspace member names; unknown names and excluding every member fail before execution. Rust build and check/lint/test support exclusions, while Go/Node/Python and `format_check` reject them. The additive `project_workspace_exclusions_v1` capability gates planning and typed Job admission. Rust all-packages maps to Cargo `--workspace` only when the Runner proves the effective Cargo workspace root is exactly the registered Project root and binds the in-Project Cargo manifest graph into the existing re-plan fence; Go all-packages keeps the canonical `./...` single-module scope. Scoped formatting fails closed. Python uses existing configured/profile/PATH Python 3 for pytest test (`python -m pytest --color=no -rA`) and project-local Ruff check/format_check (explicit target-version, no fixes, cache or bytecode). Python scope and dependency policy fail closed. Node supports Runner-owned native script-based `check` through `node --run <check|typecheck|lint>` (see #995), plus a separate, opt-in native TAP `test` profile when `package.json` declares exactly `node --test` (or `node --test --test-reporter=tap`). The native test executes fixed Runner argv, parses only complete TAP v13 summaries, and requires the distinct `project_validation_node_tap_v1` capability. Direct `scripts.test` values `vitest`, `vitest run`, and `jest` also support native tests through the installed local framework CLI. The Runner adds fixed official JSON reporter flags and a fresh private per-Job output file, bounded to 1 MiB. Only a complete consistent file supplies executed counts; stdout/stderr never do. Reports are removed after aggregate evidence is retained. Missing/oversized/invalid reports, timeout and cancellation cannot prove counts. JSON admission requires `project_validation_node_json_v1`; compound/custom scripts return `structured_test_report_unavailable` and remain usable through ordinary recipes. Node scope and filters remain unsupported. See [Node native TAP validation](implementation/node-native-tap-project-validation.md). Python test planning and Job admission require `project_validation_python_pytest_v1`, while Ruff check/format_check require the separate `project_validation_python_ruff_v1` capability. Missing selected tooling is a definite not-started failure with no automatic installation or fallback. See [Python/pytest validation](implementation/python-pytest-project-validation.md) for environment selection, evidence and same-Job behavior. The request never carries arbitrary executable, argv, shell grammar, installation or an explicit source-mutation intent; project-authored scripts and tests can still cause effects. Existing `cargo_*` / `go_test` tools remain available for ecosystem-specific advanced options. `project_validate` requires the additive `project_validation_v1` Runner capability; explicit `packages` additionally require `project_validation_package_scope_v1`, while `all_packages=true` requires `project_all_packages_v1`; exclusions additionally require `project_workspace_exclusions_v1` at planning and Job admission. Go project-validation Job admission additionally requires `project_go_single_module_v1`, so a Server cannot hand a Go gateway plan to an older Runner that may inherit ambient workspace state.
+
+An empty `exclude_packages: []` is equivalent to omission, including with explicit `packages`, and requires no exclusion capability. Nonempty exclusions affect top-level Cargo workspace selection; an excluded member may still build as a dependency. They are not an execution-permission or dependency-graph filter.
+
 
 Cargo all-packages provenance is a bounded package-selection witness, not a complete build-input snapshot. It requires a contained workspace, or a standalone package with no ancestor `Cargo.toml` marker; parent markers are only probed, never read outside the registered Project. External path dependencies are unavailable in this scope because their `package.workspace` metadata can add out-of-Project members. Relevant manifest/member/dependency aliases remain fenced, while unrelated non-manifest links are ignored. Unproven topology or exhausted bounds returns `validation_scope_unavailable` / `build_scope_unavailable`; explicit package scope and the existing specialist tools retain their contracts.
 
-For ordinary portable Rust/Go/Python/Node builds, prefer `project_build`. It accepts only an exact registered `project`, optional project-relative `cwd`, an optional `auto` / `rust` / `go` / `python` / `node` adapter hint, optional portable `scope` selecting either bounded `packages` (1..8 entries) or `all_packages=true`, and total `timeout_secs`. The Runner resolves the nearest unambiguous recipe and owns canonical argv: Rust maps explicit packages to repeated `-p` selectors and all-packages to `cargo build --workspace` only after proving the effective Cargo workspace root is the registered Project root; Go maps explicit package patterns directly and all-packages to `go build ./...`. Go project builds execute with Runner-owned `GO111MODULE=on` and `GOWORK=off`; full `go.work` workspace semantics are outside the v1 gateway rather than inherited implicitly from the Runner host. The request cannot provide an executable, argv, shell, script, release/profile/target/features, native workspace/exclude flags, arbitrary network policy, or artifact-discovery contract. Portable all-packages requests require the additive `project_all_packages_v1` Runner capability. Node executes the existing manifest-declared `build` script through detected npm/pnpm/yarn/bun, reusing packageManager/lockfile detection; missing/conflicting manager evidence and missing build scripts fail closed. Node rejects scope and dependency policy and requires `project_build_node_v1`. No dependencies or managers are installed; Runner overrides Corepack network/download/auto-pin settings to prevent implicit manager bootstrap. Build scripts and lifecycle hooks may write files or use network. Python requires `pyproject.toml`, rejects package/all-packages scope, and runs `python -m build --no-isolation` using the existing configured/profile/PATH Python interpreter. Default packaging creates an sdist then builds its wheel from the sdist; frontend and backend dependency checks remain enabled. Dependencies must already exist: the adapter never installs packages or creates an environment. `dependency_policy.mode=locked` retains these same no-install semantics.
+For ordinary portable Rust/Go/Python/Node builds, prefer `project_build`. It accepts only an exact registered `project`, optional project-relative `cwd`, an optional `auto` / `rust` / `go` / `python` / `node` adapter hint, optional portable `scope` selecting either bounded `packages` (1..8 entries) or `all_packages=true` with optional Rust-only `exclude_packages` (1–8 exact workspace member names), and total `timeout_secs`. Unknown members and excluding every workspace member fail before execution; Go/Node/Python reject exclusions. The Runner resolves the nearest unambiguous recipe and owns canonical argv: Rust maps explicit packages to repeated `-p` selectors and all-packages to `cargo build --workspace` only after proving the effective Cargo workspace root is the registered Project root; Go maps explicit package patterns directly and all-packages to `go build ./...`. Go project builds execute with Runner-owned `GO111MODULE=on` and `GOWORK=off`; full `go.work` workspace semantics are outside the v1 gateway rather than inherited implicitly from the Runner host. The request cannot provide an executable, argv, shell, script, arbitrary release/target/features flags, native workspace/exclude flags, arbitrary network policy, or arbitrary artifact-discovery contract. Portable all-packages requests require the additive `project_all_packages_v1` Runner capability; Rust exclusions additionally require `project_workspace_exclusions_v1` during planning and typed Job admission. Node executes the existing manifest-declared `build` script through detected npm/pnpm/yarn/bun, reusing packageManager/lockfile detection; missing/conflicting manager evidence and missing build scripts fail closed. Node rejects scope and dependency policy and requires `project_build_node_v1`. No dependencies or managers are installed; Runner overrides Corepack network/download/auto-pin settings to prevent implicit manager bootstrap. Build scripts and lifecycle hooks may write files or use network. Python requires `pyproject.toml`, rejects package/all-packages scope, and runs `python -m build --no-isolation` using the existing configured/profile/PATH Python interpreter. Default packaging creates an sdist then builds its wheel from the sdist; frontend and backend dependency checks remain enabled. Dependencies must already exist: the adapter never installs packages or creates an environment. `dependency_policy.mode=locked` retains these same no-install semantics.
 
 Both gateways optionally accept `dependency_policy: {"mode":"locked"}`. This is a portable dependency-resolution guarantee, not a literal cross-ecosystem flag contract: Rust build/check/lint/test use Cargo `--locked`, while Go build/vet/test use `-mod=readonly`. The policy tells the adapter not to repair project dependency selection state in order to make the operation succeed; it does **not** disable registry/module/toolchain network access. Offline dependency resolution is available as an opt-in Rust-only build/check/test extension in #962. `project_validate(action="format_check")` rejects the dependency policy instead of silently ignoring it. Policy-bearing planning and typed Job admission both require the additive `project_dependency_policy_v1` Runner capability. Locked validation derives a distinct durable validation target identity, while requests that omit the policy preserve the historical argv and identity.
 
-For Rust `project_validate(action="lint", adapter="rust"|"auto")` selects Runner-owned Cargo Clippy with fixed `--all-targets -- -D clippy::correctness`. It has distinct `cargo_clippy` tool/evidence identity and `lint` kind; Rust check/test and Node lint identities stay unchanged (Node lint still selects only `scripts.lint` with check evidence). Scope supports 1..8 sorted/deduplicated packages or the proven Cargo workspace through `all_packages=true`. Independent `dependency_policy: {"mode":"locked"}` adds `--locked` and changes target identity. Rust lint **rejects** `dependency_resolution_policy=offline` pending maintainer approval. Explicit Rust lint planning and every resolved Clippy Job admission require `project_validation_rust_clippy_v1`; auto planning keeps existing Node support and gates the resolved backend before execution. Missing Clippy returns `validation_tool_unavailable` before the validation command starts, without install, arbitrary argv, shell fallback or redispatch. Go/Python lint are unsupported. Manifest/lock/workspace provenance is revalidated at queue admission and execution; drift fails closed. One durable Job owns execution and observation. Exit zero may include warnings; nonzero, missing exit status, timeout or cancellation cannot become successful lint evidence.
+Rust `project_build` also supports optional `profile`, `targets: {"library": true, "binaries": ["server"]}` and `artifact_policy: "observe"`. They require `project_build_rust_options_v1`; other backends reject them. Omission preserves defaults. Observation is bounded, follows the same durable Job and verifies selected Project-local Cargo outputs, including cached artifacts, without claiming creation, correctness or source freshness. Truncated, missing or unsafe evidence fails observation while retaining the native exit status. See [Rust build selection and artifacts](implementation/rust-build-selection-artifacts.md).
 
-For Rust `project_validate(action="check"|"test")`, the optional `dependency_resolution_policy: "offline"` requests Cargo dependency resolution/fetching with Runner-owned `--offline`. It is independent of `dependency_policy: {"mode":"locked"}` and can be combined with it; omission preserves existing argv and validation identity. Runner-resolved non-Rust recipes and unsupported actions fail before execution instead of silently running online. A missing local dependency cache is an ordinary failed validation, never a reason to retry online. Offline and default executions have distinct canonical invocation and validation-target identities; durable Jobs and test evidence remain unchanged. **This does not sandbox the process**: build scripts and tests can still access the network, and `project_build` supports the same policy for Rust builds.
+Rust `project_validate(action="lint", adapter="rust"|"auto")` selects Runner-owned Cargo Clippy with fixed `--all-targets -- -D clippy::correctness`. It has distinct `cargo_clippy` tool/evidence identity and `lint` kind; Rust check/test and Node lint identities stay unchanged (Node lint still selects only `scripts.lint` with check evidence). Scope supports 1..8 sorted/deduplicated packages or the proven Cargo workspace through `all_packages=true`. Independent `dependency_policy: {"mode":"locked"}` adds `--locked` and changes target identity. Rust lint accepts `dependency_resolution_policy=offline`, independently combinable with `--locked`, and requires additive `project_validation_rust_clippy_offline_v1` before planning (including auto) and typed Job admission. Missing cached dependencies fail without online retry; this limits Cargo resolution, not build-script or OS network access ([#1274](https://github.com/yyjeqhc/webcodex/issues/1274)). Explicit Rust lint planning and every resolved Clippy Job admission require `project_validation_rust_clippy_v1`; auto planning keeps existing Node support and gates the resolved backend before execution. Missing Clippy returns `validation_tool_unavailable` before the validation command starts, without install, arbitrary argv, shell fallback or redispatch. Go/Python lint are unsupported. Manifest/lock/workspace provenance is revalidated at queue admission and execution; drift fails closed. One durable Job owns execution and observation. Exit zero may include warnings; nonzero, missing exit status, timeout or cancellation cannot become successful lint evidence.
+
+For Rust `project_validate(action="check"|"lint"|"test")`, the optional `dependency_resolution_policy: "offline"` requests Cargo dependency resolution/fetching with Runner-owned `--offline`. It is independent of `dependency_policy: {"mode":"locked"}` and can be combined with it; omission preserves existing argv and validation identity. Runner-resolved non-Rust recipes and unsupported actions fail before execution instead of silently running online. A missing local dependency cache is an ordinary failed validation, never a reason to retry online. Offline and default executions have distinct canonical invocation and validation-target identities; durable Jobs and test evidence remain unchanged. **This does not sandbox the process**: build scripts and tests can still access the network, and `project_build` supports the same policy for Rust builds.
 
 
 A successful Node build proves the declared script completed. It does not prove a particular output exists or works. Use `finish_coding_task(outputs=...)` for explicit output metadata inspection; artifact presence is separate from functionality.
@@ -478,13 +736,44 @@ The removed ProjectConnector capability names (`task_start`, `files_read`, `edit
 
 ### Long work continues as Jobs
 
-Stateless MCP 2026 execution tools can opt in to `_wc.compact_execution=true`.
+Routine Job observations keep one restart-safe observation token rather than also
+emitting a process-local, evictable observation ref. A cursorless handoff token is
+an initial baseline, not a log reset; actual generation changes and lost history
+still report reset/retention evidence. Generic running activity and ordinary
+command outcome summaries are omitted when lifecycle/exit code already express
+them. Validation evidence and useful phase changes remain.
+
+Process, script and shell admission applies the last registered Runner timeout
+policy as well as the tool ceiling. Only capped active handoffs include
+`timeout: 3600s (requested 99999; capped by runner policy)`; fast terminal commands
+do not add this notice. The Runner still enforces its live policy. Detached
+execution keeps native argv and keyed replay semantics; invoke a virtualenv's
+Python executable directly instead of `sh -c`.
+
+CLI text renders document symbols as identifier positions with nested children,
+Job/Project inventories and search file/count results as rows, and combines single
+Job wait/update information. Rust document symbols now wait for index readiness;
+the LSP client advertises hierarchical symbol support. Explicit file ranges do
+not suggest reading beyond their requested end; genuinely truncated reads retain
+snapshot-fenced continuation calls. Synchronous process/script/shell output displays
+at most 200 lines per stream, with truncation flags and guidance to capture full
+future output in a Project file.
+
+Adaptive Stateless MCP 2026 execution tools can opt in to `_wc.compact_execution=true`.
 This separates stable `output.execution` control facts from `output.details`
 (per item for `observe_jobs`) while retaining logs, recovery and collaboration
 obligations. Only `outcome=passed` proves successful execution; tool acceptance
 or a successful observation alone does not. It neither waits nor retries commands.
 See [Host execution control](experiments/host-execution-control.md) for supported
 tools, gateway placement, unknown outcomes and pending-chain design limits.
+
+Mixed `observe_jobs` batches compact each eligible successful observation independently.
+Failed items and `outcome_unknown` observations retain their canonical evidence; mixed
+or truncated batches preserve the outer success/error, counts, input indexes and single
+shared wait. Observation tokens, log reset/truncation recovery and the exact omitted
+suffix continuation remain unchanged. An inconsistent batch is returned unchanged.
+Canonical Session and audit facts are captured before this model-facing projection.
+This presentation does not retry, dispatch or establish successful command execution.
 
 `observe_jobs(summary_only=true)` is an opt-in presentation mode for proven successful
 structured validation Jobs. It removes routine passed-test and Cargo progress lines,
@@ -548,6 +837,45 @@ Failures return small structured errors with project-relative paths only —
 never absolute paths, commands, Runner/provider stderr, or arbitrary provider
 prose.
 
+### Project discovery and recovery
+
+`list_projects` returns 30 Projects by default and clamps explicit `limit` to
+1–100 on both MCP and the canonical Runtime API. Authorization and exact
+`client_id` / `project` or literal `query` filters run before stable ascending
+Runtime Project ID ordering and `offset` pagination. Responses include
+`matched_count`, page `count`, effective `offset` / `limit`, and
+`next_offset` (null at the end); `truncated` means another page remains.
+Keep the same filters and pass `next_offset` as the next request's `offset`.
+
+Offsets use current authorized inventory on every request, without retained
+pagination state. New/deleted registrations or changed permissions can repeat or
+omit rows between pages. Restart at zero and deduplicate exact IDs when that
+matters; pagination is not an immutable inventory snapshot. A fixed set of 107
+matches is fully traversable despite the 100-row page ceiling.
+
+MCP CLI and Adaptive calls default to `summary_only=true`: exact identity, path,
+name, provenance, availability and active-Job counts. Set it to false to retrieve
+revision, shell/policy and smoke-test capabilities, including before maintenance
+that needs a revision. Canonical API calls retain detailed rows by default within
+the same page bounds. Console's explicit inventory query keeps its separate
+2,000-row operator ceiling and the shared authorization/filter implementation.
+CLI operator fleet reports traverse at most twenty 100-row pages and explicitly
+report truncation. Known-target connection/removal/smoke checks use exact IDs.
+
+Automatic registrations remain discoverable, including queries for authoritative
+`registration_source` or `kind` metadata such as `auto_registered` and
+`managed_worktree`. Paths are not used to infer provenance. No registrations,
+worktrees or branches are removed; no recent-use ordering is inferred.
+
+Project-resolution errors expose at most five authorized suggestions, ranked by
+exact short ID/name, case-insensitive equality, prefix/substring, then thresholded
+edit distance over at most 64 characters, connection state and stable ID. Labels
+and input displays are bounded; overlong identities are omitted rather than
+shortened into a different selector. `candidate_count` describes the authorized
+candidate pool for that resolution scope, and `candidates_truncated` reports
+omissions. Candidates appear once, with a bounded `list_projects` recovery call.
+Matching suggestions never authorizes or automatically retargets execution.
+
 ## Common errors
 
 | Code | Meaning | Action |
@@ -559,6 +887,39 @@ prose.
 | `server_unreachable` / `agent_offline` | The project Runner/runtime is unavailable | Run `webcodex run` / `webcodex doctor` |
 | `required_capability_unavailable` | The current Runner/runtime lacks a required coding capability | Upgrade all binaries |
 | `project_registry_scope_denied` | A project-scoped credential tried to expand or mutate the Project registry outside its granted visibility | Use an already-visible Project or `work_on_project(mode=worktree)` |
+
+## Runner discovery bounds
+
+`list_runners` defaults to `summary_only=true` on the canonical API, Adaptive MCP,
+and CLI MCP. Each page contains at most 30 Runners by default; `limit` is clamped
+to 1–100. Authorization and `client_id`/`client_ids`, `query`, and `status`
+filters run before stable `client_id` sorting and `offset` paging. The response
+returns `matched_count`, `count`, effective `limit`, `offset`, `has_more`,
+`next_offset`, and `truncated`. Continue with the same filters and the returned
+`next_offset`; null means the current inventory ends.
+
+Pages are fresh observations, not a retained snapshot or authority lease.
+Registration, removal, or authorization changes between calls can repeat or skip
+entries. Restart at offset zero and reconcile exact `client_id` values when the
+inventory changes. No caller can use another caller's offset to widen visibility.
+
+The default returns identity, online state, Project and active Job counts, shared
+Job concurrency, and provider choices. `summary_only=false` explicitly expands
+capabilities, build information, policy and diagnostic metadata. Independently,
+`include_projects=true` adds at most 100 enabled Projects in Project-id order,
+including in summary mode. Each Runner reports `projects_count` (the full enabled
+total), `projects_returned_count`, `projects_offset`, `projects_truncated` and
+nullable `projects_next_offset`. Continue `list_runners` with that exact `client_id`,
+`include_projects=true`, and `projects_offset=projects_next_offset`. These fresh
+pages require no resource-link root identity and have no total Project source cap;
+registration or visibility changes have the same repeat/skip semantics as Runner
+pages. `list_projects` remains the richer filtered Project discovery tool.
+
+`project_inventory` in detailed mode is path-free synchronization status, not a
+second Project collection. It remains available to the CLI controller's explicit
+`summary_only=false, include_projects=false` query. Console operator pages use the
+same authorization/filtering query with an explicit complete internal inventory;
+the public tool page cap does not truncate their fleet counts.
 
 ## Adaptive Runtime extensions
 
@@ -574,7 +935,7 @@ and execution keep the direct `load_skill` and `run_skill_resource` paths.
 The optional closeout helpers `check_workspace_hygiene` and `finish_coding_task`
 are model-visible gateway tools; review/coding catalogs still recommend them.
 
-Stateless MCP 2026 exposes common untrusted invocation metadata only through one optional closed `_wc` envelope. Depending on the tool, the envelope may admit `record`, `ack`, `ack_ref`, `resolve`, `reply`, `context`, `control`, and `compact_execution`. These are adapter metadata only: they never become canonical ToolCall business arguments or grant authority. Legacy flat root wrappers such as `recording_session_id`, `ack_session_message_ids`, `ack_ref`, `session_message_resolution`, `window_reply`, `context_request`, and `_control` are rejected on this Stateless 2026 surface; legacy/non-stateless transports keep their existing contracts. `call_runtime_tool` carries `_wc` only on the outer gateway call; the nested target `arguments` remain canonical business arguments and reject a second `_wc`.
+Adaptive Stateless MCP 2026 exposes common untrusted invocation metadata only through one optional closed `_wc` envelope. Depending on the tool, the envelope may admit `record`, `ack`, `ack_ref`, `resolve`, `reply`, `context`, `control`, and `compact_execution`. These are adapter metadata only: they never become canonical ToolCall business arguments or grant authority. Legacy flat root wrappers such as `recording_session_id`, `ack_session_message_ids`, `ack_ref`, `session_message_resolution`, `window_reply`, `context_request`, and `_control` are rejected on this Stateless 2026 surface; legacy/non-stateless transports keep their existing contracts. `call_runtime_tool` carries `_wc` only on the outer gateway call; the nested target `arguments` remain canonical business arguments and reject a second `_wc`.
 
 `WEBCODEX_MCP_COMPACT_SCHEMAS` defaults to `true`. Compact `tools/list` omits
 `outputSchema` and projects shorter MCP-specific tool/input descriptions for
@@ -640,6 +1001,21 @@ payloads through model text:
   are short-lived process-local presentation state, and the normal size, MIME,
   path, and authorization bounds remain in force.
 
+Artifact uploads reserve the known `expected_bytes` exactly, including zero;
+unknown sizes reserve their bounded limit (256 MiB by default). Each Project
+still permits at most 32 active uploads and 512 MiB of reserved bytes. When a new
+upload would exceed either quota, the Runner checks its bounded reservation
+index, removes upload pairs idle for at least 24 hours, and recalculates usage
+under the upload lock. It does not recursively scan the Project or start a
+background task. Recent chunk writes keep an upload live; unreadable or
+inconsistent recovery evidence fails closed. Successful finish/abort releases
+reservations after cleanup. An uncertain transport result never authorizes a
+replay. Existing reservations recover with their original limits and unchanged
+record format. For older Runners the Server sends a minimum one-byte limit for
+empty files; current Runners reserve zero bytes for `expected_bytes=0`.
+Finish or abort these zero-byte reservations before downgrading to a Runner that
+requires positive persisted limits.
+
 The lower-level `read_project_artifact_metadata` and `read_project_artifact_chunk`
 tools remain operator/gateway primitives. The legacy `export_project_artifact`
 compatibility tool has been removed; complete host delivery is exposed only as
@@ -652,13 +1028,17 @@ Use [Coding Workflow](CODING_WORKFLOW.md) for the canonical `work_on_project` bo
 
 ## Goal and Agent continuation timing diagnostics
 
-Current resources are `ui://webcodex/goal-plan/v9` (App 8.0.0) and
-`ui://webcodex/agent-continuation/v21` (App 21.0.0). Retired resource aliases are rejected.
+Current resources are `ui://webcodex/goal-plan/v11` (App 11.0.0) and
+`ui://webcodex/agent-continuation/v25` (App 25.0.0). Retired resource aliases are rejected.
 Goal Plan and Agent Continuation cards offer **Enable timing diagnostics**, off by
 default. The local View retains at most 64 timing records: scheduled versus actual
 poll delay, monotonic tool RPC start/completion/error duration, visibility and teardown.
-`ui/message` duration is not separately measured; its outcome remains the existing
-prepare/finish acceptance or unknown observation.
+The Agent ring also records `host_dispatch_start`, `host_dispatch_complete` or
+`host_dispatch_error` around its existing `ui/message` call, elapsed `duration_ms`,
+and closed outcomes (`dispatch_accepted`, `delivery_unknown`). The existing
+`host_dispatch_result` records the same outcome after the call. Errors
+carry only a closed failure class; message bodies, consume tokens and raw errors
+never enter the ring. Host acceptance remains separate from exact Wake consume.
 Disabling clears the ring; remounting starts empty. No additional RPC, browser
 storage, model message, timing authority or scheduler is introduced. Goal diagnostics
 optionally attach the existing bounded `app_call_id`; the MCP adapter validates and
@@ -674,6 +1054,13 @@ they add no prompts, message bodies, consume tokens or raw ClientWindow values a
 are never copied into model-facing Goal results. Existing full tracing has its
 separate payload/privacy contract. Negative lease margin identifies stale observation;
 missing observation/partial coverage are evidence limits, not permission to wake.
+
+Goal Plan targets 30s while hidden, retaining the 75s observation lease and 10s
+RPC timeout. The elapsed-aware scheduler shortens that target near lease expiry
+and backs off after an expired attempt. This adds scheduling margin; browser
+throttling may still exceed it. Agent hidden heartbeat remains 15s. See the
+[real-Host comparison procedure](implementation/mcp-app-auto-resume-restoration.md#goal-hidden-cadence-baseline-and-candidate-comparison)
+for the user-assisted baseline/candidate evidence gate.
 
 For separately authorized ChatGPT acceptance, bind the actual Agent carrier and
 present its exact correlated Goal. Enable the local diagnostics and metadata tracing,

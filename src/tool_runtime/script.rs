@@ -6,18 +6,18 @@ use super::process::{
     process_tool_failure_result, terminal_structured_job_result,
 };
 use super::structured_execution::{
-    await_structured_job_result, await_structured_request_result, StructuredExecutionBudget,
-    StructuredRequestKind,
+    add_timeout_cap_notice, apply_runner_timeout_cap, await_structured_job_result,
+    await_structured_request_result, StructuredExecutionBudget, StructuredRequestKind,
 };
 use super::tool_audit::{assertion_validation_identity, run_script_validation_identity};
 use super::{ExecutionPurpose, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{
-    script_preview, ShellJobStartMetadata, ShellJobVisibility, StructuredJobExecution,
+    script_preview, JobStartContext, JobStartExecution, JobStartRequest, JobValidationCorrelation,
+    ShellJobVisibility,
 };
 use crate::runner_protocol::{
-    validate_script_request, ShellCommandExecutionState, ShellJobOpRequest, ShellScriptLanguage,
-    ShellScriptPayload,
+    validate_script_request, ShellCommandExecutionState, ShellScriptLanguage, ShellScriptPayload,
 };
 
 fn decorate(
@@ -126,6 +126,15 @@ impl ToolRuntime {
             }
         };
         let client_id = proj.client_id.clone();
+        let (budget, timeout_notice) = apply_runner_timeout_cap(
+            &self.runner_registry,
+            &client_id,
+            auth,
+            timeout_secs,
+            budget,
+        )
+        .await;
+        let timeout = budget.effective_timeout_secs;
         let effective_cwd = match resolve_runner_cwd(&proj, cwd.as_deref()) {
                 Ok(cwd) => cwd,
                 Err(error) => {
@@ -147,43 +156,38 @@ impl ToolRuntime {
         if async_handoff_available && timeout > budget.sync_wait_secs {
             let job = self
                 .runner_registry
-                .start_job_with_metadata_for_access_typed(
-                    ShellJobOpRequest {
-                        login: false,
-                        op: "start".to_string(),
-                        client_id: Some(client_id),
+                .start_job(
+                    JobStartRequest {
+                        client_id: client_id,
                         cwd: Some(effective_cwd),
-                        command: Some(String::new()),
-                        timeout_secs: Some(timeout),
-                        job_id: None,
-                        since_stdout_line: None,
-                        since_stderr_line: None,
-                        tail_lines: None,
-                        limit: None,
+                        timeout_secs: timeout,
+                        execution: JobStartExecution::Script {
+                            script: payload,
+                            stdin,
+                            correlation: JobValidationCorrelation {
+                                validation_identity: validation_identity
+                                    .as_ref()
+                                    .map(|identity| identity.identity.clone()),
+                                validation_tool: validation_identity.as_ref().and_then(
+                                    |identity| identity.validation_tool.map(str::to_string),
+                                ),
+                                assertion_name: validation_identity
+                                    .as_ref()
+                                    .filter(|identity| identity.identity.starts_with("assertion:"))
+                                    .and_then(|_| validation_assertion_name.map(str::to_string)),
+                            },
+                        },
+                        context: JobStartContext {
+                            project_id: Some(project.clone()),
+                            session_id: session_id,
+                            project_cwd: Some(resolved_cwd.clone()),
+                            purpose: Some(declared_purpose.as_str().to_string()),
+                            shell: Some(language.as_str().to_string()),
+                            visibility: ShellJobVisibility::HiddenUntilHandoff,
+                        },
                         codex: None,
                     },
                     "tool_runtime".to_string(),
-                    ShellJobStartMetadata {
-                        project_id: Some(project.clone()),
-                        session_id,
-                        project_cwd: Some(resolved_cwd.clone()),
-                        purpose: Some(declared_purpose.as_str().to_string()),
-                        shell: Some(language.as_str().to_string()),
-                        visibility: ShellJobVisibility::HiddenUntilHandoff,
-                        structured_execution: Some(StructuredJobExecution::Script(payload)),
-                        validation_identity: validation_identity
-                            .as_ref()
-                            .map(|identity| identity.identity.clone()),
-                        validation_tool: validation_identity
-                            .as_ref()
-                            .and_then(|identity| identity.validation_tool.map(str::to_string)),
-                        assertion_name: validation_identity
-                            .as_ref()
-                            .filter(|identity| identity.identity.starts_with("assertion:"))
-                            .and_then(|_| validation_assertion_name.map(str::to_string)),
-                        stdin,
-                        ..Default::default()
-                    },
                     crate::runner_http::runner_access_from_auth(auth).as_ref(),
                     None,
                 )
@@ -227,6 +231,7 @@ impl ToolRuntime {
                 Ok(result) => result,
                 Err(failure) => return failure.into_tool_result(&project, budget),
             };
+            add_timeout_cap_notice(&mut result, timeout_notice);
             decorate(
                 &mut result.output,
                 declared_purpose,

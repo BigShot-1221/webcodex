@@ -27,6 +27,27 @@ describe("progressive inventory boundaries", () => {
     unmount();
   });
 
+  it("ignores a late 401 from a credential generation that has already been replaced", async () => {
+    let rejectOld!: (value: { ok: boolean; status: number; data: null }) => void;
+    let generation = 0;
+    const post = vi.fn((_path: string, _args: unknown) => {
+      if (generation === 0) return new Promise<{ ok: boolean; status: number; data: null }>(resolve => { rejectOld = resolve; });
+      return Promise.resolve(ok({ ...runtimeOverview(), detail_level: "primary" }));
+    });
+    const client = { authorityRevision: 0, post } as unknown as RuntimeV2Client;
+    const unauthorized = vi.fn();
+    const hook = renderHook(({ revision }) => useRuntimeOverview(client, true, unauthorized), { initialProps: { revision: 0 } });
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    generation = 1;
+    (client as unknown as { authorityRevision: number }).authorityRevision = 1;
+    hook.rerender({ revision: 1 });
+    await waitFor(() => expect(hook.result.current.availability).toBe("available"));
+    await act(async () => rejectOld({ ok: false, status: 401, data: null }));
+    expect(unauthorized).not.toHaveBeenCalled();
+    expect(hook.result.current.availability).toBe("available");
+    hook.unmount();
+  });
+
   it("Window work does not request a full fleet Session scan", async () => {
     const post = vi.fn(async () => ok({ ...runtimeOverview(), detail_level: "primary" }));
     const client = { post } as unknown as RuntimeV2Client;
@@ -57,6 +78,29 @@ describe("progressive inventory boundaries", () => {
     await waitFor(() => expect(result.current.projects).toHaveLength(2));
     expect(post.mock.calls.at(-1)?.[1].limit).toBe(PROJECT_PAGE_SIZE);
     expect(result.current.canShowLess).toBe(false);
+    unmount();
+  });
+
+  it("does not offer Load more once the inventory limit is reached while still truncated", async () => {
+    const total = 2001;
+    const post = vi.fn(async (_path: string, args: { limit: number }) =>
+      ok({ total, truncated: args.limit < total, projects: Array.from({ length: Math.min(total, args.limit) }, (_, index) => ({ id: `agent:runner:p${index}`, client_id: "runner", connected: true })) }));
+    const client = { post } as unknown as RuntimeV2Client;
+    const unauthorized = vi.fn();
+    // Start at the cap: the Server clamps the query to 2000 and still reports
+    // truncated, so another Load more could not widen the result.
+    const { result, unmount } = renderHook(() => useProjects(client, true, unauthorized, { initialLimit: 2000 }));
+    await waitFor(() => expect(result.current.projects).toHaveLength(2000));
+    expect(result.current.truncated).toBe(true);
+    expect(result.current.canLoadMore).toBe(false);
+    const readsAtCap = post.mock.calls.length;
+    act(() => result.current.loadMore());
+    expect(post.mock.calls.length).toBe(readsAtCap);
+    // Narrowing the filters restarts at the first page under the same cap.
+    act(() => result.current.setQuery("specific"));
+    await waitFor(() => expect(post.mock.calls.length).toBe(readsAtCap + 1));
+    expect(post.mock.calls.at(-1)?.[1].limit).toBe(2000);
+    expect(result.current.canLoadMore).toBe(false);
     unmount();
   });
 

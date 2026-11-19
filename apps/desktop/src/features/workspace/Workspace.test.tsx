@@ -1304,3 +1304,444 @@ describe("project device filters", () => {
     expect(screen.getByText("Showing 1 of 1 loaded projects")).toBeInTheDocument();
   });
 });
+
+describe("Workspace polling lifecycle", () => {
+  const overviewCalls = () => native.invoke.mock.calls.filter(([, value]) => value.request.kind === "overview").length;
+  const pollBatchCalls = () => native.invoke.mock.calls.filter(([, value]) => ["overview", "projects", "windows"].includes(value.request.kind)).length;
+  const wrapPolling = (
+    children: React.ReactNode,
+    selected = state,
+    suspended = false,
+    preservePollDeadline = false,
+  ) => (
+    <DesktopMantineProvider>
+      <LocaleProvider>
+        <WorkspaceProvider state={selected} suspended={suspended} preservePollDeadline={preservePollDeadline}>
+          {children}
+        </WorkspaceProvider>
+      </LocaleProvider>
+    </DesktopMantineProvider>
+  );
+  const operationState = {
+    ...state,
+    current_operation: { id: "fixture-op", kind: "runtime_refresh", phase: "running", started_at_ms: 1, cancellable: false },
+  } as DesktopState;
+
+  function PollProbe({ onLoading }: { onLoading?: (loading: boolean) => void }) {
+    const workspace = useWorkspace();
+    useLayoutEffect(() => { onLoading?.(workspace.loading); });
+    return <span data-testid="poll-probe">{workspace.loading ? "loading" : "idle"}</span>;
+  }
+
+  it("does not query the workspace before the Server readiness fence opens", async () => {
+    const stopped = { ...state, readiness: { ...state.readiness, server: "stopped" as const, runtime_ready: false } };
+    render(wrapPolling(<PollProbe />), stopped));
+    await act(async () => {});
+    expect(pollBatchCalls()).toBe(0);
+  });
+
+  it("does not discard an in-flight poll or start a duplicate when suspending during the request", async () => {
+    let resolveOverview!: (value: typeof overview) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    native.invoke.mockImplementation((command, value) => value.request.kind === "overview"
+      ? new Promise(done => { resolveOverview = done; })
+      : normal(command, value));
+    const view = render(wrapPolling(<PollProbe />));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    view.rerender(wrapPolling(<PollProbe />, state, true));
+    view.rerender(wrapPolling(<PollProbe />, state, false));
+    expect(overviewCalls()).toBe(1);
+    await act(async () => resolveOverview(overview));
+    await waitFor(() => expect(screen.getByTestId("poll-probe")).toHaveTextContent("idle"));
+    expect(pollBatchCalls()).toBe(3);
+  });
+
+  it("does not issue workspace requests from timers that expire while suspended or operationBusy", async () => {
+    vi.useFakeTimers();
+    try {
+      const view = render(wrapPolling(<PollProbe />));
+      await act(async () => {});
+      const settled = overviewCalls();
+      expect(settled).toBeGreaterThanOrEqual(1);
+      view.rerender(wrapPolling(<PollProbe />, state, true));
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(overviewCalls()).toBe(settled);
+      view.rerender(wrapPolling(<PollProbe />, operationState));
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(overviewCalls()).toBe(settled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves the remaining poll deadline across passive runtime observation suspension", async () => {
+    vi.useFakeTimers();
+    const now = vi.spyOn(Date, "now");
+    try {
+      now.mockReturnValue(1_000_000);
+      const view = render(wrapPolling(<PollProbe />, state, false, true));
+      await act(async () => {});
+      expect(overviewCalls()).toBe(1);
+      now.mockReturnValue(1_010_000);
+      view.rerender(wrapPolling(<PollProbe />, state, true, true));
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+      expect(overviewCalls()).toBe(1);
+      view.rerender(wrapPolling(<PollProbe />, state, false, true));
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_000); });
+      expect(overviewCalls()).toBe(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(overviewCalls()).toBe(2);
+    } finally {
+      now.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects a late overview result after the workspace key changes", async () => {
+    const staleProject = { ...alpha, id: "agent:stale:row", name: "stale-row", path: "C:\\stale" };
+    let resolveStaleOverview!: (value: typeof overview) => void;
+    let resolveStaleProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    let resolveCurrentOverview!: (value: typeof overview) => void;
+    let resolveCurrentProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    let projectsInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind === "overview") {
+        overviewInvocation += 1;
+        return overviewInvocation === 1
+          ? new Promise(done => { resolveStaleOverview = done; })
+          : new Promise(done => { resolveCurrentOverview = done; });
+      }
+      if (value.request.kind === "projects") {
+        projectsInvocation += 1;
+        return projectsInvocation === 1
+          ? new Promise(done => { resolveStaleProjects = done; })
+          : new Promise(done => { resolveCurrentProjects = done; });
+      }
+      return normal(command, value);
+    });
+    const view = render(wrapPolling(<ProjectsPanel />));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    view.rerender(wrapPolling(<ProjectsPanel />, { ...state, workspace_runner: { ...state.workspace_runner!, config_path: "other.toml" } }));
+    await waitFor(() => expect(overviewCalls()).toBe(2));
+    await act(async () => {
+      resolveCurrentOverview(overview);
+      resolveCurrentProjects({ projects: [alpha, beta], total: 2, truncated: false });
+    });
+    await waitFor(() => expect(screen.getByRole("row", { name: "beta" })).toBeInTheDocument());
+    await act(async () => {
+      resolveStaleOverview({ ...overview, projects: [staleProject] });
+      resolveStaleProjects({ projects: [staleProject], total: 1, truncated: false });
+    });
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+    expect(screen.getByRole("row", { name: "beta" })).toBeInTheDocument();
+  });
+
+  it("rejects a late overview result after the Server readiness fence drops", async () => {
+    const staleProject = { ...alpha, id: "agent:stale:row", name: "stale-row", path: "C:\\stale" };
+    let resolveStaleOverview!: (value: typeof overview) => void;
+    let resolveStaleProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    let resolveCurrentOverview!: (value: typeof overview) => void;
+    let resolveCurrentProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    let projectsInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind === "overview") {
+        overviewInvocation += 1;
+        return overviewInvocation === 1
+          ? new Promise(done => { resolveStaleOverview = done; })
+          : new Promise(done => { resolveCurrentOverview = done; });
+      }
+      if (value.request.kind === "projects") {
+        projectsInvocation += 1;
+        return projectsInvocation === 1
+          ? new Promise(done => { resolveStaleProjects = done; })
+          : new Promise(done => { resolveCurrentProjects = done; });
+      }
+      return normal(command, value);
+    });
+    const stopped = { ...state, readiness: { ...state.readiness, server: "stopped" as const } };
+    const view = render(wrapPolling(<ProjectsPanel />));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    view.rerender(wrapPolling(<ProjectsPanel />, stopped));
+    view.rerender(wrapPolling(<ProjectsPanel />, state));
+    await waitFor(() => expect(overviewCalls()).toBe(2));
+    await act(async () => {
+      resolveCurrentOverview(overview);
+      resolveCurrentProjects({ projects: [alpha, beta], total: 2, truncated: false });
+    });
+    await waitFor(() => expect(screen.getByRole("row", { name: "beta" })).toBeInTheDocument());
+    await act(async () => {
+      resolveStaleOverview({ ...overview, projects: [staleProject] });
+      resolveStaleProjects({ projects: [staleProject], total: 1, truncated: false });
+    });
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+    expect(screen.getByRole("row", { name: "beta" })).toBeInTheDocument();
+  });
+
+  it("does not clear loading from a stale poll finally after the readiness fence drops mid-request", async () => {
+    const loadingFrames: boolean[] = [];
+    let resolveStaleOverview!: (value: typeof overview) => void;
+    let resolveCurrentOverview!: (value: typeof overview) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind !== "overview") return normal(command, value);
+      overviewInvocation += 1;
+      return overviewInvocation === 1
+        ? new Promise(done => { resolveStaleOverview = done; })
+        : new Promise(done => { resolveCurrentOverview = done; });
+    });
+    const stopped = { ...state, readiness: { ...state.readiness, server: "stopped" as const, runtime_ready: false } };
+    const view = render(wrapPolling(<PollProbe onLoading={value => loadingFrames.push(value)} />));
+    try {
+      await waitFor(() => expect(overviewCalls()).toBe(1));
+      expect(loadingFrames.at(-1)).toBe(true);
+      view.rerender(wrapPolling(<PollProbe onLoading={value => loadingFrames.push(value)} />, stopped));
+      view.rerender(wrapPolling(<PollProbe onLoading={value => loadingFrames.push(value)} />, state));
+      await waitFor(() => expect(overviewCalls()).toBe(2));
+      expect(loadingFrames.at(-1)).toBe(true);
+      await act(async () => resolveStaleOverview(overview));
+      expect(loadingFrames.at(-1)).toBe(true);
+      await act(async () => resolveCurrentOverview(overview));
+      await waitFor(() => expect(screen.getByTestId("poll-probe")).toHaveTextContent("idle"));
+    } finally {
+      await act(async () => {
+        resolveStaleOverview?.(overview);
+        resolveCurrentOverview?.(overview);
+      });
+    }
+  });
+
+  it("does not clear loading for a superseded poll when a newer refresh is in flight", async () => {
+    const loadingFrames: boolean[] = [];
+    let resolveSlow!: (value: typeof overview) => void;
+    let resolveFast!: (value: typeof overview) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind !== "overview") return normal(command, value);
+      overviewInvocation += 1;
+      return overviewInvocation === 1
+        ? new Promise(done => { resolveSlow = done; })
+        : new Promise(done => { resolveFast = done; });
+    });
+    function RefreshControl() {
+      const workspace = useWorkspace();
+      return <button onClick={workspace.refresh}>Trigger workspace refresh</button>;
+    }
+    render(wrapPolling(<><PollProbe onLoading={value => loadingFrames.push(value)} /><RefreshControl /></>));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    expect(loadingFrames.at(-1)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Trigger workspace refresh" }));
+    await waitFor(() => expect(overviewCalls()).toBe(2));
+    await act(async () => resolveSlow(overview));
+    expect(loadingFrames.at(-1)).toBe(true);
+    await act(async () => resolveFast(overview));
+    await waitFor(() => expect(screen.getByTestId("poll-probe")).toHaveTextContent("idle"));
+  });
+
+  it("triggers a manual workspace refresh when the document becomes visible", async () => {
+    render(wrapPolling(<PollProbe />));
+    await waitFor(() => expect(overviewCalls()).toBeGreaterThanOrEqual(1));
+    native.invoke.mockClear();
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    expect(pollBatchCalls()).toBe(3);
+  });
+
+  it("does not issue polls from visibility refresh while suspended", async () => {
+    vi.useFakeTimers();
+    try {
+      const view = render(wrapPolling(<PollProbe />, state, true));
+      await act(async () => {});
+      const before = overviewCalls();
+      fireEvent(document, new Event("visibilitychange"));
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(overviewCalls()).toBe(before);
+      view.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  function FleetObservedProbe() {
+    const workspace = useWorkspace();
+    return <span data-testid="fleet-observed">{workspace.fleetObservedAt ?? "none"}</span>;
+  }
+
+  function RefreshControl() {
+    const workspace = useWorkspace();
+    return <button onClick={workspace.refresh}>Trigger workspace refresh</button>;
+  }
+
+  it("rejects a stale poll after a manual refresh while suspended and fetches on resume", async () => {
+    const staleProject = { ...alpha, id: "agent:stale:row", name: "stale-row", path: "C:\\stale" };
+    const freshProject = { ...alpha, id: "agent:fresh:row", name: "fresh-row", path: "C:\\fresh" };
+    let resolveInitialOverview!: (value: typeof overview) => void;
+    let resolveInitialProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    let resolveResumedOverview!: (value: typeof overview) => void;
+    let resolveResumedProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    let projectsInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind === "overview") {
+        overviewInvocation += 1;
+        return overviewInvocation === 1
+          ? new Promise(done => { resolveInitialOverview = done; })
+          : new Promise(done => { resolveResumedOverview = done; });
+      }
+      if (value.request.kind === "projects") {
+        projectsInvocation += 1;
+        return projectsInvocation === 1
+          ? new Promise(done => { resolveInitialProjects = done; })
+          : new Promise(done => { resolveResumedProjects = done; });
+      }
+      return normal(command, value);
+    });
+    const view = render(wrapPolling(<><ProjectsPanel /><RefreshControl /></>));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    view.rerender(wrapPolling(<><ProjectsPanel /><RefreshControl /></>, state, true));
+    fireEvent.click(screen.getByRole("button", { name: "Trigger workspace refresh" }));
+    const settledBeforeResume = overviewCalls();
+    await act(async () => {
+      resolveInitialOverview({ ...overview, projects: [staleProject] });
+      resolveInitialProjects({ projects: [staleProject], total: 1, truncated: false });
+    });
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+    expect(overviewCalls()).toBe(settledBeforeResume);
+    view.rerender(wrapPolling(<><ProjectsPanel /><RefreshControl /></>, state, false));
+    await waitFor(() => expect(overviewCalls()).toBe(settledBeforeResume + 1));
+    await act(async () => {
+      resolveResumedOverview({ ...overview, projects: [freshProject, beta] });
+      resolveResumedProjects({ projects: [freshProject, beta], total: 2, truncated: false });
+    });
+    await waitFor(() => expect(screen.getByRole("row", { name: "fresh-row" })).toBeInTheDocument());
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+  });
+
+  it("rejects a stale poll after a manual refresh during operationBusy and fetches when the operation ends", async () => {
+    const staleProject = { ...alpha, id: "agent:stale:row", name: "stale-row", path: "C:\\stale" };
+    const freshProject = { ...alpha, id: "agent:fresh:row", name: "fresh-row", path: "C:\\fresh" };
+    let resolveInitialOverview!: (value: typeof overview) => void;
+    let resolveInitialProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    let resolveAfterOperationOverview!: (value: typeof overview) => void;
+    let resolveAfterOperationProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    let projectsInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind === "overview") {
+        overviewInvocation += 1;
+        return overviewInvocation === 1
+          ? new Promise(done => { resolveInitialOverview = done; })
+          : new Promise(done => { resolveAfterOperationOverview = done; });
+      }
+      if (value.request.kind === "projects") {
+        projectsInvocation += 1;
+        return projectsInvocation === 1
+          ? new Promise(done => { resolveInitialProjects = done; })
+          : new Promise(done => { resolveAfterOperationProjects = done; });
+      }
+      return normal(command, value);
+    });
+    const view = render(wrapPolling(<><ProjectsPanel /><RefreshControl /></>));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    view.rerender(wrapPolling(<><ProjectsPanel /><RefreshControl /></>, operationState));
+    fireEvent.click(screen.getByRole("button", { name: "Trigger workspace refresh" }));
+    const settledDuringOperation = overviewCalls();
+    await act(async () => {
+      resolveInitialOverview({ ...overview, projects: [staleProject] });
+      resolveInitialProjects({ projects: [staleProject], total: 1, truncated: false });
+    });
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+    expect(overviewCalls()).toBe(settledDuringOperation);
+    view.rerender(wrapPolling(<><ProjectsPanel /><RefreshControl /></>, state));
+    await waitFor(() => expect(overviewCalls()).toBe(settledDuringOperation + 1));
+    await act(async () => {
+      resolveAfterOperationOverview({ ...overview, projects: [freshProject, beta] });
+      resolveAfterOperationProjects({ projects: [freshProject, beta], total: 2, truncated: false });
+    });
+    await waitFor(() => expect(screen.getByRole("row", { name: "fresh-row" })).toBeInTheDocument());
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+  });
+
+  it("does not restore fleetObservedAt when an in-flight poll settles during operationBusy", async () => {
+    let resolveInitial!: (value: typeof overview) => void;
+    let resolveAfterOperation!: (value: typeof overview) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind !== "overview") return normal(command, value);
+      overviewInvocation += 1;
+      return overviewInvocation === 1
+        ? new Promise(done => { resolveInitial = done; })
+        : new Promise(done => { resolveAfterOperation = done; });
+    });
+    const view = render(wrapPolling(<FleetObservedProbe />));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    view.rerender(wrapPolling(<FleetObservedProbe />, operationState));
+    await waitFor(() => expect(screen.getByTestId("fleet-observed")).toHaveTextContent("none"));
+    await act(async () => resolveInitial(overview));
+    expect(screen.getByTestId("fleet-observed")).toHaveTextContent("none");
+    view.rerender(wrapPolling(<FleetObservedProbe />, state));
+    const settledAfterOperation = overviewCalls();
+    await waitFor(() => expect(overviewCalls()).toBe(settledAfterOperation + 1));
+    await act(async () => resolveAfterOperation(overview));
+    await waitFor(() => expect(screen.getByTestId("fleet-observed")).not.toHaveTextContent("none"));
+  });
+
+  it("rejects a stale pre-operation poll after operationBusy ends while a fresh poll is in flight", async () => {
+    const staleProject = { ...alpha, id: "agent:stale:row", name: "stale-row", path: "C:\\stale" };
+    const freshProject = { ...alpha, id: "agent:fresh:row", name: "fresh-row", path: "C:\\fresh" };
+    const loadingFrames: boolean[] = [];
+    let resolveStaleOverview!: (value: typeof overview) => void;
+    let resolveStaleProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    let resolveFreshOverview!: (value: typeof overview) => void;
+    let resolveFreshProjects!: (value: { projects: WorkspaceProject[]; total: number; truncated: boolean }) => void;
+    const normal = native.invoke.getMockImplementation()!;
+    let overviewInvocation = 0;
+    let projectsInvocation = 0;
+    native.invoke.mockImplementation((command, value) => {
+      if (value.request.kind === "overview") {
+        overviewInvocation += 1;
+        return overviewInvocation === 1
+          ? new Promise(done => { resolveStaleOverview = done; })
+          : new Promise(done => { resolveFreshOverview = done; });
+      }
+      if (value.request.kind === "projects") {
+        projectsInvocation += 1;
+        return projectsInvocation === 1
+          ? new Promise(done => { resolveStaleProjects = done; })
+          : new Promise(done => { resolveFreshProjects = done; });
+      }
+      return normal(command, value);
+    });
+    const view = render(wrapPolling(<><ProjectsPanel /><FleetObservedProbe /><PollProbe onLoading={value => loadingFrames.push(value)} /></>));
+    await waitFor(() => expect(overviewCalls()).toBe(1));
+    view.rerender(wrapPolling(<><ProjectsPanel /><FleetObservedProbe /><PollProbe onLoading={value => loadingFrames.push(value)} /></>, operationState));
+    await waitFor(() => expect(screen.getByTestId("fleet-observed")).toHaveTextContent("none"));
+    view.rerender(wrapPolling(<><ProjectsPanel /><FleetObservedProbe /><PollProbe onLoading={value => loadingFrames.push(value)} /></>, state));
+    const settledAfterOperation = overviewCalls();
+    await waitFor(() => expect(overviewCalls()).toBe(settledAfterOperation + 1));
+    expect(loadingFrames.at(-1)).toBe(true);
+    await act(async () => {
+      resolveStaleOverview({ ...overview, projects: [staleProject] });
+      resolveStaleProjects({ projects: [staleProject], total: 1, truncated: false });
+    });
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("fleet-observed")).toHaveTextContent("none");
+    expect(loadingFrames.at(-1)).toBe(true);
+    await act(async () => {
+      resolveFreshOverview({ ...overview, projects: [freshProject, beta] });
+      resolveFreshProjects({ projects: [freshProject, beta], total: 2, truncated: false });
+    });
+    await waitFor(() => expect(screen.getByRole("row", { name: "fresh-row" })).toBeInTheDocument());
+    expect(screen.queryByRole("row", { name: "stale-row" })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("fleet-observed")).not.toHaveTextContent("none"));
+    await waitFor(() => expect(screen.getByTestId("poll-probe")).toHaveTextContent("idle"));
+  });
+});

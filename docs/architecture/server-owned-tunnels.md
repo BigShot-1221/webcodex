@@ -104,6 +104,18 @@ existing per-profile service for standalone. Readiness files keep the existing
 freshness contract. Transport readiness is not evidence of a successful client
 operation, and process liveness is not either readiness bit.
 
+Initial readiness publication is startup-fatal: a profile must not launch until
+its first `readiness.json` observation succeeds. After the owned Tunnel task is
+running, periodic heartbeat publication is best-effort. A failed heartbeat write
+does not stop, restart, or replay the Tunnel. The supervisor keeps live lifecycle
+state and readiness bits in memory, clears only the on-disk diagnostic for the
+write attempt, and records `tunnel_health_unavailable` in memory until publication
+recovers. Failed writes do not refresh the saved observation, so readers still
+apply the existing freshness window and treat stale evidence as non-authoritative.
+Heartbeat writes reuse the existing private-file locks, ACL validation, and
+precreated `readiness.json` boundary; they do not recreate missing files or bypass
+security checks.
+
 Server termination runs these phases in order:
 
 1. Stop new Tunnel polling/admission.
@@ -177,7 +189,9 @@ still requires explicit reconciliation. This never downgrades protected history.
 ```
 cargo test --locked -p webcodex-openai-tunnel
 cargo test --locked -p webcodex-environment
+cargo test --locked -p webcodex-environment --lib tunnel::health_tests
 cargo test --locked -p webcodex --lib tunnel
+cargo test --locked -p webcodex --lib server_tunnels
 cargo test --locked -p webcodex --lib server_shutdown
 cargo check --locked -p webcodex-cli
 ```

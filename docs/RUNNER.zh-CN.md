@@ -106,6 +106,32 @@ allowed_roots = ["/root/git"]
 runtime 工具 `register_project` 与 `create_project` 让客户端在在线 Runner 上
 注册已有目录或创建新目录，受 Runner 的 `allowed_roots` policy 约束。
 
+Admin `/api/admin/projects/register` 与 `/api/admin/projects/create`，以及
+runtime project 工具（`register_project`、`create_project`），在把工作路由到
+Runner 之前共用同一套 Server 侧跨平台 path 形状校验。`path` 必须非空、不得包含
+NUL，并且必须是 POSIX 绝对路径（`/...`）、Windows 盘符绝对路径（`C:\...` 或
+`c:/...`），或 Windows UNC/verbatim 前缀（`\\server\share\...`、`\\?\C:\...` 或
+`\\?\UNC\...`）。相对路径、盘符相对路径（`C:repo`）以及 Windows 根相对路径
+（`\repo`）会被拒绝。Admin register/create 请求体对原始 path 字符串还有 4096
+字节上限。
+
+Registry `path =` 条目不会经过上述 Server 校验。Runner 在加载或应用 registry
+配置时，会在 Runner 主机侧对 path 执行 `validate_project_path_ingress`、
+canonicalization 以及 `allowed_roots` policy。
+
+JSON 请求体必须转义反斜杠（`"path":"C:\\repo"`）。Windows registry TOML 通常
+使用 literal string：
+
+```toml
+path = 'C:\Users\alice\repos\demo'
+```
+
+该 Server path 形状校验只做语法层面检查，不扫描文件系统，也不替代 host policy。
+Runner 仍对 registry ingress、canonicalization、`allowed_roots`、Windows
+namespace fence 以及目录是否真实存在拥有最终裁量权。`create_project` 不会在
+Windows 网络共享上创建新目录；若 Runner policy 已允许，仍可对既有网络共享路径
+执行 register。
+
 ## Skill 来源
 
 `list_skills` 继续只暴露一个 catalog，但其中保留三种彼此独立的 ownership / lifecycle：

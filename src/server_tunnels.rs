@@ -259,11 +259,7 @@ async fn run_profile(
                     state.state = if reached_ready { TunnelState::Running } else { TunnelState::Starting };
                     state.tunnel_ready = ready; state.local_mcp_ready = local;
                 });
-                if persist_status(&profile, &status, index)
-                .is_err()
-                {
-                    break Some("tunnel_health_unavailable".into());
-                }
+                persist_heartbeat(&profile, &status, index);
             }
         }
     };
@@ -288,12 +284,10 @@ async fn run_profile(
     tracing::info!(profile = %profile.profile_id, clean_shutdown = clean, "Server-owned Tunnel stopped");
 }
 
-fn persist_status(
+fn write_status(
     profile: &EmbeddedTunnelProfile,
-    status: &TunnelStatus,
-    index: usize,
+    state: &ProfileStatus,
 ) -> webcodex_environment::SetupResultValue<()> {
-    let state = &status.snapshot()[index];
     write_embedded_tunnel_observation(
         &profile.readiness_path,
         profile.runtime_revision,
@@ -303,3 +297,50 @@ fn persist_status(
         state.diagnostic.as_deref(),
     )
 }
+
+fn persist_status(
+    profile: &EmbeddedTunnelProfile,
+    status: &TunnelStatus,
+    index: usize,
+) -> webcodex_environment::SetupResultValue<()> {
+    write_status(profile, &status.snapshot()[index])
+}
+
+fn persist_heartbeat(profile: &EmbeddedTunnelProfile, status: &TunnelStatus, index: usize) {
+    let snapshot = status.snapshot();
+    let index_status = &snapshot[index];
+    let previous_unavailable = index_status.diagnostic.as_deref()
+        == Some("tunnel_health_unavailable");
+    let snapshot_diagnostic = index_status.diagnostic.clone();
+    let mut publication = index_status.clone();
+    publication.diagnostic = None;
+    let published = write_status(profile, &publication).is_ok();
+    status.update(index, |state| {
+        let current_diagnostic = state.diagnostic.as_deref();
+        let applies = current_diagnostic == snapshot_diagnostic.as_deref()
+            || current_diagnostic == Some("tunnel_health_unavailable");
+        if !applies {
+            return;
+        }
+        state.diagnostic = if published {
+            None
+        } else {
+            Some("tunnel_health_unavailable".into())
+        };
+    });
+    let unavailable = !published;
+    if unavailable && !previous_unavailable {
+        tracing::warn!(
+            profile = %profile.profile_id,
+            "Server-owned Tunnel heartbeat publication is unavailable"
+        );
+    } else if !unavailable && previous_unavailable {
+        tracing::info!(
+            profile = %profile.profile_id,
+            "Server-owned Tunnel heartbeat publication recovered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests;

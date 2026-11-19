@@ -1,6 +1,57 @@
 use super::*;
 
 #[test]
+fn heartbeat_contention_preserves_saved_observation_and_recovers_after_unlock() {
+    let temp = crate::test_tempdir().unwrap();
+    let store = EnvironmentStore::open(temp.path().join("environment")).unwrap();
+    let path = store.root().join("readiness.json");
+    let service_pid = std::process::id();
+    let stale = serde_json::json!({
+        "schema_version": 1,
+        "observed_at_ms": 0,
+        "service_pid": service_pid,
+        "profile_revision": 2,
+        "tunnel_ready": true,
+        "local_mcp_ready": true,
+        "state": TunnelState::Running,
+        "diagnostic": null
+    });
+    atomic_private_write(&path, stale.to_string().as_bytes()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let contender = crate::storage::open_existing_private(&path, true).unwrap();
+    fs2::FileExt::try_lock_shared(&contender).unwrap();
+    for tunnel_ready in [false, true] {
+        for local_mcp_ready in [false, true] {
+            assert!(write_embedded_tunnel_observation(
+                &path,
+                2,
+                TunnelState::Running,
+                tunnel_ready,
+                local_mcp_ready,
+                None,
+            )
+            .is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let health = read_tunnel_health(&path).unwrap();
+            assert!(!health.fresh);
+            assert!(!health.tunnel_ready && !health.local_mcp_ready);
+            assert_eq!(health.state, Some(TunnelState::Running));
+            assert_eq!(health.profile_revision, Some(2));
+            assert_eq!(health.service_pid, Some(service_pid));
+        }
+    }
+    drop(contender);
+    write_embedded_tunnel_observation(&path, 2, TunnelState::Running, true, true, None).unwrap();
+    let health = read_tunnel_health(&path).unwrap();
+    assert!(health.fresh);
+    assert_eq!(health.state, Some(TunnelState::Running));
+    assert!(health.tunnel_ready && health.local_mcp_ready);
+    assert_eq!(health.profile_revision, Some(2));
+    assert_eq!(health.service_pid, Some(service_pid));
+}
+
+#[cfg(unix)]
+#[test]
 fn health_locks_release_without_waiting_for_inherited_handles() {
     for exclusive in [false, true] {
         for fail_after_lock in [false, true] {

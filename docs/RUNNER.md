@@ -132,6 +132,35 @@ The runtime tools `register_project` and `create_project` let a client register
 an existing directory or create a new one on an online Runner, subject to the
 Runner's `allowed_roots` policy.
 
+Admin `/api/admin/projects/register` and `/api/admin/projects/create`, and runtime
+project tools (`register_project`, `create_project`), share the same Server-side
+cross-platform path-shape validation before work is routed to a Runner. The path
+must be non-empty, must not contain NUL, and must be POSIX-absolute (`/...`), a
+Windows drive absolute path (`C:\...` or `c:/...`), or a Windows UNC or verbatim
+prefix (`\\server\share\...`, `\\?\C:\...`, or `\\?\UNC\...`). Relative paths,
+drive-relative paths (`C:repo`), and root-relative Windows paths (`\repo`) are
+rejected. Admin register/create bodies enforce an additional 4096-byte ceiling on
+the raw path string.
+
+Registry `path =` entries are not checked by that Server helper. On the Runner
+host, registry paths go through `validate_project_path_ingress`,
+canonicalization, and `allowed_roots` policy when the Runner loads or applies
+configuration.
+
+JSON bodies must escape backslashes (`"path":"C:\\repo"`). TOML registry files
+often use literal strings for Windows paths:
+
+```toml
+path = 'C:\Users\alice\repos\demo'
+```
+
+The Server path-shape check is syntactic only. It does not scan the filesystem or
+apply host policy. The Runner remains authoritative for registry ingress,
+canonicalization, `allowed_roots`, Windows namespace fences, and whether the
+directory exists. `create_project` does not create new directories on Windows
+network shares even when an existing share path may be registered when Runner
+policy already grants it.
+
 ## Skill sources
 
 `list_skills` presents one catalog while preserving three distinct ownership and

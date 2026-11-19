@@ -229,6 +229,43 @@ async fn observation_token(
         .to_string()
 }
 
+const STALE_OBSERVATION_REGISTRY_EPOCH: &str = "previous-server-epoch";
+
+fn stale_registry_epoch_token(job_id: &str, token: &str) -> String {
+    let parsed = crate::job_observation::JobObservationToken::parse(token)
+        .expect("observation token must parse");
+    let stale = match (parsed.stdout_cursor, parsed.stderr_cursor) {
+        (Some(stdout), Some(stderr)) => crate::job_observation::JobObservationToken::new(
+            job_id,
+            STALE_OBSERVATION_REGISTRY_EPOCH,
+            parsed.revision,
+            stdout,
+            stderr,
+        ),
+        _ => crate::job_observation::JobObservationToken::new_baseline(
+            job_id,
+            STALE_OBSERVATION_REGISTRY_EPOCH,
+            parsed.revision,
+        ),
+    }
+    .expect("stale registry epoch token");
+    stale.encode()
+}
+
+fn assert_stale_epoch_refresh_output(item: &Value, token_before: &str, stdout_tail: &str) {
+    let output = &item["output"];
+    assert_eq!(item["success"], true);
+    assert_eq!(output["log_delta_status"], "reset");
+    assert_eq!(output["status"], "running");
+    assert_eq!(output["terminal"], false);
+    assert_eq!(output["changed"], true);
+    assert_eq!(output["meaningful_changed"], true);
+    assert_eq!(output["stdout_tail"], stdout_tail);
+    let token = output["observation_token"].as_str().unwrap();
+    assert_ne!(token, token_before);
+    assert!(!token.is_empty());
+}
+
 fn assert_item_has_no_wait_metadata(item: &serde_json::Value) {
     let output = item["output"].as_object().expect("successful Job snapshot");
     assert!(!output.contains_key("wait_outcome"));
@@ -1453,7 +1490,7 @@ async fn observe_jobs_missing_baseline_is_immediate_and_projects_activity_withou
                 items: vec![item(&job_id, None)],
                 tail_lines: 40,
                 wait_secs: Some(120),
-                wake_on: ObserveJobsWakeOn::Terminal,
+                wake_on: ObserveJobsWakeOn::Change,
 
                 summary_only: false,
             },
@@ -1473,6 +1510,56 @@ async fn observe_jobs_missing_baseline_is_immediate_and_projects_activity_withou
         result.output["items"][0]["output"]["activity"],
         serde_json::to_value(process_activity()).unwrap()
     );
+    assert_item_has_no_wait_metadata(&result.output["items"][0]);
+}
+
+#[tokio::test]
+async fn observe_jobs_all_terminal_missing_baseline_enters_shared_wait() {
+    let runtime = test_runtime();
+    let (job_id, request, auth) =
+        register_and_start_agent_job(&runtime, "observe-all-term-no-base").await;
+    update_observed_job(
+        &runtime,
+        "observe-all-term-no-base",
+        &request,
+        "running",
+        Some("still active\n"),
+        Some(process_activity()),
+        false,
+    )
+    .await;
+
+    let started = Instant::now();
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::ObserveJobs {
+                items: vec![item(&job_id, None)],
+                tail_lines: 40,
+                wait_secs: Some(1),
+                wake_on: ObserveJobsWakeOn::AllTerminal,
+
+                summary_only: false,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_ne!(
+        result.output["wait"]["outcome"],
+        "immediate",
+        "AllTerminal without a caller baseline must use the shared wait path"
+    );
+    assert_eq!(result.output["wait"]["outcome"], "timeout");
+    assert!(
+        result.output["wait"]["waited_ms"].as_u64().unwrap() > 0,
+        "shared wait must consume the deadline"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "elapsed={:?}",
+        started.elapsed()
+    );
+    assert_eq!(result.output["items"][0]["output"]["status"], "running");
     assert_item_has_no_wait_metadata(&result.output["items"][0]);
 }
 
@@ -1880,6 +1967,9 @@ async fn ordinary_receipts_production_sqlite_dual_restart_observe_and_list_filte
     assert_eq!(output["stdout_tail"], "bounded stdout\n");
     assert_eq!(output["stderr_tail"], "bounded stderr\n");
     assert_eq!(output["log_delta_status"], "reset");
+    assert_eq!(output["terminal"], true);
+    assert_eq!(observed.output["wait"]["outcome"], "terminal");
+    assert_eq!(observed.output["wait"]["waited_ms"], 0);
     assert!(started.elapsed() < Duration::from_secs(2));
     for (status, project_filter, session_id, expected) in [
         (Some("completed".into()), Some(project.clone()), None, 1),
@@ -1933,6 +2023,427 @@ async fn ordinary_receipts_production_sqlite_dual_restart_observe_and_list_filte
         "completed"
     );
     assert!(probe_patch_agent_request(&runtime, client).await.is_none());
+}
+
+#[tokio::test]
+async fn observe_jobs_stale_epoch_refreshes_before_wait_for_every_policy() {
+    for (idx, wake_on) in [
+        ObserveJobsWakeOn::Change,
+        ObserveJobsWakeOn::MeaningfulChange,
+        ObserveJobsWakeOn::Terminal,
+        ObserveJobsWakeOn::AllTerminal,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (variant, cursor_bearing) in [false, true].into_iter().enumerate() {
+            let runtime = test_runtime();
+            let client = format!("observe-stale-epoch-{idx}-{variant}");
+            let (job_id, request, auth) = register_and_start_agent_job(&runtime, &client).await;
+            let token_before = if cursor_bearing {
+                update_observed_job(
+                    &runtime,
+                    &client,
+                    &request,
+                    "running",
+                    Some("retained stdout line\n"),
+                    None,
+                    false,
+                )
+                .await;
+                update_observed_job(
+                    &runtime,
+                    &client,
+                    &request,
+                    "running",
+                    Some("cursor delta\n"),
+                    None,
+                    false,
+                )
+                .await;
+                observation_token(&runtime, &job_id, &auth).await
+            } else {
+                let baseline = observation_token(&runtime, &job_id, &auth).await;
+                update_observed_job(
+                    &runtime,
+                    &client,
+                    &request,
+                    "running",
+                    Some("retained stdout line\n"),
+                    None,
+                    false,
+                )
+                .await;
+                baseline
+            };
+            let stale_token = stale_registry_epoch_token(&job_id, &token_before);
+            let started = Instant::now();
+            let result = runtime
+                .observe_jobs_for_auth(
+                    vec![item(&job_id, Some(stale_token))],
+                    40,
+                    Some(30),
+                    wake_on,
+                    Some(&auth),
+                )
+                .await;
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(
+                result.output["wait"]["outcome"],
+                "updated",
+                "wake_on={wake_on:?} cursor_bearing={cursor_bearing}"
+            );
+            assert_eq!(result.output["wait"]["waited_ms"], 0);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "wake_on={wake_on:?} cursor_bearing={cursor_bearing} elapsed={:?}",
+                started.elapsed()
+            );
+            assert_stale_epoch_refresh_output(
+                &result.output["items"][0],
+                &token_before,
+                if cursor_bearing {
+                    "retained stdout line\ncursor delta\n"
+                } else {
+                    "retained stdout line\n"
+                },
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn observe_jobs_current_epoch_unchanged_waits_full_deadline_for_every_policy() {
+    const WAIT_SECS: u64 = 1;
+    for (idx, wake_on) in [
+        ObserveJobsWakeOn::Change,
+        ObserveJobsWakeOn::MeaningfulChange,
+        ObserveJobsWakeOn::Terminal,
+        ObserveJobsWakeOn::AllTerminal,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (variant, cursor_bearing) in [false, true].into_iter().enumerate() {
+            let runtime = test_runtime();
+            let client = format!("observe-current-epoch-{idx}-{variant}");
+            let (job_id, request, auth) = register_and_start_agent_job(&runtime, &client).await;
+            update_observed_job(
+                &runtime,
+                &client,
+                &request,
+                "running",
+                Some("stable stdout\n"),
+                None,
+                false,
+            )
+            .await;
+            let token = if cursor_bearing {
+                update_observed_job(
+                    &runtime,
+                    &client,
+                    &request,
+                    "running",
+                    Some("stable cursor\n"),
+                    None,
+                    false,
+                )
+                .await;
+                observation_token(&runtime, &job_id, &auth).await
+            } else {
+                observation_token(&runtime, &job_id, &auth).await
+            };
+            let started = Instant::now();
+            let result = runtime
+                .observe_jobs_for_auth(
+                    vec![item(&job_id, Some(token.clone()))],
+                    40,
+                    Some(WAIT_SECS),
+                    wake_on,
+                    Some(&auth),
+                )
+                .await;
+            let elapsed = started.elapsed();
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(
+                result.output["wait"]["outcome"],
+                "timeout",
+                "wake_on={wake_on:?} cursor_bearing={cursor_bearing}"
+            );
+            assert_eq!(
+                result.output["wait"]["waited_ms"],
+                WAIT_SECS * 1_000,
+                "wake_on={wake_on:?} cursor_bearing={cursor_bearing}"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(900),
+                "wake_on={wake_on:?} cursor_bearing={cursor_bearing} elapsed={elapsed:?}"
+            );
+            let output = &result.output["items"][0]["output"];
+            assert_eq!(output["observation_token"], token);
+            assert_eq!(output["changed"], false);
+            assert_eq!(output["meaningful_changed"], false);
+            assert_eq!(output["log_delta_status"], "unchanged");
+            assert_eq!(output["terminal"], false);
+        }
+    }
+}
+
+#[tokio::test]
+async fn observe_jobs_initial_log_delta_reset_skips_shared_wait_for_all_wake_policies() {
+    for (idx, wake_on) in [
+        ObserveJobsWakeOn::Change,
+        ObserveJobsWakeOn::MeaningfulChange,
+        ObserveJobsWakeOn::Terminal,
+        ObserveJobsWakeOn::AllTerminal,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let runtime = test_runtime();
+        let client = format!("observe-reset-wake-{idx}");
+        let (job_id, request, auth) = register_and_start_agent_job(&runtime, &client).await;
+        update_observed_job(
+            &runtime,
+            &client,
+            &request,
+            "running",
+            Some("first\n"),
+            None,
+            false,
+        )
+        .await;
+        let token = observation_token(&runtime, &job_id, &auth).await;
+        let large = "discarded\n".repeat(30_000);
+        update_observed_job(
+            &runtime,
+            &client,
+            &request,
+            "running",
+            Some(&large),
+            None,
+            false,
+        )
+        .await;
+        let started = Instant::now();
+        let result = runtime
+            .observe_jobs_for_auth(
+                vec![item(&job_id, Some(token))],
+                3,
+                Some(30),
+                wake_on,
+                Some(&auth),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["wait"]["outcome"],
+            "updated",
+            "wake_on={wake_on:?}"
+        );
+        assert_eq!(result.output["wait"]["waited_ms"], 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "wake_on={wake_on:?} elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result.output["items"][0]["output"]["log_delta_status"],
+            "reset"
+        );
+    }
+}
+
+#[tokio::test]
+async fn observe_jobs_streaming_log_delta_reset_wakes_before_deadline() {
+    for (idx, wake_on) in [
+        ObserveJobsWakeOn::Change,
+        ObserveJobsWakeOn::MeaningfulChange,
+        ObserveJobsWakeOn::Terminal,
+        ObserveJobsWakeOn::AllTerminal,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let runtime = test_runtime();
+        let client = format!("observe-stream-reset-{idx}");
+        let (job_id, request, auth) = register_and_start_agent_job(&runtime, &client).await;
+        update_observed_job(
+            &runtime,
+            &client,
+            &request,
+            "running",
+            Some("first\n"),
+            None,
+            false,
+        )
+        .await;
+        let token = observation_token(&runtime, &job_id, &auth).await;
+        let started = Instant::now();
+        let observation = runtime.observe_jobs_for_auth(
+            vec![item(&job_id, Some(token))],
+            3,
+            Some(30),
+            wake_on,
+            Some(&auth),
+        );
+        tokio::pin!(observation);
+        assert!(
+            futures_util::poll!(&mut observation).is_pending(),
+            "wake_on={wake_on:?}"
+        );
+        let large = "discarded\n".repeat(30_000);
+        update_observed_job(
+            &runtime,
+            &client,
+            &request,
+            "running",
+            Some(&large),
+            None,
+            false,
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), observation)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "streaming reset must wake before deadline; wake_on={wake_on:?} elapsed={:?}",
+                    started.elapsed()
+                )
+            });
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["wait"]["outcome"],
+            "updated",
+            "wake_on={wake_on:?}"
+        );
+        assert!(
+            result.output["wait"]["waited_ms"].as_u64().unwrap_or(0) < 30_000,
+            "wake_on={wake_on:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "wake_on={wake_on:?} elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result.output["items"][0]["output"]["log_delta_status"],
+            "reset"
+        );
+        assert_eq!(
+            result.output["items"][0]["output"]["meaningful_changed"],
+            false,
+            "wake_on={wake_on:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn observe_jobs_all_terminal_streaming_reset_on_one_job_returns_updated_before_peer_terminal() {
+    let runtime = test_runtime();
+    let (job_a, request_a, auth) =
+        register_and_start_agent_job(&runtime, "stream-reset-all-a").await;
+    let (job_b, request_b, _) = register_and_start_agent_job(&runtime, "stream-reset-all-b").await;
+    for (client, request) in [
+        ("stream-reset-all-a", &request_a),
+        ("stream-reset-all-b", &request_b),
+    ] {
+        update_observed_job(
+            &runtime,
+            client,
+            request,
+            "running",
+            Some("baseline\n"),
+            None,
+            false,
+        )
+        .await;
+    }
+    let token_a = observation_token(&runtime, &job_a, &auth).await;
+    let token_b = observation_token(&runtime, &job_b, &auth).await;
+    let observation = runtime.observe_jobs_for_auth(
+        vec![item(&job_a, Some(token_a)), item(&job_b, Some(token_b))],
+        3,
+        Some(30),
+        ObserveJobsWakeOn::AllTerminal,
+        Some(&auth),
+    );
+    tokio::pin!(observation);
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    let large = "discarded\n".repeat(30_000);
+    update_observed_job(
+        &runtime,
+        "stream-reset-all-a",
+        &request_a,
+        "running",
+        Some(&large),
+        None,
+        false,
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(2), observation)
+        .await
+        .expect("all_terminal must return updated when one Job resets while the peer is still running");
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["wait"]["outcome"], "updated");
+    assert_eq!(result.output["terminal_count"], 0);
+    assert_eq!(
+        result.output["items"][0]["output"]["log_delta_status"],
+        "reset"
+    );
+    assert_eq!(result.output["items"][1]["output"]["terminal"], false);
+    assert_eq!(
+        result.output["items"][0]["output"]["meaningful_changed"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn observe_jobs_streaming_terminal_precedes_log_delta_reset() {
+    let runtime = test_runtime();
+    let client = "observe-stream-term-reset";
+    let (job_id, request, auth) = register_and_start_agent_job(&runtime, client).await;
+    update_observed_job(
+        &runtime,
+        client,
+        &request,
+        "running",
+        Some("first\n"),
+        None,
+        false,
+    )
+    .await;
+    let token = observation_token(&runtime, &job_id, &auth).await;
+    let observation = runtime.observe_jobs_for_auth(
+        vec![item(&job_id, Some(token))],
+        3,
+        Some(30),
+        ObserveJobsWakeOn::Terminal,
+        Some(&auth),
+    );
+    tokio::pin!(observation);
+    assert!(futures_util::poll!(&mut observation).is_pending());
+    let large = "discarded\n".repeat(30_000);
+    update_observed_job(
+        &runtime,
+        client,
+        &request,
+        "completed",
+        Some(&large),
+        None,
+        true,
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(2), observation)
+        .await
+        .expect("terminal completion must wake before deadline");
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["wait"]["outcome"], "terminal");
+    assert_eq!(
+        result.output["items"][0]["output"]["log_delta_status"],
+        "reset"
+    );
+    assert_eq!(result.output["items"][0]["output"]["terminal"], true);
 }
 
 #[tokio::test]

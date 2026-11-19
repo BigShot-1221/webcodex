@@ -145,6 +145,57 @@ async fn readiness_runtime_dogfood_any_consumes_a_before_b_without_redispatch() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn readiness_log_delta_reset_on_running_job_does_not_end_as_deadline() {
+    let runtime = test_runtime();
+    let (id, request, auth) = register_and_start_agent_job(&runtime, "reset-ready").await;
+    update_observed_job(
+        &runtime,
+        "reset-ready",
+        &request,
+        "running",
+        Some("first\n"),
+        None,
+        false,
+    )
+    .await;
+    let wait = ready(&runtime, vec![id.clone()], Any, 45, &auth);
+    tokio::pin!(wait);
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    let large = "discarded\n".repeat(30_000);
+    update_observed_job(
+        &runtime,
+        "reset-ready",
+        &request,
+        "running",
+        Some(&large),
+        None,
+        false,
+    )
+    .await;
+    assert!(
+        futures_util::poll!(&mut wait).is_pending(),
+        "log retention reset must not map readiness to deadline while Job is still running"
+    );
+    update_observed_job(
+        &runtime,
+        "reset-ready",
+        &request,
+        "completed",
+        None,
+        None,
+        true,
+    )
+    .await;
+    let std::task::Poll::Ready(result) = futures_util::poll!(&mut wait) else {
+        panic!("terminal completion must wake readiness after reset")
+    };
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["wait_state"], "ready");
+    assert_eq!(result.output["ready"][0]["job_id"], id);
+    assert_eq!(result.output["pending_job_ids"], json!([]));
+}
+
+#[tokio::test(start_paused = true)]
 async fn readiness_all_retains_remaining_wait_and_progress_never_resets_deadline() {
     let runtime = test_runtime();
     let (a, ra, auth) = register_and_start_agent_job(&runtime, "deadline-a").await;

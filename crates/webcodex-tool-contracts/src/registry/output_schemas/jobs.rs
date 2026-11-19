@@ -558,7 +558,7 @@ fn observe_jobs_output_schema() -> Value {
             "log_delta_status": {
                 "type": "string",
                 "enum": ["baseline", "delta", "unchanged", "reset"],
-                "description": "baseline is a bounded non-delta selection (first observation or explicit pagination); delta contains newly observable output and may conservatively replay an unterminated final line; unchanged has no model-facing output; reset is a bounded recovery tail because exact continuity could not be proved."
+                "description": "baseline is a bounded non-delta selection (first observation or explicit pagination); delta contains newly observable output and may conservatively replay an unterminated final line; unchanged has no model-facing output; reset is a bounded recovery tail because exact continuity could not be proved. reset on the initial or streaming snapshot forces wait.outcome=updated for every wake_on (including terminal and all_terminal) so callers refresh after_observation_token; terminal still wins when terminal and reset coincide; reset is not meaningful_changed."
             },
             "stdout_delta_reset": schema_type("boolean", "Whether stdout automatic delta continuity was reset for this observation."),
             "stderr_delta_reset": schema_type("boolean", "Whether stderr automatic delta continuity was reset for this observation."),
@@ -637,7 +637,7 @@ fn observe_jobs_output_schema() -> Value {
             "log_delta_status": {
                 "type": "string",
                 "enum": ["baseline", "delta", "unchanged", "reset"],
-                "description": "Exact canonical log projection class. reset remains an explicit bounded recovery tail, never ordinary delta."
+                "description": "Exact canonical log projection class. reset remains an explicit bounded recovery tail, never ordinary delta, and forces batch wait.outcome=updated even under terminal/all_terminal wake policies so baselines refresh."
             },
             "observation_token": {
                 "type": "string",
@@ -841,7 +841,7 @@ fn observe_jobs_output_schema() -> Value {
                     }
                 },
                 "required": ["outcome", "waited_ms"],
-                "description": "The single shared-wait fact for this batch. terminal policy never wakes updated: timeout means the deadline elapsed and may coexist with changed=true and cumulative log deltas. Item errors take precedence over terminal, then timeout. Final item outputs are snapshots and do not expose a second wait outcome."
+                "description": "The single shared-wait fact for this batch. Item errors take precedence over terminal, then timeout. wake_on=terminal and all_terminal normally wake only on terminal completion, except log_delta_status=reset forces updated so stale observation baselines refresh first; all_terminal may return updated when only one Job resets while peers are still running. One absolute wait_secs deadline is never extended by progress or reset. timeout means the deadline elapsed and may coexist with changed=true and cumulative log deltas. Final item outputs are snapshots and do not expose a second wait outcome."
             },
             "changed_count": {"type": "integer", "minimum": 0, "maximum": 8},
             "terminal_count": {"type": "integer", "minimum": 0, "maximum": 8},
@@ -900,7 +900,7 @@ fn observe_jobs_output_schema() -> Value {
                     }
                 },
                 "required": ["outcome"],
-                "description": "The one shared-wait fact for an ordinary all-success, non-truncated compact batch. terminal policy never wakes updated; timeout may coexist with changed=true and cumulative deltas."
+                "description": "The one shared-wait fact for an ordinary all-success, non-truncated compact batch. terminal and all_terminal normally avoid updated except log_delta_status=reset stale-baseline recovery; timeout after the shared deadline may coexist with changed=true and cumulative deltas."
             },
             "session_hint": session_hint_schema(),
             "permission": permission_decision_schema()
@@ -1752,7 +1752,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 json!({
                     "type": "string",
                     "enum": ["baseline", "delta", "unchanged", "reset"],
-                    "description": "baseline is a bounded non-delta selection (first observation or explicit pagination); delta contains newly observable output and may conservatively replay an unterminated final line; unchanged has no model-facing output; reset is a bounded recovery tail because exact continuity could not be proved."
+                    "description": "baseline is a bounded non-delta selection (first observation or explicit pagination); delta contains newly observable output and may conservatively replay an unterminated final line; unchanged has no model-facing output; reset is a bounded recovery tail because exact continuity could not be proved. reset on the initial or streaming snapshot forces wait.outcome=updated for every wake_on (including terminal and all_terminal) so callers refresh after_observation_token; terminal still wins when terminal and reset coincide; reset is not meaningful_changed."
                 }),
             ),
             (

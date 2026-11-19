@@ -114,6 +114,8 @@ fn final_readiness_reason(
         && (changed || wait_reason == WakeReason::Updated)
     {
         WakeReason::Updated
+    } else if wait_reason == WakeReason::Updated {
+        WakeReason::Updated
     } else {
         WakeReason::Timeout
     }
@@ -129,6 +131,49 @@ fn observed_has_meaningful_change(observed: &[ObservedJob]) -> bool {
     observed
         .iter()
         .any(|item| item.result.output["meaningful_changed"].as_bool() == Some(true))
+}
+
+fn observed_has_log_delta_reset(observed: &[ObservedJob]) -> bool {
+    observed.iter().any(|item| {
+        item.result.output["log_delta_status"].as_str() == Some("reset")
+    })
+}
+
+/// Shared initial-snapshot classification before the batch enters the shared wait.
+fn initial_batch_wake_reason(
+    initial: &[ObservedJob],
+    wake_on: ObserveJobsWakeOn,
+    wait_secs: Option<u64>,
+    missing_baseline: bool,
+) -> Option<WakeReason> {
+    if wake_on == ObserveJobsWakeOn::AllTerminal && observed_has_error(initial) {
+        Some(WakeReason::ItemError)
+    } else if wait_secs.is_none() {
+        Some(WakeReason::Immediate)
+    } else if missing_baseline
+        && matches!(
+            wake_on,
+            ObserveJobsWakeOn::Change | ObserveJobsWakeOn::MeaningfulChange
+        )
+    {
+        Some(WakeReason::Immediate)
+    } else if observed_has_error(initial) {
+        Some(WakeReason::ItemError)
+    } else if observed_terminal_satisfied(initial, wake_on) {
+        Some(WakeReason::Terminal)
+    } else if observed_has_log_delta_reset(initial) {
+        // A reset invalidates the caller's baseline; refresh it before coalescing
+        // an ordinary terminal wait. The shared absolute deadline is unchanged.
+        Some(WakeReason::Updated)
+    } else if wake_on == ObserveJobsWakeOn::Change && observed_has_change(initial) {
+        Some(WakeReason::Updated)
+    } else if wake_on == ObserveJobsWakeOn::MeaningfulChange
+        && observed_has_meaningful_change(initial)
+    {
+        Some(WakeReason::Updated)
+    } else {
+        None
+    }
 }
 
 /// Only classify updated waits: all other lanes already have an exact
@@ -1071,6 +1116,7 @@ impl ToolRuntime {
         wait_secs: u64,
         wake_on: ObserveJobsWakeOn,
         deadline: Instant,
+        reset_wakes: bool,
     ) -> Result<WakeReason, String> {
         // Each Job keeps its own waiter across other Jobs' updates. The
         // canonical Notify + revision recheck covers updates both before and
@@ -1100,6 +1146,20 @@ impl ToolRuntime {
                 };
                 if observation.terminal {
                     return Ok(WakeReason::Terminal);
+                }
+                if observation.log_delta_status == crate::job_observation::JobLogDeltaStatus::Reset {
+                    if reset_wakes {
+                        return Ok(WakeReason::Updated);
+                    }
+                    let token = job
+                        .observation_token
+                        .filter(|token| !token.is_empty())
+                        .ok_or("canonical Job wait returned no observation token")?;
+                    if item.after_observation_token.as_deref() == Some(token.as_str()) {
+                        return Err("canonical Job wait did not advance its token".into());
+                    }
+                    item.after_observation_token = Some(token);
+                    continue;
                 }
                 if observation.changed {
                     if wake_on == ObserveJobsWakeOn::Change {
@@ -1241,7 +1301,7 @@ impl ToolRuntime {
                 });
             }
             let reason = match self
-                .wait_for_observed_jobs(&pending, auth, wait_secs, wake_on, deadline)
+                .wait_for_observed_jobs(&pending, auth, wait_secs, wake_on, deadline, false)
                 .await
             {
                 Ok(WakeReason::ItemError) | Err(_) => return denied(),
@@ -1381,23 +1441,7 @@ impl ToolRuntime {
             .iter()
             .any(|resolved| resolved.item.after_observation_token.is_none());
         let immediate_reason =
-            if wake_on == ObserveJobsWakeOn::AllTerminal && observed_has_error(&initial) {
-                Some(WakeReason::ItemError)
-            } else if wait_secs.is_none() || missing_baseline {
-                Some(WakeReason::Immediate)
-            } else if observed_has_error(&initial) {
-                Some(WakeReason::ItemError)
-            } else if observed_terminal_satisfied(&initial, wake_on) {
-                Some(WakeReason::Terminal)
-            } else if wake_on == ObserveJobsWakeOn::Change && observed_has_change(&initial) {
-                Some(WakeReason::Updated)
-            } else if wake_on == ObserveJobsWakeOn::MeaningfulChange
-                && observed_has_meaningful_change(&initial)
-            {
-                Some(WakeReason::Updated)
-            } else {
-                None
-            };
+            initial_batch_wake_reason(&initial, wake_on, wait_secs, missing_baseline);
 
         let (observed, wake_reason, waited_ms) = if let Some(reason) = immediate_reason {
             (initial, reason, 0)
@@ -1424,6 +1468,7 @@ impl ToolRuntime {
                     wait_secs,
                     wake_on,
                     wait_started + Duration::from_secs(wait_secs),
+                    true,
                 )
                 .await
             {
@@ -1573,6 +1618,38 @@ mod budget_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_readiness_preserves_streaming_updated_wake_after_meaningful_change_flag_clears() {
+        assert_eq!(
+            final_readiness_reason(
+                false,
+                false,
+                false,
+                ObserveJobsWakeOn::MeaningfulChange,
+                WakeReason::Updated
+            ),
+            WakeReason::Updated
+        );
+        assert_eq!(
+            final_wake_reason(
+                &[wake_policy_fixture_observed("unchanged", false, false, false)],
+                ObserveJobsWakeOn::MeaningfulChange,
+                WakeReason::Updated
+            ),
+            WakeReason::Updated
+        );
+        assert_eq!(
+            final_readiness_reason(
+                false,
+                true,
+                false,
+                ObserveJobsWakeOn::MeaningfulChange,
+                WakeReason::Updated
+            ),
+            WakeReason::Terminal
+        );
+    }
 
     #[test]
     fn readiness_final_snapshot_deadline_race_matches_observation_contract() {
@@ -1947,6 +2024,194 @@ mod tests {
         assert_eq!(
             webcodex_core::runner_protocol::JOB_SNAPSHOT_STREAM_MAX_BYTES,
             64 * 1024
+        );
+    }
+
+    fn wake_policy_fixture_observed(
+        log_delta_status: &str,
+        changed: bool,
+        meaningful_changed: bool,
+        terminal: bool,
+    ) -> ObservedJob {
+        ObservedJob {
+            index: 0,
+            job_id: "job".into(),
+            observation_ref: None,
+            result: ToolResult::ok(json!({
+                "log_delta_status": log_delta_status,
+                "changed": changed,
+                "meaningful_changed": meaningful_changed,
+                "terminal": terminal,
+            })),
+        }
+    }
+
+    #[test]
+    fn initial_batch_log_delta_reset_wakes_updated_for_every_wait_policy() {
+        for wake_on in [
+            ObserveJobsWakeOn::Change,
+            ObserveJobsWakeOn::MeaningfulChange,
+            ObserveJobsWakeOn::Terminal,
+            ObserveJobsWakeOn::AllTerminal,
+        ] {
+            let observed = vec![wake_policy_fixture_observed("reset", false, false, false)];
+            assert_eq!(
+                initial_batch_wake_reason(&observed, wake_on, Some(30), false),
+                Some(WakeReason::Updated),
+                "wake_on={wake_on:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_batch_wake_precedence_preserves_error_terminal_and_change_policies() {
+        let reset_only = vec![wake_policy_fixture_observed("reset", false, false, false)];
+        assert_eq!(
+            initial_batch_wake_reason(&reset_only, ObserveJobsWakeOn::Change, None, false),
+            Some(WakeReason::Immediate)
+        );
+        assert_eq!(
+            initial_batch_wake_reason(&reset_only, ObserveJobsWakeOn::Change, Some(30), true),
+            Some(WakeReason::Immediate)
+        );
+        assert_eq!(
+            initial_batch_wake_reason(
+                &reset_only,
+                ObserveJobsWakeOn::MeaningfulChange,
+                Some(30),
+                true
+            ),
+            Some(WakeReason::Immediate)
+        );
+
+        let unchanged_no_baseline = vec![wake_policy_fixture_observed("unchanged", false, false, false)];
+        assert_eq!(
+            initial_batch_wake_reason(
+                &unchanged_no_baseline,
+                ObserveJobsWakeOn::AllTerminal,
+                Some(30),
+                true
+            ),
+            None,
+            "missing caller baseline must not short-circuit AllTerminal into immediate"
+        );
+        assert_eq!(
+            initial_batch_wake_reason(
+                &unchanged_no_baseline,
+                ObserveJobsWakeOn::Terminal,
+                Some(30),
+                true
+            ),
+            None,
+            "missing caller baseline must not short-circuit Terminal into immediate"
+        );
+
+        let mut errored = reset_only.clone();
+        errored.push(ObservedJob {
+            index: 1,
+            job_id: "bad".into(),
+            observation_ref: None,
+            result: ToolResult::err("unknown job: bad"),
+        });
+        assert_eq!(
+            initial_batch_wake_reason(&errored, ObserveJobsWakeOn::Terminal, Some(30), false),
+            Some(WakeReason::ItemError)
+        );
+        assert_eq!(
+            initial_batch_wake_reason(&errored, ObserveJobsWakeOn::AllTerminal, Some(30), false),
+            Some(WakeReason::ItemError)
+        );
+
+        let terminal_reset = vec![wake_policy_fixture_observed("reset", false, false, true)];
+        assert_eq!(
+            initial_batch_wake_reason(&terminal_reset, ObserveJobsWakeOn::Terminal, Some(30), false),
+            Some(WakeReason::Terminal)
+        );
+        assert_eq!(
+            initial_batch_wake_reason(&terminal_reset, ObserveJobsWakeOn::AllTerminal, Some(30), false),
+            Some(WakeReason::Terminal)
+        );
+
+        let unchanged = vec![wake_policy_fixture_observed("unchanged", false, false, false)];
+        assert_eq!(
+            initial_batch_wake_reason(&unchanged, ObserveJobsWakeOn::Change, Some(30), false),
+            None
+        );
+        assert_eq!(
+            initial_batch_wake_reason(&unchanged, ObserveJobsWakeOn::MeaningfulChange, Some(30), false),
+            None
+        );
+
+        let plain_change = vec![wake_policy_fixture_observed("delta", true, false, false)];
+        assert_eq!(
+            initial_batch_wake_reason(&plain_change, ObserveJobsWakeOn::Change, Some(30), false),
+            Some(WakeReason::Updated)
+        );
+        assert_eq!(
+            initial_batch_wake_reason(&plain_change, ObserveJobsWakeOn::MeaningfulChange, Some(30), false),
+            None
+        );
+
+        let meaningful_change = vec![wake_policy_fixture_observed("delta", true, true, false)];
+        assert_eq!(
+            initial_batch_wake_reason(
+                &meaningful_change,
+                ObserveJobsWakeOn::MeaningfulChange,
+                Some(30),
+                false
+            ),
+            Some(WakeReason::Updated)
+        );
+    }
+
+    #[test]
+    fn updated_wake_kind_classifies_log_delta_reset_as_change_not_meaningful() {
+        let items = vec![json!({
+            "index": 0,
+            "job_id": "job",
+            "success": true,
+            "output": {
+                "log_delta_status": "reset",
+                "changed": false,
+                "meaningful_changed": false,
+                "heartbeat_changed": false,
+                "terminal": false,
+            },
+            "error_kind": null,
+            "error": null,
+        })];
+        assert_eq!(
+            updated_wake_kind(&items, WakeReason::Updated),
+            Some("change")
+        );
+    }
+
+    #[test]
+    fn observed_log_delta_reset_does_not_require_success_or_changed_flags() {
+        let observed = vec![ObservedJob {
+            index: 0,
+            job_id: "job".into(),
+            observation_ref: None,
+            result: ToolResult {
+                success: true,
+                output: json!({
+                    "log_delta_status": "reset",
+                    "changed": false,
+                    "meaningful_changed": false,
+                    "terminal": false,
+                }),
+                error: None,
+            },
+        }];
+        assert!(observed_has_log_delta_reset(&observed));
+        assert_eq!(
+            initial_batch_wake_reason(
+                &observed,
+                ObserveJobsWakeOn::MeaningfulChange,
+                Some(45),
+                false
+            ),
+            Some(WakeReason::Updated)
         );
     }
 }

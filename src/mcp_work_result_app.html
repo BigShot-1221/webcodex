@@ -154,7 +154,30 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
   overflow-wrap: anywhere;
   cursor: pointer;
 }
-.file-toggle:hover { background: var(--surface-hover); }
+.file-toggle {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+.file-toggle::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  color: var(--muted);
+  transform: rotate(-45deg);
+}
+.file-toggle[aria-expanded="true"]::before { transform: rotate(45deg); }
+.file-toggle:hover, .file-toggle[aria-expanded="true"] { background: var(--surface-hover); }
+.file-toggle-path { min-width: 0; overflow-wrap: anywhere; }
+.file-toggle-stats { justify-self: end; color: var(--muted); }
+.file-toggle-stats .add { color: var(--success); }
+.file-toggle-stats .remove { color: var(--danger); }
+@media (max-width: 360px) {
+  .file-toggle-stats { grid-column: 2; justify-self: start; }
+}
 .file-views { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 .full-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .markdown-preview { max-height: 65vh; overflow: auto; overflow-wrap: anywhere; }
@@ -268,11 +291,11 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
 .thread-review .file-views { margin: 0; padding: 8px 10px; border-top: 1px solid var(--divider); }
 .thread-review .file-views .refresh[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
 .thread-review .frozen-file .secondary { padding: 4px 10px; }
-.thread-review .diff-line { display: grid; grid-template-columns: 4ch 4ch minmax(0, 1fr); gap: 6px; padding: 0 8px; }
-.thread-review .diff-line::before, .thread-review .diff-line::after { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; user-select: none; }
-.thread-review .diff-line::before { content: attr(data-old-line); grid-column: 1; grid-row: 1; }
-.thread-review .diff-line::after { content: attr(data-new-line); grid-column: 2; grid-row: 1; }
-.thread-review .diff-code { grid-column: 3; grid-row: 1; min-width: 0; }
+.diff-line[data-old-line] { display: grid; grid-template-columns: 4ch 4ch minmax(0, 1fr); gap: 6px; padding: 0 8px; }
+.diff-line[data-old-line]::before, .diff-line[data-old-line]::after { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; user-select: none; }
+.diff-line[data-old-line]::before { content: attr(data-old-line); grid-column: 1; grid-row: 1; }
+.diff-line[data-old-line]::after { content: attr(data-new-line); grid-column: 2; grid-row: 1; }
+.diff-line[data-old-line] .diff-code { grid-column: 3; grid-row: 1; min-width: 0; }
 .thread-review .no-wrap .diff-line { grid-template-columns: 4ch 4ch max-content; }
 .thread-review .no-wrap .diff-code, .thread-review .full-text.no-wrap { white-space: pre; overflow-wrap: normal; }
 .file-navigator { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; padding: 8px 0; background: Canvas; border-bottom: 1px solid var(--divider); }
@@ -492,7 +515,7 @@ select:disabled { opacity: .48; cursor: default; }
       </section>
       <section id="finalChanges" class="section" hidden>
         <div class="section-head"><h2>Final changes</h2><span id="frozenStats" class="stats-inline"></span></div>
-        <p id="finalChangesDescription" class="secondary" hidden>Final task changes captured at completion. Later edits appear in Changed files.</p>
+        <p id="finalChangesDescription" class="secondary">Session baseline compared with the workspace at completion. Concurrent workspace edits may be included; later edits do not change this snapshot.</p>
         <div id="frozenSummary" class="primary"></div>
         <nav id="frozenNavigator" class="file-navigator" aria-label="Final changes file navigation" hidden></nav>
         <div id="frozenFiles"></div>
@@ -2016,7 +2039,7 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
         newNumber = newLine++; newLeft--; kind = "added";
       } else if (value !== "\\ No newline at end of file") oldLeft = newLeft = 0;
       line.className = `diff-line ${kind}`;
-      if (threadSession !== undefined) {
+      if (styled || threadSession !== undefined) {
         line.setAttribute("data-old-line", oldNumber); line.setAttribute("data-new-line", newNumber);
         const code = document.createElement("span"); code.className = "diff-code"; code.textContent = value; line.append(code);
       } else line.textContent = value;
@@ -2350,8 +2373,12 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
     const button = document.createElement("button"); button.className = "file-toggle"; button.type = "button";
     const previous = file.previous_path || file.old_path;
     const path = previous ? `${previous} → ${file.path}` : file.path;
-    const stats = file.binary ? "binary" : !safeCount(file.additions) || !safeCount(file.deletions) ? "line counts unavailable" : `+${file.additions} −${file.deletions}`;
-    button.textContent = `${path} · ${stats}`;
+    const label = document.createElement("span"); label.className = "file-toggle-path"; label.textContent = path;
+    const stats = document.createElement("span"); stats.className = "stats-inline file-toggle-stats";
+    if (file.binary) stats.textContent = "Binary";
+    else if (!safeCount(file.additions) || !safeCount(file.deletions)) stats.textContent = "Counts unavailable";
+    else renderLineStats(stats, file.additions, file.deletions);
+    button.append(label, stats);
     button.setAttribute("aria-expanded", "false");
     const wrap = document.createElement("div"); wrap.hidden = true;
     const state = document.createElement("div"); state.className = "secondary";
@@ -3072,11 +3099,10 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
     el("tabResults").textContent = "Review";
     panes.splice(0, panes.length, "Results", "Activity", "Collaboration");
     el("viewTabs").append(el("tabResults"), el("tabActivity"), el("tabCollaboration"));
-    el("panelResults").append(el("resultChecks"), el("quotePanel"), el("workspaceChangesSection"), el("finalChanges"), el("taskOutputsSection"), el("discussResults"));
+    el("panelResults").append(el("resultChecks"), el("quotePanel"), el("finalChanges"), el("workspaceChangesSection"), el("taskOutputsSection"), el("discussResults"));
     el("reviewSections").hidden = false;
     el("diagnosticContent").append(el("taskContext"));
     el("diagnostics").hidden = false;
-    el("finalChangesDescription").hidden = false;
     selectPane("Results");
   }
   function selectPane(name, focus = false) {

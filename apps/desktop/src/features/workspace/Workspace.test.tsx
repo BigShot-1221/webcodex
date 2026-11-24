@@ -1335,7 +1335,7 @@ describe("Workspace polling lifecycle", () => {
 
   it("does not query the workspace before the Server readiness fence opens", async () => {
     const stopped = { ...state, readiness: { ...state.readiness, server: "stopped" as const, runtime_ready: false } };
-    render(wrapPolling(<PollProbe />), stopped));
+    render(wrapPolling(<PollProbe />, stopped));
     await act(async () => {});
     expect(pollBatchCalls()).toBe(0);
   });

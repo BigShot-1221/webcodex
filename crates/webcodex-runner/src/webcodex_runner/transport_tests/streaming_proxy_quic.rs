@@ -1,4 +1,3 @@
-
 #[test]
 fn websocket_proxy_env_precedence_and_no_proxy_bypass() {
     use std::ffi::OsString;
@@ -659,7 +658,10 @@ async fn streaming_pending_dispatch_slot_does_not_block_ping_or_pong() {
     })
     .await
     .expect("ping must be answered while a request waits for a dispatch permit");
-    assert!(pong, "expected Pong while shared dispatch slots are saturated");
+    assert!(
+        pong,
+        "expected Pong while shared dispatch slots are saturated"
+    );
 
     let overflow = tokio::time::timeout(Duration::from_millis(500), async {
         while let Some(env) = tap_rx.recv().await {
@@ -807,7 +809,7 @@ async fn streaming_stop_job_bypasses_shared_dispatch_backpressure() {
 
     for _ in 0..128 {
         if let Ok(env) = tap_rx.try_recv() {
-            if let RunnerEnvelope::Result { payload } = env {
+            if let RunnerEnvelope::Result { payload } = &env {
                 if payload.result.request_id == "stop-under-pressure" {
                     panic!(
                         "stop_job must bypass ordinary dispatch backpressure without emitting a pre-dispatch Result"
@@ -1008,10 +1010,7 @@ async fn streaming_pending_slot_rejection_outbound_closed_terminates_session() {
         .expect("session must exit promptly when overflow rejection cannot be sent")
         .unwrap()
         .expect_err("closed outbound must surface as session error, not a silent hang");
-    assert!(
-        error.contains("stream_outbound_channel_closed"),
-        "{error}"
-    );
+    assert!(error.contains("stream_outbound_channel_closed"), "{error}");
 }
 
 #[tokio::test]

@@ -81,8 +81,8 @@ fn cancel_queued_for_shutdown_terminals_agent_queued_prestart_jobs() {
         ),
     );
     assert_eq!(lock_unpoison(&manager.queued).len(), 1);
-    let queued = manager
-        .inventory()
+    let queued_inventory = manager.inventory();
+    let queued = queued_inventory
         .jobs
         .iter()
         .find(|snapshot| snapshot.job_id == "job-profile")
@@ -93,8 +93,8 @@ fn cancel_queued_for_shutdown_terminals_agent_queued_prestart_jobs() {
     assert!(lock_unpoison(&manager.queued).is_empty());
     assert!(manager.shutting_down.load(Ordering::SeqCst));
 
-    let terminal = manager
-        .inventory()
+    let terminal_inventory = manager.inventory();
+    let terminal = terminal_inventory
         .jobs
         .iter()
         .find(|snapshot| snapshot.job_id == "job-profile")
@@ -113,10 +113,12 @@ fn cancel_queued_for_shutdown_terminals_agent_queued_prestart_jobs() {
             "never executed"
         )))
     );
-    assert!(!lock_unpoison(&manager.jobs)
-        .get("job-profile")
-        .expect("queued job record")
-        .slot_reserved);
+    assert!(
+        !lock_unpoison(&manager.jobs)
+            .get("job-profile")
+            .expect("queued job record")
+            .slot_reserved
+    );
 }
 
 #[test]
@@ -164,8 +166,8 @@ fn start_available_queued_during_shutdown_does_not_drop_queued_prestart_jobs() {
         1,
         "shutdown scheduling must leave queued starts for cancel_queued_for_shutdown"
     );
-    let pre_cancel = manager
-        .inventory()
+    let queued_inventory = manager.inventory();
+    let pre_cancel = queued_inventory
         .jobs
         .iter()
         .find(|snapshot| snapshot.job_id == "job-profile")
@@ -175,8 +177,8 @@ fn start_available_queued_during_shutdown_does_not_drop_queued_prestart_jobs() {
     assert_eq!(manager.cancel_queued_for_shutdown(), 1);
     assert!(lock_unpoison(&manager.queued).is_empty());
 
-    let terminal = manager
-        .inventory()
+    let terminal_inventory = manager.inventory();
+    let terminal = terminal_inventory
         .jobs
         .iter()
         .find(|snapshot| snapshot.job_id == "job-profile")

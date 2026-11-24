@@ -408,7 +408,7 @@ expiry_ordinal INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_session_retention_tombstones_expiry
 ON workflow_session_retention_tombstones (expiry_ordinal);
-INSERT INTO workflow_session_storage(id,schema_version,legacy_imported) VALUES(1,1);
+INSERT INTO workflow_session_storage(id,schema_version,legacy_imported) VALUES(1,1,1);
 "#,
         )
         .unwrap();

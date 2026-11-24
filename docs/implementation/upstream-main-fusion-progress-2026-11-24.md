@@ -9,7 +9,7 @@
 - 个人 HEAD / main：`9a85be368b832ec29e2b12642004b09446dca7dc`。
 - 官方 main / MERGE_HEAD：`026413dce8a7166a3ba27d8df19e321a46782532`（https://github.com/yyjeqhc/webcodex）。
 - 初始冲突 89 个，累计解决 89 个，剩余 0 个；冲突解决率 100%。第一至第六批已完成。已验证本地双父融合提交 `12c1029994b08ef1c951e829d260b45f92e4e658`，仍在 integration 分支，不等同于功能验收。
-- 未重新 merge、未重置、未切换分支；保留已有融合成果及无关文件。未推送、未合入 main、未执行测试/编译或实际数据库迁移。第七批待授权。
+- 未重新 merge、未重置、未切换分支；保留已有融合成果及无关文件。第七批编译、打包及隔离验收已成功，原生安装/卸载验收因当前用户已有安装且无 Windows Sandbox 而未执行。未推送、未合入 main、未实际迁移用户数据库。
 
 ## 2. 总体策略与授权
 
@@ -17,7 +17,7 @@
 
 GPT 主导，WebCodex 为默认执行通道，Cursor ACP 按实际收益委托；仅在互不冲突、契约稳定时并行。ACP 沿用配置默认 Composer 2.5，不主动覆盖；此前因 retention_capacity_exhausted 明确未启动，后续须核实状态，不盲目重复派发。
 
-目前授权：D1 官方 SQLite 结构及一次性无损迁移源码；D2 不按数量自动淘汰持久历史；第一至第六批源码开发、静态审查及本地融合提交。实际数据库访问/迁移、测试、构建、打包、推送、合入 main 仍需相应授权。
+目前授权：D1 官方 SQLite 结构及一次性无损迁移源码；D2 不按数量自动淘汰持久历史；第一至第七批源码开发、静态审查、本地融合提交、编译、打包与隔离验收。实际用户数据库访问/迁移、覆盖安装、推送、合入 main 仍需相应授权。
 
 ## 3. 七批任务与验收条件
 
@@ -29,7 +29,7 @@ GPT 主导，WebCodex 为默认执行通道，Cursor ACP 按实际收益委托�
 | 4 | Server 调用链适配 | 已完成（源码与定向静态复查；未编译/运行验收） | 初始化、工具、Coding Agent、Work Result、Console、协作及 Project 权限契约一致；冲突归零 |
 | 5 | 已融合模块复查 | 已完成（定向源码复查与必要修复；未编译/运行验收） | Runner/Desktop/MCP/ACP/OAuth/Work Result/Environment 按真实代码独立审查；仅修复有依据的问题 |
 | 6 | 全局静态审查及融合提交 | 已完成（融合提交及双父核验成功） | 无未解决冲突/重复入口/废弃引用；审查权限、兼容性、持久化及 Windows；仅提交本任务改动并记录 ID |
-| 7 | 编译、打包与验收 | 待授权 | 按现行构建脚本执行；报告实际结果与安装包绝对路径；运行验收后另行决定合入 main、推送 |
+| 7 | 编译、打包与验收 | 编译/打包/隔离验收完成；原生安装验收受环境限制 | 按现行构建脚本执行；报告实际结果与安装包绝对路径；运行验收后另行决定合入 main、推送 |
 
 依赖：1 → 2 → 3/4（共享接口和数据库先串行确定，独立部分可并行）→ 5 → 6 → 7。禁止多个执行者同时修改相同文件或共享状态。阶段完成以实际源码和复查证据为准，不以任务派发为准。
 
@@ -332,3 +332,30 @@ D1 迁移设计必须满足：
 - 第二父提交：`026413dce8a7166a3ba27d8df19e321a46782532`（已选定官方 main）。
 - 树对象：`35ee6908a51ebe24d314664671576e7249cce584`，与静态审查后锁定的索引一致；相对个人基线纳入 1351 个文件，已跟踪工作区无未提交变更；8 个无关未跟踪文件原样保留。
 - 本节提交回执另以仅文档提交记录，不修改融合源码。第六批完成；尚未测试、编译、打包、部署、实际迁移、推送或合入 main。第七批负责构建与运行验收。
+
+## 13. 第七批 — Windows 编译、打包与验收（2026-11-24）
+
+### 13.1 实际构建修复
+
+- 使用 WebCodex 原生工具，未启动 Cursor ACP/CLI。按 `scripts/build_desktop_windows_local.ps1 -AllowDirty` 构建当前用户 NSIS dogfood 安装包；原有 8 个无关 untracked 文件保留，不伪造 clean 状态。
+- 首次构建发现 Salvo 0.93 要求 Rust 1.92，而默认 1.91.1 不满足；临时指定本机已有 `RUSTUP_TOOLCHAIN=1.92.0-x86_64-pc-windows-msvc`。Node 22.12 不满足 pdfjs/jsdom 等依赖要求，下载镜像 Node 22.22.2 并与官方 SHA256 清单核对，使用 `target/batch7-toolchain` 下的临时 PATH。npm 使用 npmmirror，Cargo 官方依赖经 127.0.0.1:10808 代理；中科大镜像核验可用且包含所需版本，rsproxy 访问超时。未调整系统或全局配置，未修改 Cargo.lock 或降级依赖。
+- 修复五个真实生产编译错误：Store 重复 `LAST_USED_UPDATE_FLOOR_SECS`；rusqlite 0.41.1 `trace_v2` 泛型与 Result；Runner catalog、Server admin lifecycle、Server project result 的三处重复 `registration_incarnation`，保留经过 UUID 校验的管理接口身份。五个文件静态格式与 diff 检查通过，提交 `d2ccfe2c0e1832cb273bfe8068ace18a526643fe`。
+- `cargo build --locked --profile dogfood -p webcodex -p webcodex-cli -p webcodex-runner` 成功；完整 Windows 构建脚本重新以此提交成功，含前端 npm ci、Desktop TypeScript/Vite、Tauri release 与 NSIS 封装，退出码 0（Job `wc_job_IismYfHH-zY_QlT0`）。仍有 Rust unused/dead_code 等非阻塞警告与 Vite 大 chunk 警告，未为消除警告扩大改造范围。
+
+### 13.2 交付产物
+
+- 版本：0.5.1，Windows x64，unsigned local dogfood。
+- 安装包绝对路径：`E:\myself\webcodex\target\desktop-local-dist\webcodex-desktop-local-dirty-d2ccfe2c0e18-v0.5.1-win32-x64-setup.exe`。
+- 文件大小：36,038,706 字节；生成时间 2026-11-24 20:48:55（本地）。SHA-256：`60f2662cb7ac9307edb95f8057b2c7f28ddb054a1b2dd78f8b7d7d892af3dedb`，独立计算与 `.sha256` 一致。
+- CLI、Server、Runner 运行 `--version`；Desktop `--build-info-json`，四个组件均证实版本 0.5.1、完整源提交 `d2ccfe2c0e1832cb273bfe8068ace18a526643fe`、dirty=true、built_at=1795524191；Desktop PE Machine=8664、Subsystem=2。NSIS 启动器为 32 位 GUI stub，内置 Desktop 为 x64。构建阶段运行时暂存副本的 SHA-256 和原文件一致。
+- 本节及测试夹具后续提交仅修改测试代码和进度文档，生产源码不变，故已生成安装包仍对应最终生产代码，不重打包以伪造新源码身份。
+
+### 13.3 隔离运行与回归验收
+
+- 隔离 Server：仅使用 `target/batch7-isolated-c3a7442220704d32b0e2b288cc8e2c89` 新建数据目录、loopback 随机端口、临时凭据；连续启动两次、两次 `/healthz` 200 且确认监听进程归属、stdin EOF 正常关闭退出码 0；新数据库存在。Job `wc_job_yZNjhZOpUFrY1_Px` 成功。未读取/迁移真实用户数据库。
+- `cargo test --locked --profile dogfood -p webcodex-workflow-session fork_sqlite_migration_preserves_retained_history_and_replay_authority -- --nocapture`：1 passed，0 failed。首次失败为测试夹具三列只给两个值；补 `legacy_imported=1` 后通过，未弱化迁移逻辑。
+- `cargo test --locked --profile dogfood -p webcodex-runner --bin webcodex-runner enforce_durable_capacity_archives_uncertain_without_losing_replay_identity -- --nocapture`：1 passed；`permission_tool_call_title_is_optional_but_authorization_identity_is_exact`：1 passed。Runner 测试目标原有四处临时 inventory 借用生命周期与一处消息部分移动导致编译失败，仅修复测试代码持有快照/借用消息，不修改断言。最终 Job `wc_job_CuXfW5QH4EG7IneT` 退出码 0，2 passed、0 failed。
+- 未运行全量 Workspace 测试；实际 Cursor provider、Server 跨组件归档回执的故障注入、Windows ACL 全面运行测试、OAuth 交易并发、Desktop GUI 轮询均未专项验收，不能据定向测试宣称所有运行行为已验证。
+- 原生安装/卸载 smoke 未执行：当前 Windows 用户已安装 WebCodex Desktop 与 Dev 0.5.0，仓库 smoke 脚本明确拒绝该情形，Windows Sandbox 不可用。未覆盖安装、未卸载、未启用系统功能。需独立测试用户或测试机完成原生安装与真实 GUI 验收。
+
+结论：第七批编译、安装包交付及本机可安全实施的隔离验收已经完成；原生安装/全面 GUI 验收仍受环境限制，不标记为全面验收通过。构建与定向测试均已结束，没有遗留执行中的构建任务。未实际迁移用户数据库，未部署、发布、推送或合入 main。

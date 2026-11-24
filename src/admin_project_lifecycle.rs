@@ -864,10 +864,6 @@ fn lifecycle_summary(output: &Value, id: &str) -> Option<RunnerProjectSummary> {
             .get("revision")
             .and_then(Value::as_str)
             .map(str::to_string),
-        registration_incarnation: output
-            .get("registration_incarnation")
-            .and_then(Value::as_str)
-            .map(str::to_string),
         root_fingerprint: output
             .get("root_fingerprint")
             .and_then(Value::as_str)
@@ -907,10 +903,7 @@ fn validate_common(
     {
         return Err(api_error(400, "invalid_request"));
     }
-    if name.trim().is_empty()
-        || name.len() > 120
-        || description.is_some_and(|v| v.len() > 500)
-    {
+    if name.trim().is_empty() || name.len() > 120 || description.is_some_and(|v| v.len() > 500) {
         return Err(api_error(400, "invalid_request"));
     }
     if path.len() > 4096 {

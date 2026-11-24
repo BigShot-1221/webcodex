@@ -1,9 +1,5 @@
 //! Durable WebCodex state persistence and SQLite storage semantics.
 
-/// Minimum spacing between successive `last_used_at` writes on live credentials.
-/// Used for audit display only; not part of authentication or authorization.
-pub const LAST_USED_UPDATE_FLOOR_SECS: i64 = 60;
-
 use self::connection_observation::{
     lock_connection as observed_lock_connection, StoreConnectionGuard, StoreConnectionObserver,
     TracingStoreConnectionObserver,
@@ -118,6 +114,11 @@ pub use self::artifact_handoff::{
     DEFAULT_ARTIFACT_HANDOFF_TTL_MS, MAX_ARTIFACT_HANDOFF_IDEMPOTENCY_KEY_CHARS,
     MAX_ARTIFACT_HANDOFF_TTL_MS,
 };
+pub use self::backup::{
+    BackupArtifact, BackupControl, BackupErrorKind, BackupOptions, BackupPhase,
+    BackupStatusSnapshot,
+};
+pub use self::backup_maintenance::BackupMaintenanceOwner;
 pub use self::communication::{
     AgentEndpointLifecycle, AgentEndpointMutation, AgentEndpointRecord, AgentIdentityMutation,
     AgentIdentityPage, AgentInboxItem, AgentInboxPage, AgentProfilePatch, ConversationAccess,
@@ -172,10 +173,6 @@ pub use self::peer_collaboration::{
     MAX_PEER_MESSAGE_LIMIT,
 };
 pub use self::project_reference::{ProjectReferenceRecord, ProjectReferenceStoreError};
-pub use self::backup::{
-    BackupArtifact, BackupControl, BackupErrorKind, BackupOptions, BackupPhase, BackupStatusSnapshot,
-};
-pub use self::backup_maintenance::BackupMaintenanceOwner;
 pub use self::restore::{
     OfflineRestoreOwner, PendingRestoreStartup, RestorePreflightFacts,
     RestoreWorkflowSessionRequirement,
@@ -283,8 +280,7 @@ impl Database {
         }
         let connection = Connection::open_with_flags(
             &self.state_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|_| "connection_open")?;
         connection
@@ -292,9 +288,7 @@ impl Database {
                 "PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA cache_size=-512;",
             )
             .map_err(|_| "connection_open")?;
-        let _ = self
-            .wal_diagnostic_connection
-            .set(Mutex::new(connection));
+        let _ = self.wal_diagnostic_connection.set(Mutex::new(connection));
         self.wal_diagnostic_connection
             .get()
             .ok_or("connection_open")
@@ -320,7 +314,11 @@ impl Database {
             }
         };
         let checkpoint = match guard.query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
-            Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, i32>(2)?,
+            ))
         }) {
             Ok(values) => values,
             Err(rusqlite::Error::SqliteFailure(failure, _))

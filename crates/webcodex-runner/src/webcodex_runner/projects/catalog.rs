@@ -598,7 +598,6 @@ fn runner_project_summary_with_shutdown(
         allow_patch: project.allow_patch,
         kind: project_wire_kind(project),
         registration_source: Some(registration_source.as_str().to_string()),
-        registration_incarnation: project.registration_incarnation.clone(),
         description: project.description.clone(),
         hooks,
         disabled: project.disabled,

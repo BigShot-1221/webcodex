@@ -1573,10 +1573,6 @@ fn parse_project_summary_from_result(
         Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
     };
     Some(RunnerProjectSummary {
-        registration_incarnation: result
-            .get("registration_incarnation")
-            .and_then(Value::as_str)
-            .map(str::to_string),
         id: agent_project_id.to_string(),
         name: name.or_else(|| Some(agent_project_id.to_string())),
         path: path.to_string(),

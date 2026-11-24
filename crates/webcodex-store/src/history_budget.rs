@@ -185,8 +185,10 @@ impl Drop for HistoryConnectionGuard<'_> {
     fn drop(&mut self) {
         if let Some(timeout) = self.old_busy_timeout {
             if self.sql_profile {
-                self.connection
-                    .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+                let _ = self.connection.trace_v2(
+                    rusqlite::trace::TraceEventCodes::empty(),
+                    None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+                );
             }
             let _ = self.connection.progress_handler(0, None::<fn() -> bool>);
             let _ = self.connection.busy_timeout(timeout);
@@ -277,7 +279,7 @@ impl Database {
             connection.trace_v2(
                 rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
                 Some(profile),
-            );
+            )?;
         }
         Ok(connection)
     }

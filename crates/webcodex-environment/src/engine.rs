@@ -57,6 +57,37 @@ impl<B: EnvironmentBackend> EnvironmentSetup<B> {
         result
     }
 
+    /// Bind an interactive local setup to the exact unfinished journal shown to
+    /// the operator. An absent ID means the operator chose a fresh installation.
+    pub async fn configure_local_if_current(
+        &mut self,
+        store: &EnvironmentStore,
+        expected_pending_id: Option<&str>,
+        request: SetupRequest,
+        secrets: &SetupSecrets,
+        progress: impl FnMut(SetupProgress),
+    ) -> SetupResultValue<SetupResult> {
+        let lock = store.lock()?;
+        let journal = store.load_journal()?;
+        if !request.local_server()
+            || store.load_environment()?.is_some()
+            || migration_journal(store)?.is_some()
+            || journal.as_ref().is_some_and(|j| j.environment.configured)
+            || journal
+                .as_ref()
+                .map(|j| j.environment.environment_id.as_str())
+                != expected_pending_id
+        {
+            return Err(SetupDiagnostic::new(
+                "environment_changed",
+                "The local setup target has changed",
+                "Refresh the computer's setup before continuing.",
+            ));
+        }
+        self.configure_under_lock(store, &lock, request, secrets, progress)
+            .await
+    }
+
     pub(crate) async fn configure_under_lock(
         &mut self,
         store: &EnvironmentStore,
@@ -110,9 +141,25 @@ impl<B: EnvironmentBackend> EnvironmentSetup<B> {
                 .await;
             let result = match reconciled {
                 Ok(Reconciliation::Complete) => Ok(()),
-                Ok(Reconciliation::Unknown) => Err(SetupDiagnostic::new("operation_uncertain", "The previous external operation has an unknown result", "Inspect its actual state before retrying; do not start another instance")),
-                Ok(Reconciliation::Missing) if step == SetupStep::RunnerEnrollment && prior.is_some() && !secrets.replacement_pairing_code => {
-                    Err(SetupDiagnostic::new("pairing_recovery_required", "Pairing may have consumed its code, but saved credentials could not be verified", "Recover the credentials or explicitly resume with a new pairing code"))
+                Ok(Reconciliation::Unknown) => Err(SetupDiagnostic::new(
+                    "operation_uncertain",
+                    "The previous external operation has an unknown result",
+                    "Inspect its actual state before retrying; do not start another instance",
+                )
+                .with_component(step.component_name())
+                .with_stage(step.stage_name())),
+                Ok(Reconciliation::Missing)
+                    if step == SetupStep::RunnerEnrollment
+                        && prior.is_some()
+                        && !secrets.replacement_pairing_code =>
+                {
+                    Err(SetupDiagnostic::new(
+                        "pairing_recovery_required",
+                        "Pairing may have consumed its code, but saved credentials could not be verified",
+                        "Recover the credentials or explicitly resume with a new pairing code",
+                    )
+                    .with_component("auth")
+                    .with_stage(step.stage_name()))
                 }
                 Ok(Reconciliation::Missing) => {
                     journal.steps.insert(step, StepState::Started);
@@ -124,6 +171,9 @@ impl<B: EnvironmentBackend> EnvironmentSetup<B> {
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
+                let error = error
+                    .with_default_stage(step.stage_name())
+                    .with_default_component(step.component_name());
                 journal.last_diagnostic = Some(error.clone());
                 // Preserve the original actionable failure if writing its diagnostic fails.
                 let _ = store.save_journal(&journal);
@@ -137,7 +187,15 @@ impl<B: EnvironmentBackend> EnvironmentSetup<B> {
                 state: StepState::Complete,
             });
         }
-        let observation = self.backend.observe(store, &journal.environment).await?;
+        let observation = self
+            .backend
+            .observe(store, &journal.environment)
+            .await
+            .map_err(|error| {
+                error
+                    .with_default_stage(SetupStep::Readiness.stage_name())
+                    .with_default_component(SetupStep::Readiness.component_name())
+            })?;
         journal.environment.configured = true;
         store.save_journal(&journal)?;
         store.save_environment(&journal.environment)?;
@@ -153,6 +211,17 @@ impl<B: EnvironmentBackend> EnvironmentSetup<B> {
         secrets: &SetupSecrets,
         progress: impl FnMut(SetupProgress),
     ) -> SetupResultValue<SetupResult> {
+        self.resume_if_current(store, None, secrets, progress).await
+    }
+
+    pub async fn resume_if_current(
+        &mut self,
+        store: &EnvironmentStore,
+        expected_id: Option<&str>,
+        secrets: &SetupSecrets,
+        progress: impl FnMut(SetupProgress),
+    ) -> SetupResultValue<SetupResult> {
+        let lock = store.lock()?;
         let journal = store.load_journal()?.ok_or_else(|| {
             SetupDiagnostic::new(
                 "setup_not_found",
@@ -160,7 +229,21 @@ impl<B: EnvironmentBackend> EnvironmentSetup<B> {
                 "Configure this environment first",
             )
         })?;
-        self.configure(store, journal.environment.request, secrets, progress)
+        if let Some(id) = expected_id {
+            if journal.environment.environment_id != id
+                || store
+                    .load_environment()?
+                    .as_ref()
+                    .is_none_or(|record| record.environment_id != id)
+            {
+                return Err(SetupDiagnostic::new(
+                    "environment_changed",
+                    "The saved computer setup changed",
+                    "Refresh before continuing.",
+                ));
+            }
+        }
+        self.configure_under_lock(store, &lock, journal.environment.request, secrets, progress)
             .await
     }
 }

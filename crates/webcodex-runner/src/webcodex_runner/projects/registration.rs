@@ -48,6 +48,9 @@ fn project_registry_config_is_upgradeable(path: &Path) -> Result<(), &'static st
     if metadata.file_type().is_symlink() {
         return Err("project_registry_symlink");
     }
+    if !metadata.file_type().is_file() {
+        return Err("project_registry_unavailable");
+    }
     Ok(())
 }
 
@@ -107,22 +110,27 @@ pub(crate) fn load_runner_project_registry_record(
     let _registry_guard = project_registry_write_lock()
         .lock()
         .map_err(|_| "project registry lock unavailable".to_string())?;
+    load_runner_project_registry_record_locked(path).map(|(project, _)| project)
+}
+
+/// Call only while holding the registry write lock. The returned TOML is the
+/// exact current record (including any durable legacy identity upgrade), so
+/// revision-fenced edits never act on a stale pre-migration snapshot.
+pub(super) fn load_runner_project_registry_record_locked(
+    path: &Path,
+) -> Result<(RunnerProjectFile, String), String> {
     project_registry_config_is_upgradeable(path).map_err(|code| code.to_string())?;
-    let refreshed =
-        std::fs::read_to_string(path).map_err(|error| format!("failed to read project config: {error}"))?;
-    let refreshed_project = parse_runner_project_toml(&refreshed)?;
-    if let Some(existing) = refreshed_project.registration_incarnation.as_deref() {
-        if valid_registration_incarnation(existing) {
-            return Ok(refreshed_project);
-        }
-        return Err("registration_incarnation is invalid".to_string());
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read project config: {error}"))?;
+    let mut project = parse_runner_project_toml(&content)?;
+    if project.registration_incarnation.is_some() {
+        return Ok((project, content));
     }
     let incarnation = mint_registration_incarnation();
-    let migrated = append_registration_incarnation_to_toml(&refreshed, &incarnation)?;
+    let migrated = append_registration_incarnation_to_toml(&content, &incarnation)?;
     write_registry_record_atomic(path, &migrated)?;
-    let mut upgraded = refreshed_project;
-    upgraded.registration_incarnation = Some(incarnation);
-    Ok(upgraded)
+    project.registration_incarnation = Some(incarnation);
+    Ok((project, migrated))
 }
 
 /// Windows-only raw/canonical namespace fence. Local disks plus UNC and
@@ -441,7 +449,7 @@ pub(super) fn write_project_toml_atomic(
     })
 }
 
-pub(super) fn load_project_files_for_path_resolution(
+pub(super) fn load_project_files_for_path_resolution_locked(
     project_registry_dir: &Path,
 ) -> Result<Vec<RunnerProjectFile>, &'static str> {
     let entries = match std::fs::read_dir(project_registry_dir) {
@@ -462,7 +470,9 @@ pub(super) fn load_project_files_for_path_resolution(
     let mut projects = Vec::with_capacity(files.len());
     for file in files {
         let project =
-            load_runner_project_registry_record(&file).map_err(|_| "project_registry_unavailable")?;
+            load_runner_project_registry_record_locked(&file)
+                .map(|(project, _)| project)
+                .map_err(|_| "project_registry_unavailable")?;
         projects.push(project);
     }
     Ok(projects)
@@ -630,6 +640,7 @@ fn path_resolution_success(
         "disabled": project.disabled,
         "revision": project_revision(project),
         "root_fingerprint": project_root_fingerprint(canonical_path),
+        "registration_incarnation": project.registration_incarnation,
         "lineage": project_lineage(project),
         "source": "path",
         "outcome": outcome,
@@ -718,7 +729,7 @@ pub(crate) fn handle_resolve_or_register_project_operation(
             )
         }
     };
-    if payload.len() != 1 {
+    if payload.is_empty() || payload.len() > 2 {
         return structured_project_error_cmd(
             start,
             "invalid_request",
@@ -736,6 +747,59 @@ pub(crate) fn handle_resolve_or_register_project_operation(
                 "invalid_project_path",
                 false,
                 serde_json::json!({"field": "path"}),
+            )
+        }
+    };
+    // Optional project-share parent-root grant forwarded by the Server. The
+    // Server owns the grant; the Runner re-derives the admission decision
+    // against its own filesystem view of the committed target before its
+    // first side effect (the registry write below), so a path that resolves
+    // differently here than it did at the Server fence fails closed.
+    // Ordinary credentials omit the field and keep the exact previous
+    // behavior. Empty or non-absolute entries fail closed.
+    let granted_roots = match payload.get("project_root_scopes") {
+        None => {
+            if payload.len() != 1 {
+                return structured_project_error_cmd(
+                    start,
+                    "invalid_request",
+                    false,
+                    serde_json::json!({}),
+                );
+            }
+            None
+        }
+        Some(serde_json::Value::Array(items)) => {
+            if items.is_empty() {
+                return structured_project_error_cmd(
+                    start,
+                    "invalid_request",
+                    false,
+                    serde_json::json!({}),
+                );
+            }
+            let mut roots = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(root) = item.as_str().filter(|root| {
+                    !root.is_empty() && !root.contains('\0') && Path::new(root).is_absolute()
+                }) else {
+                    return structured_project_error_cmd(
+                        start,
+                        "invalid_request",
+                        false,
+                        serde_json::json!({"field": "project_root_scopes"}),
+                    );
+                };
+                roots.push(PathBuf::from(root));
+            }
+            Some(roots)
+        }
+        Some(_) => {
+            return structured_project_error_cmd(
+                start,
+                "invalid_request",
+                false,
+                serde_json::json!({}),
             )
         }
     };
@@ -805,8 +869,33 @@ pub(crate) fn handle_resolve_or_register_project_operation(
             serde_json::json!({"field": "path"}),
         );
     }
+    if let Some(granted_roots) = &granted_roots {
+        // Share-grant admission is judged on the Runner's own canonical
+        // resolution of the committed target, component-wise against the
+        // Server-granted roots. Both sides are compared in canonical form so a
+        // text difference (an unresolved component, or a Windows verbatim
+        // namespace prefix) cannot decide admission; a root this Runner cannot
+        // resolve stays denied.
+        // This is the last gate before any resolution outcome below: neither an
+        // existing registration nor a fresh registration may be resolved outside
+        // the grant, and the Runner filesystem allowed_roots above is a coarser
+        // boundary that never substitutes for it.
+        let admitted = granted_roots.iter().any(|root| {
+            canonicalize_existing(root).is_ok_and(|root| {
+                webcodex_runner_config::paths::path_is_within(&canonical_path, &root)
+            })
+        });
+        if !admitted {
+            return structured_project_error_cmd(
+                start,
+                "project_path_outside_granted_roots",
+                false,
+                serde_json::json!({"field": "path"}),
+            );
+        }
+    }
 
-    let projects = match load_project_files_for_path_resolution(project_registry_dir) {
+    let projects = match load_project_files_for_path_resolution_locked(project_registry_dir) {
         Ok(projects) => projects,
         Err(error_kind) => {
             return structured_project_error_cmd(start, error_kind, false, serde_json::json!({}))
@@ -840,6 +929,11 @@ pub(crate) fn handle_resolve_or_register_project_operation(
         &description,
         true,
     );
+    let mut toml_content = toml_content;
+    toml_content.push_str(&format!(
+        "registration_incarnation = \"{}\"\n",
+        uuid::Uuid::new_v4()
+    ));
     let write_result =
         match write_project_toml_atomic(project_registry_dir, &project_id, &toml_content, false) {
             Ok(result) => result,
@@ -847,7 +941,7 @@ pub(crate) fn handle_resolve_or_register_project_operation(
                 // A different process may have won publication. Rescan under
                 // our process-local lock and converge if it registered the
                 // same canonical directory.
-                if let Ok(projects) = load_project_files_for_path_resolution(project_registry_dir) {
+                if let Ok(projects) = load_project_files_for_path_resolution_locked(project_registry_dir) {
                     let matches = projects_matching_canonical_path(&projects, &canonical_path);
                     if let Some(result) =
                         existing_path_resolution_result(start, client_id, &canonical_path, matches)

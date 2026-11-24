@@ -198,6 +198,7 @@ async fn register_plugin_runner_with_status(
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 client_id: client_id.to_string(),
                 runner_instance_id: runner_instance_id.to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -230,6 +231,7 @@ async fn register_non_plugin_runner_for_owner(
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 client_id: client_id.to_string(),
                 runner_instance_id: runner_instance_id.to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -611,9 +613,12 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
         )
         .await;
         match outcome {
-            McpOutcome::Forbidden { required_scope, .. } => {
-                assert_eq!(required_scope, Some(required));
-            }
+            McpOutcome::Ok(body) => super::fixed_scope::assert_fixed_scope_failure(
+                &body,
+                required,
+                false,
+                "fixed token",
+            ),
             other => panic!("plugin:inspect must not escalate to {required}: {other:?}"),
         }
     }
@@ -664,9 +669,12 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
         )
         .await;
         match outcome {
-            McpOutcome::Forbidden { required_scope, .. } => {
-                assert_eq!(required_scope, Some(crate::auth::SCOPE_PLUGIN_MANAGE));
-            }
+            McpOutcome::Ok(body) => super::fixed_scope::assert_fixed_scope_failure(
+                &body,
+                crate::auth::SCOPE_PLUGIN_MANAGE,
+                false,
+                "fixed token",
+            ),
             other => panic!("plugin:invoke must not manage Plugins: {other:?}"),
         }
     }
@@ -689,9 +697,12 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
     )
     .await;
     match manage_call {
-        McpOutcome::Forbidden { required_scope, .. } => {
-            assert_eq!(required_scope, Some(crate::auth::SCOPE_PLUGIN_INVOKE));
-        }
+        McpOutcome::Ok(body) => super::fixed_scope::assert_fixed_scope_failure(
+            &body,
+            crate::auth::SCOPE_PLUGIN_INVOKE,
+            false,
+            "fixed token",
+        ),
         other => panic!("plugin:manage must not imply plugin:invoke: {other:?}"),
     }
 
@@ -2105,7 +2116,10 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
         .iter()
         .find(|tool| tool["name"] == crate::plugin_gateway::PLUGIN_TOOL_NAME)
         .expect("plugin_tool after Runner registration");
-    assert_eq!(gateway["inputSchema"], output["input_schema"]);
+    assert_eq!(
+        super::cli::business_schema_without_sidecars(&gateway["inputSchema"]),
+        output["input_schema"]
+    );
     assert!(!listed["result"]["tools"]
         .as_array()
         .unwrap()
@@ -2753,7 +2767,15 @@ async fn plugin_binding_rechecks_scope_and_runner_owner_without_invalidating_own
         Some(&plugin_auth_for("alice", false)),
     )
     .await;
-    assert!(matches!(no_scope, McpOutcome::Forbidden { .. }));
+    let McpOutcome::Ok(no_scope) = no_scope else {
+        panic!("missing plugin scope must return a failed MCP result");
+    };
+    super::fixed_scope::assert_fixed_scope_failure(
+        &no_scope,
+        crate::auth::SCOPE_PLUGIN_INVOKE,
+        false,
+        "fixed token",
+    );
 
     let bob = plugin_auth_for("bob", true);
     let bob_result = handle_mcp_request(

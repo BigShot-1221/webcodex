@@ -8,23 +8,27 @@
 
 mod cargo_test_assertions;
 mod project_validation;
+mod typed_observations;
 
 use super::support::*;
-use crate::runner_http::{ShellJobStartMetadata, ShellJobVisibility};
+use crate::runner_http::ShellJobVisibility;
 use crate::runner_protocol::{
     RunnerCapabilities, RunnerJobUpdateRequest, ShellCommandExecutionState, ShellJobActivity,
-    ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState, ShellJobOpRequest,
+    ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
     ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
     JOB_INVENTORY_MAX_TERMINAL_JOBS, VALIDATION_STEP_SPAWN_FAILED_CODE,
     VALIDATION_STEP_WAIT_FAILED_CODE, VALIDATION_TOOL_UNAVAILABLE_CODE,
 };
-use crate::tool_runtime::sessions::{SessionTransport, DEFAULT_MAX_EVENTS_PER_SESSION};
+use crate::tool_runtime::sessions::{SessionTransport, DEFAULT_RECENT_EVENT_LIMIT};
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::{ObserveJobsItem, ObserveJobsWakeOn, ToolCall, ToolRuntime};
 use serde_json::json;
 use webcodex_core::project_validation::{
     ProjectValidationAction, ProjectValidationPlan, ProjectValidationPlanningResult,
     ProjectValidationProvenance, ProjectValidationRequest, ProjectValidationScope,
+};
+use webcodex_runner_registry::{
+    JobStartContext, JobStartExecution, JobStartRequest, JobValidationPlan,
 };
 
 /// Fetch the `start_validation_job` request that the agent should have polled
@@ -83,6 +87,10 @@ pub(super) async fn complete_project_validation_plan_request(
             .as_ref()
             .and_then(|test| test.filter.as_deref()),
     )
+    .unwrap()
+    .with_dependency_policy(semantic.dependency_policy)
+    .unwrap()
+    .with_dependency_resolution_policy(semantic.dependency_resolution_policy)
     .unwrap();
     let adapter = operation.evidence_profile();
     let step = if backend == "node" && check == webcodex_validation::SemanticCheck::Test {
@@ -236,25 +244,20 @@ pub(super) fn cargo_test_update(
             source: ShellJobActivitySource::ValidationPlan,
         });
     RunnerJobUpdateRequest {
-        client_id: client_id.to_string(),
-        runner_instance_id: "inst".to_string(),
-        update_seq: None,
-        job_id: job_id.to_string(),
         request_id: Some(request_id.to_string()),
-        status: status.to_string(),
         stdout_chunk: (!stdout_chunk.is_empty()).then(|| stdout_chunk.to_string()),
         stderr_chunk: (!stderr_chunk.is_empty()).then(|| stderr_chunk.to_string()),
-        log_snapshot: None,
         exit_code,
         duration_ms: Some(25),
-        error: None,
-        command_execution_state: None,
         validation_progress: Some(progress),
-        test_count_evidence: None,
-        format_mutation: None,
-        build_artifacts: None,
         activity,
-        finished,
+        ..runner_job_update(
+            client_id.to_string(),
+            "inst".to_string(),
+            job_id.to_string(),
+            status.to_string(),
+            finished,
+        )
     }
 }
 
@@ -347,46 +350,43 @@ async fn seed_retained_terminal_validation_job(
     };
     let job = runtime
         .runner_registry
-        .start_job_with_metadata(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some(client_id.to_string()),
+        .start_job(
+            JobStartRequest {
+                timeout_secs: 600,
                 cwd: Some("/tmp/agent-proj".to_string()),
-                command: Some("cargo check --all-targets".to_string()),
-                timeout_secs: Some(600),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
+                context: JobStartContext {
+                    project_id: Some(project.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    project_cwd: Some("/tmp/agent-proj".to_string()),
+                    purpose: Some("validation".to_string()),
+                    shell: Some("bash".to_string()),
+                    visibility: ShellJobVisibility::Public,
+                    ..Default::default()
+                },
+                ..JobStartRequest::new(
+                    client_id.to_string(),
+                    JobStartExecution::Validation {
+                        plan: JobValidationPlan::Metadata(ShellJobValidationMetadata {
+                            project_validation: None,
+                            source_fence: None,
+                            tool: "cargo_check".to_string(),
+                            kind: "check".to_string(),
+                            steps: vec![step],
+                            effective_timeout_secs: 600,
+                            sync_wait_secs: 10,
+                            adapter: "cargo_check".to_string(),
+                            validation_target_id: Some(validation_target_id.clone()),
+                            minimum_tests: None,
+                            require_tests: None,
+                            no_run: None,
+                        }),
+                        ssh_resource: None,
+                    },
+                )
             },
             "validation-stale-snapshot-test".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(project.to_string()),
-                session_id: Some(session_id.to_string()),
-                project_cwd: Some("/tmp/agent-proj".to_string()),
-                purpose: Some("validation".to_string()),
-                shell: Some("bash".to_string()),
-                validation_steps: vec![step.clone()],
-                validation: Some(ShellJobValidationMetadata {
-                    project_validation: None,
-                    source_fence: None,
-                    tool: "cargo_check".to_string(),
-                    kind: "check".to_string(),
-                    steps: vec![step],
-                    effective_timeout_secs: 600,
-                    sync_wait_secs: 10,
-                    adapter: "cargo_check".to_string(),
-                    validation_target_id: Some(validation_target_id.clone()),
-                    minimum_tests: None,
-                    require_tests: None,
-                    no_run: None,
-                }),
-                visibility: ShellJobVisibility::Public,
-                ..Default::default()
-            },
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -416,16 +416,22 @@ async fn seed_retained_terminal_validation_job(
         )
         .await;
     let status = runtime
-        .job_status_for_auth(job.job_id.clone(), false, None)
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["terminal"], true);
+        .query_job_status_for_auth(&job.job_id, None)
+        .await
+        .unwrap();
+    let status_validation = status.validation.unwrap().into_value();
+    assert!(
+        webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::from_wire(&status.job.status)
+            .unwrap()
+            .is_terminal()
+    );
     assert_eq!(
-        status.output["validation"]["validation_target_id"],
+        status_validation["validation_target_id"],
         validation_target_id
     );
-    let ended_at = status.output["ended_at"]
-        .as_i64()
+    let ended_at = status
+        .job
+        .ended_at
         .expect("terminal seeded Job must expose ended_at");
     SeededTerminalValidationJob {
         job_id: job.job_id,
@@ -547,6 +553,7 @@ async fn go_test_rejects_empty_or_oversized_package_lists_before_dispatch() {
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
             project_all_packages_v1: false,
+            project_workspace_exclusions_v1: false,
             structured_go_test_tool: true,
             ..Default::default()
         },
@@ -664,6 +671,7 @@ async fn fast_go_test_uses_exact_structured_argv_cwd_and_records_session_evidenc
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
             project_all_packages_v1: false,
+            project_workspace_exclusions_v1: false,
             structured_go_test_tool: true,
             ..Default::default()
         },
@@ -768,6 +776,7 @@ async fn go_test_failure_reports_failed_test_identity_in_result_and_session() {
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
             project_all_packages_v1: false,
+            project_workspace_exclusions_v1: false,
             structured_go_test_tool: true,
             ..Default::default()
         },
@@ -848,6 +857,7 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
             project_validation_v1: false,
             project_validation_package_scope_v1: false,
             project_all_packages_v1: false,
+            project_workspace_exclusions_v1: false,
             structured_go_test_tool: true,
             structured_go_test_packages: true,
             ..Default::default()
@@ -902,6 +912,7 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
+                page: false,
                 job_id: job_id.clone(),
                 after_observation_token: Some(observation_token.clone()),
                 observation_ref: None,
@@ -1283,6 +1294,7 @@ async fn default_cargo_check_handoff_preserves_same_execution_through_terminal()
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
+                page: false,
                 job_id: job_id.clone(),
                 after_observation_token: Some(observation_token.clone()),
                 observation_ref: None,
@@ -1328,12 +1340,16 @@ async fn default_cargo_check_handoff_preserves_same_execution_through_terminal()
         )
         .await;
     let terminal = runtime
-        .job_status_for_auth(job_id.clone(), false, None)
-        .await;
-    assert!(terminal.success, "{:?}", terminal.error);
-    assert_eq!(terminal.output["job_id"], job_id);
-    assert_eq!(terminal.output["status"], "completed");
-    assert_eq!(terminal.output["terminal"], true);
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    assert_eq!(terminal.job.job_id, job_id);
+    assert_eq!(terminal.job.status, "completed");
+    assert!(
+        webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::from_wire(&terminal.job.status)
+            .unwrap()
+            .is_terminal()
+    );
     assert!(
         probe_patch_agent_request(&runtime, client_id)
             .await
@@ -1509,12 +1525,16 @@ async fn default_validation_handoff_beats_host_like_observation_deadline() {
 
     completion.await.unwrap();
     let terminal = runtime
-        .job_status_for_auth(job_id.clone(), false, None)
-        .await;
-    assert!(terminal.success, "{:?}", terminal.error);
-    assert_eq!(terminal.output["job_id"], job_id);
-    assert_eq!(terminal.output["status"], "completed");
-    assert_eq!(terminal.output["terminal"], true);
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    assert_eq!(terminal.job.job_id, job_id);
+    assert_eq!(terminal.job.status, "completed");
+    assert!(
+        webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::from_wire(&terminal.job.status)
+            .unwrap()
+            .is_terminal()
+    );
 }
 
 /// Auto handoff: a validation still running when the injected sync window
@@ -1579,6 +1599,7 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
+                page: false,
                 job_id: job_id.clone(),
                 after_observation_token: Some(observation_token.clone()),
                 observation_ref: None,
@@ -1609,22 +1630,27 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
 
     // Job is immediately queryable and still active.
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, None)
-        .await;
-    assert!(status.success);
-    assert_eq!(status.output["status"], "running");
-    assert_eq!(status.output["active"], true);
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    let status_validation = status.validation.unwrap().into_value();
+    assert_eq!(status.job.status, "running");
+    assert!(
+        webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::from_wire(&status.job.status)
+            .unwrap()
+            .is_active()
+    );
     assert_eq!(
-        status.output["activity"],
+        serde_json::to_value(&status.job.activity).unwrap(),
         json!({
             "state": "working",
             "phase": "validation_test",
             "source": "validation_plan"
         })
     );
-    assert_eq!(status.output["validation"]["tool"], "cargo_test");
-    assert_eq!(status.output["validation"]["kind"], "test");
-    assert_eq!(status.output["validation"]["state"], "running");
+    assert_eq!(status_validation["tool"], "cargo_test");
+    assert_eq!(status_validation["kind"], "test");
+    assert_eq!(status_validation["state"], "running");
     let log = runtime
         .job_log_for_auth(job_id.clone(), None, Some(200), None, None, None)
         .await;
@@ -1641,10 +1667,11 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
             "source": "validation_plan"
         })
     );
-    assert_eq!(log.output["validation"], status.output["validation"]);
+    assert_eq!(log.output["validation"], status_validation);
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
+                page: false,
                 job_id,
                 after_observation_token: Some(observation_token),
                 observation_ref: None,
@@ -1834,23 +1861,28 @@ async fn handoff_job_terminal_success_produces_passed_validation_summary() {
 
     // Job status terminal + structured counts.
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, None)
-        .await;
-    assert!(status.success);
-    assert_eq!(status.output["status"], "completed");
-    assert_eq!(status.output["terminal"], true);
-    assert_eq!(status.output["validation"]["tool"], "cargo_test");
-    assert_eq!(status.output["validation"]["kind"], "test");
-    assert_eq!(status.output["validation"]["passed"], true);
-    assert_eq!(status.output["validation"]["tests_detected"], true);
-    assert_eq!(status.output["validation"]["tests_run_count"], 3);
-    assert_eq!(status.output["validation"]["tests_passed"], 3);
-    assert_eq!(status.output["validation"]["tests_failed"], 0);
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    let status_validation = status.validation.unwrap().into_value();
+    assert_eq!(status.job.status, "completed");
+    assert!(
+        webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::from_wire(&status.job.status)
+            .unwrap()
+            .is_terminal()
+    );
+    assert_eq!(status_validation["tool"], "cargo_test");
+    assert_eq!(status_validation["kind"], "test");
+    assert_eq!(status_validation["passed"], true);
+    assert_eq!(status_validation["tests_detected"], true);
+    assert_eq!(status_validation["tests_run_count"], 3);
+    assert_eq!(status_validation["tests_passed"], 3);
+    assert_eq!(status_validation["tests_failed"], 0);
     let log = runtime
         .job_log_for_auth(job_id.clone(), None, Some(200), None, None, None)
         .await;
     assert!(log.success);
-    assert_eq!(log.output["validation"], status.output["validation"]);
+    assert_eq!(log.output["validation"], status_validation);
 
     // The session validation summary reflects the real terminal result. The
     // handoff itself is non-terminal (accepted as a job), so the summary must
@@ -1869,7 +1901,7 @@ async fn handoff_job_terminal_success_produces_passed_validation_summary() {
     assert_eq!(latest["exit_code"], 0);
     assert_eq!(
         latest["tests_run_count"],
-        status.output["validation"]["tests_run_count"]
+        status_validation["tests_run_count"]
     );
 }
 
@@ -2000,6 +2032,7 @@ async fn e3_cargo_test_lib_handoff_arms_terminal_attention_without_polling() {
         .dispatch_with_auth(
             ToolCall::ObserveJobs {
                 items: vec![ObserveJobsItem {
+                    page: false,
                     job_id: job_id.clone(),
                     after_observation_token: None,
                     observation_ref: None,
@@ -2115,15 +2148,9 @@ async fn stale_validation_terminal_snapshot_cannot_evict_newer_materialization_m
         .get(&session_id)
         .expect("new authoritative candidate snapshot");
     assert_eq!(newer_candidates.len(), JOB_INVENTORY_MAX_TERMINAL_JOBS);
-    assert!(newer_candidates
-        .iter()
-        .all(|job| job["job_id"].as_str() != Some(j0.job_id.as_str())));
-    assert!(newer_candidates
-        .iter()
-        .any(|job| job["job_id"].as_str() == Some(jold.job_id.as_str())));
-    assert!(newer_candidates
-        .iter()
-        .any(|job| job["job_id"].as_str() == Some(jnew.job_id.as_str())));
+    assert!(newer_candidates.iter().all(|job| job.job_id != j0.job_id));
+    assert!(newer_candidates.iter().any(|job| job.job_id == jold.job_id));
+    assert!(newer_candidates.iter().any(|job| job.job_id == jnew.job_id));
 
     let newer_reconciliation = tokio::spawn({
         let runtime = runtime.clone();
@@ -2151,7 +2178,7 @@ async fn stale_validation_terminal_snapshot_cannot_evict_newer_materialization_m
 
     let materialized = runtime
         .sessions
-        .summary(&session_id, Some(DEFAULT_MAX_EVENTS_PER_SESSION))
+        .summary(&session_id, Some(DEFAULT_RECENT_EVENT_LIMIT))
         .unwrap();
     for job in [&jold, &jnew] {
         assert_eq!(
@@ -2184,7 +2211,7 @@ async fn stale_validation_terminal_snapshot_cannot_evict_newer_materialization_m
         .await;
     let after_repeat = runtime
         .sessions
-        .summary(&session_id, Some(DEFAULT_MAX_EVENTS_PER_SESSION))
+        .summary(&session_id, Some(DEFAULT_RECENT_EVENT_LIMIT))
         .unwrap();
     assert_eq!(after_repeat.events_total, events_total_before_repeat);
     assert_eq!(
@@ -2361,7 +2388,7 @@ async fn async_same_cargo_check_target_success_resolves_prior_failure_without_du
     // the authoritative Job registry. The retained Job must remain a candidate,
     // but reconciliation must not resurrect its terminal evidence or refresh
     // Session activity merely because a read path ran later.
-    for index in 0..=DEFAULT_MAX_EVENTS_PER_SESSION {
+    for index in 0..=DEFAULT_RECENT_EVENT_LIMIT {
         let started = runtime.sessions.record_tool_call_started(
             Some(&session_id),
             SessionTransport::Api,
@@ -2385,7 +2412,7 @@ async fn async_same_cargo_check_target_success_resolves_prior_failure_without_du
         .get(&session_id)
         .into_iter()
         .flatten()
-        .any(|job| job["job_id"].as_str() == Some(success_job_id.as_str())));
+        .any(|job| job.job_id == success_job_id));
     let events_total_before_repeat = evicted.events_total;
     let updated_at_before_repeat = evicted.updated_at;
     let _ = runtime
@@ -2489,18 +2516,19 @@ async fn partial_agent_status_is_conservative_while_delta_log_uses_frozen_valida
         .await;
 
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, Some(&auth))
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["validation"]["passed"], true);
-    assert_eq!(status.output["validation"]["truncated"], true);
+        .query_job_status_for_auth(&job_id, Some(&auth))
+        .await
+        .unwrap();
+    let status_validation = status.validation.unwrap().into_value();
+    assert_eq!(status_validation["passed"], true);
+    assert_eq!(status_validation["truncated"], true);
     for field in [
         "tests_run_count",
         "tests_passed",
         "tests_failed",
         "zero_tests_run",
     ] {
-        assert!(status.output["validation"][field].is_null(), "{field}");
+        assert!(status_validation[field].is_null(), "{field}");
     }
 
     let log = runtime
@@ -2602,13 +2630,14 @@ async fn handoff_job_terminal_failure_is_validation_failed_not_timeout() {
         .await;
 
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, None)
-        .await;
-    assert!(status.success);
-    assert_eq!(status.output["status"], "failed");
-    assert_eq!(status.output["validation"]["passed"], false);
-    assert_eq!(status.output["validation"]["tests_failed"], 1);
-    assert_eq!(status.output["validation"]["tests_passed"], 0);
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    let status_validation = status.validation.unwrap().into_value();
+    assert_eq!(status.job.status, "failed");
+    assert_eq!(status_validation["passed"], false);
+    assert_eq!(status_validation["tests_failed"], 1);
+    assert_eq!(status_validation["tests_passed"], 0);
 }
 
 /// A real total-runtime timeout (job reaches `timeout`) must be classified as
@@ -2651,15 +2680,20 @@ async fn handoff_job_total_timeout_is_classified_timeout() {
         .await;
 
     let status = runtime
-        .job_status_for_auth(job_id.clone(), false, None)
-        .await;
-    assert!(status.success);
-    assert_eq!(status.output["status"], "timeout");
-    assert_eq!(status.output["terminal"], true);
-    assert_eq!(status.output["validation"]["state"], "timed_out");
-    assert!(status.output["validation"]["passed"].is_null());
-    assert!(status.output["validation"]["warnings_count"].is_null());
-    assert!(status.output["validation"]["errors_count"].is_null());
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .unwrap();
+    let status_validation = status.validation.unwrap().into_value();
+    assert_eq!(status.job.status, "timeout");
+    assert!(
+        webcodex_core::runner_job_lifecycle::RunnerJobLifecycle::from_wire(&status.job.status)
+            .unwrap()
+            .is_terminal()
+    );
+    assert_eq!(status_validation["state"], "timed_out");
+    assert!(status_validation["passed"].is_null());
+    assert!(status_validation["warnings_count"].is_null());
+    assert!(status_validation["errors_count"].is_null());
 }
 
 /// Explicit short timeout: a requested budget at or below the sync window
@@ -3015,12 +3049,10 @@ async fn cancel_running_before_handoff_retains_record_until_runner_stops() {
         .await
         .expect("cleanup-pending job must remain internally queryable");
     assert_eq!(hidden.status, "stop_requested");
-    assert!(
-        !runtime
-            .job_status_for_auth(job_id.clone(), false, None)
-            .await
-            .success
-    );
+    assert!(runtime
+        .query_job_status_for_auth(&job_id, None)
+        .await
+        .is_err());
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 
     runtime
@@ -3200,16 +3232,15 @@ async fn cargo_fmt_ensure_formatted_ignores_sync_wait_and_skips_mutation_when_al
     runtime
         .runner_registry
         .complete(crate::runner_protocol::RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some("".to_string()),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(5),
-            error: None,
+            ..runner_result_request(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.request_id,
+            )
         })
         .await
         .unwrap();

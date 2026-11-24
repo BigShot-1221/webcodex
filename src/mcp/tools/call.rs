@@ -10,6 +10,10 @@ use surface::RuntimeSurface;
 
 struct CallContext<'a> {
     runtime: &'a ToolRuntime,
+    surface: crate::mcp::request_policy::McpSurface,
+    exposure: crate::mcp::tool_exposure::ToolExposure,
+    default_project: Option<&'a str>,
+    text_json_compat: bool,
     id: Option<Value>,
     auth: Option<&'a AuthContext>,
     stateless_2026: bool,
@@ -34,6 +38,73 @@ struct ParsedCall {
     result_presentation: McpToolResultPresentation,
 }
 
+/// Frame an already-denied tools/call scope check without dispatching or granting authority.
+fn tool_scope_denied(
+    context: &CallContext<'_>,
+    lifecycle: Option<&ToolRequestLifecycle>,
+    required_scope: Option<&'static str>,
+    description: impl Into<String>,
+) -> McpOutcome {
+    let description = description.into();
+    let fixed_credential = context.auth.is_some_and(|auth| !auth.is_oauth_token());
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.dispatch_failed("forbidden");
+        lifecycle.dispatch_finished(
+            fixed_credential,
+            Some(false),
+            if fixed_credential {
+                "tool_error"
+            } else {
+                "forbidden"
+            },
+        );
+    }
+    if !fixed_credential {
+        return scope_forbidden(context.auth, required_scope, description);
+    }
+    let recovery = match context.auth.map(|auth| auth.kind) {
+        Some(crate::auth::AuthKind::ApiToken) =>
+            "Use a token issued with the required scope; this fixed token cannot add scopes through OAuth.",
+        Some(crate::auth::AuthKind::SharedKey) =>
+            "Check the shared-key connection identity and its fixed permission profile; use an authorized credential.",
+        Some(crate::auth::AuthKind::ProjectCredential) =>
+            "Check the project credential grant with its issuer; use an authorized credential.",
+        _ => "Check the current connection identity and permissions; use an authorized credential.",
+    };
+    let mut output = json!({
+        "error_kind": "insufficient_scope",
+        "execution_started": false,
+        "recovery": recovery,
+    });
+    let missing_scope = if let Some(scope) = required_scope {
+        output["missing_scope"] = json!(scope);
+        format!("missing_scope={scope}; ")
+    } else {
+        String::new()
+    };
+    let result = ToolResult::err_with_output(
+        format!(
+            "insufficient_scope: {missing_scope}execution_started=false. {description}. {recovery}"
+        ),
+        output,
+    );
+    // Keep isError=true even for OpenAI structured-failure compatibility.
+    // Hosts that hide structuredContent on errors still receive every failure fact in text.
+    let result = mcp_runtime_tool_result_fallback(
+        result,
+        context.text_json_compat,
+        McpToolResultPresentation::Standard,
+    );
+    McpOutcome::Ok(rpc_result(
+        context.id.clone(),
+        if context.stateless_2026 {
+            mcp_stateless_result(result, false)
+        } else {
+            result
+        },
+    ))
+}
+
 pub(in crate::mcp) async fn handle_call(
     runtime: &ToolRuntime,
     request_params: Value,
@@ -47,6 +118,9 @@ pub(in crate::mcp) async fn handle_call(
     lifecycle: Option<&mut ToolRequestLifecycle>,
     model_ergonomics_out: Option<&mut Option<ModelErgonomicsRecord>>,
     correlation_out: Option<&mut crate::tool_runtime::ToolCallCorrelation>,
+    surface: crate::mcp::request_policy::McpSurface,
+    default_project: Option<&str>,
+    text_json_compat: bool,
 ) -> McpOutcome {
     if let Some(name) = request_params.get("name").and_then(Value::as_str) {
         if super::super::workbench::is_adapter_tool(name) {
@@ -84,6 +158,13 @@ pub(in crate::mcp) async fn handle_call(
     }
     let context = CallContext {
         runtime,
+        surface,
+        exposure: runtime
+            .runtime_info
+            .mcp_tool_exposure
+            .resolve(surface, auth),
+        default_project,
+        text_json_compat,
         id,
         auth,
         stateless_2026,
@@ -128,12 +209,16 @@ impl ParsedCall {
         diagnostics: &mut CallDiagnostics<'_>,
         request_params: Value,
     ) -> Result<Self, McpOutcome> {
-        let runtime = context.runtime;
         let stateless_2026 = context.stateless_2026;
         let app_enabled = context.app_enabled;
         let id = context.id.clone();
         let lifecycle = &mut diagnostics.lifecycle;
-        let result_presentation = McpToolResultPresentation::from_request_params(&request_params);
+        let cli = context.surface == crate::mcp::request_policy::McpSurface::Cli;
+        let result_presentation = if cli {
+            McpToolResultPresentation::Standard
+        } else {
+            McpToolResultPresentation::from_request_params(&request_params)
+        };
         if let (Some(lc), Some(name), Some(arguments)) = (
             lifecycle.as_deref(),
             request_params.get("name").and_then(Value::as_str),
@@ -178,6 +263,24 @@ impl ParsedCall {
         // their existing bounded audit projections below.
         let raw_mcp_arguments = params.arguments.clone();
         let via_adaptive_runtime_gateway = params.name == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
+        if cli && params.arguments.get("_wc").is_some() {
+            return Err(McpOutcome::BadRequest(rpc_error(
+                id,
+                -32602,
+                "Invocation sidecars are unavailable on the execution-only CLI surface",
+            )));
+        }
+        if cli {
+            if let Some(key) =
+                crate::mcp::cli::unavailable_argument(&params.name, &params.arguments)
+            {
+                return Err(McpOutcome::BadRequest(rpc_error(
+                    id,
+                    -32602,
+                    format!("{key} is unavailable on the execution-only CLI surface"),
+                )));
+            }
+        }
         let stale_contract_target = if via_adaptive_runtime_gateway {
             params
                 .arguments
@@ -189,11 +292,17 @@ impl ParsedCall {
         };
         let stale_contract_fields =
             mcp_legacy_invocation_contract_fields(stale_contract_target, &params.arguments);
-        let stale_contract_target_admitted = matches!(
-            mcp_adaptive_runtime_gateway_target_route(stale_contract_target, stateless_2026),
-            crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
-                | crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Direct
-        )
+        let stale_contract_target_admitted = !cli
+            && context.exposure.allows(stale_contract_target)
+            && (if via_adaptive_runtime_gateway {
+                matches!(
+                    mcp_adaptive_runtime_gateway_target_route(stale_contract_target, stateless_2026),
+                    crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
+                        | crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Direct
+                ) && !(context.app_enabled && presentation::tool_requires_direct_app_presentation(stale_contract_target))
+            } else {
+                context.exposure.is_direct(context.surface, stale_contract_target)
+            })
             && crate::tool_runtime::kernel::runtime_tool_scope_allows_discovery(
                 context.auth,
                 stale_contract_target,
@@ -240,7 +349,7 @@ impl ParsedCall {
         let invocation = match parse_mcp_invocation_envelope(
             &params.name,
             &mut params.arguments,
-            stateless_2026,
+            stateless_2026 && !cli,
         ) {
             Ok(invocation) => invocation,
             Err(message) => {
@@ -251,6 +360,22 @@ impl ParsedCall {
                 return Err(McpOutcome::BadRequest(rpc_error(id, -32602, message)));
             }
         };
+        if invocation
+            .metadata
+            .control
+            .as_ref()
+            .is_some_and(|sidecars| {
+                sidecars
+                    .canonical_tools()
+                    .any(|name| !context.exposure.allows(name))
+            })
+        {
+            return Err(McpOutcome::BadRequest(rpc_error(
+                id,
+                -32602,
+                "Control operation is unavailable on the configured MCP tool surface",
+            )));
+        }
         if via_adaptive_runtime_gateway {
             let (target, arguments) =
                 match unwrap_adaptive_runtime_gateway_arguments(params.arguments) {
@@ -259,6 +384,13 @@ impl ParsedCall {
                         return Err(McpOutcome::BadRequest(rpc_error(id, -32602, message)));
                     }
                 };
+            if !context.exposure.allows(&target) || (cli && !crate::mcp::cli::admits(&target)) {
+                return Err(McpOutcome::BadRequest(rpc_error(
+                    id,
+                    -32602,
+                    "Tool is unavailable on the configured MCP tool surface; refresh tools/list",
+                )));
+            }
             match mcp_adaptive_runtime_gateway_target_route(&target, stateless_2026) {
                 crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
                 | crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Direct => {
@@ -291,6 +423,19 @@ impl ParsedCall {
                     params.name = target;
                     params.arguments = arguments;
                 }
+                crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::DirectOnly => {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("direct_host_review_required");
+                        lc.dispatch_finished(false, Some(false), "direct_host_review_required");
+                    }
+                    return Err(McpOutcome::BadRequest(rpc_error(
+                        id,
+                        -32602,
+                        format!(
+                            "direct_host_review_required: '{target}' requires its own Host-reviewed callable descriptor; call_runtime_tool cannot invoke it. Refresh tools/list if the descriptor is unavailable. A Host refusal must not be retried through another route."
+                        ),
+                    )));
+                }
                 crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Unknown => {
                     if let Some(lc) = lifecycle.as_deref() {
                         lc.dispatch_failed("unknown_tool");
@@ -298,7 +443,7 @@ impl ParsedCall {
                     }
                     let rendered = mcp_runtime_tool_result_fallback(
                         adaptive_runtime_gateway_unknown_target(&target),
-                        runtime.runtime_info.mcp_text_json_compat_enabled,
+                        context.text_json_compat,
                         result_presentation,
                     );
                     return Err(McpOutcome::Ok(rpc_result(
@@ -318,6 +463,55 @@ impl ParsedCall {
                 )));
                 }
             }
+        }
+        if cli && (!crate::mcp::cli::admits(&params.name) || params.arguments.get("_wc").is_some())
+        {
+            return Err(McpOutcome::BadRequest(rpc_error(
+                id,
+                -32602,
+                "Tool or invocation sidecar is unavailable on the execution-only CLI surface",
+            )));
+        }
+        if cli {
+            if let Some(key) = via_adaptive_runtime_gateway
+                .then(|| crate::mcp::cli::unavailable_argument(&params.name, &params.arguments))
+                .flatten()
+            {
+                return Err(McpOutcome::BadRequest(rpc_error(
+                    id,
+                    -32602,
+                    format!("{key} is unavailable on the execution-only CLI surface"),
+                )));
+            }
+            if params.name == "run_shell" {
+                if let Some(args) = params.arguments.as_object_mut() {
+                    if args.get("timeout_secs").is_none_or(Value::is_null) {
+                        args.insert(
+                            "timeout_secs".into(),
+                            json!(crate::mcp::cli::DEFAULT_COMMAND_TIMEOUT_SECS),
+                        );
+                    }
+                }
+            }
+            if matches!(params.name.as_str(), "read_files" | "search_project_texts") {
+                if let Some(args) = params.arguments.as_object_mut() {
+                    if args.get("max_result_bytes").is_none_or(Value::is_null) {
+                        args.insert("max_result_bytes".into(), json!(45000));
+                    }
+                }
+            }
+            // Calling the destructive stop tool is explicit cancellation intent.
+            // Client review and canonical Project/Job ownership checks still apply.
+            if params.name == "stop_job" {
+                if let Some(args) = params.arguments.as_object_mut() {
+                    args.entry("confirm").or_insert(json!(true));
+                }
+            }
+            crate::mcp::cli::apply_default_project(
+                &params.name,
+                &mut params.arguments,
+                context.default_project,
+            );
         }
         if let Some(lc) = lifecycle.as_deref_mut() {
             lc.set_tool_name(Some(params.name.clone()));
@@ -381,8 +575,57 @@ impl PreparedRuntimeCall {
         )?;
         let McpInvocationEnvelope {
             recording_session_selector,
-            metadata,
+            mut metadata,
         } = invocation;
+        if params.name == "read_tool_manifest" {
+            if context.surface == crate::mcp::request_policy::McpSurface::Cli {
+                if params.arguments.is_null() {
+                    params.arguments = json!({});
+                }
+                if let Some(arguments) = params.arguments.as_object_mut() {
+                    if arguments
+                        .get("include_recommended_flows")
+                        .is_some_and(|v| !v.is_null() && v != &json!(false))
+                    {
+                        return Err(McpOutcome::BadRequest(rpc_error(
+                            context.id.clone(),
+                            -32602,
+                            "Workflow recipes are unavailable on the execution-only CLI surface",
+                        )));
+                    }
+                    // Workflow recipes belong to the caller, including exact manifests.
+                    arguments.insert("include_recommended_flows".into(), json!(false));
+                    if arguments.get("tool_name").is_none_or(Value::is_null)
+                        && arguments.get("limit").is_none_or(Value::is_null)
+                    {
+                        arguments.insert(
+                            "limit".into(),
+                            json!(crate::mcp::cli::MANIFEST_DEFAULT_LIMIT),
+                        );
+                    }
+                }
+            }
+            metadata.discovery_tools = Some(
+                webcodex_tool_contracts::tool_definitions()
+                    .filter(|definition| {
+                        if context.surface == crate::mcp::request_policy::McpSurface::Cli
+                            && ["tool_name", "query", "category", "intent"]
+                                .iter()
+                                .all(|key| params.arguments.get(*key).is_none_or(Value::is_null))
+                            && !crate::mcp::cli::coding_catalog_entry(definition.name)
+                        {
+                            return false;
+                        }
+                        context.exposure.route(
+                            context.surface,
+                            definition.name,
+                            context.stateless_2026,
+                        ) != crate::model_surface::SuggestedToolCallRoute::Unavailable
+                    })
+                    .map(|definition| definition.name.to_owned())
+                    .collect(),
+            );
+        }
         let runtime = context.runtime;
         let auth = context.auth;
         let stateless_2026 = context.stateless_2026;
@@ -433,7 +676,11 @@ impl PreparedRuntimeCall {
             )));
         }
         // Preserve omission versus explicit false before canonical bool parsing.
-        project_mcp_model_argument_defaults(&params.name, &mut params.arguments);
+        if context.surface != crate::mcp::request_policy::McpSurface::Cli
+            || params.name != "observe_jobs"
+        {
+            project_mcp_model_argument_defaults(&params.name, &mut params.arguments);
+        }
         let invocation_facts = crate::tool_runtime::model_ergonomics_telemetry::invocation::InvocationFacts::from_arguments(&raw_mcp_arguments);
         let mut pre_kernel_model_ergonomics =
             ModelErgonomicsTimer::start_with_arguments(&params.name, &params.arguments);
@@ -548,7 +795,7 @@ impl PreparedRuntimeCall {
         }
         let outcome = context
             .runtime
-            .call_tool_with_invocation_metadata(
+            .call_tool_with_invocation_metadata_and_return_timing(
                 KernelToolCallRequest {
                     tool_name: params.name.clone(),
                     arguments: params.arguments,
@@ -563,6 +810,11 @@ impl PreparedRuntimeCall {
                 },
                 metadata,
                 response.surface.capabilities,
+                if context.surface == crate::mcp::request_policy::McpSurface::Cli {
+                    crate::tool_runtime::return_timing::ToolReturnTimingPolicy::handoff_default_secs(50)
+                } else {
+                    crate::tool_runtime::return_timing::ToolReturnTimingPolicy::unconstrained()
+                },
             )
             .await;
         response.finish(

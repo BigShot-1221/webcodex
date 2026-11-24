@@ -17,20 +17,21 @@ pub(crate) use webcodex_workflow_session::{
     SessionExecutionContext, SessionExecutionContextUpdateError, SessionGuardDenial, SessionGuards,
     SessionLifecycle, SessionLifecycleDenial, SessionMessage, SessionMessageDelivery,
     SessionMessageError, SessionMessageKind, SessionMessageObservationError,
-    SessionMessagePriority, SessionMessageStatus, SessionPathHint, SessionStore, SessionSummary,
-    SessionToolContract, SessionTransport, ToolCallExpectation, ToolCallRecorderMetadata,
-    ToolCallSessionMessageResolution, ToolCallStart, WorkflowSessionConsoleAggregate,
-    WorkflowSessionConsoleAttentionOverview, WorkflowSessionConsoleDetail,
-    WorkflowSessionConsoleList, WorkflowSessionConsoleListItem, DEFAULT_MAX_EVENTS_PER_SESSION,
-    DEFAULT_MAX_RETAINED_CLOSED_SESSIONS, DEFAULT_MAX_SESSIONS, MAX_CODING_INSTRUCTION_CHARS,
-    MAX_MESSAGE_CHARS, MAX_MESSAGE_COMPLETION_KEY_CHARS, MAX_MESSAGE_DELIVERY_KEY_CHARS,
-    MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_RESOLUTION_CHARS, MAX_MESSAGE_TAGS, MAX_MESSAGE_TAG_CHARS,
-    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_TOOL_CALL_ACK_MESSAGE_IDS,
-    MAX_TOOL_CALL_ACK_REF_CHARS, SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION,
-    SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON, TOOL_ACCEPTED_EXIT_CODES_FIELD,
-    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_REF_FIELD, TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
-    TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
-    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_RESULT_EXPECTATION_FIELD,
+    SessionMessagePriority, SessionMessageStatus, SessionPathHint, SessionProjectIdentity,
+    SessionStore, SessionSummary, SessionToolContract, SessionTransport, ToolCallExpectation,
+    ToolCallRecorderMetadata, ToolCallSessionMessageResolution, ToolCallStart,
+    WorkflowSessionConsoleAggregate, WorkflowSessionConsoleAttentionOverview,
+    WorkflowSessionConsoleDetail, WorkflowSessionConsoleList, WorkflowSessionConsoleListItem,
+    DEFAULT_MAX_SESSIONS, DEFAULT_RECENT_EVENT_LIMIT, DEFAULT_SESSION_CACHE_BYTES,
+    MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_CHARS, MAX_MESSAGE_COMPLETION_KEY_CHARS,
+    MAX_MESSAGE_DELIVERY_KEY_CHARS, MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_RESOLUTION_CHARS,
+    MAX_MESSAGE_TAGS, MAX_MESSAGE_TAG_CHARS, MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
+    MAX_TOOL_CALL_ACK_MESSAGE_IDS, MAX_TOOL_CALL_ACK_REF_CHARS,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
+    TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_REF_FIELD,
+    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
+    TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
+    TOOL_RESULT_EXPECTATION_FIELD,
 };
 
 use super::metadata::{ToolPathHint, ToolRisk};
@@ -60,6 +61,21 @@ pub(crate) fn session_tool_contract(tool_name: &str) -> SessionToolContract {
             ToolPathHint::Artifact => SessionPathHint::Artifact,
         },
     }
+}
+
+/// The effect contract, not presentation risk labels, controls durable admission.
+/// A live ACP diagnostic is an execution even though presence-only diagnosis is read-only.
+pub(crate) fn session_dispatch_requires_durable_start(call: &super::ToolCall) -> bool {
+    !runtime_tool_metadata(call.tool_name())
+        .effect
+        .read_only_hint()
+        || matches!(
+            call,
+            super::ToolCall::CodingAgentDiagnose {
+                include_live_acp: true,
+                ..
+            }
+        )
 }
 
 pub(crate) fn console_validation_hooks() -> ConsoleValidationHooks {
@@ -110,14 +126,7 @@ pub(crate) mod events {
 
 #[cfg(test)]
 pub(crate) mod model {
-    pub(crate) use webcodex_workflow_session::root_test_support::{
-        PersistedSessionLedger, MAX_OBSERVED_PATHS_PER_EVENT, SESSION_LEDGER_VERSION,
-    };
-}
-
-#[cfg(test)]
-pub(crate) mod persistence {
-    pub(crate) use webcodex_workflow_session::root_test_support::write_ledger_atomic;
+    pub(crate) use webcodex_workflow_session::root_test_support::MAX_OBSERVED_PATHS_PER_EVENT;
 }
 
 #[cfg(test)]

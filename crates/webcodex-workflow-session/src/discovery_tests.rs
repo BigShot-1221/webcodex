@@ -97,7 +97,8 @@ fn discovery_preserves_closed_cold_history_and_restart_order() {
     let active = create(&store, "project", &owner, "active");
     let closed = create(&store, "project", &owner, "closed");
     store.close_session(&closed).unwrap();
-    assert_eq!(store.status().cold_sessions, 2);
+    store.flush_persistence();
+    assert_eq!(store.status().cold_sessions, 1);
     let before = store.discover_sessions("project", &owner, None, 0, 10);
     let closed_page =
         store.discover_sessions("project", &owner, Some(SessionLifecycle::Closed), 0, 10);
@@ -105,7 +106,7 @@ fn discovery_preserves_closed_cold_history_and_restart_order() {
     assert_eq!(closed_page.sessions[0].session_id, closed);
     assert_eq!(
         store.status().cold_sessions,
-        2,
+        1,
         "discovery must not warm Active or Closed identities"
     );
     let active_page =
@@ -126,4 +127,65 @@ fn discovery_preserves_closed_cold_history_and_restart_order() {
             .total,
         0
     );
+}
+
+#[test]
+fn current_registration_filters_discovery_and_console_before_counting() {
+    use crate::{ConsoleValidationHooks, SessionProjectIdentity};
+    let store = SessionStore::new(10, 10);
+    let owner = "a".repeat(64);
+    let root = format!(
+        "{}{}",
+        webcodex_core::runner_protocol::PROJECT_ROOT_FINGERPRINT_PREFIX,
+        "b".repeat(64)
+    );
+    let old = SessionProjectIdentity::from_runner_inventory(
+        Some(root.clone()),
+        String::new(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    let current = SessionProjectIdentity::from_runner_inventory(
+        Some(root),
+        String::new(),
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .unwrap();
+    let create = |identity: &SessionProjectIdentity| {
+        store
+            .start_session_with_options(
+                SessionCreateOptions::new(
+                    Some("project".into()),
+                    None,
+                    SessionMode::Normal,
+                    Default::default(),
+                )
+                .with_project_identity(Some(identity.clone()))
+                .with_owner_authority_fingerprint(Some(owner.clone())),
+            )
+            .unwrap()
+            .session_id
+    };
+    let old_id = create(&old);
+    let current_id = create(&current);
+    let page = store.discover_sessions_for_registration("project", &owner, &current, None, 0, 1);
+    assert_eq!(page.total, 1);
+    assert_eq!(page.sessions[0].session_id, current_id);
+    assert!(page.next_offset.is_none());
+    assert!(store.contains_session(&old_id));
+    let hooks = ConsoleValidationHooks {
+        event_observes_validation_activity: |_| false,
+        validation_summary_from_events: |_, _| serde_json::json!({}),
+    };
+    let lists =
+        store.console_lists_for_registrations(&[("project", Some(&current))], Some(1), hooks);
+    assert_eq!(lists["project"].total, 1);
+    assert_eq!(lists["project"].sessions[0].session_id, current_id);
+    assert!(!lists["project"].truncated);
+    assert!(store
+        .console_detail_for_registration("project", &old_id, Some(&current), None, hooks)
+        .is_none());
+    assert!(store
+        .console_detail_for_registration("project", &current_id, Some(&current), None, hooks)
+        .is_some());
 }

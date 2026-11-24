@@ -1,5 +1,4 @@
 use super::{map_error, resolve_surface_window};
-use crate::validate_key_input;
 use crate::{
     bounded_text, ensure_raw_capture_bound, prepare_clipboard_write_text, validate_input_text,
     AccessibilityTreeResult, ApplicationRecord, ClipboardWriteEffectState, ComputerAction,
@@ -7,6 +6,7 @@ use crate::{
     SurfaceRecord,
 };
 use crate::{is_supported_text_input_fingerprint, ElementFingerprint};
+use crate::{local_control, validate_key_input};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -51,15 +51,19 @@ use windows::{
         System::Ole::CF_UNICODETEXT,
         UI::Accessibility::{
             CUIAutomation8, IUIAutomation2, IUIAutomationElement, IUIAutomationInvokePattern,
-            IUIAutomationScrollItemPattern, IUIAutomationSelectionPattern, IUIAutomationTreeWalker,
-            IUIAutomationValuePattern, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
-            UIA_ComboBoxControlTypeId, UIA_CustomControlTypeId, UIA_DataGridControlTypeId,
-            UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
-            UIA_GroupControlTypeId, UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId,
-            UIA_HyperlinkControlTypeId, UIA_InvokePatternId, UIA_ListControlTypeId,
-            UIA_ListItemControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
-            UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
-            UIA_ScrollBarControlTypeId, UIA_ScrollItemPatternId, UIA_SelectionPatternId,
+            IUIAutomationScrollItemPattern, IUIAutomationScrollPattern,
+            IUIAutomationSelectionItemPattern, IUIAutomationSelectionPattern,
+            IUIAutomationTreeWalker, IUIAutomationValuePattern, ScrollAmount,
+            ScrollAmount_LargeDecrement, ScrollAmount_LargeIncrement, ScrollAmount_NoAmount,
+            ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement, UIA_ButtonControlTypeId,
+            UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId, UIA_CustomControlTypeId,
+            UIA_DataGridControlTypeId, UIA_DataItemControlTypeId, UIA_DocumentControlTypeId,
+            UIA_EditControlTypeId, UIA_GroupControlTypeId, UIA_HeaderControlTypeId,
+            UIA_HeaderItemControlTypeId, UIA_HyperlinkControlTypeId, UIA_InvokePatternId,
+            UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_MenuControlTypeId,
+            UIA_MenuItemControlTypeId, UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId,
+            UIA_RadioButtonControlTypeId, UIA_ScrollBarControlTypeId, UIA_ScrollItemPatternId,
+            UIA_ScrollPatternId, UIA_SelectionItemPatternId, UIA_SelectionPatternId,
             UIA_SeparatorControlTypeId, UIA_SliderControlTypeId, UIA_SpinnerControlTypeId,
             UIA_StatusBarControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId,
             UIA_TableControlTypeId, UIA_TextControlTypeId, UIA_ToolBarControlTypeId,
@@ -75,10 +79,13 @@ use windows::{
             GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
             KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE,
             MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
-            MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE,
-            VK_HOME, VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MBUTTON,
-            VK_MENU, VK_NEXT, VK_PRIOR, VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-            VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, VK_UP, VK_XBUTTON1, VK_XBUTTON2,
+            MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CONTROL, VK_DECIMAL,
+            VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT,
+            VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MBUTTON, VK_MENU,
+            VK_MULTIPLY, VK_NEXT, VK_NUMPAD0, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
+            VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
+            VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+            VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP, VK_XBUTTON1, VK_XBUTTON2,
         },
         UI::Shell::{
             Common::ITEMIDLIST, FOLDERID_AppsFolder, IEnumIDList, ILCombine, ILGetSize,
@@ -88,9 +95,9 @@ use windows::{
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-            IsIconic, ShowWindowAsync, EDD_GET_DEVICE_INTERFACE_NAME, HWND_MESSAGE,
-            SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-            SW_RESTORE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE,
+            GetWindowThreadProcessId, IsIconic, ShowWindowAsync, EDD_GET_DEVICE_INTERFACE_NAME,
+            HWND_MESSAGE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WINDOW_STYLE,
         },
     },
 };
@@ -114,7 +121,7 @@ mod input;
 
 pub(crate) use accessibility::{
     accessibility_status, accessibility_tree, accessibility_tree_scoped, activate_window, control,
-    element_state, scroll_to_element, uia_semantic_text_input_role, win_hwnd,
+    element_state, scroll, scroll_to_element, uia_semantic_text_input_role, win_hwnd,
 };
 use accessibility::{
     exact_uia_window, resolve_uia_element, uia_element_has_exact_focus, uia_error,

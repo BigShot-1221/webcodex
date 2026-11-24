@@ -207,11 +207,27 @@ pub async fn runner_poll(req: &mut Request, depot: &mut Depot, res: &mut Respons
         return;
     }
     let _ = registry
+        .update_job_capacity(
+            &body.request.client_id,
+            &body.request.runner_instance_id,
+            None,
+            body.job_capacity,
+        )
+        .await;
+    let _ = registry
         .update_runtime_metadata(
             &body.request.client_id,
             &body.request.runner_instance_id,
             body.tool_providers,
             body.mcp_gateway_providers,
+        )
+        .await;
+    let _ = registry
+        .update_computer_control_epoch(
+            &body.request.client_id,
+            &body.request.runner_instance_id,
+            None,
+            body.computer_control_epoch,
         )
         .await;
     let _ = registry

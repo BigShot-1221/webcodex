@@ -1,17 +1,16 @@
 import { useFlowingSelection } from "../../ui/useFlowingSelection.js";
 import {
-  Box,
-  CircleDot,
-  Clock3,
-  FolderOpen,
+  ArrowLeft,
+  Filter,
+  RefreshCw,
+  X,
   MessageSquare,
   Monitor,
   Search,
-  Server,
 } from "lucide-react";
 import { CopyIdentity } from "./ui/CopyIdentity.js";
-import { TextInput } from "@mantine/core";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { FocusTrap, Popover, TextInput } from "@mantine/core";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   displayProjectPath,
   projectFamilyId,
@@ -23,13 +22,20 @@ import { ProjectPicker } from "../../ui/ProjectPicker.js";
 import type { RuntimeLanguage } from "../../runtime_i18n.js";
 import { translate } from "../../runtime_i18n.js";
 import type { RuntimeV2Client } from "../api/client.js";
-import { absoluteTime, clockTime, relativeTime, shortId } from "../model/format.js";
+import { absoluteTime, clockTime, relativeTime } from "../model/format.js";
 import type { ProjectRow, WindowSummary } from "../model/types.js";
+import { windowSessionCatalog } from "../model/windowSessions.js";
 
 import { useWindowWorkspace } from "../state/useWindowWorkspace.js";
+import type { SessionLocation } from "../state/useSessionWorkspace.js";
+import { WindowSessionRecord } from "./WindowSessionRecord.js";
 import { WindowCollaboration } from "./WindowCollaboration.js";
 import { WindowActivityFeed } from "./WindowActivityFeed.js";
-import { TraceSearch } from "./TraceSearch.js";
+import { WindowLabelEditor } from "./WindowLabelEditor.js";
+import { WindowBoardRow } from "./WindowBoardRow.js";
+import { WindowBoardSplit } from "./WindowBoardSplit.js";
+import { compareWindowRows, matchesWindowRow, windowBoardRow, WINDOW_TIERS, WINDOW_TIER_TEXT, type WindowTier } from "../model/windowBoard.js";
+import { useWindowBoardNavigation } from "../state/useWindowBoardNavigation.js";
 
 
 type Props = {
@@ -37,15 +43,23 @@ type Props = {
   language: RuntimeLanguage;
   projects: ProjectRow[];
   onUnauthorized: () => void;
-  onOpenSessionRecord?: (project: string, sessionId: string) => void;
   requestedWindowKey?: string;
   requestedSessionId?: string;
   onRequestedWindowConsumed?: () => void;
+  onMobileDetailChange?: (open: boolean) => void;
 };
 
-type WindowNavigationRow = Pick<WindowSummary,
-  "client_window_key" | "last_project" | "source" | "last_seen_at_ms" |
-  "last_meaningful_activity_at_ms" | "last_activity_name" | "active_count">;
+type SessionRecordTarget = {
+  client: RuntimeV2Client;
+  authorityRevision: number;
+  windowKey: string;
+  location: SessionLocation;
+};
+type ActivityScroll = {
+  target: Pick<SessionRecordTarget, "client" | "authorityRevision" | "windowKey">;
+  positions: Array<{ element: HTMLElement; top: number }>;
+  focus: HTMLElement | null;
+};
 
 type ProjectFamily = {
   id: string;
@@ -58,15 +72,11 @@ type ProjectFamily = {
 };
 
 function windowObservedAt(window: WindowSummary): number {
-  return window.last_seen_at_ms || window.last_tool_call_at_ms || window.last_meaningful_activity_at_ms || 0;
+  return window.last_seen_at_ms || 0;
 }
 
 function projectFor(index: ReadonlyMap<string, ProjectRow>, id?: string): ProjectRow | undefined {
   return id ? index.get(id) : undefined;
-}
-
-function peerId(windowKey: string): string {
-  return windowKey.length >= 32 ? "wc_peer_" + windowKey.slice(0, 32) : windowKey;
 }
 
 function buildProjectFamilies(projects: ProjectRow[], projectIndex: ReadonlyMap<string, ProjectRow>, windows: WindowSummary[]): ProjectFamily[] {
@@ -111,23 +121,83 @@ export function WindowWorkbench({
   language,
   projects,
   onUnauthorized,
-  onOpenSessionRecord,
   requestedWindowKey,
   requestedSessionId,
   onRequestedWindowConsumed,
+  onMobileDetailChange,
 }: Props) {
   const t = (value: string) => translate(value, language);
   const projectIndex = useMemo(() => new Map(projects.map(project => [project.id, project])), [projects]);
   const [projectFamily, setProjectFamily] = useState("");
   const selectedProjects = useMemo(() => projectFamily ? projects.filter(project => projectFamilyId(project) === projectFamily).map(project => project.id) : undefined, [projects, projectFamily]);
-  const windows = useWindowWorkspace(client, !selectedProjects || selectedProjects.length > 0, onUnauthorized, { refreshMs: 3_000, loadDetail: true, initialWindowKey: requestedWindowKey, projects: selectedProjects });
-  const listRef = useRef<HTMLDivElement | null>(null);
-  const selectedRowRef = useRef<HTMLButtonElement | null>(null);
+  const windows = useWindowWorkspace(client, !selectedProjects || selectedProjects.length > 0, onUnauthorized, { refreshMs: 3_000, loadDetail: true, autoSelect: false, initialWindowKey: requestedWindowKey, projects: selectedProjects });
+  const navigation = useWindowBoardNavigation(windows.selectedKey, windows.select, onMobileDetailChange);
+  const [tierFilter, setTierFilter] = useState<"all" | "named" | WindowTier>("all");
+  const [editingKey, setEditingKey] = useState("");
   const [search, setSearch] = useState("");
-  const [centerTab, setCenterTab] = useState<"window" | "collaboration">("window");
+  const [centerTab, setCenterTab] = useState<"window" | "collaboration" | "session">("window");
+  const [recordTarget, setRecordTarget] = useState<SessionRecordTarget | null>(null);
+  const authorityRevision = client.authorityRevision ?? 0;
+  // The record is owned by an exact Window and credential before effects run.
+  const record = recordTarget?.client === client
+    && recordTarget.authorityRevision === authorityRevision
+    && recordTarget.windowKey === windows.selectedKey ? recordTarget : null;
+  const activeTab = centerTab === "session" && !record ? "window" : centerTab;
+  const activityPanelRef = useRef<HTMLDivElement | null>(null);
+  const activityScroll = useRef<ActivityScroll | null>(null);
   const selectionRef = useRef<HTMLDivElement | null>(null);
-  useFlowingSelection(selectionRef, centerTab, { variant: "underline" });
+  useFlowingSelection(selectionRef, activeTab, { variant: "underline" });
   const [selectedSessionId, setSelectedSessionId] = useState("");
+
+  const rememberActivityScroll = () => {
+    if (activeTab !== "window") return;
+    const panel = activityPanelRef.current;
+    const containers = [panel, panel?.querySelector<HTMLElement>(".window-activity-results"), navigation.detailRef.current,
+      ...(navigation.mobile ? [navigation.detailRef.current?.closest<HTMLElement>(".app-content"), document.scrollingElement] : [])];
+    const focused = document.activeElement;
+    activityScroll.current = {
+      target: { client, authorityRevision, windowKey: windows.selectedKey },
+      positions: containers.filter((element): element is HTMLElement => element instanceof HTMLElement)
+        .map(element => ({ element, top: element.scrollTop })),
+      focus: focused instanceof HTMLElement && panel?.contains(focused) ? focused : null,
+    };
+  };
+  const changeCenterTab = (next: typeof centerTab) => {
+    if (next !== "window") rememberActivityScroll();
+    setCenterTab(next);
+  };
+  const openSessionRecord = (projectId: string, sessionId: string, windowKey?: string) => {
+    if (!windows.selectedKey || windowKey !== windows.selectedKey) return;
+    const project = projectIndex.get(projectId);
+    rememberActivityScroll();
+    setRecordTarget({ client, authorityRevision, windowKey, location: {
+      projectId, sessionId, projectName: project?.name || projectId, runner: project?.client_id || "",
+    } });
+    setCenterTab("session");
+  };
+  useLayoutEffect(() => {
+    const saved = activityScroll.current;
+    if (!saved) return;
+    if (saved.target.client !== client || saved.target.authorityRevision !== authorityRevision
+        || saved.target.windowKey !== windows.selectedKey) {
+      activityScroll.current = null;
+      return;
+    }
+    if (activeTab === "session") {
+      for (const { element } of saved.positions) element.scrollTop = 0;
+    } else if (activeTab === "window") {
+      for (const { element, top } of saved.positions) if (element.isConnected) element.scrollTop = top;
+      saved.focus?.focus({ preventScroll: true });
+      activityScroll.current = null;
+    }
+  }, [activeTab, client, authorityRevision, windows.selectedKey]);
+  const openLinkedWindow = (windowKey: string) => {
+    if (windowKey !== windows.selectedKey) { setSearch(""); setProjectFamily(""); }
+    setRecordTarget(null);
+    setCenterTab("window");
+    navigation.open(windowKey);
+  };
+
   const historicalFamilies = useMemo(() => buildProjectFamilies(projects, projectIndex, windows.historicalWindows), [projects, projectIndex, windows.historicalWindows]);
   const familyById = useMemo(() => new Map(historicalFamilies.map(family => [family.id, family])), [historicalFamilies]);
   const families = useMemo(() => {
@@ -140,46 +210,25 @@ export function WindowWorkbench({
     }
     return historicalFamilies.map(family => ({ ...family, activeWindowCount: active.get(family.id) || 0 }));
   }, [historicalFamilies, projectIndex, windows.windows]);
+  const activeFamily = families.find(family => family.id === projectFamily);
   const windowIndex = useMemo(() => new Map(windows.windows.map(window => [window.client_window_key, window])), [windows.windows]);
 
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
+  const now = Date.now();
+  const rows = useMemo(() => windows.windows.map(row => windowBoardRow(row, projectIndex, now, t("Window"))).sort(compareWindowRows), [windows.windows, projectIndex, now, language]);
+  const matching = rows.filter(row => {
     const family = familyById.get(projectFamily);
-    return windows.windows
-      .filter((window) => {
-        if (family && (!window.last_project || !family.projectIds.has(window.last_project))) return false;
-        if (!query) return true;
-        const project = projectFor(projectIndex, window.last_project);
-        const sourceId = project ? sourceProjectRuntimeId(project) : undefined;
-        const source = projectFor(projectIndex, sourceId);
-        const values = [
-          window.client_window_key,
-          peerId(window.client_window_key),
-          window.source,
-          window.last_activity_name || "",
-          window.last_activity_status || "",
-          window.last_project || "",
-          project?.name || "",
-          project?.path || "",
-          project?.client_id || "",
-          source?.name || "",
-          source?.path || "",
-          window.active_count ? "active running" : "idle",
-        ];
-        return values.some((value) => value.toLowerCase().includes(query));
-      })
-      .sort((a, b) =>
-        Number(b.active_count > 0) - Number(a.active_count > 0) ||
-        windowObservedAt(b) - windowObservedAt(a) ||
-        a.client_window_key.localeCompare(b.client_window_key));
-  }, [familyById, projectFamily, projectIndex, search, windows.windows]);
+    return (!family || (row.window.last_project && family.projectIds.has(row.window.last_project))) && matchesWindowRow(row, search);
+  });
+  const filtered = matching.filter(row => tierFilter === "all" || (tierFilter === "named" ? row.named : row.tier === tierFilter));
 
   const detail = windows.detail;
+  const linkedSessions = useMemo(() => detail ? windowSessionCatalog(detail) : [], [detail?.activity, detail?.linked_sessions]);
+  // Keep the Window/collaboration view, but never carry a Session to another owner.
   useEffect(() => {
-    if (!windows.selectedKey) return;
-    setCenterTab("window");
     setSelectedSessionId("");
-  }, [windows.selectedKey]);
+    setRecordTarget(null);
+    setCenterTab(current => current === "session" ? "window" : current);
+  }, [client, authorityRevision, windows.selectedKey]);
   useEffect(() => {
     if (!requestedWindowKey) return;
     if (windows.selectedKey !== requestedWindowKey) {
@@ -201,9 +250,10 @@ export function WindowWorkbench({
     selectedSummary?.last_activity_name ||
     detail?.activity[0]?.tool_name ||
     detail?.activity[0]?.method;
-  const lastObservedAt = detail?.last_seen_at_ms || selectedSummary?.last_seen_at_ms;
+  const lastObservedAt = Math.max(detail?.last_seen_at_ms || 0, selectedSummary?.last_seen_at_ms || 0) || undefined;
+  const lastMeaningfulAt = Math.max(detail?.last_meaningful_activity_at_ms || 0, selectedSummary?.last_meaningful_activity_at_ms || 0) || undefined;
   const firstObservedAt = detail?.first_seen_at_ms || selectedSummary?.first_seen_at_ms;
-  const isActive = (detail?.active_count ?? selectedSummary?.active_count ?? 0) > 0;
+  const isActive = (selectedSummary?.active_count ?? detail?.active_count ?? 0) > 0;
   const currentProjectName = currentProject
     ? projectFamilyName(sourceProject || currentProject, projectIndex)
     : undefined;
@@ -212,77 +262,44 @@ export function WindowWorkbench({
     : currentProjectName;
   const currentRunnerId = currentProject?.client_id;
   const currentDirectory = displayProjectPath(currentProject?.path);
-  const hasSelectedWindow = Boolean(selectedSummary || detail);
-  const visibleActiveCount = detail?.active_count ?? selectedSummary?.active_count ?? 0;
-  const visibleActivityCount = (detail?.activity_returned || 0) + visibleActiveCount;
-
-  // Keep the exact selected resource represented even when a bounded inventory
-  // or a user filter omits it. Derive its presentation from the same detail as
-  // the main pane rather than assigning another Window's Project to it.
-  const selectedNavigationRow: WindowNavigationRow | undefined = detail ? {
-    client_window_key: detail.client_window_key,
-    source: detail.source,
-    last_project: currentProjectId,
-    last_seen_at_ms: detail.last_seen_at_ms,
-    last_meaningful_activity_at_ms: detail.last_meaningful_activity_at_ms,
-    last_activity_name: currentActivity,
-    active_count: detail.active_count,
+  const hasSelectedWindow = Boolean(windows.selectedKey);
+  const visibleActiveCount = selectedSummary?.active_count ?? detail?.active_count ?? 0;
+  const selectedNavigationRow: WindowSummary | undefined = detail ? {
+    ...selectedSummary,
+    label: selectedSummary && Object.hasOwn(selectedSummary, "label") ? selectedSummary.label : detail.label,
+    client_window_key: detail.client_window_key, source: detail.source,
+    last_project: currentProjectId, last_seen_at_ms: lastObservedAt || 0,
+    first_seen_at_ms: firstObservedAt, last_meaningful_activity_at_ms: lastMeaningfulAt,
+    last_activity_name: currentActivity, active_count: visibleActiveCount,
+    linked_session_count: selectedSummary?.linked_session_count ?? detail.sessions_returned,
+    recorder_gap_count: selectedSummary?.recorder_gap_count ?? 0,
   } : selectedSummary;
-  const selectedIsPinned = Boolean(windows.selectedKey && !filtered.some(row => row.client_window_key === windows.selectedKey));
-  useEffect(() => {
-    const list = listRef.current;
-    const row = selectedRowRef.current;
-    if (!list || !row || list.scrollHeight <= list.clientHeight) return;
-    const viewport = list.getBoundingClientRect();
-    const bounds = row.getBoundingClientRect();
-    if (bounds.top < viewport.top) list.scrollTop -= viewport.top - bounds.top;
-    else if (bounds.bottom > viewport.bottom) list.scrollTop += bounds.bottom - viewport.bottom;
-  }, [windows.selectedKey, selectedIsPinned, Boolean(selectedNavigationRow)]);
-
-  const renderWindow = (window: WindowNavigationRow) => {
-    const project = projectFor(projectIndex, window.last_project);
-    const source = project ? projectFor(projectIndex, sourceProjectRuntimeId(project)) : undefined;
-    const activity = window.last_activity_name || t("Observed Window");
-    const observedAt = window.last_meaningful_activity_at_ms || window.last_seen_at_ms;
-    const projectLabel = project
-      ? projectFamilyName(source || project, projectIndex)
-      : window.last_project || t("Project information unavailable");
-    const workspaceLabel = project?.lineage ? projectVariantLabel(project) : projectLabel;
-    return (
-      <button
-        type="button"
-        className={"window-work-row" + (windows.selectedKey === window.client_window_key ? " selected" : "")}
-        aria-current={windows.selectedKey === window.client_window_key ? "true" : undefined}
-        ref={windows.selectedKey === window.client_window_key ? selectedRowRef : undefined}
-        onClick={() => windows.select(window.client_window_key)}
-        key={window.client_window_key}
-        data-testid={"work-window-row-" + window.client_window_key}
-      >
-        <span className={"work-state-dot " + (window.active_count ? "running" : "recent")} />
-        <span className="window-work-row-main">
-          <strong>{workspaceLabel}</strong>
-          <small className="window-work-row-activity" title={activity}>{project?.lineage ? projectLabel + " · " : ""}{activity}</small>
-          <small className="window-work-row-context" title={[window.client_window_key, displayProjectPath(project?.path || source?.path)].filter(Boolean).join(" · ")}>
-            {project?.client_id || t("Runner unavailable")} · {shortId(window.client_window_key, 6, 4)}
-          </small>
-        </span>
-        <span className="window-work-row-side">
-          {window.active_count > 0
-            ? <em>{window.active_count} {t("active")}</em>
-            : <time title={absoluteTime(observedAt)}>{relativeTime(observedAt)}</time>}
-        </span>
-      </button>
-    );
-  };
+  const selectedRow = selectedNavigationRow && windowBoardRow(selectedNavigationRow, projectIndex, now, t("Window"));
+  const selectedIsPinned = Boolean(windows.selectedKey && !filtered.some(row => row.window.client_window_key === windows.selectedKey));
+  const renderWindow = (row: ReturnType<typeof windowBoardRow>) => <WindowBoardRow key={row.window.client_window_key}
+    row={row} selected={windows.selectedKey === row.window.client_window_key} language={language} onSelect={navigation.open} onRename={key => { navigation.open(key); setEditingKey(key); }} />;
+  const fact = (name: string, value: string | undefined) => <div><dt>{t(name)}</dt><dd>{value || "—"}</dd></div>;
+  const identity = <dl className="window-board-facts window-board-id-facts">
+    <div data-testid="current-window-identity" title={windows.selectedKey}><dt>{t("Window ID")}</dt><dd><CopyIdentity value={windows.selectedKey} label={t("Window ID")} language={language} /></dd></div>
+    {currentProjectId && <div><dt>{t("Project ID")}</dt><dd><CopyIdentity value={currentProjectId} label={t("Project ID")} language={language} /></dd></div>}
+    {fact("Last request activity", absoluteTime(lastObservedAt))}
+  </dl>;
 
   return (
-    <div className="work-layout window-primary-workbench" data-testid="window-primary-workbench">
-      <aside className="work-list-panel window-primary-list">
-        <div className="work-list-header">
-          <div><span className="eyebrow">{t("Live work")}</span><h1>{t("Work")}</h1></div>
-        </div>
-        <div className="window-work-filters">
-          <button type="button" className="text-button" onClick={windows.refresh}>{t("Refresh")}</button>
+    <div className="window-primary-workbench" data-testid="window-primary-workbench" data-mobile-detail={navigation.mobile && hasSelectedWindow || undefined}>
+      <div className="window-board-toolbar">
+        <TextInput type="search" aria-label={t("Search Windows")} leftSection={<Search size={14} />} value={search}
+          onChange={event => setSearch(event.currentTarget.value)} placeholder={t("Search windows or projects…")} />
+        <div className="window-board-chips">
+          {(["all", "running", "recent", "named"] as const).map(tier => <button key={tier} type="button" aria-pressed={tierFilter === tier}
+            onClick={() => setTierFilter(tier)}>{t(tier === "all" ? "All" : tier === "named" ? "Named" : WINDOW_TIER_TEXT[tier])} <span>{matching.filter(row => tier === "all" || (tier === "named" ? row.named : row.tier === tier)).length}</span></button>)}
+          <Popover position="bottom-start" width={320}>
+            {/* A server-side Project filter changes every count, so it stays visible while active. */}
+            <Popover.Target><button type="button" className={activeFamily ? "active" : undefined}
+              aria-label={activeFamily ? t("Filter") + ": " + activeFamily.label : undefined}>
+              <Filter size={14} />{activeFamily ? <span className="window-board-filter-label">{activeFamily.label}</span> : t("Filter")}
+            </button></Popover.Target>
+            <Popover.Dropdown>
           <ProjectPicker
             label={t("Projects")}
             allLabel={t("All projects")}
@@ -302,144 +319,94 @@ export function WindowWorkbench({
                 : t("No Window activity") + " · " + row.runner,
             }))}
           />
-          <TextInput
-            type="search"
-            aria-label={t("Search Windows")}
-            leftSection={<Search size={14} />}
-            value={search}
-            onChange={(event) => setSearch(event.currentTarget.value)}
-            placeholder={t("Search windows or projects…")}
-          />
+            </Popover.Dropdown>
+          </Popover>
         </div>
-        <div className="work-list-scroll" ref={listRef}>
-          <TraceSearch client={client} language={language} onSelectWindow={windows.select} />
-          {selectedIsPinned && <div className="window-current-selection">
-            <div className="window-list-summary"><span>{t("Current Window")}</span></div>
-            {selectedNavigationRow ? renderWindow(selectedNavigationRow) : (
-              <button className="window-work-row selected" type="button" aria-current="true"
-                ref={selectedRowRef} data-testid={"work-window-row-" + windows.selectedKey}
-                onClick={windows.refresh}>
-                <Monitor size={14} />
-                <span className="window-work-row-main">
-                  <strong title={windows.selectedKey}>{t("Window")} · {shortId(windows.selectedKey, 6, 4)}</strong>
-                  <small role="status">{t(windows.detailAvailability === "error" || windows.detailAvailability === "denied" ? "Window activity unavailable" : "Loading recent activity…")}</small>
-                </span>
-              </button>
-            )}
-          </div>}
-          <div className="window-list-summary">
-            <span>{filtered.length} {t("Windows")}</span>
-            <small>{filtered.filter((row) => row.active_count > 0).length} {t("active")}</small>
-          </div>
-          {filtered.map(row => renderWindow(row.client_window_key === windows.selectedKey && selectedNavigationRow ? selectedNavigationRow : row))}
+        <div className="window-board-sync"><span>{t("Synced")} {clockTime(windows.updatedAt ?? undefined)}</span>
+          <button type="button" aria-label={t("Refresh")} onClick={windows.refresh}><RefreshCw size={16} /></button></div>
+      </div>
+      <WindowBoardSplit selected={hasSelectedWindow} label={t("Resize window list")}>
+      <section className="window-board-list" aria-label={t("Windows")}>
+        <div className="window-board-columns" aria-hidden="true"><span /><span>{t("Name")}</span><span className="window-board-machine">{t("Machine")}</span>
+          <span className="window-board-project">{t("Project")} · {t("Directory")}</span><span className="window-board-first">{t("First active")}</span>
+          <span>{t("Last active")}</span><span className="window-board-action">{t("Latest activity")}</span></div>
+        {selectedIsPinned && <section className="window-current-selection"><h3>{t("Current Window")}</h3>{selectedRow ? renderWindow(selectedRow) : <button type="button" className="window-board-pinned" aria-current="true" data-testid={"work-window-row-" + windows.selectedKey} onClick={windows.refresh}>
+          {t("Window")} · {windows.selectedKey.slice(0, 4)}<small>{t(windows.detailAvailability === "error" || windows.detailAvailability === "denied" ? "Window activity unavailable" : "Loading recent activity…")}</small></button>}</section>}
+        {WINDOW_TIERS.map(tier => {
+          const group = filtered.filter(row => row.tier === tier);
+          return group.length > 0 && <section key={tier}><h3><span className={"window-board-dot " + tier} aria-hidden="true" />{t(WINDOW_TIER_TEXT[tier])} <span>{group.length}</span></h3>{group.map(row => renderWindow(row.window.client_window_key === windows.selectedKey && selectedRow ? selectedRow : row))}</section>;
+        })}
           {windows.availability === "loading" && <div className="empty-inline">{t("Loading Window activity…")}</div>}
           {windows.availability === "stale" && <div className="inventory-note">{t("Window activity refresh failed; showing previous observations.")}</div>}
           {(windows.availability === "error" || windows.availability === "denied") && <div className="empty-inline">{t("Window activity unavailable")}</div>}
           {windows.availability === "available" && !filtered.length && <div className="empty-panel"><Monitor size={18} /><strong>{t("No matching Windows")}</strong></div>}
           {windows.truncated && <div className="inventory-note">{t("Window inventory is bounded; not all observed Windows are loaded.")} <button type="button" className="text-button" disabled={windows.loadingMore} onClick={windows.loadMore}>{t("Load more")} · {windows.windows.length} / {windows.total}</button></div>}
-        </div>
-      </aside>
+      </section>
 
-      <main className="window-work-main ui-workbench-surface">
-        {hasSelectedWindow ? (
-          <>
-            <header className="window-work-header">
-              <div>
-                <div className="breadcrumbs">
-                  {currentProject?.lineage ? (
-                    <><span>{currentProjectName || t("Project")}</span><span>/</span><span>{t("Workspace")}</span></>
-                  ) : (
-                    <span>{t("Project")}</span>
-                  )}
-                </div>
-                <h2>{currentWorkspaceName || currentActivity || t("Window")}</h2>
-              </div>
-              <span className={"quiet-pill " + (isActive ? "running" : "")}>
-                <CircleDot size={11} />
-                {isActive
-                  ? visibleActiveCount + " " + t("active")
-                  : t("Idle") + " · " + relativeTime(lastObservedAt)}
-              </span>
-              <details className="window-header-details">
-                <summary>{t("Window details")}</summary>
-                <dl className="window-header-facts" aria-label={t("Window details")}>
-                  <div className="window-header-fact" title={windows.selectedKey} data-testid="current-window-identity">
-                    <dt><Monitor size={14} aria-hidden="true" />{t("Window ID")}</dt>
-                    <dd><CopyIdentity key={windows.selectedKey} value={windows.selectedKey} label={t("Window ID")} language={language} /></dd>
-                  </div>
-                  {currentRunnerId && (
-                    <div className="window-header-fact" title={currentRunnerId}>
-                      <dt><Server size={14} aria-hidden="true" />{t("Runner ID")}</dt>
-                      <dd><CopyIdentity key={currentRunnerId} value={currentRunnerId} label={t("Runner ID")} language={language} /></dd>
-                    </div>
-                  )}
-                  {currentDirectory && (
-                    <div className="window-header-fact" title={currentDirectory}>
-                      <dt><FolderOpen size={14} aria-hidden="true" />{t("Directory")}</dt>
-                      <dd><CopyIdentity key={currentDirectory} value={currentDirectory} label={t("Directory")} language={language} /></dd>
-                    </div>
-                  )}
-                  {currentProjectId && (
-                    <div className="window-header-fact" title={currentProjectId}>
-                      <dt><Box size={14} aria-hidden="true" />{t("Project ID")}</dt>
-                      <dd><CopyIdentity key={currentProjectId} value={currentProjectId} label={t("Project ID")} language={language} /></dd>
-                    </div>
-                  )}
-                </dl>
-                <div className="window-header-timeline">
-                  {firstObservedAt && (
-                    <span className="window-header-event" title={absoluteTime(firstObservedAt)}>
-                      <Clock3 size={14} />
-                      <small>{t("First observed")}</small>
-                      <time>{absoluteTime(firstObservedAt)}</time>
-                    </span>
-                  )}
-                  {currentActivity && (
-                    <span className="window-header-event">
-                      <CircleDot size={12} />
-                      <small>{t("Latest activity")}</small>
-                      <strong>{currentActivity}</strong>
-                      {lastObservedAt && <time title={absoluteTime(lastObservedAt)}>{clockTime(lastObservedAt)}</time>}
-                    </span>
-                  )}
-                </div>
-              </details>
+      {hasSelectedWindow && <>
+      {navigation.drawer && <button className="window-board-backdrop" type="button" aria-label={t("Close")} onClick={navigation.close} />}
+      <FocusTrap active={navigation.drawer} innerRef={navigation.detailRef}>
+      <section role={navigation.drawer ? "dialog" : undefined} aria-modal={navigation.drawer || undefined} className="window-board-detail" tabIndex={-1} aria-label={t("Window details")}
+        data-layout={navigation.mobile ? "page" : navigation.drawer ? "drawer" : "split"}>
+            <header className="window-board-detail-header">
+              {navigation.mobile && <button type="button" aria-label={t("Back")} onClick={navigation.close}><ArrowLeft size={18} /></button>}
+              <div><WindowLabelEditor key={windows.selectedKey} name={selectedRow?.displayName || t("Window") + " · " + windows.selectedKey.slice(0, 4)}
+                label={selectedNavigationRow?.label} mobile={navigation.mobile} language={language} editing={editingKey === windows.selectedKey}
+                saving={windows.labelSaving || !selectedNavigationRow} error={windows.labelError} onEditingChange={editing => setEditingKey(editing ? windows.selectedKey : "")}
+                onSave={label => windows.saveLabel(windows.selectedKey, label)} />
+                <span className={"window-board-status" + (isActive ? " running" : "")}>{selectedRow && <span className={"window-board-dot " + (isActive ? "running" : selectedRow.tier)} aria-hidden="true" />}{isActive ? t("Running") + (currentActivity ? " · " + currentActivity : "") : selectedRow ? t(WINDOW_TIER_TEXT[selectedRow.tier]) + " · " + relativeTime(selectedRow.lastActiveAt) : t("Loading…")}</span></div>
+              {!navigation.mobile && <button type="button" aria-label={t("Close")} onClick={navigation.close}><X size={18} /></button>}
             </header>
-
+            <div className="window-board-context">
+              <dl className="window-board-facts">
+                {fact("Machine", currentRunnerId)}{fact("Source", selectedRow?.sourceLabel)}{fact("Project", currentWorkspaceName)}
+                {fact("First active", absoluteTime(firstObservedAt))}
+                {fact("Last active", absoluteTime(lastMeaningfulAt ?? lastObservedAt))}
+                <div className="window-board-path"><dt>{t("Directory")}</dt><dd><code>{currentDirectory || "—"}</code></dd></div>
+              </dl>
+              {/* Canonical IDs stay one disclosure away so activity keeps the detail height. */}
+              <details><summary>{t("IDs")}</summary>{identity}</details>
+            </div>
             <div ref={selectionRef} className="session-view-tabs window-center-tabs equal-view-tabs" role="tablist" aria-label={t("Window views")}>
               <button
                 id="window-activity-tab"
                 role="tab"
-                aria-selected={centerTab === "window"}
+                aria-selected={activeTab === "window"}
                 aria-controls="window-activity-panel"
-                className={centerTab === "window" ? "active" : ""}
+                className={activeTab === "window" ? "active" : ""}
                 type="button"
-                onClick={() => setCenterTab("window")}
+                onClick={() => changeCenterTab("window")}
               >
                 <Monitor size={14} />
                 {t("Window")}
-                <span>{visibleActivityCount}</span>
               </button>
               <button
                 id="window-collaboration-tab"
                 role="tab"
-                aria-selected={centerTab === "collaboration"}
+                aria-selected={activeTab === "collaboration"}
                 aria-controls="window-collaboration-panel"
-                className={centerTab === "collaboration" ? "active" : ""}
+                className={activeTab === "collaboration" ? "active" : ""}
                 type="button"
-                onClick={() => setCenterTab("collaboration")}
+                onClick={() => changeCenterTab("collaboration")}
               >
                 <MessageSquare size={14} />
                 {t("Collaboration")}
               </button>
+              {record && <button
+                id="window-session-record-tab" role="tab"
+                aria-selected={activeTab === "session"} aria-controls="window-session-record-panel"
+                className={activeTab === "session" ? "active" : ""} type="button"
+                onClick={() => changeCenterTab("session")}
+              >{t("Session record")}</button>}
             </div>
 
             <div
               id="window-activity-panel"
-              className="window-work-scroll session-center-pane"
+              ref={activityPanelRef}
+              className="window-board-panel"
               role="tabpanel"
               aria-labelledby="window-activity-tab"
-              hidden={centerTab !== "window"}
+              hidden={activeTab !== "window"}
             >
               {windows.detailAvailability === "stale" && <div className="inventory-note">{t("Window activity refresh failed; showing previous observations.")}</div>}
               {windows.detailHydrating && detail?.detail_level !== "full" && (
@@ -454,7 +421,7 @@ export function WindowWorkbench({
                   language={language}
                   selectedSessionId={selectedSessionId}
                   onSelectSession={setSelectedSessionId}
-                  onOpenSessionRecord={onOpenSessionRecord}
+                  onOpenSessionRecord={openSessionRecord}
                 />
               ) : (
                 <div className="empty-inline">
@@ -469,32 +436,43 @@ export function WindowWorkbench({
 
             <div
               id="window-collaboration-panel"
-              className="window-work-scroll session-center-pane window-collaboration-pane"
+              className="window-board-panel window-collaboration-pane"
               role="tabpanel"
               aria-labelledby="window-collaboration-tab"
-              hidden={centerTab !== "collaboration"}
+              hidden={activeTab !== "collaboration"}
             >
               {windows.selectedKey && (
                 <WindowCollaboration
                   key={windows.selectedKey}
                   client={client}
                   windowKey={windows.selectedKey}
-                  active={centerTab === "collaboration"}
+                  active={activeTab === "collaboration"}
                   selectedSessionId={selectedSessionId}
+                  sessions={linkedSessions}
+                  onSelectSession={setSelectedSessionId}
                   language={language}
                   onUnauthorized={onUnauthorized}
                 />
               )}
             </div>
-          </>
-        ) : (
-          <div className="empty-work">
-            <Monitor size={22} />
-            <h2>{t(windows.detailAvailability === "loading" ? "Loading Window activity…" : windows.detailAvailability === "error" || windows.detailAvailability === "denied" ? "Window activity unavailable" : "Select a window")}</h2>
-            <p>{t("Choose a window to see its tool calls.")}</p>
-          </div>
-        )}
-      </main>
+
+            {record && <div
+              id="window-session-record-panel"
+              className="window-board-panel window-board-session-panel"
+              role="tabpanel"
+              aria-labelledby="window-session-record-tab"
+              hidden={activeTab !== "session"}
+            >
+              {activeTab === "session" && <WindowSessionRecord
+                key={record.windowKey + ":" + record.location.projectId + ":" + record.location.sessionId + ":" + authorityRevision}
+                client={client} location={record.location} language={language} onUnauthorized={onUnauthorized}
+                onBack={() => setCenterTab("window")} onOpenWindow={openLinkedWindow}
+              />}
+            </div>}
+      </section>
+      </FocusTrap>
+      </>}
+      </WindowBoardSplit>
     </div>
   );
 }

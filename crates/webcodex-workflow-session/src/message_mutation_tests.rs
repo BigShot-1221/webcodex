@@ -1,4 +1,4 @@
-use super::model::{SessionMessageClosureKind, DEFAULT_MAX_MESSAGES_PER_SESSION};
+use super::model::{SessionMessageClosureKind, LEGACY_MESSAGE_RETENTION_LIMIT};
 use super::*;
 use serde_json::Value;
 
@@ -94,8 +94,8 @@ fn persisted_session<'a>(raw: &'a Value, session_id: &str) -> &'a Value {
         .expect("persisted session")
 }
 
-#[test]
-fn withdraw_open_message_is_history_preserving() {
+#[tokio::test]
+async fn withdraw_open_message_is_history_preserving() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post(
@@ -107,7 +107,8 @@ fn withdraw_open_message_is_history_preserving() {
     );
 
     let outcome = store
-        .withdraw_message_for_test(&session.session_id, &original.message_id)
+        .withdraw_message(&session.session_id, &original.message_id)
+        .await
         .unwrap();
     assert!(!outcome.replayed);
     assert_eq!(outcome.message.message_id, original.message_id);
@@ -125,13 +126,14 @@ fn withdraw_open_message_is_history_preserving() {
     );
 }
 
-#[test]
-fn withdraw_before_ack_makes_stale_ack_ignored() {
+#[tokio::test]
+async fn withdraw_before_ack_makes_stale_ack_ignored() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let guidance = post_ack_guidance(&store, &session.session_id, "withdraw before ACK");
     store
-        .withdraw_message_for_test(&session.session_id, &guidance.message_id)
+        .withdraw_message(&session.session_id, &guidance.message_id)
+        .await
         .unwrap();
 
     let ack = store.observe_message_acks(
@@ -152,8 +154,8 @@ fn withdraw_before_ack_makes_stale_ack_ignored() {
         .is_empty());
 }
 
-#[test]
-fn ack_before_withdraw_preserves_first_ack_history() {
+#[tokio::test]
+async fn ack_before_withdraw_preserves_first_ack_history() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let guidance = post_ack_guidance(&store, &session.session_id, "ACK then withdraw");
@@ -167,7 +169,8 @@ fn ack_before_withdraw_preserves_first_ack_history() {
         .expect("ACK timestamp");
 
     let withdrawn = store
-        .withdraw_message_for_test(&session.session_id, &guidance.message_id)
+        .withdraw_message(&session.session_id, &guidance.message_id)
+        .await
         .unwrap();
     assert_eq!(withdrawn.message.first_ack_observed_at, Some(first_ack));
     assert_eq!(
@@ -176,8 +179,8 @@ fn ack_before_withdraw_preserves_first_ack_history() {
     );
 }
 
-#[test]
-fn replace_creates_fresh_message_id() {
+#[tokio::test]
+async fn replace_creates_fresh_message_id() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post(
@@ -188,11 +191,12 @@ fn replace_creates_fresh_message_id() {
         SessionMessagePriority::Normal,
     );
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "correct question",
         ))
+        .await
         .unwrap();
 
     assert_ne!(
@@ -217,8 +221,8 @@ fn replace_creates_fresh_message_id() {
     );
 }
 
-#[test]
-fn replace_preserves_kind_priority_tags_reply_to_and_requires_ack() {
+#[tokio::test]
+async fn replace_preserves_kind_priority_tags_reply_to_and_requires_ack() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let parent = post(
@@ -242,11 +246,12 @@ fn replace_preserves_kind_priority_tags_reply_to_and_requires_ack() {
         )
         .unwrap();
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "new guidance",
         ))
+        .await
         .unwrap();
 
     assert_eq!(replaced.replacement.kind, original.kind);
@@ -256,8 +261,8 @@ fn replace_preserves_kind_priority_tags_reply_to_and_requires_ack() {
     assert_eq!(replaced.replacement.requires_ack, original.requires_ack);
 }
 
-#[test]
-fn replace_never_carries_first_ack_to_new_message() {
+#[tokio::test]
+async fn replace_never_carries_first_ack_to_new_message() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post_ack_guidance(&store, &session.session_id, "old guidance");
@@ -271,27 +276,29 @@ fn replace_never_carries_first_ack_to_new_message() {
         1
     );
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "replacement guidance",
         ))
+        .await
         .unwrap();
     assert!(replaced.original.first_ack_observed_at.is_some());
     assert!(replaced.replacement.first_ack_observed_at.is_none());
 }
 
-#[test]
-fn stale_old_ack_does_not_ack_replacement() {
+#[tokio::test]
+async fn stale_old_ack_does_not_ack_replacement() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post_ack_guidance(&store, &session.session_id, "replace first");
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "fresh replacement",
         ))
+        .await
         .unwrap();
 
     let ack = store.observe_message_acks(
@@ -309,17 +316,18 @@ fn stale_old_ack_does_not_ack_replacement() {
     .is_none());
 }
 
-#[test]
-fn replacement_requires_fresh_ack() {
+#[tokio::test]
+async fn replacement_requires_fresh_ack() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post_ack_guidance(&store, &session.session_id, "old ACK target");
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "new ACK target",
         ))
+        .await
         .unwrap();
     let attention = store.ack_required_messages(&session.session_id, &[]);
     assert_eq!(attention.messages.len(), 1);
@@ -417,8 +425,8 @@ async fn withdraw_allocates_one_observation_revision() {
     );
 }
 
-#[test]
-fn replace_retention_keeps_old_and_new_transactionally() {
+#[tokio::test]
+async fn replace_retention_keeps_old_and_new_transactionally() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post(
@@ -428,7 +436,7 @@ fn replace_retention_keeps_old_and_new_transactionally() {
         "protected source",
         SessionMessagePriority::Normal,
     );
-    for index in 0..(DEFAULT_MAX_MESSAGES_PER_SESSION - 1) {
+    for index in 0..(LEGACY_MESSAGE_RETENTION_LIMIT - 1) {
         post(
             &store,
             &session.session_id,
@@ -438,11 +446,12 @@ fn replace_retention_keeps_old_and_new_transactionally() {
         );
     }
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "protected replacement",
         ))
+        .await
         .unwrap();
     assert_eq!(
         exact(&store, &session.session_id, &original.message_id).closure_kind,
@@ -458,11 +467,12 @@ fn replace_retention_keeps_old_and_new_transactionally() {
         "protected replacement"
     );
     let replay = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "protected replacement",
         ))
+        .await
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(
@@ -471,8 +481,8 @@ fn replace_retention_keeps_old_and_new_transactionally() {
     );
 }
 
-#[test]
-fn withdraw_replay_is_idempotent() {
+#[tokio::test]
+async fn withdraw_replay_is_idempotent() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post(
@@ -483,10 +493,12 @@ fn withdraw_replay_is_idempotent() {
         SessionMessagePriority::Normal,
     );
     let first = store
-        .withdraw_message_for_test(&session.session_id, &original.message_id)
+        .withdraw_message(&session.session_id, &original.message_id)
+        .await
         .unwrap();
     let replay = store
-        .withdraw_message_for_test(&session.session_id, &original.message_id)
+        .withdraw_message(&session.session_id, &original.message_id)
+        .await
         .unwrap();
     assert!(!first.replayed);
     assert!(replay.replayed);
@@ -494,8 +506,8 @@ fn withdraw_replay_is_idempotent() {
     assert_eq!(replay.message.resolved_at, first.message.resolved_at);
 }
 
-#[test]
-fn replace_same_body_replay_returns_same_new_message() {
+#[tokio::test]
+async fn replace_same_body_replay_returns_same_new_message() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post(
@@ -506,25 +518,27 @@ fn replace_same_body_replay_returns_same_new_message() {
         SessionMessagePriority::Normal,
     );
     let first = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "new",
         ))
+        .await
         .unwrap();
     let replay = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "new",
         ))
+        .await
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.replacement.message_id, first.replacement.message_id);
 }
 
-#[test]
-fn replace_different_body_after_supersede_conflicts() {
+#[tokio::test]
+async fn replace_different_body_after_supersede_conflicts() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post(
@@ -535,18 +549,21 @@ fn replace_different_body_after_supersede_conflicts() {
         SessionMessagePriority::Normal,
     );
     let first = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "new A",
         ))
+        .await
         .unwrap();
     assert!(matches!(
-        store.replace_message_for_test(replace_input(
-            &session.session_id,
-            &original.message_id,
-            "new B"
-        )),
+        store
+            .replace_message(replace_input(
+                &session.session_id,
+                &original.message_id,
+                "new B"
+            ))
+            .await,
         Err(SessionMessageError::IdempotencyConflict)
     ));
     let retained = store
@@ -561,8 +578,8 @@ fn replace_different_body_after_supersede_conflicts() {
     assert_eq!(retained.len(), 1);
 }
 
-#[test]
-fn completion_first_then_replace_fails_without_mutation() {
+#[tokio::test]
+async fn completion_first_then_replace_fails_without_mutation() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let todo = post(
@@ -573,22 +590,26 @@ fn completion_first_then_replace_fails_without_mutation() {
         SessionMessagePriority::Normal,
     );
     let fence = store
-        .get_assignment_for_test(&session.session_id, &todo.message_id)
+        .get_assignment(&session.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     let completion = store
-        .complete_message_for_test(completion_input(
+        .complete_message(completion_input(
             &session.session_id,
             &todo.message_id,
             fence,
         ))
+        .await
         .unwrap();
     assert!(matches!(
-        store.replace_message_for_test(replace_input(
-            &session.session_id,
-            &todo.message_id,
-            "late edit"
-        )),
+        store
+            .replace_message(replace_input(
+                &session.session_id,
+                &todo.message_id,
+                "late edit"
+            ))
+            .await,
         Err(SessionMessageError::MessageNotOpen)
     ));
     let retained = exact(&store, &session.session_id, &todo.message_id);
@@ -599,8 +620,8 @@ fn completion_first_then_replace_fails_without_mutation() {
     assert!(retained.closure_kind.is_none());
 }
 
-#[test]
-fn replace_first_then_old_completion_fails_without_answer() {
+#[tokio::test]
+async fn replace_first_then_old_completion_fails_without_answer() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let todo = post(
@@ -611,22 +632,26 @@ fn replace_first_then_old_completion_fails_without_answer() {
         SessionMessagePriority::Normal,
     );
     let old_fence = store
-        .get_assignment_for_test(&session.session_id, &todo.message_id)
+        .get_assignment(&session.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &todo.message_id,
             "new work",
         ))
+        .await
         .unwrap();
     assert!(matches!(
-        store.complete_message_for_test(completion_input(
-            &session.session_id,
-            &todo.message_id,
-            old_fence,
-        )),
+        store
+            .complete_message(completion_input(
+                &session.session_id,
+                &todo.message_id,
+                old_fence,
+            ))
+            .await,
         Err(SessionMessageError::AssignmentStale { .. })
     ));
     let replies = store
@@ -651,8 +676,8 @@ fn replace_first_then_old_completion_fails_without_answer() {
     );
 }
 
-#[test]
-fn completion_first_then_withdraw_does_not_overwrite_completion() {
+#[tokio::test]
+async fn completion_first_then_withdraw_does_not_overwrite_completion() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let todo = post(
@@ -663,18 +688,22 @@ fn completion_first_then_withdraw_does_not_overwrite_completion() {
         SessionMessagePriority::Normal,
     );
     let fence = store
-        .get_assignment_for_test(&session.session_id, &todo.message_id)
+        .get_assignment(&session.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     let completion = store
-        .complete_message_for_test(completion_input(
+        .complete_message(completion_input(
             &session.session_id,
             &todo.message_id,
             fence,
         ))
+        .await
         .unwrap();
     assert!(matches!(
-        store.withdraw_message_for_test(&session.session_id, &todo.message_id),
+        store
+            .withdraw_message(&session.session_id, &todo.message_id)
+            .await,
         Err(SessionMessageError::MessageNotOpen)
     ));
     let retained = exact(&store, &session.session_id, &todo.message_id);
@@ -685,8 +714,8 @@ fn completion_first_then_withdraw_does_not_overwrite_completion() {
     assert!(retained.closure_kind.is_none());
 }
 
-#[test]
-fn ordinary_resolve_first_then_replace_fails() {
+#[tokio::test]
+async fn ordinary_resolve_first_then_replace_fails() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let note = post(
@@ -704,11 +733,13 @@ fn ordinary_resolve_first_then_replace_fails() {
         )
         .unwrap();
     assert!(matches!(
-        store.replace_message_for_test(replace_input(
-            &session.session_id,
-            &note.message_id,
-            "edited"
-        )),
+        store
+            .replace_message(replace_input(
+                &session.session_id,
+                &note.message_id,
+                "edited"
+            ))
+            .await,
         Err(SessionMessageError::MessageNotOpen)
     ));
     assert_eq!(
@@ -719,8 +750,8 @@ fn ordinary_resolve_first_then_replace_fails() {
     );
 }
 
-#[test]
-fn ordinary_resolve_first_then_withdraw_does_not_relabel_resolution() {
+#[tokio::test]
+async fn ordinary_resolve_first_then_withdraw_does_not_relabel_resolution() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let note = post(
@@ -738,7 +769,9 @@ fn ordinary_resolve_first_then_withdraw_does_not_relabel_resolution() {
         )
         .unwrap();
     assert!(matches!(
-        store.withdraw_message_for_test(&session.session_id, &note.message_id),
+        store
+            .withdraw_message(&session.session_id, &note.message_id)
+            .await,
         Err(SessionMessageError::MessageNotOpen)
     ));
     let retained = exact(&store, &session.session_id, &note.message_id);
@@ -746,8 +779,8 @@ fn ordinary_resolve_first_then_withdraw_does_not_relabel_resolution() {
     assert!(retained.closure_kind.is_none());
 }
 
-#[test]
-fn ack_first_then_replace_requires_fresh_new_ack() {
+#[tokio::test]
+async fn ack_first_then_replace_requires_fresh_new_ack() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let original = post_ack_guidance(&store, &session.session_id, "ACK old first");
@@ -756,11 +789,12 @@ fn ack_first_then_replace_requires_fresh_new_ack() {
         std::slice::from_ref(&original.message_id),
     );
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &original.message_id,
             "fresh body",
         ))
+        .await
         .unwrap();
     assert!(replaced.original.first_ack_observed_at.is_some());
     assert!(replaced.replacement.first_ack_observed_at.is_none());
@@ -771,21 +805,6 @@ fn ack_first_then_replace_requires_fresh_new_ack() {
             .message_id,
         replaced.replacement.message_id
     );
-}
-
-#[test]
-fn replace_first_then_stale_ack_is_ignored() {
-    stale_old_ack_does_not_ack_replacement();
-}
-
-#[test]
-fn ack_first_then_withdraw_preserves_ack_history() {
-    ack_before_withdraw_preserves_first_ack_history();
-}
-
-#[test]
-fn withdraw_first_then_ack_is_ignored() {
-    withdraw_before_ack_makes_stale_ack_ignored();
 }
 
 #[tokio::test]
@@ -827,8 +846,8 @@ async fn observation_delta_for_replace_contains_old_then_new_and_pages_without_d
     );
 }
 
-#[test]
-fn withdraw_and_replace_observation_revisions_are_durable_and_consecutive() {
+#[tokio::test]
+async fn withdraw_and_replace_observation_revisions_are_durable_and_consecutive() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 50);
@@ -841,16 +860,18 @@ fn withdraw_and_replace_observation_revisions_are_durable_and_consecutive() {
         SessionMessagePriority::Normal,
     );
     store.flush_persistence();
-    let before: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let before: Value =
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let before_revision = persisted_session(&before, &session.session_id)
         ["message_observation_revision"]
         .as_u64()
         .unwrap();
     store
-        .withdraw_message_for_test(&session.session_id, &withdraw.message_id)
+        .withdraw_message(&session.session_id, &withdraw.message_id)
+        .await
         .unwrap();
     let after_withdraw: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let record = persisted_session(&after_withdraw, &session.session_id);
     assert_eq!(
         record["message_observation_revision"].as_u64(),
@@ -870,20 +891,21 @@ fn withdraw_and_replace_observation_revisions_are_durable_and_consecutive() {
     );
     store.flush_persistence();
     let before_replace: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let base = persisted_session(&before_replace, &session.session_id)
         ["message_observation_revision"]
         .as_u64()
         .unwrap();
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &source.message_id,
             "replacement",
         ))
+        .await
         .unwrap();
     let after_replace: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let record = persisted_session(&after_replace, &session.session_id);
     assert_eq!(
         record["message_observation_revision"].as_u64(),
@@ -899,15 +921,16 @@ fn withdraw_and_replace_observation_revisions_are_durable_and_consecutive() {
     );
 }
 
-#[test]
-fn withdraw_durable_restart_stays_withdrawn_and_out_of_attention() {
+#[tokio::test]
+async fn withdraw_durable_restart_stays_withdrawn_and_out_of_attention() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 50);
     let session = store.start_session(None, None);
     let guidance = post_ack_guidance(&store, &session.session_id, "withdraw durably");
     store
-        .withdraw_message_for_test(&session.session_id, &guidance.message_id)
+        .withdraw_message(&session.session_id, &guidance.message_id)
+        .await
         .unwrap();
     drop(store);
 
@@ -924,8 +947,8 @@ fn withdraw_durable_restart_stays_withdrawn_and_out_of_attention() {
         .is_empty());
 }
 
-#[test]
-fn replace_durable_restart_preserves_links_and_fresh_ack_requirement() {
+#[tokio::test]
+async fn replace_durable_restart_preserves_links_and_fresh_ack_requirement() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 50);
@@ -936,11 +959,12 @@ fn replace_durable_restart_preserves_links_and_fresh_ack_requirement() {
         std::slice::from_ref(&guidance.message_id),
     );
     let replaced = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &guidance.message_id,
             "new durable guidance",
         ))
+        .await
         .unwrap();
     let replacement_id = replaced.replacement.message_id.clone();
     drop(store);
@@ -972,8 +996,8 @@ fn replace_durable_restart_preserves_links_and_fresh_ack_requirement() {
     );
 }
 
-#[test]
-fn withdraw_persistence_failure_is_uncertain_then_exact_replay_recovers() {
+#[tokio::test]
+async fn withdraw_persistence_failure_is_uncertain_then_exact_replay_recovers() {
     let root = tempfile::tempdir().unwrap();
     let ledger_dir = root.path().join("ledger");
     std::fs::create_dir_all(&ledger_dir).unwrap();
@@ -988,11 +1012,12 @@ fn withdraw_persistence_failure_is_uncertain_then_exact_replay_recovers() {
         SessionMessagePriority::Normal,
     );
     store.flush_persistence();
-    std::fs::remove_dir_all(&ledger_dir).unwrap();
-    std::fs::write(&ledger_dir, b"block directory recreation").unwrap();
+    crate::test_storage::fail_writes(&store, true);
 
     assert!(matches!(
-        store.withdraw_message_for_test(&session.session_id, &message.message_id),
+        store
+            .withdraw_message(&session.session_id, &message.message_id)
+            .await,
         Err(SessionMessageError::PersistenceUncertain)
     ));
     assert_eq!(
@@ -1000,10 +1025,10 @@ fn withdraw_persistence_failure_is_uncertain_then_exact_replay_recovers() {
         Some(SessionMessageClosureKind::Withdrawn)
     );
 
-    std::fs::remove_file(&ledger_dir).unwrap();
-    std::fs::create_dir_all(&ledger_dir).unwrap();
+    crate::test_storage::fail_writes(&store, false);
     let replay = store
-        .withdraw_message_for_test(&session.session_id, &message.message_id)
+        .withdraw_message(&session.session_id, &message.message_id)
+        .await
         .unwrap();
     assert!(replay.replayed);
     drop(store);
@@ -1014,8 +1039,8 @@ fn withdraw_persistence_failure_is_uncertain_then_exact_replay_recovers() {
     );
 }
 
-#[test]
-fn replace_persistence_failure_replays_same_id_and_conflicts_on_different_body() {
+#[tokio::test]
+async fn replace_persistence_failure_replays_same_id_and_conflicts_on_different_body() {
     let root = tempfile::tempdir().unwrap();
     let ledger_dir = root.path().join("ledger");
     std::fs::create_dir_all(&ledger_dir).unwrap();
@@ -1030,15 +1055,16 @@ fn replace_persistence_failure_replays_same_id_and_conflicts_on_different_body()
         SessionMessagePriority::Normal,
     );
     store.flush_persistence();
-    std::fs::remove_dir_all(&ledger_dir).unwrap();
-    std::fs::write(&ledger_dir, b"block directory recreation").unwrap();
+    crate::test_storage::fail_writes(&store, true);
 
     assert!(matches!(
-        store.replace_message_for_test(replace_input(
-            &session.session_id,
-            &message.message_id,
-            "durable replacement",
-        )),
+        store
+            .replace_message(replace_input(
+                &session.session_id,
+                &message.message_id,
+                "durable replacement",
+            ))
+            .await,
         Err(SessionMessageError::PersistenceUncertain)
     ));
     let old = exact(&store, &session.session_id, &message.message_id);
@@ -1047,22 +1073,24 @@ fn replace_persistence_failure_replays_same_id_and_conflicts_on_different_body()
         .clone()
         .expect("live replacement id");
     assert!(matches!(
-        store.replace_message_for_test(replace_input(
-            &session.session_id,
-            &message.message_id,
-            "different replacement",
-        )),
+        store
+            .replace_message(replace_input(
+                &session.session_id,
+                &message.message_id,
+                "different replacement",
+            ))
+            .await,
         Err(SessionMessageError::IdempotencyConflict)
     ));
 
-    std::fs::remove_file(&ledger_dir).unwrap();
-    std::fs::create_dir_all(&ledger_dir).unwrap();
+    crate::test_storage::fail_writes(&store, false);
     let replay = store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &message.message_id,
             "durable replacement",
         ))
+        .await
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.replacement.message_id, replacement_id);
@@ -1090,7 +1118,8 @@ fn malformed_persisted_closure_metadata_is_not_replay_authority() {
     store.flush_persistence();
     drop(store);
 
-    let mut raw: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let mut raw: Value =
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger).unwrap()).unwrap();
     let persisted = raw["sessions"]
         .as_array_mut()
         .unwrap()
@@ -1118,7 +1147,7 @@ fn malformed_persisted_closure_metadata_is_not_replay_authority() {
     );
     std::fs::write(&ledger, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 50);
+    let restored = crate::test_storage::import_ledger(&ledger, 10, 50);
     let retained = exact(&restored, &session.session_id, &message.message_id);
     assert!(retained.closure_kind.is_none());
     assert!(retained.superseded_by_message_id.is_none());
@@ -1129,8 +1158,8 @@ fn malformed_persisted_closure_metadata_is_not_replay_authority() {
     assert_eq!(retained.message, "retained despite malformed metadata");
 }
 
-#[test]
-fn resolve_cannot_relabel_withdrawn_or_superseded_closure() {
+#[tokio::test]
+async fn resolve_cannot_relabel_withdrawn_or_superseded_closure() {
     let store = SessionStore::default();
     let session = store.start_session(None, None);
     let withdrawn = post(
@@ -1141,7 +1170,8 @@ fn resolve_cannot_relabel_withdrawn_or_superseded_closure() {
         SessionMessagePriority::Normal,
     );
     store
-        .withdraw_message_for_test(&session.session_id, &withdrawn.message_id)
+        .withdraw_message(&session.session_id, &withdrawn.message_id)
+        .await
         .unwrap();
     assert!(matches!(
         store.resolve_message(
@@ -1163,11 +1193,12 @@ fn resolve_cannot_relabel_withdrawn_or_superseded_closure() {
         SessionMessagePriority::Normal,
     );
     store
-        .replace_message_for_test(replace_input(
+        .replace_message(replace_input(
             &session.session_id,
             &source.message_id,
             "replacement",
         ))
+        .await
         .unwrap();
     assert!(matches!(
         store.resolve_message(

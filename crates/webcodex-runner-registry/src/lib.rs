@@ -22,6 +22,8 @@ mod jobs;
 mod maintenance;
 mod polling;
 mod project_inventory;
+mod project_selection;
+pub use project_selection::{ProjectSelection, ProjectSelectionRow, PROJECT_SELECTION_MAX_RESULTS};
 mod projects;
 mod protocol;
 mod receipts;
@@ -54,10 +56,40 @@ pub(crate) mod test_support {
     use crate::RunnerRegistry;
     use std::sync::atomic::{AtomicU64, Ordering};
     use webcodex_core::runner_protocol::{
-        RunnerCapabilities, RunnerCapabilityId, RunnerProjectSummary, RunnerRegisterRequest,
-        ShellProjectInventoryPage, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
-        RUNNER_PROTOCOL_GENERATION_V2,
+        RunnerCapabilities, RunnerCapabilityId, RunnerProjectSummary,
+        RunnerProtocolGenerationNumber, RunnerRegisterRequest, ShellProjectInventoryPage,
+        PROJECT_INVENTORY_PAGE_MAX_SUMMARIES, RUNNER_PROTOCOL_GENERATION_V2,
     };
+
+    // Keep identity and capabilities exactly as supplied, including invalid protocol
+    // generations and missing capabilities used by rejection tests. Normalization is
+    // a separate, explicit call to `current_runner_registration`.
+    pub(crate) fn runner_registration_request(
+        client_id: String,
+        runner_instance_id: String,
+        runner_protocol_generation: RunnerProtocolGenerationNumber,
+        capabilities: RunnerCapabilities,
+    ) -> RunnerRegisterRequest {
+        RunnerRegisterRequest {
+            client_id,
+            runner_instance_id,
+            runner_protocol_generation,
+            capabilities,
+            display_name: None,
+            owner: None,
+            hostname: None,
+            computer_session_availability: None,
+            computer_control_epoch: None,
+            host_context: None,
+            policy: None,
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
+        }
+    }
 
     pub(crate) fn current_runner_capabilities(
         mut capabilities: RunnerCapabilities,
@@ -134,9 +166,10 @@ pub use access::{DetachedInitiatorIdentity, RunnerAccess, RunnerAccessGroup};
 pub use capabilities::{RunnerFeature, RunnerFeatureSet};
 pub use job_status::job_status_is_active;
 pub use job_updates::{
-    JobAttentionSnapshot, JobLogWait, JobLogWaitOutcome, JobTelemetrySnapshot, JobValidationOutput,
-    RuntimeJobAggregateSnapshot, RuntimeJobRunnerCounts, ShellJobLogObservation,
-    ShellJobStartMetadata, StructuredJobExecution, MAX_JOB_TELEMETRY_SNAPSHOTS,
+    JobAttentionSnapshot, JobLogWait, JobLogWaitOutcome, JobShellTarget, JobStartContext,
+    JobStartExecution, JobStartRequest, JobTelemetrySnapshot, JobValidationCorrelation,
+    JobValidationOutput, JobValidationPlan, RuntimeJobAggregateSnapshot, RuntimeJobRunnerCounts,
+    ShellJobLogObservation, MAX_JOB_TELEMETRY_SNAPSHOTS,
 };
 pub use jobs::{command_preview, process_preview, script_preview, COMMAND_PREVIEW_MAX_CHARS};
 pub use maintenance::{
@@ -157,4 +190,7 @@ pub(crate) use registry::{
 pub use requests::{EnqueueLspError, EnqueueRunnerSkillError};
 pub use state::{JobRecoveryPhase, JobRecoveryReason};
 pub use state::{RunnerSemanticView, ShellJobVisibility};
-pub use telemetry::{NoopRunnerRegistryTelemetry, RunnerRegistryTelemetry, ValidatedMcpToolResult};
+pub use telemetry::{
+    NoopRunnerRegistryTelemetry, RunnerRegistryTelemetry, RunnerRequestCancellationReason,
+    ValidatedMcpToolResult,
+};

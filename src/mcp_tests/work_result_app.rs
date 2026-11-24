@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn work_result_null_session_input_has_no_explicit_runtime_selection() {
+    for project in ["agent:demo:project", "~p1"] {
+        for arguments in [
+            json!({"project": project}),
+            json!({"project": project, "session_id": null}),
+        ] {
+            let call =
+                crate::tool_runtime::ToolCall::from_tool_name("present_work_result", arguments)
+                    .expect("optional Session input");
+            assert!(matches!(
+                call,
+                crate::tool_runtime::ToolCall::PresentWorkResult {
+                    project: selected_project,
+                    session_id: None,
+                } if selected_project == project
+            ));
+        }
+    }
+}
+
 fn tool<'a>(payload: &'a Value, name: &str) -> Option<&'a Value> {
     payload["tools"]
         .as_array()?
@@ -40,9 +61,9 @@ fn work_result_pdf_bytes_are_private_and_do_not_enter_structured_or_text_content
 async fn work_result_descriptor_keeps_renderers_public_and_bridge_tools_app_only() {
     assert_eq!(
         MCP_WORK_RESULT_UI_RESOURCE_URI,
-        "ui://webcodex/work-result/v36"
+        "ui://webcodex/work-result/v40"
     );
-    let runtime = test_runtime();
+    let runtime = workflow_runtime();
 
     let ui = handle_with_app_policy(
         &runtime,
@@ -141,7 +162,7 @@ async fn work_result_descriptor_keeps_renderers_public_and_bridge_tools_app_only
         )
     );
 
-    let full = test_runtime();
+    let full = workflow_runtime();
     let full_ui = handle_with_app_policy(
         &full,
         rpc(
@@ -677,13 +698,13 @@ fn work_result_html_is_bounded_live_progress_ui() {
         "id=\"windowIdentity\"",
         "Project · ",
         "Session · ",
-        "Calls in this chat, earliest first.",
+        "id=\"summaryStrip\"",
         "Activity",
         "Collaboration",
         "Final changes",
         "id=\"tabResults\"",
         "id=\"workspaceFiles\"",
-        "Workspace changes",
+        "Changed files",
         "Checks and review",
         "Message this Window",
         "No messages yet",
@@ -709,6 +730,18 @@ fn work_result_html_is_bounded_live_progress_ui() {
         assert!(
             MCP_WORK_RESULT_APP_HTML.contains(required),
             "missing {required}"
+        );
+    }
+    // Explanations that only restate the UI stay out of the always-visible body.
+    for retired in [
+        "Calls in this chat, earliest first.",
+        "id=\"viewResults\"",
+        "id=\"discussResults\"",
+        "id=\"reviewSections\"",
+    ] {
+        assert!(
+            !MCP_WORK_RESULT_APP_HTML.contains(retired),
+            "retired {retired}"
         );
     }
     assert!(MCP_WORK_RESULT_APP_HTML.contains("const VISIBLE_REFRESH_MS = 10000;"));

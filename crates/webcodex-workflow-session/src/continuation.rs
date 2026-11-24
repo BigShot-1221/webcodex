@@ -30,12 +30,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::task_context::RECONCILE_ACTION;
 use crate::{
     canonical_tool_call_finished_events, closeout_work_projection, current_attempt_event_view,
     exploration_tool_kind, normalize_observed_project_path, ExplorationToolKind,
     SessionDiscussionSummary, SessionEvent, SessionMessage, SessionSummary,
 };
-use crate::task_context::RECONCILE_ACTION;
 
 /// Maximum number of characters returned from the previous instruction.
 const MAX_INSTRUCTION_EXCERPT_CHARS: usize = 500;
@@ -54,92 +54,86 @@ pub const EXPLORATION_CONTINUITY_ACTION: &str =
 const MUTATING_HISTORY_INCOMPLETE_ACTION: &str =
     "inspect whether durable Session history is missing before resuming mutating work";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct CallIdentity<'a> {
-    session_id: &'a str,
-    project: Option<&'a str>,
-    tool_name: &'a str,
-    call_id: &'a str,
-    logical_invocation_id: Option<&'a str>,
-    logical_invocation_role: Option<&'a str>,
+/// Exact correlation identity, shared by the bounded in-memory tail and
+/// the SQLite full-history recovery scan. A call ID alone is not authority.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct RetainedCallIdentity {
+    session_id: String,
+    call_id: String,
+    project: Option<String>,
+    tool_name: String,
+    logical_invocation_id: Option<String>,
+    logical_invocation_role: Option<String>,
 }
 
-fn retained_scope_project(event: &SessionEvent) -> Option<&str> {
-    event
-        .resolved_project
-        .as_deref()
-        .or(event.project.as_deref())
-}
-
-fn mutating_tool_call_identity<'a>(
-    event: &'a SessionEvent,
-    session_id: &'a str,
-) -> Option<CallIdentity<'a>> {
-    let call_id = event.call_id.as_deref()?;
-    if call_id.is_empty() {
+pub(crate) fn retained_call_identity(event: &SessionEvent) -> Option<RetainedCallIdentity> {
+    if !matches!(
+        event.kind.as_str(),
+        "tool_call_started" | "tool_call_finished"
+    ) {
         return None;
     }
-    Some(CallIdentity {
-        session_id,
-        project: retained_scope_project(event),
-        tool_name: &event.tool_name,
-        call_id,
-        logical_invocation_id: event.logical_invocation_id.as_deref(),
-        logical_invocation_role: event.logical_invocation_role.as_deref(),
+    let call_id = event.call_id.as_ref().filter(|id| !id.is_empty())?;
+    Some(RetainedCallIdentity {
+        session_id: event.session_id.clone(),
+        call_id: call_id.clone(),
+        project: event
+            .resolved_project
+            .clone()
+            .or_else(|| event.project.clone()),
+        tool_name: event.tool_name.clone(),
+        logical_invocation_id: event.logical_invocation_id.clone(),
+        logical_invocation_role: event.logical_invocation_role.clone(),
     })
 }
 
-fn mutating_start_like(event: &SessionEvent) -> bool {
-    event.write_like || event.shell_like
+pub(crate) fn mutating_start_like(event: &SessionEvent) -> bool {
+    event.kind == "tool_call_started" && (event.write_like || event.shell_like)
 }
 
-/// Fail closed when retained durable history has ambiguous or unclosed mutating
-/// tool-call pairing. Only `write_like` / `shell_like` starts participate; read-like
-/// calls are ignored even when unclosed. Finish pairing uses exact call identity and
-/// does not rely on finish metadata flags, which may differ from the paired start.
+/// Reverse-order pairing for one exact identity. More than one candidate
+/// finish is ambiguous; saturation at two keeps even malformed groups bounded.
+#[derive(Debug, Default)]
+pub(crate) struct RetainedCallPairing {
+    finishes: u8,
+}
+
+impl RetainedCallPairing {
+    /// Returns true for an unclosed or ambiguous mutation.
+    pub(crate) fn observe_reverse(&mut self, event: &SessionEvent) -> bool {
+        if event.kind == "tool_call_finished" {
+            self.finishes = self.finishes.saturating_add(1).min(2);
+        } else if mutating_start_like(event) {
+            if self.finishes != 1 {
+                return true;
+            }
+            self.finishes = 0;
+        }
+        false
+    }
+}
+
+/// Fail closed when retained history has an ambiguous or unclosed mutating
+/// tool-call pairing. Finish metadata flags do not have to match start flags.
 pub(crate) fn retained_history_has_unclosed_mutating_tool_calls<'a>(
     events: impl DoubleEndedIterator<Item = &'a SessionEvent>,
     session_id: &'a str,
 ) -> bool {
-    let mut pending_finishes: HashMap<CallIdentity<'_>, usize> = HashMap::new();
-
+    let mut pairings: HashMap<RetainedCallIdentity, RetainedCallPairing> = HashMap::new();
     for event in events.rev() {
         if event.session_id != session_id {
             continue;
         }
-        match event.kind.as_str() {
-            "tool_call_finished" => {
-                let Some(identity) = mutating_tool_call_identity(event, session_id) else {
-                    continue;
-                };
-                *pending_finishes.entry(identity).or_insert(0) += 1;
+        let Some(identity) = retained_call_identity(event) else {
+            if mutating_start_like(event) {
+                return true;
             }
-            "tool_call_started" => {
-                if !mutating_start_like(event) {
-                    continue;
-                }
-                let Some(call_id) = event.call_id.as_deref().filter(|id| !id.is_empty()) else {
-                    return true;
-                };
-                let identity = CallIdentity {
-                    session_id,
-                    project: retained_scope_project(event),
-                    tool_name: &event.tool_name,
-                    call_id,
-                    logical_invocation_id: event.logical_invocation_id.as_deref(),
-                    logical_invocation_role: event.logical_invocation_role.as_deref(),
-                };
-                match pending_finishes.get(&identity).copied().unwrap_or(0) {
-                    1 => {
-                        pending_finishes.insert(identity, 0);
-                    }
-                    _ => return true,
-                }
-            }
-            _ => {}
+            continue;
+        };
+        if pairings.entry(identity).or_default().observe_reverse(event) {
+            return true;
         }
     }
-
     false
 }
 
@@ -413,21 +407,111 @@ impl ContinuationProjectionHooks {
     }
 }
 
-/// Bounded current-validation view computed by the canonical Validation owner.
-/// The full validation summary remains a separate input because it may carry
-/// job-enriched history while this snapshot is derived from durable Session
-/// events using the exact current-evidence fence semantics.
-#[derive(Clone, Copy)]
-pub struct ContinuationValidationSnapshot<'a> {
-    current_evidence: &'a Value,
-    current_validation: &'a Value,
+/// Current validation facts provided directly by the canonical Validation owner.
+/// The serialized detail is used only for bounded failure-identity presentation.
+#[derive(Clone)]
+pub struct ContinuationValidationSnapshot {
+    pub requested: bool,
+    pub status: String,
+    pub latest_status: String,
+    pub resolved_failure_count: usize,
+    pub unresolved_failure_count: usize,
+    pub evidence_gap_event_count: usize,
+    pub events_total: usize,
+    pub stale_failure_count: usize,
+    pub latest_kind: Option<String>,
+    pub latest_at: Option<i64>,
+    pub current_validation: Value,
 }
 
-impl<'a> ContinuationValidationSnapshot<'a> {
-    pub fn new(current_evidence: &'a Value, current_validation: &'a Value) -> Self {
+#[derive(Clone)]
+pub struct ContinuationJobSnapshot {
+    pub active_count: u64,
+    pub running_count: u64,
+    pub recovering_count: u64,
+    pub terminal_pending_count: u64,
+    pub recent_truncated: bool,
+    pub latest_job_status: String,
+}
+
+impl Default for ContinuationJobSnapshot {
+    fn default() -> Self {
         Self {
-            current_evidence,
-            current_validation,
+            active_count: 0,
+            running_count: 0,
+            recovering_count: 0,
+            terminal_pending_count: 0,
+            recent_truncated: false,
+            latest_job_status: "not_observed".to_string(),
+        }
+    }
+}
+
+// Historical JSON fixtures remain convenient test inputs, never runtime facts.
+#[cfg(any(test, feature = "root-test-support"))]
+impl ContinuationValidationSnapshot {
+    pub fn new(current_evidence: &Value, current_validation: &Value) -> Self {
+        let count = |key| {
+            current_evidence
+                .get(key)
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize
+        };
+        let latest = current_validation.get("latest");
+        Self {
+            requested: true,
+            status: current_evidence
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            latest_status: current_evidence
+                .get("latest_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            resolved_failure_count: count("resolved_failure_count"),
+            unresolved_failure_count: count("unresolved_failure_count"),
+            evidence_gap_event_count: count("evidence_gap_event_count"),
+            events_total: count("events_total"),
+            stale_failure_count: count("stale_failure_count"),
+            latest_kind: latest
+                .and_then(|event| event.get("validation_kind"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            latest_at: latest
+                .and_then(|event| {
+                    event
+                        .get("completed_at")
+                        .or_else(|| event.get("started_at"))
+                })
+                .and_then(Value::as_i64),
+            current_validation: current_validation.clone(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "root-test-support"))]
+impl ContinuationJobSnapshot {
+    pub fn from_json(jobs: &Value) -> Self {
+        let count = |key| jobs.get(key).and_then(Value::as_u64).unwrap_or(0);
+        Self {
+            active_count: count("active_count"),
+            running_count: count("running_count"),
+            recovering_count: count("recovering_count"),
+            terminal_pending_count: count("terminal_pending_count"),
+            recent_truncated: jobs
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            latest_job_status: jobs
+                .get("recent")
+                .and_then(Value::as_array)
+                .and_then(|recent| recent.first())
+                .and_then(|job| job.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("not_observed")
+                .to_string(),
         }
     }
 }
@@ -460,8 +544,8 @@ pub struct ContinuationFeedbackInput<'a> {
     /// Ledger-derived validation summary value (`validation_summary_from_events`
     /// output) for the *current* session events, already job-enriched.
     pub validation: &'a Value,
-    /// `active_jobs_summary` value, already bounded by the caller.
-    pub jobs: &'a Value,
+    /// Counts over the authorized active inventory, independent of display limits.
+    pub jobs: ContinuationJobSnapshot,
     /// Discussion/message-board summary with open guidance/risk/todo lists.
     pub discussion: &'a SessionDiscussionSummary,
     /// Continuation kind reported by the session start path:
@@ -474,7 +558,7 @@ pub struct ContinuationFeedbackInput<'a> {
     /// projection. It gates the optional exploration continuity suggestion.
     pub workspace_conflicts: bool,
     pub hooks: ContinuationProjectionHooks,
-    pub current_validation: ContinuationValidationSnapshot<'a>,
+    pub current_validation: ContinuationValidationSnapshot,
     /// Exact raw failed ToolCall event ids that the canonical runtime closeout
     /// projection still considers actionable.
     pub tool_failures: ContinuationToolFailureSnapshot<'a>,
@@ -506,7 +590,8 @@ impl ContinuationFeedback {
         let semantic_attempt_events = attempt_view.semantic_events;
         let boundary_event = attempt_view
             .boundary_event_index
-            .map(|index| &events[index]);
+            .map(|index| &events[index])
+            .or(input.session_summary.current_instruction.as_ref());
 
         let attempt = build_attempt_summary(
             attempt_events,
@@ -645,9 +730,9 @@ fn build_attempt_summary(
     session_summary: &SessionSummary,
     validation: &Value,
     hooks: ContinuationProjectionHooks,
-    current_validation: ContinuationValidationSnapshot<'_>,
+    current_validation: ContinuationValidationSnapshot,
     tool_failures: ContinuationToolFailureSnapshot<'_>,
-    jobs: &Value,
+    jobs: ContinuationJobSnapshot,
     discussion: &SessionDiscussionSummary,
     continuation: &'static str,
     suggest_exploration_continuity: bool,
@@ -664,7 +749,7 @@ fn build_attempt_summary(
     // before that boundary is not fully represented by the retained tail.
     // Otherwise the boundary event and everything after it is retained, so the
     // attempt tail is complete relative to the durable ledger.
-    let complete = boundary_reason_code != Some("attempt_boundary_evicted");
+    let complete = boundary_reason_code.is_none();
     // Sequences are absolute within the retained ledger: the returned window
     // starts at `first_retained_sequence`, so the attempt's first event has
     // sequence `first_retained_sequence + attempt_start`.
@@ -717,18 +802,8 @@ fn build_attempt_summary(
     // material workspace-content change. Historical validation remains intact
     // in the session-wide summary, while activity/open-failure counts use only
     // evidence that still describes the current workspace state.
-    let current_evidence = validation
-        .get("current_evidence")
-        .filter(|value| value.is_object())
-        .unwrap_or(current_validation.current_evidence);
-    let resolved_failures = current_evidence
-        .get("resolved_failure_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    let unresolved_failures = current_evidence
-        .get("unresolved_failure_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let resolved_failures = current_validation.resolved_failure_count;
+    let unresolved_failures = current_validation.unresolved_failure_count;
 
     // --- changes (deduped, deterministic order via closeout_work_projection) ---
     let (_, changed_paths_value) = closeout_work_projection(semantic_attempt_events);
@@ -749,7 +824,7 @@ fn build_attempt_summary(
 
     // --- validation (current attempt verdict, history must not pollute) ---
     let delta = validation_delta(validation);
-    let validation_block = build_attempt_validation(validation, current_validation, &delta);
+    let validation_block = build_attempt_validation(&current_validation, &delta);
 
     // --- jobs (reuse existing lifecycle fields) ---
     let jobs_block = build_attempt_jobs(jobs);
@@ -767,7 +842,6 @@ fn build_attempt_summary(
         &guidance_block,
         &validation_block,
     );
-
     let mut suggested_next_actions = build_suggested_next_actions(
         &outcome_status,
         unresolved_failures,
@@ -778,24 +852,6 @@ fn build_attempt_summary(
         suggest_exploration_continuity,
         workspace_conflicts,
     );
-
-    if session_summary.retained_unclosed_mutating_tool_call {
-        suggested_next_actions.clear();
-        suggested_next_actions.push(RECONCILE_ACTION.to_string());
-        if session_summary.events_truncated || session_summary.retention_truncated {
-            push_unique(
-                &mut suggested_next_actions,
-                MUTATING_HISTORY_INCOMPLETE_ACTION,
-            );
-        }
-        suggested_next_actions.truncate(MAX_SUGGESTED_ACTIONS);
-    } else if session_summary.events_truncated || session_summary.retention_truncated {
-        insert_unique_front(
-            &mut suggested_next_actions,
-            MUTATING_HISTORY_INCOMPLETE_ACTION,
-        );
-        suggested_next_actions.truncate(MAX_SUGGESTED_ACTIONS);
-    }
 
     let task_context = crate::task_context::task_context_value(
         session_summary,
@@ -817,6 +873,23 @@ fn build_attempt_summary(
             suggested_next_actions.clear();
         }
         suggested_next_actions.insert(0, action.to_string());
+        suggested_next_actions.truncate(MAX_SUGGESTED_ACTIONS);
+    }
+    if session_summary.retained_unclosed_mutating_tool_call {
+        suggested_next_actions.clear();
+        suggested_next_actions.push(RECONCILE_ACTION.to_string());
+        if session_summary.events_truncated || session_summary.retention_truncated {
+            push_unique(
+                &mut suggested_next_actions,
+                MUTATING_HISTORY_INCOMPLETE_ACTION,
+            );
+        }
+        suggested_next_actions.truncate(MAX_SUGGESTED_ACTIONS);
+    } else if session_summary.events_truncated || session_summary.retention_truncated {
+        insert_unique_front(
+            &mut suggested_next_actions,
+            MUTATING_HISTORY_INCOMPLETE_ACTION,
+        );
         suggested_next_actions.truncate(MAX_SUGGESTED_ACTIONS);
     }
 
@@ -960,60 +1033,36 @@ fn instruction_from_boundary(
 }
 
 fn build_attempt_validation(
-    validation: &Value,
-    current_validation: ContinuationValidationSnapshot<'_>,
+    current_validation: &ContinuationValidationSnapshot,
     delta: &ValidationDelta,
 ) -> AttemptValidation {
-    // When the caller explicitly did not request validation (handoff with
-    // `include_validation=false`), report it as unavailable with a stable
-    // reason rather than masquerading the absence as `not_run`.
-    let not_requested = validation
-        .get("not_requested")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let evidence = validation
-        .get("current_evidence")
-        .filter(|value| value.is_object())
-        .unwrap_or(current_validation.current_evidence);
+    let not_requested = !current_validation.requested;
     let current_status = if not_requested {
         "unknown"
     } else {
-        evidence
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
+        &current_validation.status
     };
     let current_unresolved = if not_requested {
         0
     } else {
-        evidence
-            .get("unresolved_failure_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize
+        current_validation.unresolved_failure_count
     };
     let evidence_gap_event_count = if not_requested {
         0
     } else {
-        evidence
-            .get("evidence_gap_event_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize
+        current_validation.evidence_gap_event_count
     };
     let (open_failures, observed_open_failures, observed_truncated) = if not_requested {
         (Vec::new(), 0, false)
     } else {
-        attempt_open_failures(current_validation.current_validation)
+        attempt_open_failures(&current_validation.current_validation)
     };
     let total_open_failures = observed_open_failures.max(current_unresolved);
     let failures_truncated = observed_truncated || total_open_failures > open_failures.len();
     let latest_status = if not_requested {
         "unavailable".to_string()
     } else {
-        evidence
-            .get("latest_status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string()
+        current_validation.latest_status.clone()
     };
     let delta_available = !not_requested && delta.comparison.status == "available";
     let delta_reason_code = if not_requested {
@@ -1027,33 +1076,17 @@ fn build_attempt_validation(
             .map(|code| code.to_string())
             .or_else(|| Some("no_previous_validation".to_string()))
     };
-    let latest = current_validation.current_validation.get("latest");
-    let latest_kind = latest
-        .and_then(|event| event.get("validation_kind"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let latest_at = latest
-        .and_then(|event| {
-            event
-                .get("completed_at")
-                .or_else(|| event.get("started_at"))
-        })
-        .and_then(Value::as_i64);
+    let latest_kind = current_validation.latest_kind.clone();
+    let latest_at = current_validation.latest_at;
     let validation_events = if not_requested {
         0
     } else {
-        evidence
-            .get("events_total")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize
+        current_validation.events_total
     };
     let stale_failure_count = if not_requested {
         0
     } else {
-        evidence
-            .get("stale_failure_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize
+        current_validation.stale_failure_count
     };
     AttemptValidation {
         status: current_status.to_string(),
@@ -1079,35 +1112,15 @@ fn build_attempt_validation(
 /// with healthy `running`, runner-offline is never equated with process-lost,
 /// and `failed`/`lost`/`orphaned` counts are not reported because the active
 /// aggregate never includes terminal jobs. No Runner query or network call.
-fn build_attempt_jobs(jobs: &Value) -> AttemptJobs {
-    let active_count = jobs
-        .get("active_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let running_count = jobs
-        .get("running_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let recovering_count = jobs
-        .get("recovering_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let terminal_pending_count = jobs
-        .get("terminal_pending_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let recent_truncated = jobs
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let latest_job_status = jobs
-        .get("recent")
-        .and_then(Value::as_array)
-        .and_then(|recent| recent.first())
-        .and_then(|job| job.get("status"))
-        .and_then(Value::as_str)
-        .unwrap_or("not_observed")
-        .to_string();
+fn build_attempt_jobs(jobs: ContinuationJobSnapshot) -> AttemptJobs {
+    let ContinuationJobSnapshot {
+        active_count,
+        running_count,
+        recovering_count,
+        terminal_pending_count,
+        recent_truncated,
+        latest_job_status,
+    } = jobs;
     let recovery_state = if active_count == 0 && terminal_pending_count == 0 {
         "none".to_string()
     } else if recovering_count > 0 {

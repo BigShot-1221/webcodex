@@ -209,7 +209,7 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         summary:
             "Validate: use structured validators when their canonical diagnostics, evidence/test-count, validation identity, or same-execution Job semantics help; native execution is first-class when the command is outside or awkward for that contract. Prefer project_validate for portable common validation.",
         manifest_purpose:
-            "For portable project validation, prefer project_validate; dependency_policy.mode=locked prevents adapter-managed dependency selection updates for check/test without implying offline execution. For Rust check/test, dependency_resolution_policy=offline requests Runner-owned Cargo --offline for dependency resolution (not an OS network sandbox); omitted defaults are unchanged. Keep cargo_fmt for explicit formatting semantics; cargo_check/cargo_test/go_test remain exact-name advanced specialists rather than ordinary routing choices. Native validation is first-class when the command is outside or awkward for that structured contract: prefer run_process for one literal-argv executable, run_shell when shell grammar/output shaping is required, and run_script for program-like supported scripts. Keep independent failure/permission boundaries separate. cargo_fmt check=false retains ensure-format mutation truth; check=true stays read-only.",
+            "For portable project validation, prefer project_validate; dependency_policy.mode=locked prevents adapter-managed dependency selection updates for check/test without implying offline execution. For Rust check/lint/test, dependency_resolution_policy=offline requests Runner-owned Cargo --offline for dependency resolution (not an OS network sandbox); omitted defaults are unchanged. Keep cargo_fmt for explicit formatting semantics; cargo_check/cargo_test/go_test remain exact-name advanced specialists rather than ordinary routing choices. Native validation is first-class when the command is outside or awkward for that structured contract: prefer run_process for one literal-argv executable, run_shell when shell grammar/output shaping is required, and run_script for program-like supported scripts. Keep independent failure/permission boundaries separate. cargo_fmt check=false retains ensure-format mutation truth; check=true stays read-only.",
         tools: &[
             "project_validate",
             "cargo_fmt",
@@ -228,9 +228,9 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     },
     ToolRecommendedFlow {
         name: "observe_computer",
-        summary: "Computer observe: discover targets and current elements; when action support is unclear, inspect element_state can_press/can_focus/can_input_text. Tree/search replaces element IDs; state preserves their generation. Observation grants no control authority.",
+        summary: "Computer observe: discover targets and current elements; when action support is unclear, inspect element_state can_press/can_focus/can_input_text/can_select. Tree/search replaces element IDs; state preserves their generation. Observation grants no control authority.",
         manifest_purpose:
-            "Use observe_computer with the smallest read-only action needed: targets/windows/displays/applications, accessibility_status/accessibility_tree/find_elements/element_state, snapshot_window/snapshot_display, or read_clipboard. When an element's semantic action support is unclear, call element_state with its exact client_id/surface_id/element_id and inspect can_press/can_focus/can_input_text. Recheck only when changed state matters to the next decision. Successful tree/search observations replace all element IDs on that surface; element_state preserves observation_generation and cannot refresh stale IDs. A readable value does not imply action support. Exact action scopes and Runner capabilities remain fenced; native state grants no execution authority.",
+            "Use observe_computer with the smallest read-only action needed: targets/windows/displays/applications, accessibility_status/accessibility_tree/find_elements/element_state, snapshot_window/snapshot_display, or read_clipboard. When an element's semantic action support is unclear, call element_state with its exact client_id/surface_id/element_id and inspect can_press/can_focus/can_input_text/can_select. For further Windows container content, inspect optional scroll axes/percentages and use control_computer(action=scroll) for one small/large increment; optional observe_after returns a fresh bounded tree. A missing scroll field is unknown. Recheck only when changed state matters to the next decision. Successful tree/search observations replace all element IDs on that surface; element_state preserves observation_generation and cannot refresh stale IDs. A readable value does not imply action support. Exact action scopes and Runner capabilities remain fenced; native state grants no execution authority.",
         tools: &["observe_computer"],
     },
     ToolRecommendedFlow {
@@ -261,9 +261,9 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         name: "delegated_acp_coding",
         summary: "ACP coding: provider from current Runner inventory only; start_coding_agent/observe_coding_agent manage Run lifecycle; required after uncertain start; default omit config overrides; live probe may side effect; no automatic fallback; no provider/model fallback.",
         manifest_purpose:
-            "Delegated ACP coding when the current Runner advertises a provider: choose provider_id only from that exact inventory, not a guarantee on every Runner. Omit config overrides by default; call inspect_coding_agent_config only when needed and accept that include_live_acp probing may have provider-side side effects. start_coding_agent starts one Run; observe_coding_agent follows the same Run to a terminal state and is required after any uncertain start instead of starting a replacement. respond_coding_agent_permission only with the exact live pending permission_request_token and an advertised option id from that request. cancel_coding_agent stops an active Run when needed. WebCodex does not automatically fall back to another provider or model.",
+            "Delegated ACP coding when the current Runner advertises a provider: choose provider_id only from that exact inventory, not a guarantee on every Runner. Omit config overrides by default; call diagnose_coding_agent only when needed and accept that include_live_acp probing may have provider-side side effects. start_coding_agent starts one Run; observe_coding_agent follows the same Run to a terminal state and is required after any uncertain start instead of starting a replacement. respond_coding_agent_permission only with the exact live pending permission_request_token and an advertised option id from that request. cancel_coding_agent stops an active Run when needed. WebCodex does not automatically fall back to another provider or model.",
         tools: &[
-            "inspect_coding_agent_config",
+            "diagnose_coding_agent",
             "start_coding_agent",
             "observe_coding_agent",
             "respond_coding_agent_permission",
@@ -334,7 +334,7 @@ pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "review_changes",
     "check_workspace_hygiene",
     // Delegated ACP lifecycle when the current Runner advertises a provider.
-    "inspect_coding_agent_config",
+    "diagnose_coding_agent",
     "start_coding_agent",
     "observe_coding_agent",
     "respond_coding_agent_permission",

@@ -126,19 +126,35 @@ impl DesktopCore {
             return None;
         }
         let identity = identity_from_config(&self.config)?;
-        let webcodex = self.adapter.binaries().ok()?.webcodex.clone();
-        Some(ChatGptActivityProbe { identity, webcodex })
+        // A reopened persistent Environment can be ready before this Desktop
+        // process has resolved its CLI. Resolve on the captured adapter outside
+        // the core lock instead of treating an empty binary cache as no activity.
+        Some(ChatGptActivityProbe {
+            identity,
+            adapter: self.adapter.clone(),
+            runtime_source: self.config.runtime_binary_source.clone(),
+            runtime_selection_revision: self.config.runtime_selection_revision,
+        })
     }
 
     fn apply_chatgpt_activity_observation(
         &mut self,
-        expected_identity: &ProjectRuntimeIdentity,
-        last_meaningful_activity_at_ms: Option<i64>,
+        probe: &ChatGptActivityProbe,
+        observation: DesktopResult<Option<i64>>,
     ) -> DesktopResult<DesktopStateSnapshot> {
         if !self.snapshot.readiness.runtime_ready
-            || identity_from_config(&self.config).as_ref() != Some(expected_identity)
+            || identity_from_config(&self.config).as_ref() != Some(&probe.identity)
+            || self.config.runtime_binary_source != probe.runtime_source
+            || self.config.runtime_selection_revision != probe.runtime_selection_revision
         {
             return Ok(self.publish_snapshot());
+        }
+        // Only publish a checked observation. In particular, a failed query is
+        // not evidence that the current Project has never been used by ChatGPT.
+        let last_meaningful_activity_at_ms = observation?;
+        self.adapter = probe.adapter.clone();
+        if let Ok(binaries) = self.adapter.binaries() {
+            self.snapshot.binaries = Some(binaries.info());
         }
         let last_meaningful_activity_at_ms = last_meaningful_activity_at_ms.max(
             self.snapshot
@@ -292,6 +308,7 @@ impl DesktopCore {
             .snapshot(self.coding_agents_applied_revision);
         self.project_connections();
         self.snapshot.current_operation = None;
+        self.snapshot.state_generation = self.snapshot.state_generation.saturating_add(1);
         self.snapshot.activity_sequence = self.activity.latest_sequence();
         apply_openai_tunnel_configuration(
             &mut self.snapshot,
@@ -318,6 +335,7 @@ impl DesktopCore {
         cancellation: &CancellationContext,
     ) -> DesktopResult<DesktopStateSnapshot> {
         cancellation.check()?;
+        environment::validate_legacy_runner_layout(&self.config)?;
         self.preflight_providers()?;
         if self.config.persistent_environment.is_some() {
             return self.resume_environment(cancellation).await;
@@ -425,6 +443,16 @@ impl DesktopCore {
         };
         self.config.tunnel_proxy = TunnelProxyConfig { mode, custom_url };
         self.save_config().await?;
+        if self.config.persistent_environment.is_some() {
+            let proxy = effective_tunnel_proxy(&self.config.tunnel_proxy)?;
+            let store = environment::store()?;
+            let native = webcodex_environment::NativeEnvironment::new()
+                .map_err(environment::desktop_error)?;
+            let secret_proxy = proxy.url.map(webcodex_environment::Secret::new);
+            let _ = native
+                .update_openai_tunnel_proxies(&store, secret_proxy.as_ref())
+                .map_err(environment::desktop_error)?;
+        }
         self.get_state().await
     }
 
@@ -1006,255 +1034,6 @@ impl DesktopCore {
         self.autostart_connections(cancellation).await?;
         self.get_state().await
     }
-    pub async fn configure_remote_setup(
-        &mut self,
-        server_url: &str,
-        pairing_code: &str,
-        project_path: &str,
-        cancellation: &CancellationContext,
-    ) -> DesktopResult<DesktopStateSnapshot> {
-        cancellation.check()?;
-        self.preflight_providers()?;
-        let server_url = crate::webcodex::validate_server_url(server_url)?;
-        let project = self.adapter.inspect_project(project_path).await?;
-        cancellation.check()?;
-        let binaries = self.adapter.ensure_binaries(cancellation).await?.clone();
-        self.snapshot.binaries = Some(binaries.info());
-        crate::runtime_selection::verify_resolved_files(&binaries).await?;
-        let exposure = if server_url.starts_with("https://") {
-            Exposure::ExistingHttps {
-                url: server_url.clone(),
-            }
-        } else {
-            Exposure::None
-        };
-        let topology = RuntimeTopology {
-            experience: Experience::Full,
-            server: ServerTopology::Remote {
-                url: server_url.clone(),
-            },
-            runner: RunnerTopology::Local,
-            exposure,
-            enrollment: Enrollment::ManagedPairing,
-        };
-        self.snapshot.topology = Some(topology.clone());
-        self.stage_project_scope(project.clone());
-        self.config.topology = Some(topology.clone());
-        self.config.runtime_autostart = Some(true);
-        self.config.preferred_connection = Some(RegularConnectionPreference::NoChatGpt);
-        self.snapshot.readiness = aggregate_readiness(
-            ServerReadiness::Starting,
-            RunnerReadiness::Connecting,
-            if server_url.starts_with("https://") {
-                ExposureReadiness::Starting
-            } else {
-                ExposureReadiness::Degraded
-            },
-            ProjectReadiness::Configured,
-        );
-        self.activity.push(
-            ActivityEventKind::RemoteConnecting,
-            "desktop",
-            ActivityLevel::Info,
-            "Connecting this computer to the existing WebCodex Server",
-        );
-        self.publish_snapshot();
-
-        let reusable_identity = runner_identity_from_config(&self.config)
-            .filter(|identity| same_server(&identity.server_url, &server_url));
-        let saved_runner_client_id = stored_runner_client_id(&self.config);
-        let reusable_observation = match reusable_identity.as_ref() {
-            Some(identity) => self
-                .adapter
-                .observe_runner_connection(
-                    identity,
-                    saved_runner_client_id.as_deref(),
-                    cancellation,
-                )
-                .await
-                .ok(),
-            None => None,
-        };
-        let (identity, identity_replaced, runner_client_id) = match (
-            reusable_identity,
-            reusable_observation,
-        ) {
-            (Some(identity), Some(observation)) => (identity, false, observation.client_id),
-            _ => {
-                if !pairing_code.starts_with("wc_pair_") {
-                    return Err(DesktopError::new(
-                            "pairing_code_invalid",
-                            "The saved Runner identity is not reusable and no new WebCodex pairing code was provided",
-                            "Refresh this Runner connection with a new wc_pair_… code.",
-                        ));
-                }
-                let project_identity = self
-                    .adapter
-                    .login_with_pairing(
-                        &server_url,
-                        pairing_code,
-                        &self.data_dir.join("connections"),
-                        &project,
-                        cancellation,
-                    )
-                    .await?;
-                let observation = self
-                    .adapter
-                    .observe_runner_connection(&project_identity, None, cancellation)
-                    .await?;
-                // A remote pairing code is one-shot. Publish the newly
-                // validated connection identity before Runner/project
-                // activation so a later readiness failure can retry this
-                // same credential instead of forcing another pairing.
-                self.config.topology = Some(topology.clone());
-                self.store_identity(
-                    &project,
-                    &project_identity,
-                    None,
-                    Some(observation.client_id.clone()),
-                )
-                .await?;
-                cancellation.check()?;
-                (project_identity.runner, true, observation.client_id)
-            }
-        };
-
-        let server_deadline = Deadline::after(SERVER_READY_TIMEOUT);
-        let server_status = match self
-            .adapter
-            .server_status_until(
-                Some(&server_url),
-                None,
-                Some(&identity.user_token_file),
-                cancellation,
-                server_deadline,
-            )
-            .await
-        {
-            Ok(status) => status,
-            Err(error) => {
-                cancellation.check()?;
-                if server_deadline.is_elapsed() {
-                    return Err(readiness_timeout_error(
-                        "server_unreachable",
-                        "The existing WebCodex Server did not respond before the readiness deadline",
-                        "Check the Server URL and network path, then retry.",
-                    ));
-                }
-                return Err(error);
-            }
-        };
-        cancellation.check()?;
-        if !server_status.http_reachable {
-            return Err(DesktopError::new(
-                "server_unreachable",
-                "The existing WebCodex Server is not reachable",
-                "Check the Server URL and network path, then retry.",
-            ));
-        }
-        let runner_deadline = Deadline::after(RUNNER_READY_TIMEOUT);
-        let replacing_owned_runner = identity_replaced
-            && process_is_active(self.process_snapshot(ProcessKey::LocalRunner).await);
-        if replacing_owned_runner {
-            self.stop_process_until(ProcessKey::LocalRunner, runner_deadline)
-                .await;
-            cancellation.check()?;
-        }
-        let runner_ready = if identity_replaced {
-            false
-        } else {
-            self.adapter
-                .runner_ready_until(&identity, cancellation, runner_deadline)
-                .await
-                .unwrap_or(false)
-        };
-        cancellation.check()?;
-        let runner_started = if !runner_ready {
-            if runner_deadline.is_elapsed() {
-                return Err(readiness_timeout_error(
-                    "runner_offline",
-                    "Runner did not become connected",
-                    "Check Server reachability and Runner diagnostics, then retry.",
-                ));
-            }
-            self.spawn_configured_runner(&identity, cancellation)
-                .await?;
-            true
-        } else {
-            false
-        };
-        self.wait_for_runner(&identity, cancellation, runner_deadline, runner_started)
-            .await?;
-        let identity = match self
-            .adapter
-            .activate_project(&identity, &runner_client_id, &project, cancellation)
-            .await
-        {
-            Ok(identity) => identity,
-            Err(error)
-                if matches!(
-                    error.code.as_str(),
-                    "project_activation_capability_unavailable"
-                        | "project_activation_restart_required"
-                ) =>
-            {
-                if !can_refresh_legacy_runner(self.process_snapshot(ProcessKey::LocalRunner).await)
-                {
-                    return Err(DesktopError::new(
-                        "project_activation_legacy_runner",
-                        "This Runner needs to be refreshed before the new project can be activated",
-                        "Refresh the Runner, then select this project again.",
-                    ));
-                }
-                let legacy_identity = self
-                    .adapter
-                    .legacy_register_project(&identity, &runner_client_id, &project, cancellation)
-                    .await?;
-                let legacy_deadline = Deadline::after(RUNNER_READY_TIMEOUT);
-                self.stop_process_until(ProcessKey::LocalRunner, legacy_deadline)
-                    .await;
-                if legacy_deadline.is_elapsed() {
-                    return Err(readiness_timeout_error(
-                        "runner_offline",
-                        "Desktop could not refresh its legacy Runner",
-                        "Retry project setup after checking Runner diagnostics.",
-                    ));
-                }
-                self.spawn_configured_runner(&legacy_identity, cancellation)
-                    .await?;
-                self.wait_for_runner(&legacy_identity, cancellation, legacy_deadline, true)
-                    .await?;
-                legacy_identity
-            }
-            Err(error) => return Err(error),
-        };
-        self.wait_for_project(&identity, cancellation).await?;
-        cancellation.check()?;
-        self.config.topology = Some(topology);
-        self.store_identity(&project, &identity, None, Some(runner_client_id))
-            .await?;
-        self.snapshot.readiness = aggregate_readiness(
-            ServerReadiness::Ready,
-            RunnerReadiness::Ready,
-            if server_url.starts_with("https://") {
-                // HTTPS proves transport shape, not that ChatGPT can reach and
-                // authenticate to the MCP endpoint. D1 has no canonical remote
-                // MCP/handoff probe, so keep this explicitly unverified.
-                ExposureReadiness::Unknown
-            } else {
-                ExposureReadiness::Degraded
-            },
-            ProjectReadiness::Ready,
-        );
-        self.activity.push(
-            ActivityEventKind::RemoteConnected,
-            "desktop",
-            ActivityLevel::Info,
-            "This computer is connected to the existing WebCodex Server",
-        );
-        self.get_state().await
-    }
-
     pub async fn start_quick_share(
         &mut self,
         project_path: &str,
@@ -1701,29 +1480,6 @@ impl DesktopCore {
             )
             .await;
         }
-    }
-
-    async fn store_identity(
-        &mut self,
-        project: &ProjectSelection,
-        identity: &ProjectRuntimeIdentity,
-        server_env_file: Option<PathBuf>,
-        runner_client_id: Option<String>,
-    ) -> DesktopResult<()> {
-        let mut project = project.clone();
-        project.runtime_project_id = Some(identity.runtime_project_id.clone());
-        self.config.project = Some(project.clone());
-        self.config.runtime = Some(StoredRuntime {
-            server_url: identity.server_url.clone(),
-            server_env_file,
-            runner_config: Some(identity.runner_config.clone()),
-            user_token_file: Some(identity.user_token_file.clone()),
-            runner_client_id,
-            project_id: Some(identity.project_id.clone()),
-            runtime_project_id: Some(identity.runtime_project_id.clone()),
-        });
-        self.snapshot.project = Some(project);
-        self.save_config().await
     }
 
     async fn save_config(&mut self) -> DesktopResult<()> {

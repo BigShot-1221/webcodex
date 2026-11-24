@@ -123,6 +123,7 @@ async fn runtime_home_recent_and_project_scans_are_explicitly_bounded() {
     let visible = RuntimeConsoleProjects {
         projects: (0..HOME_PROJECT_SCAN_LIMIT)
             .map(|index| RuntimeConsoleProject {
+                session_identity: None,
                 id: format!("agent:runner:project-{index}"),
                 client_id: "runner".to_string(),
                 project_ref: None,
@@ -168,6 +169,7 @@ async fn runtime_home_projects_all_retained_sessions_without_extra_presentation_
     }
     let visible = RuntimeConsoleProjects {
         projects: vec![RuntimeConsoleProject {
+            session_identity: None,
             id: project_id.to_string(),
             client_id: "runner".to_string(),
             project_ref: None,
@@ -278,7 +280,7 @@ async fn navigation_overview_does_not_project_projects_or_scan_job_history() {
     )
     .await;
     for _ in 0..20 {
-        start_authorized_session(&runtime, "agent:own:repo", &auth);
+        start_authorized_session(&runtime, "agent:own:repo", &auth).await;
     }
     let before_jobs = runtime
         .runner_registry
@@ -324,32 +326,88 @@ async fn navigation_overview_does_not_project_projects_or_scan_job_history() {
     );
 }
 
-#[test]
-fn navigation_family_count_uses_explicit_lineage_like_project_view() {
-    let row = |id: &str, source: Option<&str>| RuntimeConsoleProject {
-        id: format!("agent:r:{id}"),
-        client_id: "r".into(),
-        project_ref: None,
-        name: None,
-        path: None,
-        registration_source: None,
-        lineage: source.map(
-            |source| RuntimeConsoleProjectLineage::ManagedWorktreeSource {
-                source_project_id: source.into(),
-                base_sha: "a".repeat(40),
-            },
-        ),
-        connected: true,
-        runner_status: None,
-        sessions: None,
-    };
+#[tokio::test]
+async fn navigation_family_count_and_inventory_identity_match_full_overview() {
+    let runtime = test_runtime();
+    let auth = crate::auth::shared_key_context("canonical-families");
+    let foreign = crate::auth::shared_key_context("hidden-families");
+    register_project(&runtime, "own", "seed", "/fixture/seed", Some(&auth)).await;
+    register_project(
+        &runtime,
+        "foreign",
+        "hidden",
+        "/fixture/hidden",
+        Some(&foreign),
+    )
+    .await;
+    let mut summaries = (0..MAX_PROJECT_LIMIT + 10)
+        .map(|index| {
+            let mut summary = project(&format!("p{index:05}"), &format!("/fixture/p{index:05}"));
+            summary.disabled = index == MAX_PROJECT_LIMIT + 9;
+            if index == 1 {
+                summary.lineage = Some(
+                    webcodex_core::runner_protocol::RunnerProjectLineage::ManagedWorktreeSource {
+                        source_project_id: "p00000".into(),
+                        source_root_fingerprint: format!("wc_projroot_{}", "1".repeat(64)),
+                        base_sha: "a".repeat(40),
+                    },
+                );
+            }
+            summary
+        })
+        .collect::<Vec<_>>();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "own",
+        "inst-own",
+        summaries.clone(),
+    )
+    .await;
+    let primary = super::super::overview_primary::primary_for_auth(&runtime, &auth)
+        .await
+        .unwrap();
+    let full = overview_for_auth(&runtime, &auth).await.unwrap();
+    assert_eq!(primary.visible_project_families, MAX_PROJECT_LIMIT + 8);
     assert_eq!(
-        super::super::overview_primary::family_count(&[
-            row("repo", None),
-            row("wt", Some("repo")),
-            row("other", None)
-        ]),
-        2
+        full.visible_project_families,
+        primary.visible_project_families
+    );
+    assert_eq!(full.projects.len(), MAX_PROJECT_LIMIT);
+    assert!(full.projects_truncated);
+    assert_eq!(primary.runners.len(), 1);
+    let primary_row = serde_json::to_value(&primary.runners[0]).unwrap();
+    let full_row = serde_json::to_value(&full.runners[0]).unwrap();
+    for field in [
+        "project_inventory_generation",
+        "project_inventory_sync_state",
+        "project_inventory_updated_at",
+    ] {
+        assert_eq!(primary_row[field], full_row[field], "{field}");
+        assert!(!primary_row[field].is_null(), "missing wire field {field}");
+    }
+    assert_eq!(primary_row["project_inventory_sync_state"], "complete");
+    assert!(primary_row["project_inventory_generation"]
+        .as_str()
+        .unwrap()
+        .starts_with("test-inventory-"));
+
+    // Same cardinality, new metadata: a new completed generation must invalidate
+    // the browser catalogue without depending on count or ordinary heartbeat age.
+    summaries[0].name = Some("Renamed".into());
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "own",
+        "inst-own",
+        summaries,
+    )
+    .await;
+    let updated = super::super::overview_primary::primary_for_auth(&runtime, &auth)
+        .await
+        .unwrap();
+    assert_eq!(updated.visible_projects, primary.visible_projects);
+    assert_ne!(
+        updated.runners[0].project_inventory_generation,
+        primary.runners[0].project_inventory_generation
     );
 }
 
@@ -367,7 +425,7 @@ async fn runtime_home_primary_skips_session_hydration_but_keeps_visibility_and_p
         Some(&foreign),
     )
     .await;
-    start_authorized_session(&runtime, "agent:own:one", &auth);
+    start_authorized_session(&runtime, "agent:own:one", &auth).await;
     let primary = overview_for_auth_detail(&runtime, &auth, false)
         .await
         .unwrap();
@@ -397,8 +455,8 @@ async fn runtime_home_projects_and_recent_sessions_span_visible_runners() {
     let auth = crate::auth::shared_key_context("runtime-home-fleet");
     register_project(&runtime, "runner-a", "proj-a", "/private/a", Some(&auth)).await;
     register_project(&runtime, "runner-b", "proj-b", "/private/b", Some(&auth)).await;
-    start_authorized_session(&runtime, "agent:runner-a:proj-a", &auth);
-    start_authorized_session(&runtime, "agent:runner-b:proj-b", &auth);
+    start_authorized_session(&runtime, "agent:runner-a:proj-a", &auth).await;
+    start_authorized_session(&runtime, "agent:runner-b:proj-b", &auth).await;
 
     let home = overview_for_auth(&runtime, &auth).await.unwrap();
     let recent_clients = home
@@ -438,8 +496,8 @@ async fn runtime_home_recent_sessions_follow_project_authority() {
     let auth_b = crate::auth::shared_key_context("runtime-home-b");
     register_project(&runtime, "runner-a", "proj-a", "/private/a", Some(&auth_a)).await;
     register_project(&runtime, "runner-b", "proj-b", "/private/b", Some(&auth_b)).await;
-    start_authorized_session(&runtime, "agent:runner-a:proj-a", &auth_a);
-    start_authorized_session(&runtime, "agent:runner-b:proj-b", &auth_b);
+    start_authorized_session(&runtime, "agent:runner-a:proj-a", &auth_a).await;
+    start_authorized_session(&runtime, "agent:runner-b:proj-b", &auth_b).await;
 
     let home = overview_for_auth(&runtime, &auth_a).await.unwrap();
     assert_eq!(home.projects.len(), 1);
@@ -466,6 +524,7 @@ fn runtime_home_full_scan_repeated_cold_sessions_cost_comparison() {
     for project_index in 0..3 {
         let project_id = format!("agent:bench:project-{project_index}");
         benchmark_projects.push(RuntimeConsoleProject {
+            session_identity: None,
             id: project_id.clone(),
             client_id: "bench".to_string(),
             project_ref: None,

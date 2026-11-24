@@ -58,6 +58,9 @@ pub(crate) struct ToolCallRequest {
 pub(crate) struct ToolInvocationMetadata {
     /// Explicit presentation request; never dispatch or continuation authority.
     pub(crate) compact_execution: bool,
+    /// Adapter-selected discovery subset, bounded by the static registry. This
+    /// only narrows catalog visibility; dispatch never consults it for authority.
+    pub(crate) discovery_tools: Option<std::collections::BTreeSet<String>>,
     pub(crate) control: Option<super::control_sidecar::ControlSidecars>,
     // Historical wrapper name retained for protocol compatibility. Exact IDs may
     // acknowledge either legacy Session-board messages or Window collaboration
@@ -71,6 +74,9 @@ pub(crate) struct ToolInvocationMetadata {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ToolProtocolCapabilities {
+    /// Caller owns workflow/context. Skip optional continuity enrichment; never
+    /// changes authorization, canonical evidence, execution or Job recovery.
+    pub(crate) execution_only: bool,
     /// Explicit model-facing control wrapper support; internal/App calls default off.
     pub(crate) control_sidecars: bool,
     pub(crate) context_sidecar: bool,
@@ -160,6 +166,9 @@ impl ToolCallOutcome {
 
 fn session_selector_failure(error: super::SessionSelectorError) -> ToolCallOutcome {
     match error {
+        super::SessionSelectorError::StorageUnavailable => ToolCallOutcome::rejected_result(
+            super::session_tools::session_storage_unavailable_result(),
+        ),
         super::SessionSelectorError::UnknownRef(message) => {
             ToolCallOutcome::rejected(ToolCallErrorStatus::InvalidArguments { message })
         }
@@ -233,6 +242,7 @@ impl ToolRuntime {
             request,
             context,
             ToolProtocolCapabilities {
+                execution_only: false,
                 context_sidecar: context_sidecar_capable,
                 control_sidecars: false,
                 skill_runtime: context_sidecar_capable,
@@ -279,7 +289,7 @@ impl ToolRuntime {
         )
     }
 
-    fn call_tool_with_invocation_metadata_and_return_timing<'a>(
+    pub(crate) fn call_tool_with_invocation_metadata_and_return_timing<'a>(
         &'a self,
         request: ToolCallRequest,
         context: ToolCallContext<'a>,
@@ -399,7 +409,9 @@ impl ToolRuntime {
         if let Some(mut outcome) =
             super::specialized::try_dispatch_specialized_gateway(self, &request, context).await
         {
-            if super::tool_definition::is_model_visible_tool_name(&request.tool_name) {
+            if !capabilities.execution_only
+                && super::tool_definition::is_model_visible_tool_name(&request.tool_name)
+            {
                 let peer_project = outcome.project.clone();
                 if let Some(result) = outcome.result.as_mut() {
                     self.add_window_model_reply_sidecar(
@@ -483,20 +495,16 @@ impl ToolRuntime {
         // never re-evaluate (no second request id / inconsistent outcome).
         let execution_started = std::time::Instant::now();
         let (mut result, result_projection, mut correlation) = self
-            .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
+            .dispatch_canonical(
                 call,
-                context.auth,
-                context.transport.into(),
-                recording.metadata.clone(),
-                context.window,
-                context.session_id.is_none(),
-                context_request,
-                super::context_projection::ContextMaterialCapabilities {
-                    skill_runtime: capabilities.skill_runtime,
-                    memory_surface: capabilities.memory_surface,
+                super::dispatch::DispatchContext {
+                    recorder: recording.metadata.clone(),
+                    context_request,
+                    capabilities,
+                    discovery_tools: invocation_metadata.discovery_tools.clone(),
+                    return_timing,
+                    ..super::dispatch::DispatchContext::new(context)
                 },
-                capabilities,
-                return_timing,
             )
             .await;
         crate::tool_request_trace::record_phase_latency(
@@ -890,7 +898,7 @@ mod tests {
                 "observe_coding_agent",
                 "cancel_coding_agent",
                 "respond_coding_agent_permission",
-                "inspect_coding_agent_config",
+                "diagnose_coding_agent",
             ] {
                 assert_eq!(
                     check_runtime_tool_scope(Some(&insufficient), tool),
@@ -913,7 +921,7 @@ mod tests {
         for tool in [
             "observe_coding_agent",
             "cancel_coding_agent",
-            "inspect_coding_agent_config",
+            "diagnose_coding_agent",
         ] {
             assert_eq!(
                 check_runtime_tool_scope(Some(&run_only), tool),

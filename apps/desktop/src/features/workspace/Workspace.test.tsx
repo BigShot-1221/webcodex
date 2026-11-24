@@ -120,7 +120,7 @@ describe("product workspace task flows", () => {
     expect(screen.queryByText("History is partial")).not.toBeInTheDocument();
   });
 
-  it("ignores failures from pre-refresh observations and resumes overview and Git reads", async () => {
+  it("reports failures from an in-flight refresh paused mid-request and resumes overview and Git reads", async () => {
     const pending = new Map<string, (error: Error) => void>();
     const normal = native.invoke.getMockImplementation()!;
     function Status() {
@@ -140,7 +140,9 @@ describe("product workspace task flows", () => {
     expect(pending.size).toBe(5);
     view.rerender(content(true));
     await act(async () => { for (const reject of pending.values()) reject(new Error("workspace_unavailable")); });
-    expect(screen.getByText("Observation healthy")).toBeInTheDocument();
+    // The in-flight refresh is not discarded by the pause: its failure is the
+    // freshest observation of this workspace and is reported truthfully.
+    expect(screen.getByText("Observation failed")).toBeInTheDocument();
     expect(screen.queryByText("feat/export")).not.toBeInTheDocument();
     native.invoke.mockClear();
     native.invoke.mockImplementation(normal);
@@ -148,6 +150,84 @@ describe("product workspace task flows", () => {
     expect(await screen.findAllByText("feat/export")).toHaveLength(2);
     await waitFor(() => expect(native.invoke).toHaveBeenCalledTimes(5));
     expect(screen.getByText("Observation healthy")).toBeInTheDocument();
+  });
+
+  describe("in-flight observations across polling pauses", () => {
+    type DeferredCall = { kind: string; resolve: (value: unknown) => void; reject: (error: Error) => void };
+    function deferredInvoke() {
+      const calls: DeferredCall[] = [];
+      native.invoke.mockImplementation((_command: string, { request }: { request: { kind: string } }) => new Promise((resolve, reject) => {
+        calls.push({ kind: request.kind, resolve, reject });
+      }));
+      return calls;
+    }
+    const settle = async (calls: DeferredCall[], data: Record<string, unknown>) => {
+      await act(async () => {
+        for (const call of calls) {
+          const payload = data[call.kind];
+          if (payload === undefined) call.reject(new Error("unexpected query " + call.kind));
+          else call.resolve(payload);
+        }
+      });
+    };
+    function Probe() {
+      const workspace = useWorkspace();
+      return <div>{workspace.projects.map(project => <span key={project.id}>{project.name}</span>)}</div>;
+    }
+    const content = (suspended: boolean, selected = state) => <DesktopMantineProvider><LocaleProvider><WorkspaceProvider state={selected} suspended={suspended}>
+      <Probe />
+    </WorkspaceProvider></LocaleProvider></DesktopMantineProvider>;
+    const fixtures = {
+      overview,
+      projects: { projects: overview.projects, total: overview.visible_project_count, truncated: false },
+      windows: { windows: [windowRow] },
+    };
+
+    it("commits an in-flight observation across a polling pause", async () => {
+      const calls = deferredInvoke();
+      const view = render(content(false));
+      expect(calls).toHaveLength(3);
+      view.rerender(content(true));
+      await settle(calls, fixtures);
+      // Before the fix the pause disposed this request and the successful
+      // observation was dropped; now the freshest result is committed.
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+      expect(screen.getByText("beta")).toBeInTheDocument();
+    });
+
+    it("does not stack duplicate polls while a request is in flight", async () => {
+      const calls = deferredInvoke();
+      const view = render(content(false));
+      expect(calls).toHaveLength(3);
+      // Passive observation flaps must not pile new polls onto the pending one.
+      view.rerender(content(true));
+      view.rerender(content(false));
+      view.rerender(content(true));
+      expect(native.invoke.mock.calls).toHaveLength(3);
+      await settle(calls, fixtures);
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+    });
+
+    it("does not write results that belong to a switched workspace", async () => {
+      const calls = deferredInvoke();
+      const view = render(content(false));
+      expect(calls).toHaveLength(3);
+      const switched = { ...state, topology: { ...state.topology!, server: { kind: "local" as const, url: "http://workspace-b" } } } as DesktopState;
+      view.rerender(content(false, switched));
+      await waitFor(() => expect(calls).toHaveLength(6));
+      const late = calls.slice(0, 3);
+      const fresh = calls.slice(3);
+      // The old workspace's late result carries a project only it knows about.
+      await act(async () => {
+        late[0].resolve({ ...overview, projects: [{ ...alpha, id: "agent:mini:gamma", path: "C:\\work\\gamma", name: "gamma" }], visible_project_count: 3 });
+        late[1].resolve({ projects: [{ ...alpha, id: "agent:mini:gamma", path: "C:\\work\\gamma", name: "gamma" }], total: 3, truncated: false });
+        late[2].resolve({ windows: [] });
+      });
+      expect(screen.queryByText("gamma")).not.toBeInTheDocument();
+      await settle(fresh, fixtures);
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+      expect(screen.queryByText("gamma")).not.toBeInTheDocument();
+    });
   });
 
 
@@ -182,8 +262,8 @@ describe("product workspace task flows", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Server connectionRunning");
     expect(screen.getByRole("status")).not.toHaveTextContent("Local Runner");
     expect(screen.getByRole("status")).toHaveTextContent("Desktop Tunnel connectionsNo Tunnel connections saved in Desktop");
-    expect(screen.getByRole("complementary")).toHaveTextContent("Server connection · Running");
-    expect(screen.getByRole("complementary")).toHaveTextContent("No Tunnel connections saved in Desktop");
+    expect(screen.getByRole("complementary")).toHaveTextContent("WebCodex ·");
+    expect(screen.getByRole("complementary")).not.toHaveTextContent("No Tunnel connections saved in Desktop");
     expect(screen.getByRole("complementary")).not.toHaveTextContent("Local Runner");
     expect(screen.queryByText("ChatGPT connected")).not.toBeInTheDocument();
     expect(native.invoke.mock.calls.every(([command]) => command === "workspace_query")).toBe(true);
@@ -198,7 +278,7 @@ describe("product workspace task flows", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Server connectionRunning");
     expect(screen.getByRole("status")).not.toHaveTextContent("Local Runner");
     expect(screen.getByRole("status")).toHaveTextContent("1 of 1 Desktop Tunnels locally ready");
-    expect(screen.getByRole("complementary")).toHaveTextContent("Server connection · Running");
+    expect(screen.getByRole("complementary")).toHaveTextContent("WebCodex ·");
   });
 
   it("does not invent a configured Runner before topology is available", () => {
@@ -212,7 +292,7 @@ describe("product workspace task flows", () => {
     const full = { ...state, persistent_environment, readiness: { ...state.readiness, runner: "error" as const, runtime_ready: false } };
     render(wrap(<><WorkspaceStatus state={full} /><Sidebar state={full} navigation="home" setNavigation={vi.fn()} /></>, full));
     expect(screen.getByRole("status")).toHaveTextContent("Local RunnerUnavailable");
-    expect(screen.getByRole("complementary")).toHaveTextContent("Local Runner · Unavailable");
+    expect(screen.getByRole("complementary")).toHaveTextContent("WebCodex ·");
   });
 
   it("shows the configured Runner when joining an independently managed Server", () => {
@@ -220,7 +300,7 @@ describe("product workspace task flows", () => {
       topology: { ...state.topology!, server: { kind: "remote" as const, url: "https://central.example" } }, connections: connectionSnapshot() };
     render(wrap(<><WorkspaceStatus state={joined} /><Sidebar state={joined} navigation="home" setNavigation={vi.fn()} /></>, joined));
     expect(screen.getByRole("status")).toHaveTextContent("Local RunnerRunning");
-    expect(screen.getByRole("complementary")).toHaveTextContent("Local Runner · Running");
+    expect(screen.getByRole("complementary")).toHaveTextContent("WebCodex ·");
     expect(screen.getByRole("status")).toHaveTextContent("No Tunnel connections saved in Desktop");
   });
 
@@ -229,7 +309,7 @@ describe("product workspace task flows", () => {
       readiness: { ...state.readiness, exposure: "remote_ready" as const }, connections: connectionSnapshot() };
     render(wrap(<><WorkspaceStatus state={quickShare} /><Sidebar state={quickShare} navigation="home" setNavigation={vi.fn()} /></>, quickShare));
     expect(screen.getByRole("status")).toHaveTextContent("Quick ShareRunning");
-    expect(screen.getByRole("complementary")).toHaveTextContent("Quick Share · Running");
+    expect(screen.getByRole("complementary")).toHaveTextContent("WebCodex ·");
     expect(screen.queryByText("Desktop Tunnel connections")).not.toBeInTheDocument();
     expect(screen.queryByText("No Tunnel connections saved in Desktop")).not.toBeInTheDocument();
   });
@@ -237,15 +317,17 @@ describe("product workspace task flows", () => {
   it("keeps a viewer read-only without offering a local project picker", () => {
     const viewer = { ...state, project: null, saved_projects: [], workspace_runner: null,
       topology: { ...state.topology!, server: { kind: "remote" as const, url: "https://central.example" }, runner: { kind: "none" as const } } } as DesktopState;
-    render(wrap(<Dashboard state={viewer} refreshing={false} onRefresh={vi.fn()} onResumeRuntime={vi.fn()}
-      onChangeSetup={vi.fn()} onNavigate={vi.fn()} onStopQuickShare={vi.fn()} />, viewer));
+    render(wrap(<Dashboard state={viewer} refreshing={false} onRefresh={vi.fn()} activity={[]}
+      onConnection={vi.fn()} onNavigate={vi.fn()} onStopQuickShare={vi.fn()} />, viewer));
     expect(screen.queryByRole("button", { name: "Add Project" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Desktop events/ })).toHaveTextContent("No Desktop events in this app session");
+    expect(screen.queryByRole("button", { name: /Recent activity/ })).not.toBeInTheDocument();
   });
   it("describes locally ready tunnels without counting a live but unhealthy process as ready", () => {
     const selected = { ...state, connections: connectionSnapshot(connectionFixture({ ready: false, process_started: true, lifecycle: "running" })) };
     render(wrap(<><WorkspaceStatus state={selected} /><Sidebar state={selected} navigation="home" setNavigation={vi.fn()} /></>, selected));
     expect(screen.getByRole("status")).toHaveTextContent("0 of 1 Desktop Tunnels locally ready");
-    expect(screen.getByRole("complementary")).toHaveTextContent("0 of 1 Desktop Tunnels locally ready");
+    expect(screen.getByRole("complementary")).not.toHaveTextContent("0 of 1 Desktop Tunnels locally ready");
     expect(screen.queryByText("ChatGPT connected")).not.toBeInTheDocument();
   });
   it.each([
@@ -360,7 +442,14 @@ describe("product workspace task flows", () => {
   });
 
   it("shows Runner Projects as read-only observed runtime inventory", async () => {
+    const normal = native.invoke.getMockImplementation()!;
+    native.invoke.mockImplementation((command, value) => value.request.kind === "projects"
+      ? Promise.resolve({ projects: [alpha, { ...beta, sessions: undefined }], total: 2, truncated: false })
+      : normal(command, value));
     render(wrap(<ProjectsPanel />));    await screen.findByLabelText("Open sessions: 2"); expect(await screen.findAllByText("feat/export")).toHaveLength(2);
+    const missingSummary = screen.getByRole("row", { name: "beta" });
+    expect(within(missingSummary).getByText("Not checked")).toBeInTheDocument();
+    expect(missingSummary).not.toHaveTextContent("No activity observed yet");
     expect(screen.getAllByRole("row")).toHaveLength(3);
     for (const row of screen.getAllByRole("row")) expect(within(row).queryByRole("button", { name: /Use project|Select project/ })).not.toBeInTheDocument();
     expect(screen.queryByText("Current")).not.toBeInTheDocument();
@@ -756,11 +845,24 @@ describe("product workspace task flows", () => {
     expect(screen.queryByText("Stale project")).not.toBeInTheDocument();
     expect(screen.getByRole("row", { name: "beta" })).toBeInTheDocument();
   });
+  it.each([
+    ["idle", "ChatGPT activity has not been checked"],
+    ["pending", "Checking ChatGPT activity…"],
+    ["failed", "Could not check ChatGPT activity"],
+  ] as const)("distinguishes an %s ChatGPT query from an empty observation", (queryStatus, label) => {
+    render(<LocaleProvider><ChatgptObservation state={{ ...state, chatgpt_activity: null }} queryStatus={queryStatus} /></LocaleProvider>);
+    expect(screen.getByText(label)).toBeInTheDocument();
+    expect(screen.queryByText("No ChatGPT activity observed yet")).not.toBeInTheDocument();
+  });
   it("uses timestamps, never inferred ChatGPT presence", () => {
     const view = render(<LocaleProvider><ChatgptObservation state={state} /></LocaleProvider>);
     expect(screen.getByText("No ChatGPT activity observed yet")).toBeInTheDocument();
-    view.rerender(<LocaleProvider><ChatgptObservation state={{ ...state, chatgpt_activity: { observed: true, last_meaningful_activity_at_ms: Date.now() - 120_000 } }} /></LocaleProvider>);
+    const observed = { ...state, chatgpt_activity: { observed: true, last_meaningful_activity_at_ms: Date.now() - 120_000 } };
+    view.rerender(<LocaleProvider><ChatgptObservation state={observed} /></LocaleProvider>);
     expect(screen.getByText(/Last ChatGPT activity/)).toHaveTextContent("2 minutes ago");
+    view.rerender(<LocaleProvider><ChatgptObservation state={observed} queryStatus="failed" /></LocaleProvider>);
+    expect(screen.getByText(/Last ChatGPT activity/)).toHaveTextContent("2 minutes ago");
+    expect(screen.getByText(/Last ChatGPT activity/)).toHaveTextContent("Could not check ChatGPT activity");
     expect(screen.queryByText(/connected|disconnected|Waiting for ChatGPT/i)).not.toBeInTheDocument();
   });
 });

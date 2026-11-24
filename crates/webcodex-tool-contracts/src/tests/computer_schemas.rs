@@ -1,5 +1,54 @@
 use super::*;
 
+#[test]
+fn computer_post_observation_contract_is_explicit_and_narrow() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "control_computer");
+    assert!(action_properties(&spec.input_schema, "press").contains_key("observe_after"));
+    assert!(action_properties(&spec.input_schema, "input_text").contains_key("observe_after"));
+    assert!(action_properties(&spec.input_schema, "scroll").contains_key("observe_after"));
+    assert!(!action_properties(&spec.input_schema, "focus").contains_key("observe_after"));
+    assert_eq!(
+        spec.output_schema["properties"]["output"]["properties"]["post_observation"]["properties"]
+            ["success"]["type"],
+        "boolean"
+    );
+    test_support::validate_schema_instance(
+        &json!({"success":true,"output":{"platform":"windows","surface_id":"surface_test",
+            "element_id":"element_test","action":"press","success":true,
+            "post_observation":{"success":false,"output":{"error_kind":"timeout","message":"read timed out"},"error":"read timed out"}}}),
+        &spec.output_schema,
+    ).unwrap();
+    for action in ["press", "input_text", "scroll"] {
+        let mut args = json!({"action":action,"client_id":"runner","surface_id":"surface_test",
+            "element_id":"element_test", "observe_after":{"action":"accessibility_tree","max_depth":3,"max_nodes":32}});
+        if action == "input_text" {
+            args["text"] = json!("hello");
+        }
+        if action == "scroll" {
+            args["direction"] = json!("down");
+        }
+        test_support::validate_schema_instance(&args, &spec.input_schema).unwrap();
+        let call = ToolCall::from_tool_name("control_computer", args.clone()).unwrap();
+        let ToolCall::ComputerControl(control) = call else {
+            panic!("Computer control call")
+        };
+        assert_eq!(
+            serde_json::to_value(control).unwrap()["observe_after"],
+            args["observe_after"]
+        );
+        args["observe_after"]["action"] = json!("snapshot_display");
+        assert!(ToolCall::from_tool_name("control_computer", args).is_err());
+    }
+    assert!(ToolCall::from_tool_name(
+        "control_computer",
+        json!({"action":"focus",
+        "client_id":"runner","surface_id":"surface_test","element_id":"element_test",
+        "observe_after":{"action":"accessibility_tree"}})
+    )
+    .is_err());
+}
+
 fn action_branch<'a>(schema: &'a Value, action: &str) -> &'a Value {
     schema["oneOf"]
         .as_array()
@@ -33,6 +82,23 @@ fn tool_specs_hide_legacy_sync_wait_from_process_and_script_discovery() {
             "{name} must hide sync_wait_secs from model discovery"
         );
         assert!(!required_fields(spec).contains(&"sync_wait_secs".to_string()));
+    }
+}
+
+#[test]
+fn computer_discovery_keywords_cover_desktop_gui_tasks() {
+    for (tool, expected) in [
+        ("observe_computer", ["desktop", "gui", "mac", "screen"]),
+        ("control_computer", ["desktop", "gui", "mac", "operate"]),
+    ] {
+        let definition = crate::lookup_tool_definition(tool).expect("canonical Computer tool");
+        let keywords = definition
+            .model_spec
+            .expect("model-visible Computer descriptor")
+            .discovery_keywords;
+        for term in expected {
+            assert!(keywords.contains(&term), "{tool} missing {term}");
+        }
     }
 }
 
@@ -178,8 +244,10 @@ fn computer_control_schema_is_closed_action_union() {
         "launch_application",
         "activate_window",
         "press",
+        "select",
         "focus",
         "scroll_to_element",
+        "scroll",
         "key",
         "input_text",
         "pointer_move",
@@ -243,7 +311,8 @@ fn computer_key_schema_discloses_closed_vocabulary_and_modifier_constraints() {
     let specs = registered_tool_specs();
     let spec = spec_named(&specs, "control_computer");
     let key = action_properties(&spec.input_schema, "key");
-    assert_eq!(key["key"]["enum"], json!(COMPUTER_KEY_INPUT_KEYS));
+    let keys: Vec<_> = webcodex_core::computer_input_contract::computer_key_input_keys().collect();
+    assert_eq!(key["key"]["enum"], json!(keys));
     let modifiers = key["modifiers"]["anyOf"]
         .as_array()
         .unwrap()
@@ -272,7 +341,7 @@ fn computer_key_schema_discloses_closed_vocabulary_and_modifier_constraints() {
         }
     }
     for (name, modifiers) in [
-        ("p", json!([])),
+        ("unknown", json!([])),
         ("Ctrl+P", json!([])),
         ("Enter", json!([])),
         ("tab", json!(["ctrl"])),
@@ -308,6 +377,86 @@ fn computer_key_schema_discloses_closed_vocabulary_and_modifier_constraints() {
             spec.description.contains(text),
             "missing model guidance: {text}"
         );
+    }
+}
+
+#[test]
+fn computer_key_chords_accept_canonical_keys_and_reject_malformed_modifiers() {
+    let schema = crate::input_schema_for_tool("control_computer");
+    for key in ["a", "j", "p", "0", "f24", "delete", "slash", "numpad_enter"] {
+        let input =
+            json!({"action":"key", "client_id":"client", "surface_id":"surface_test", "key":key});
+        for modifiers in [
+            None,
+            Some(Value::Null),
+            Some(json!([])),
+            Some(json!(["shift"])),
+            Some(json!(["control"])),
+            Some(json!(["control", "shift", "option"])),
+        ] {
+            let mut valid = input.clone();
+            if let Some(modifiers) = modifiers {
+                valid["modifiers"] = modifiers;
+            }
+            test_support::validate_schema_instance(&valid, &schema).unwrap();
+            ToolCall::from_tool_name("control_computer", valid).unwrap();
+        }
+        for modifiers in [
+            Some(json!(["ctrl"])),
+            Some(json!(["control", "control"])),
+            Some(json!(["shift", "control", "option", "command", "shift"])),
+            Some(json!("control")),
+        ] {
+            let mut invalid = input.clone();
+            invalid.as_object_mut().unwrap().remove("modifiers");
+            if let Some(modifiers) = modifiers {
+                invalid["modifiers"] = modifiers;
+            }
+            assert!(
+                test_support::validate_schema_instance(&invalid, &schema).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn computer_key_success_receipts_fit_primitive_and_gateway_output_schemas() {
+    let specs = registered_tool_specs();
+    let control = spec_named(&specs, "control_computer");
+    let primitive = output_schema_for_tool("computer_key_input");
+    let output_schemas = [
+        ("computer_key_input", &primitive),
+        ("control_computer", &control.output_schema),
+    ];
+    let mut failures = Vec::new();
+    for key in webcodex_core::computer_input_contract::computer_key_input_keys() {
+        let modifiers = if matches!(key, "j" | "p") {
+            json!(["control"])
+        } else {
+            json!([])
+        };
+        let input = json!({"action":"key", "client_id":"client", "surface_id":"surface_test",
+            "key":key, "modifiers":modifiers});
+        test_support::validate_schema_instance(&input, &control.input_schema).unwrap();
+        let receipt = json!({"success":true, "output":{"platform":"windows",
+            "surface_id":"surface_test", "key":key, "modifiers":modifiers, "success":true}});
+        for (name, schema) in output_schemas {
+            if let Err(error) = test_support::validate_schema_instance(&receipt, schema) {
+                failures.push(format!("{name} {key}: {error}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    for key in ["unknown", "Ctrl+P", "P"] {
+        let receipt = json!({"success":true, "output":{"platform":"windows",
+            "surface_id":"surface_test", "key":key, "modifiers":["control"], "success":true}});
+        for (name, schema) in output_schemas {
+            assert!(
+                test_support::validate_schema_instance(&receipt, schema).is_err(),
+                "{name} accepted {receipt}"
+            );
+        }
     }
 }
 
@@ -437,4 +586,110 @@ fn computer_save_snapshot_remains_separate_create_only_project_write() {
         present: ["project", "path", "client_id", "surface_id", "source_width", "source_height", "region", "width", "height", "mime_type", "file_bytes", "sha256", "saved"],
         absent: ["content_base64", "captured_at_unix_ms"]
     );
+}
+
+#[test]
+fn computer_selection_has_one_exact_target_and_no_implicit_effects() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "control_computer");
+    let args = json!({"action":"select","client_id":"runner","surface_id":"surface_test","element_id":"element_test"});
+    test_support::validate_schema_instance(&args, &spec.input_schema).unwrap();
+    let call = ToolCall::from_tool_name("control_computer", args.clone()).unwrap();
+    let ToolCall::ComputerControl(control) = call else {
+        panic!("selection control")
+    };
+    assert_eq!(control.action_name(), "select");
+    assert_eq!(serde_json::to_value(control).unwrap(), args);
+    for field in ["observe_after", "index", "label", "add", "toggle"] {
+        let mut extra = args.clone();
+        extra[field] = json!(true);
+        assert!(ToolCall::from_tool_name("control_computer", extra.clone()).is_err());
+        assert!(test_support::validate_schema_instance(&extra, &spec.input_schema).is_err());
+    }
+    for field in ["client_id", "surface_id", "element_id"] {
+        let mut missing = args.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(ToolCall::from_tool_name("control_computer", missing).is_err());
+    }
+}
+
+#[test]
+fn computer_scroll_schema_matches_closed_parser_and_bounded_receipts() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "control_computer");
+    for direction in ["up", "down", "left", "right"] {
+        for amount in [
+            None,
+            Some(json!(null)),
+            Some(json!("small")),
+            Some(json!("large")),
+        ] {
+            let mut args = json!({"action":"scroll","client_id":"runner","surface_id":"surface_test","element_id":"element_test","direction":direction});
+            if let Some(value) = amount {
+                args["amount"] = value;
+            }
+            test_support::validate_schema_instance(&args, &spec.input_schema).unwrap();
+            assert!(ToolCall::from_tool_name("control_computer", args).is_ok());
+        }
+    }
+    for (field, value) in [
+        ("direction", json!("diagonal")),
+        ("amount", json!("pixels")),
+        ("steps", json!(2)),
+        (
+            "observe_after",
+            json!({"action":"accessibility_tree", "surface_id":"other"}),
+        ),
+    ] {
+        let mut args = json!({"action":"scroll","client_id":"runner","surface_id":"surface_test","element_id":"element_test","direction":"down"});
+        args[field] = value;
+        assert!(test_support::validate_schema_instance(&args, &spec.input_schema).is_err());
+        assert!(ToolCall::from_tool_name("control_computer", args).is_err());
+    }
+    let mut result = json!({"success":true,"output":{"platform":"windows","surface_id":"surface_test","element_id":"element_test","direction":"down","amount":"small","position_before":0.0,"position_after":10.0,"success":true}});
+    test_support::validate_schema_instance(&result, &spec.output_schema).unwrap();
+    result["output"]["position_after"] = json!(101.0);
+    assert!(test_support::validate_schema_instance(&result, &spec.output_schema).is_err());
+}
+
+#[test]
+fn computer_scroll_post_observation_keeps_optional_defaults_and_closed_read() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "control_computer");
+    let base = json!({"action":"scroll","client_id":"runner","surface_id":"surface_test","element_id":"element_test","direction":"down"});
+    for after in [None, Some(Value::Null)] {
+        let mut args = base.clone();
+        if let Some(value) = after {
+            args["observe_after"] = value;
+        }
+        test_support::validate_schema_instance(&args, &spec.input_schema).unwrap();
+        let ToolCall::ComputerControl(call) =
+            ToolCall::from_tool_name("control_computer", args).unwrap()
+        else {
+            panic!("scroll control");
+        };
+        assert!(call.observe_after().is_none());
+        assert!(serde_json::to_value(call)
+            .unwrap()
+            .get("observe_after")
+            .is_none());
+    }
+    for after in [
+        json!({"action":"snapshot_display"}),
+        json!({"action":"accessibility_tree", "root_element_id":"element_old"}),
+        json!({"action":"accessibility_tree", "repeat":2}),
+    ] {
+        let mut args = base.clone();
+        args["observe_after"] = after;
+        assert!(test_support::validate_schema_instance(&args, &spec.input_schema).is_err());
+        assert!(ToolCall::from_tool_name("control_computer", args).is_err());
+    }
+    let result = json!({"success":true,"output":{"platform":"windows","surface_id":"surface_test",
+        "element_id":"element_old","direction":"down","amount":"small","position_before":0,"position_after":10,"success":true,
+        "post_observation":{"success":true,"output":{"platform":"windows","surface_id":"surface_test","observation_generation":2,
+            "max_depth":3,"max_nodes":16,"truncated":false,"node_count":1,
+            "nodes":[{"element_id":"element_new","parent_element_id":null,"depth":0,"role":"AXWindow",
+            "subrole":null,"title":null,"description":null,"placeholder":null,"value":null,
+            "enabled":true,"focused":false,"child_count":0}]}}}});
+    test_support::validate_schema_instance(&result, &spec.output_schema).unwrap();
 }

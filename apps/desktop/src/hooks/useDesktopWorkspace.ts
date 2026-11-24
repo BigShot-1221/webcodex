@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { subscribeDesktopNavigation } from "../lib/desktop-navigation";
 import { desktopApi } from "../lib/desktop-api";
+import { desktopIdentity, type ChatgptActivityQueryStatus } from "../lib/desktop-observation";
+import { isErrorStaleForState, reconcileDesktopStateErrors } from "../lib/desktop-errors";
 import type { ActivityEntry, DesktopError, DesktopState } from "../models/topology";
 import { normalizeDesktopError } from "../i18n/presentation";
 import { NAVIGATION, type Navigation } from "../components/Sidebar";
@@ -12,15 +14,27 @@ const ACTIVE_OPERATION_OBSERVATION_INTERVAL_MS = 1_000;
 export function useDesktopWorkspace() {
   const [state, setState] = useState<DesktopState | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
-  const [navigation, setNavigation] = useState<Navigation>("home");
+  const [{navigation, previousPage}, setPage] = useState<{navigation: Navigation; previousPage?: Navigation}>({navigation: "home"});
+  const selectPage = useCallback((page: Navigation) => {
+    setPage(current => current.navigation === page ? current : { navigation: page, previousPage: current.navigation });
+  }, []);
   const [refreshing, setRefreshing] = useState(false);
   const [runtimeObservations, setRuntimeObservations] = useState(0);
   const [error, setError] = useState<DesktopError | null>(null);
   const [cancelSubmittingId, setCancelSubmittingId] = useState<string | null>(null);
-  const [showSetup, setShowSetup] = useState(false);
+  const [setupOrigin, setSetupOrigin] = useState<"home" | "settings" | "connection" | null>(null);
+  const showSetup = setupOrigin !== null;
+  const setNavigation = useCallback((page: Navigation) => {
+    setSetupOrigin(null);
+    selectPage(page);
+  }, [selectPage]);
   const [startupAttempt, setStartupAttempt] = useState(0);
   const [windowFocused, setWindowFocused] = useState(true);
+  const [chatgptActivityQuery, setChatgptActivityQuery] = useState<{ identity: string; status: ChatgptActivityQueryStatus } | null>(null);
+  const latestGeneration = useRef(0);
   const stateVersionRef = useRef(0);
+  const activeIdentityRef = useRef<string | null>(null);
+  const errorIdentityRef = useRef<string | null>(null);
   const mainRef = useRef<HTMLElement>(null);
   const hasCurrentOperation = Boolean(state?.current_operation);
   const hasLoadedState = Boolean(state);
@@ -31,6 +45,10 @@ export function useDesktopWorkspace() {
       && !refreshing
       && windowFocused,
   );
+  const chatgptActivityIdentity = state ? desktopIdentity(state) : null;
+  const chatgptActivityQueryStatus: ChatgptActivityQueryStatus = chatgptActivityQuery?.identity === chatgptActivityIdentity
+    ? chatgptActivityQuery.status === "pending" && !shouldObserveChatgptActivity ? "idle" : chatgptActivityQuery.status
+    : "idle";
 
   useEffect(() => {
     const onFocus = () => setWindowFocused(true);
@@ -51,9 +69,8 @@ export function useDesktopWorkspace() {
   }, [navigation, showSetup]);
 
   useEffect(() => subscribeDesktopNavigation((target) => {
-    setShowSetup(false);
     setNavigation(target === "connections" ? "connection" : target);
-  }), []);
+  }), [setNavigation]);
 
   useEffect(() => {
     const navigateWithKeyboard = (event: KeyboardEvent) => {
@@ -66,26 +83,49 @@ export function useDesktopWorkspace() {
     };
     window.addEventListener("keydown", navigateWithKeyboard);
     return () => window.removeEventListener("keydown", navigateWithKeyboard);
-  }, []);
+  }, [setNavigation]);
 
   const openSetup = () => {
-    setShowSetup(true);
-    setNavigation("home");
+    setSetupOrigin(navigation === "settings" && previousPage === "connection" ? "connection" : navigation === "settings" ? "settings" : "home");
+    selectPage("home");
   };
 
+  const closeSetup = () => setNavigation(setupOrigin ?? "home");
+
   const commitState = useCallback((next: DesktopState) => {
+    if (next.state_generation !== undefined) {
+      if (next.state_generation < latestGeneration.current) return;
+      latestGeneration.current = next.state_generation;
+    }
     stateVersionRef.current += 1;
-    // The native RuntimeRefresh reconciles this error on confirmed recovery.
-    // A getState response may still carry the old error during that handoff;
-    // never publish contradictory Runner-ready + runner_offline UI state.
-    const staleRunnerError = next.readiness.runner === "ready" && next.runtime_error?.code === "runner_offline";
-    setState(staleRunnerError ? { ...next, runtime_error: null } : next);
-    setError((current) => current?.code === "runner_offline" && next.readiness.runner === "ready" ? null : current);
+    const reconciled = reconcileDesktopStateErrors(next);
+    const nextIdentity = desktopIdentity(reconciled);
+    activeIdentityRef.current = nextIdentity;
+    setState(reconciled);
+    setError((current) => {
+      if (!current) return null;
+      return isErrorStaleForState(current, reconciled, errorIdentityRef.current, nextIdentity)
+        ? null
+        : current;
+    });
+  }, []);
+
+  const recordError = useCallback((value: unknown, expectedIdentity?: string | null) => {
+    if (
+      expectedIdentity
+      && activeIdentityRef.current
+      && expectedIdentity !== activeIdentityRef.current
+    ) {
+      return;
+    }
+    errorIdentityRef.current = activeIdentityRef.current;
+    setError(normalizeDesktopError(value));
   }, []);
 
   const observeFailedOperation = useCallback(async (value: unknown, current: () => boolean = () => true) => {
     if (!current()) return;
-    setError(normalizeDesktopError(value));
+    const observedIdentity = activeIdentityRef.current;
+    recordError(value, observedIdentity);
     const observedVersion = stateVersionRef.current;
     try {
       const terminal = await desktopApi.getState();
@@ -93,12 +133,13 @@ export function useDesktopWorkspace() {
     } catch {
       // Preserve the original failure if this best-effort observation fails.
     }
-  }, [commitState]);
+  }, [commitState, recordError]);
 
   const commitChatgptActivity = useCallback((next: DesktopState) => {
     stateVersionRef.current += 1;
     setState((current) => {
       if (!current) return next;
+      if (desktopIdentity(current) !== desktopIdentity(next)) return current;
       if (current.chatgpt_activity?.observed && !next.chatgpt_activity?.observed) return current;
       return { ...current, chatgpt_activity: next.chatgpt_activity };
     });
@@ -117,7 +158,7 @@ export function useDesktopWorkspace() {
           return;
         }
 
-        // Fresh setup starts with an explicit Create/Join choice. Reading state
+        // Fresh setup presents local defaults. Reading state
         // must never enroll a Runner or install/start services on mount.
         commitState(initial);
         if (!initial.topology) {
@@ -142,7 +183,7 @@ export function useDesktopWorkspace() {
             const observed = await desktopApi.refresh();
             if (!cancelled) commitState(observed);
           } catch (value) {
-            if (!cancelled) setError(normalizeDesktopError(value));
+            if (!cancelled) recordError(value);
           } finally {
             if (!cancelled) setRefreshing(false);
           }
@@ -179,7 +220,7 @@ export function useDesktopWorkspace() {
         }
         bootstrapSettled = true;
       } catch (value) {
-        if (!cancelled) setError(normalizeDesktopError(value));
+        if (!cancelled) recordError(value);
       } finally {
         if (!cancelled && bootstrapSettled) {
           try {
@@ -238,17 +279,25 @@ export function useDesktopWorkspace() {
   }, [commitState, hasCurrentOperation, hasLoadedState, refreshing, state?.persistent_environment]);
 
   useEffect(() => {
-    if (!shouldObserveChatgptActivity) return;
+    if (!shouldObserveChatgptActivity || !chatgptActivityIdentity) return;
 
+    const identity = chatgptActivityIdentity;
     let cancelled = false;
     let timeoutId: number | undefined;
+    const current = () => !cancelled && activeIdentityRef.current === identity;
     const observe = async () => {
+      if (!current()) return;
+      setChatgptActivityQuery({ identity, status: "pending" });
       try {
         const next = await desktopApi.observeChatgptActivity();
-        if (!cancelled) commitChatgptActivity(next);
+        if (current()) {
+          if (desktopIdentity(next) === identity) commitChatgptActivity(next);
+          setChatgptActivityQuery({ identity, status: "idle" });
+        }
       } catch {
-        // Observation is best-effort. Keep the runtime usable and retry only
-        // while the Desktop window remains focused.
+        // A failed read is not an empty activity history. Keep it scoped to the
+        // same runtime identity and preserve any previously observed evidence.
+        if (current()) setChatgptActivityQuery({ identity, status: "failed" });
       } finally {
         if (!cancelled) {
           timeoutId = window.setTimeout(
@@ -264,13 +313,14 @@ export function useDesktopWorkspace() {
       cancelled = true;
       if (timeoutId !== undefined) window.clearTimeout(timeoutId);
     };
-  }, [commitChatgptActivity, shouldObserveChatgptActivity]);
+  }, [chatgptActivityIdentity, commitChatgptActivity, shouldObserveChatgptActivity]);
 
   useEffect(() => {
-    if (navigation === "activity") {
-      void desktopApi.activity().then(setActivity).catch(() => undefined);
-    }
-  }, [navigation, state?.activity_sequence]);
+    if (navigation !== "activity" && !(navigation === "home" && hasLoadedState && state?.topology)) return;
+    let current = true;
+    void desktopApi.activity().then(entries => { if (current) setActivity(entries ?? []); }).catch(() => undefined);
+    return () => { current = false; };
+  }, [navigation, state?.activity_sequence, hasLoadedState, Boolean(state?.topology)]);
 
   const runStateOperation = async (operation: () => Promise<DesktopState>) => {
     setError(null);
@@ -323,11 +373,11 @@ export function useDesktopWorkspace() {
     try {
       commitState(await desktopApi.cancelOperation(observed.id));
     } catch (value) {
-      setError(normalizeDesktopError(value));
+      recordError(value);
     } finally {
       setCancelSubmittingId((current) => current === observed.id ? null : current);
     }
   };
 
-  return { state, activity, navigation, setNavigation, refreshing: refreshing || runtimeObservations > 0, preserveWorkspacePollDeadline: runtimeObservations > 0 && !refreshing, error, setError, cancelSubmittingId, showSetup, setShowSetup, setStartupAttempt, mainRef, commitState, openSetup, refresh, resumeRuntime, cancelCurrentOperation, runStateOperation };
+  return { state, activity, chatgptActivityQueryStatus, navigation, previousPage, setNavigation, refreshing: refreshing || runtimeObservations > 0, preserveWorkspacePollDeadline: runtimeObservations > 0 && !refreshing, error, setError, cancelSubmittingId, showSetup, setupOrigin, closeSetup, setStartupAttempt, mainRef, commitState, openSetup, refresh, resumeRuntime, cancelCurrentOperation, runStateOperation };
 }

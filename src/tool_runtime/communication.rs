@@ -404,6 +404,15 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         input: RotateAgentContinuationEndpointInput,
     ) -> ToolResult {
+        self.attach_agent_endpoint_for_window(auth, None, input)
+    }
+
+    pub(crate) fn attach_agent_endpoint_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        input: RotateAgentContinuationEndpointInput,
+    ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
             Err(result) => return result,
@@ -411,7 +420,14 @@ impl ToolRuntime {
         let Some(db) = self.communication_db.as_ref() else {
             return communication_store_unavailable();
         };
-        match db.attach_agent_endpoint(
+        // Only authenticated request-scoped ChatGPT ClientWindow evidence can
+        // reserve first-mount recovery. A bare principal, a caller-supplied
+        // attachment label, or an unrelated MCP session is never a substitute.
+        // This does not wake a model or mark the newly attached Endpoint live.
+        let origin_window_key = window
+            .filter(|window| window.source() == "openai-session")
+            .map(crate::client_window::ClientWindow::key);
+        match db.attach_agent_endpoint_with_host_window(
             &principal,
             NewAgentEndpoint {
                 agent_id: input.agent_id,
@@ -423,6 +439,7 @@ impl ToolRuntime {
                 wake_capable: false,
                 idempotency_key: input.idempotency_key,
             },
+            origin_window_key,
         ) {
             Ok(result) => {
                 if result.state_changed {

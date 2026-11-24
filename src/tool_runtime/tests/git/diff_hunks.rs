@@ -1012,6 +1012,58 @@ async fn git_diff_hunks_ignores_external_diff_helpers_in_worktree_and_cached_mod
 }
 
 #[tokio::test]
+async fn git_diff_hunks_paths_ignore_user_diff_prefix_config() {
+    // diff.mnemonicPrefix rewrites worktree/index headers to i/ and w/, and
+    // diff.noprefix drops them; neither may leak into reported paths.
+    for (label, config) in [
+        ("mnemonic", "git config diff.mnemonicPrefix true"),
+        ("noprefix", "git config diff.noprefix true"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+        write_git_review_fixture_file(tmp.path(), "safe.txt", "safe-old\n");
+        commit_git_review_fixture(tmp.path(), "base");
+        write_git_review_fixture_file(tmp.path(), "safe.txt", "safe-new\n");
+        git_test_command_ok(tmp.path(), config);
+
+        let runtime = test_runtime();
+        let client_id = format!("diff-hunks-prefix-{label}");
+        let project =
+            register_structured_git_agent_at_path(&runtime, &client_id, "repo", tmp.path()).await;
+        for cached in [false, true] {
+            if cached {
+                git_test_command_ok(tmp.path(), "git add -- safe.txt");
+            }
+            let (page, _, script) = run_runner_git_diff_hunks_page(
+                &runtime,
+                &client_id,
+                &project,
+                tmp.path(),
+                None,
+                10,
+                80,
+                cached,
+                None,
+            )
+            .await;
+            assert!(page.success, "{label} cached={cached}: {:?}", page.error);
+            assert!(script.contains("--src-prefix=a/") && script.contains("--dst-prefix=b/"));
+            let output = serde_json::to_string(&page.output).unwrap();
+            assert!(
+                output.contains("\"safe.txt\""),
+                "{label} cached={cached}: {output}"
+            );
+            for bogus in ["w/safe.txt", "i/safe.txt", "c/safe.txt"] {
+                assert!(
+                    !output.contains(bogus),
+                    "{label} cached={cached} leaked {bogus}: {output}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn git_diff_hunks_never_returns_secret_path_content_in_any_mode() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
@@ -2472,7 +2524,7 @@ async fn git_diff_hunks_committed_drains_bounded_consumer_and_preserves_producer
         .clone();
     let head_q = shell_escape_simple(&head);
     let needle = format!(
-        "git --no-pager -c core.quotePath=false diff --no-ext-diff --no-textconv --find-renames --unified=80 {} {head_q} -- 'file.txt'",
+        "git --no-pager -c core.quotePath=false diff --no-ext-diff --no-textconv --src-prefix=a/ --dst-prefix=b/ --find-renames --unified=80 {} {head_q} -- 'file.txt'",
         shell_escape_simple(&base),
     );
     assert_eq!(

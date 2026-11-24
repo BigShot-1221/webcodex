@@ -27,7 +27,7 @@ fn base_body(path: &str, idempotency_key: &str) -> Value {
 }
 
 async fn post_admin_project(route: &str, body: Value) -> (StatusCode, Value) {
-    let (_tmp, service) = service(Some(admin_auth()));
+    let service = service(Some(admin_auth()));
     let mut response = TestClient::post(format!("http://127.0.0.1/admin/projects/{route}"))
         .add_header("host", "127.0.0.1", true)
         .add_header("origin", "http://127.0.0.1", true)
@@ -68,6 +68,8 @@ async fn admin_register_rejects_invalid_project_paths() {
         ("", "empty"),
         ("relative/path", "relative-posix"),
         (r"C:repo", "drive-relative"),
+        ("D:", "bare-drive"),
+        (r"relative\path", "relative-windows"),
         (r"\repo", "root-relative"),
         ("/root/git/\0", "nul"),
         (overlong.as_str(), "overlong"),
@@ -83,6 +85,8 @@ async fn admin_create_rejects_invalid_project_paths() {
         ("", "empty"),
         ("relative/path", "relative-posix"),
         (r"C:repo", "drive-relative"),
+        ("D:", "bare-drive"),
+        (r"relative\path", "relative-windows"),
         (r"\repo", "root-relative"),
         ("/root/git/\0", "nul"),
         (overlong.as_str(), "overlong"),

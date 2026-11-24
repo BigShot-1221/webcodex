@@ -958,6 +958,9 @@ pub(crate) fn git_diff_hunks_command(paths: &[String], cached: bool) -> Result<S
     }
     parts.push("--no-ext-diff".to_string());
     parts.push("--no-textconv".to_string());
+    // Pin prefixes so user diff.mnemonicPrefix/noprefix config cannot change paths.
+    parts.push("--src-prefix=a/".to_string());
+    parts.push("--dst-prefix=b/".to_string());
     parts.push("--unified=80".to_string());
     if !paths.is_empty() {
         parts.push("--".to_string());
@@ -974,6 +977,8 @@ fn git_diff_hunks_fingerprint_command(paths: &[String], cached: bool) -> String 
     parts.extend([
         "--no-ext-diff".to_string(),
         "--no-textconv".to_string(),
+        "--src-prefix=a/".to_string(),
+        "--dst-prefix=b/".to_string(),
         "--binary".to_string(),
         "--full-index".to_string(),
         "--unified=80".to_string(),
@@ -1000,6 +1005,8 @@ fn git_diff_hunks_committed_command(
         "diff".to_string(),
         "--no-ext-diff".to_string(),
         "--no-textconv".to_string(),
+        "--src-prefix=a/".to_string(),
+        "--dst-prefix=b/".to_string(),
         "--find-renames".to_string(),
     ];
     if fingerprint {

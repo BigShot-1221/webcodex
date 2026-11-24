@@ -66,11 +66,12 @@ impl RuntimeSurface {
                             required_scope,
                             description,
                         }) => {
-                            if let Some(lc) = lifecycle.as_deref() {
-                                lc.dispatch_failed("forbidden");
-                                lc.dispatch_finished(false, Some(false), "forbidden");
-                            }
-                            return Err(scope_forbidden(auth, required_scope, description));
+                            return Err(tool_scope_denied(
+                                context,
+                                lifecycle.as_deref(),
+                                required_scope,
+                                description,
+                            ));
                         }
                         Err(ToolCallErrorStatus::InvalidArguments { message }) => {
                             if let Some(lc) = lifecycle.as_deref() {
@@ -82,7 +83,7 @@ impl RuntimeSurface {
                     }
                     let mut result = mcp_runtime_tool_result_fallback(
                         ToolResult::ok(json!({"work_result": null})),
-                        runtime.runtime_info.mcp_text_json_compat_enabled,
+                        context.text_json_compat,
                         result_presentation,
                     );
                     attach_work_result_app_private_result(&mut result, None);
@@ -137,6 +138,17 @@ impl RuntimeSurface {
                         | "list_sessions"
                         | "open_webcodex_workbench"
                 ));
+        // The Workbench retains independently admitted App-only Goal controls.
+        // This exception never admits a gateway target or advertises a model route.
+        if !context.exposure.allows(&params.name)
+            && !(workbench_view_call && !via_adaptive_runtime_gateway)
+        {
+            return Err(McpOutcome::BadRequest(rpc_error(
+                id,
+                -32602,
+                "Tool is unavailable on the configured MCP tool surface; refresh tools/list",
+            )));
+        }
         let direct_denied = !workbench_view_call
             && !app_only_artifact_read
             && !app_only_goal_plan_sync
@@ -148,7 +160,10 @@ impl RuntimeSurface {
             && !app_only_job_terminal_continuation
             && !protocol_extension_admitted
             && !via_adaptive_runtime_gateway
-            && !is_adaptive_runtime_direct_tool(&params.name);
+            && (!context.exposure.is_direct(context.surface, &params.name)
+                || (context.surface == crate::mcp::request_policy::McpSurface::Cli
+                    && context.default_project.is_some()
+                    && params.name == "list_projects"));
         if direct_denied {
             if let Some(lc) = lifecycle.as_deref() {
                 lc.dispatch_failed("direct_route_denied");
@@ -156,28 +171,77 @@ impl RuntimeSurface {
             }
             // A recovery hint must name a real, currently admitted route. Retired
             // names and unavailable App tools cannot become valid through a gateway.
-            let denial =
-                mcp_adaptive_runtime_direct_route_denial(&params.name, auth, stateless_2026);
-            return Err(McpOutcome::BadRequest(rpc_error_with_data(
-                id,
-                -32602,
-                denial.message,
-                denial.diagnostics,
-            )));
+            if context.surface != crate::mcp::request_policy::McpSurface::Cli {
+                let denial =
+                    mcp_adaptive_runtime_direct_route_denial(&params.name, auth, stateless_2026);
+                return Err(McpOutcome::BadRequest(rpc_error_with_data(
+                    id,
+                    -32602,
+                    denial.message,
+                    denial.diagnostics,
+                )));
+            }
+            let gateway_available =
+                if context.surface == crate::mcp::request_policy::McpSurface::Cli {
+                    matches!(
+                        crate::mcp::cli::default_project_route(
+                            &params.name,
+                            context
+                                .exposure
+                                .route(context.surface, &params.name, stateless_2026),
+                            context.default_project.is_some(),
+                        ),
+                        crate::model_surface::SuggestedToolCallRoute::Gateway(_)
+                    )
+                } else {
+                    mcp_adaptive_runtime_gateway_target_route(&params.name, stateless_2026)
+                        == crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
+                };
+            let message = if !gateway_available {
+                if params.name == "import_conversation_files_to_project" {
+                    format!(
+                        "tool '{}' is unavailable on the current MCP surface; refresh tools/list (reconnect the MCP client after a Server upgrade if its tool catalog is stale) and select a current callable",
+                        params.name
+                    )
+                } else {
+                    format!(
+                        "tool '{}' is unavailable on the current MCP surface; refresh tools/list and select a current callable",
+                        params.name
+                    )
+                }
+            } else if !crate::tool_runtime::kernel::runtime_tool_scope_allows_discovery(
+                auth,
+                &params.name,
+            ) {
+                format!(
+                    "tool '{}' is unavailable under the current authorization; check granted scopes and current tools/list",
+                    params.name
+                )
+            } else {
+                format!(
+                    "tool '{}' is not directly callable on {}; use call_runtime_tool with its current canonical arguments and normal authorization",
+                    params.name,
+                    if context.surface == crate::mcp::request_policy::McpSurface::Cli { "CLI" } else { "Adaptive Runtime" }
+                )
+            };
+            return Err(McpOutcome::BadRequest(rpc_error(id, -32602, message)));
         }
 
+        let execution_only = context.surface == crate::mcp::request_policy::McpSurface::Cli;
         Ok(Self {
             capabilities: ToolProtocolCapabilities {
-                control_sidecars: stateless_2026,
-                context_sidecar: stateless_2026,
-                skill_runtime: stateless_2026,
-                skill_management: stateless_2026,
-                memory_surface: stateless_2026,
+                execution_only,
+                control_sidecars: stateless_2026 && !execution_only,
+                context_sidecar: stateless_2026 && !execution_only,
+                skill_runtime: stateless_2026 && !execution_only,
+                skill_management: stateless_2026 && !execution_only,
+                memory_surface: stateless_2026 && !execution_only,
                 trace_diagnostics: stateless_2026,
-                goal_plan_app: goal_plan_app_admitted,
+                goal_plan_app: goal_plan_app_admitted && context.exposure.goals,
                 work_result_app: work_result_app_admitted,
                 artifact_app: server_mcp_apps_enabled && stateless_2026,
-                agent_continuation_app: agent_continuation_app_admitted,
+                agent_continuation_app: agent_continuation_app_admitted
+                    && (context.exposure.agent_continuation || context.exposure.job_continuation),
             },
             work_result_thread_context,
             discard_recorder: (workbench_view_call

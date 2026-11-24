@@ -132,27 +132,75 @@ async fn registry_allows_quic_v1_file_and_project_ops_queueing() {
 }
 
 #[tokio::test]
+async fn project_allow_patch_update_queue_requires_independent_feature() {
+    let registry = RunnerRegistry::default();
+    let mut modern = runner_registration("project-settings-new", "inst-new", Vec::new());
+    modern.capabilities.project_settings_update = true;
+    registry
+        .register(current_runner_registration(modern))
+        .await
+        .unwrap();
+
+    let payload = r#"{"project_id":"demo","expected_revision":"sha256:old","expected_root_fingerprint":"sha256:root","allow_patch":false}"#;
+    let (request_id, _response) = registry
+        .enqueue_project_op(
+            "project-settings-new".to_string(),
+            "project_update_allow_patch",
+            payload.to_string(),
+            "admin_project_settings".to_string(),
+        )
+        .await
+        .expect("new Runner must accept the revision-guarded admin Project update");
+    let polled = registry
+        .poll(RunnerPollRequest {
+            client_id: "project-settings-new".to_string(),
+            runner_instance_id: "inst-new".to_string(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(polled.request_id, request_id);
+    assert_eq!(polled.kind, "project_update_allow_patch");
+
+    let legacy = runner_registration("project-settings-old", "inst-old", Vec::new());
+    registry
+        .register(current_runner_registration(legacy))
+        .await
+        .unwrap();
+    let error = registry
+        .enqueue_project_op(
+            "project-settings-old".to_string(),
+            "project_update_allow_patch",
+            payload.to_string(),
+            "admin_project_settings".to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("capability_unavailable") && error.contains("project_settings_update"),
+        "{error}"
+    );
+    assert_eq!(
+        registry
+            .get_runner_view("project-settings-old")
+            .await
+            .unwrap()
+            .pending_requests,
+        0
+    );
+}
+
+#[tokio::test]
 async fn registry_allows_quic_v1_start_job_queueing() {
     let registry = RunnerRegistry::default();
     register_quic_v1_runner(&registry, "quic-job").await;
 
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("quic-job".to_string()),
-                cwd: None,
-                command: Some("sleep 1".to_string()),
-                timeout_secs: Some(5),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("quic-job", "sleep 1", Some(5)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -168,42 +216,22 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
     let registry = RunnerRegistry::default();
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "quic-stop".to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
-            capabilities: async_job_capabilities(),
-            policy: None,
+            ..runner_registration_request(
+                "quic-stop".to_string(),
+                "inst".to_string(),
+                crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                async_job_capabilities(),
+            )
         }))
         .await
         .unwrap();
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("quic-stop".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("quic-stop", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();

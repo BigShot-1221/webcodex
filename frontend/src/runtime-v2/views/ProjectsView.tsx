@@ -32,6 +32,7 @@ type Props = {
   client: RuntimeV2Client;
   language: RuntimeLanguage;
   runners: RunnerSummary[];
+  inventoryKey?: string;
   onOpenSession: (location: SessionLocation) => void;
   onOpenWindow: (windowKey: string) => void;
   onUnauthorized: () => void;
@@ -73,9 +74,9 @@ function windowTime(window: WindowSummary): number {
   return window.last_seen_at_ms || window.last_tool_call_at_ms || window.last_meaningful_activity_at_ms || 0;
 }
 
-export function ProjectsView({ client, language, runners, onOpenSession, onOpenWindow, onUnauthorized }: Props) {
+export function ProjectsView({ client, language, runners, inventoryKey, onOpenSession, onOpenWindow, onUnauthorized }: Props) {
   const t = (value: string) => translate(value, language);
-  const projectsState = useProjects(client, true, onUnauthorized);
+  const projectsState = useProjects(client, true, onUnauthorized, { inventoryKey });
   const [selectedFamilyId, setSelectedFamilyId] = useState("");
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [addOpen, setAddOpen] = useState(false);
@@ -249,7 +250,8 @@ export function ProjectsView({ client, language, runners, onOpenSession, onOpenW
           )}
           <div className="inventory-note wide" role="status">
             {projectsState.projects.length} / {projectsState.total} {t("workspaces")}
-            {projectsState.truncated && <button type="button" className="text-button" disabled={projectsState.refreshing} onClick={projectsState.loadMore}>{t("Load more")}</button>}
+            {projectsState.truncated && projectsState.canLoadMore && <button type="button" className="text-button" disabled={projectsState.refreshing} onClick={projectsState.loadMore}>{t("Load more")}</button>}
+            {projectsState.truncated && !projectsState.canLoadMore && <span>{t("Inventory is capped at 2000 workspaces; narrow the filters to see more.")}</span>}
             {projectsState.canShowLess && <button type="button" className="text-button" disabled={projectsState.refreshing} onClick={projectsState.showLess}>{t("Show less")}</button>}
             {projectsState.refreshing && <span>{t("Loading projects…")}</span>}
           </div>

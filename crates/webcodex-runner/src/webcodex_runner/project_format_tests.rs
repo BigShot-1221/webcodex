@@ -259,7 +259,7 @@ fn project_format_bounds_total_bytes_and_rejects_invalid_utf8() {
 #[ignore = "requires installed rustfmt; exercises the owned native process boundary"]
 fn runner_real_process_project_format_rustfmt_stdin_leaves_sources_untouched() {
     use super::config::ShellConfig;
-    use super::shell::{run_process_with_profiles_and_execution_state, PreparedShellProfileCache};
+    use super::shell::{PreparedShellProfileCache, ShellExecutionContext};
     let fixture = Fixture::new();
     fs::write(
         fixture.root.join("src/main.rs"),
@@ -269,17 +269,22 @@ fn runner_real_process_project_format_rustfmt_stdin_leaves_sources_untouched() {
     fs::write(fixture.root.join("child.rs"), "fn child( ){ }\n").unwrap();
     let planned = fixture.plan();
     let command = planned.plan.profile.process("src/main.rs").unwrap();
-    let result = run_process_with_profiles_and_execution_state(
-        1,
-        &fixture.policy,
-        &ShellConfig::default(),
-        &fixture.registry,
-        &PreparedShellProfileCache::default(),
-        planned.cwd.to_str(),
+    let result = (ShellExecutionContext {
+        generation: 1,
+        policy: &fixture.policy,
+        shell: &ShellConfig::default(),
+        project_registry_dir: &fixture.registry,
+        cache: &PreparedShellProfileCache::default(),
+        cwd: planned.cwd.to_str(),
+        timeout_secs: 10,
+        stop_requested: None,
+    })
+    .run_process(
         &command.executable,
         &command.args,
         Some(&planned.sources[0]),
-        10,
+        &[],
+        None,
         None,
     );
     assert_eq!(
@@ -523,6 +528,8 @@ fn project_format_candidates_fails_on_nonzero_exit_syntax_error() {
     let planned = fixture.plan();
     let shell = ShellConfig::default();
     let cache = PreparedShellProfileCache::default();
+    // Exercise the formatter failure, not an incidental rustup cold-start
+    // timeout on oversubscribed Windows CI; deadline behavior has its own tests.
     let result = format_candidates(
         &fixture.policy,
         &shell,
@@ -530,7 +537,7 @@ fn project_format_candidates_fails_on_nonzero_exit_syntax_error() {
         &planned,
         &cache,
         1,
-        10,
+        60,
         None,
     );
     assert_eq!(result, Err("format_process_failed"));
@@ -545,6 +552,7 @@ fn project_format_candidates_fails_on_truncated_output() {
     policy.max_output_bytes = 4;
     let shell = ShellConfig::default();
     let cache = PreparedShellProfileCache::default();
+    // Keep the test focused on output truncation under loaded CI runners.
     let result = format_candidates(
         &policy,
         &shell,
@@ -552,7 +560,7 @@ fn project_format_candidates_fails_on_truncated_output() {
         &planned,
         &cache,
         1,
-        10,
+        60,
         None,
     );
     assert_eq!(result, Err("format_output_truncated"));

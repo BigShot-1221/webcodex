@@ -115,6 +115,8 @@ pub struct ToolRuntime {
     /// clones may narrow or switch this preference without changing authority or
     /// execution lifetime.
     pub(crate) mcp_host_policy: crate::mcp_host::McpHostRuntimePolicy,
+    /// Request-local diagnostic provenance; never shared mutable Host preference.
+    pub(crate) mcp_host_profile_source: crate::mcp_host::McpHostPolicySource,
     /// Immutable deployment snapshot reported by runtime diagnostics. Request-local
     /// views must never rewrite this operator-facing configuration evidence.
     pub(crate) deployment_mcp_host_policy: crate::mcp_host::McpHostRuntimePolicy,
@@ -235,6 +237,7 @@ impl ToolRuntime {
             coding_agent_runs: Arc::new(super::coding_agent::CodingAgentServerState::default()),
             runtime_info,
             mcp_host_policy: crate::mcp_host::McpHostRuntimePolicy::default(),
+            mcp_host_profile_source: crate::mcp_host::McpHostPolicySource::Deployment,
             deployment_mcp_host_policy: crate::mcp_host::McpHostRuntimePolicy::default(),
             model_workflow_policy: crate::model_workflow::ModelWorkflowPolicy::default(),
             #[cfg(feature = "workspace-checkpoints")]
@@ -309,14 +312,16 @@ impl ToolRuntime {
     ) -> Self {
         self.mcp_host_policy = policy;
         self.deployment_mcp_host_policy = policy;
+        self.mcp_host_profile_source = crate::mcp_host::McpHostPolicySource::Deployment;
         self
     }
 
     pub(crate) fn with_request_mcp_host_policy(
         mut self,
-        policy: crate::mcp_host::McpHostRuntimePolicy,
+        selection: crate::mcp_host::McpHostPolicySelection,
     ) -> Self {
-        self.mcp_host_policy = policy;
+        self.mcp_host_policy = selection.effective;
+        self.mcp_host_profile_source = selection.profile_source;
         self
     }
 
@@ -417,13 +422,24 @@ impl ToolRuntime {
         Self::new(runner_registry, Arc::new(RuntimeInfo::default()))
     }
 
+    #[cfg(test)]
     pub fn with_session_ledger(mut self, path: impl Into<PathBuf>) -> Self {
-        self.sessions = sessions::SessionStore::with_persistence_limits(
-            path,
-            sessions::DEFAULT_MAX_SESSIONS,
-            sessions::DEFAULT_MAX_RETAINED_CLOSED_SESSIONS,
-            sessions::DEFAULT_MAX_EVENTS_PER_SESSION,
-        );
+        let path = path.into();
+        // This is a test fixture adapter. Production always opens the configured
+        // SQLite database and imports a legacy source at most once.
+        self.sessions = if path.exists() {
+            webcodex_workflow_session::root_test_support::import_ledger(
+                &path,
+                sessions::DEFAULT_MAX_SESSIONS,
+                sessions::DEFAULT_RECENT_EVENT_LIMIT,
+            )
+        } else {
+            sessions::SessionStore::with_persistence(
+                &path,
+                sessions::DEFAULT_MAX_SESSIONS,
+                sessions::DEFAULT_RECENT_EVENT_LIMIT,
+            )
+        };
         self
     }
 
@@ -434,16 +450,17 @@ impl ToolRuntime {
         db_path: impl Into<PathBuf>,
         legacy_ledger_path: impl Into<PathBuf>,
     ) -> std::io::Result<Self> {
-        self.sessions = sessions::SessionStore::with_persistence_database_limits(
+        let legacy_ledger_path = legacy_ledger_path.into();
+        self.sessions = sessions::SessionStore::open_database(
             db_path,
-            legacy_ledger_path,
-            sessions::DEFAULT_MAX_SESSIONS,
-            sessions::DEFAULT_MAX_RETAINED_CLOSED_SESSIONS,
-            sessions::DEFAULT_MAX_EVENTS_PER_SESSION,
+            Some(&legacy_ledger_path),
+            sessions::DEFAULT_SESSION_CACHE_BYTES,
+            sessions::DEFAULT_RECENT_EVENT_LIMIT,
         )?;
         Ok(self)
     }
 
+    #[cfg(test)]
     pub(crate) fn workflow_sessions_console_list(
         &self,
         project: &str,
@@ -453,6 +470,46 @@ impl ToolRuntime {
             .console_list_for_project(project, limit, sessions::console_validation_hooks())
     }
 
+    pub(crate) fn workflow_sessions_console_lists_for_registrations(
+        &self,
+        projects: &[(&str, Option<&sessions::SessionProjectIdentity>)],
+        limit: Option<usize>,
+    ) -> std::collections::HashMap<String, sessions::WorkflowSessionConsoleList> {
+        self.sessions.console_lists_for_registrations(
+            projects,
+            limit,
+            sessions::console_validation_hooks(),
+        )
+    }
+
+    pub(crate) fn workflow_sessions_console_list_for_registration(
+        &self,
+        project: &str,
+        identity: Option<&sessions::SessionProjectIdentity>,
+        limit: Option<usize>,
+    ) -> sessions::WorkflowSessionConsoleList {
+        self.workflow_sessions_console_lists_for_registrations(&[(project, identity)], limit)
+            .remove(project)
+            .expect("requested project has a console list")
+    }
+
+    pub(crate) fn workflow_session_console_detail_for_registration(
+        &self,
+        project: &str,
+        session_id: &str,
+        identity: Option<&sessions::SessionProjectIdentity>,
+        limit: Option<usize>,
+    ) -> Option<sessions::WorkflowSessionConsoleDetail> {
+        self.sessions.console_detail_for_registration(
+            project,
+            session_id,
+            identity,
+            limit,
+            sessions::console_validation_hooks(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn workflow_sessions_console_lists(
         &self,
         projects: &[&str],

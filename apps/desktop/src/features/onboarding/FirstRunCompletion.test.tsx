@@ -16,37 +16,23 @@ const state = {
   connections: { profiles: [], config_error: false, running: 0 }, chatgpt_activity: { observed: false },
 } as unknown as DesktopState;
 function wrap(content: React.ReactNode) { return <DesktopMantineProvider><LocaleProvider>{content}</LocaleProvider></DesktopMantineProvider>; }
-function mount(next = state) {
-  const onState = vi.fn(), onComplete = vi.fn(), onProjects = vi.fn(), onConnection = vi.fn();
-  return { ...render(wrap(<FirstRunCompletion state={next} {...{onState,onComplete,onProjects,onConnection}} />)), onState,onComplete,onProjects,onConnection };
+function mount() {
+  const onComplete = vi.fn(), onProjects = vi.fn(), onConnection = vi.fn();
+  return { ...render(wrap(<FirstRunCompletion {...{onComplete,onProjects,onConnection}} />)), onComplete,onProjects,onConnection };
 }
-beforeEach(() => { vi.resetAllMocks(); localStorage.setItem("webcodex.desktop.locale", "en-US"); clipboard.writeText.mockResolvedValue(undefined); api.saveTunnelProfile.mockResolvedValue(state); });
-describe("first-run connection completion", () => {
-  it("focuses the completion heading and opens the existing Tunnel editor after Create", async () => {
-    const {onState}=mount();
-    expect(screen.getByRole("heading", { level:1 })).toHaveFocus();
-    fireEvent.click(screen.getByRole("button", { name:"Add ChatGPT Tunnel" }));
-    expect(await screen.findByRole("dialog")).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Name"), {target:{value:"Primary"}});
-    fireEvent.change(screen.getByLabelText("Tunnel ID"), {target:{value:"tunnel-id"}});
-    fireEvent.change(screen.getByLabelText("API key"), {target:{value:"private-secret"}});
-    fireEvent.click(screen.getByRole("button", {name:"Save and apply"}));
-    await waitFor(()=>expect(onState).toHaveBeenCalledWith(state));
-    expect(api.saveTunnelProfile).toHaveBeenCalledWith(expect.objectContaining({id:null,name:"Primary",tunnel_id:"tunnel-id"}));
-    expect(document.body).not.toHaveTextContent("private-secret");
-  });
-  it("allows an explicit later choice with a projectless Runner", () => {
-    const {onComplete}=mount({...state,project:null});
-    expect(screen.getByText(/Your Runner can stay connected without a Project/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button",{name:"Continue later"}));
-    expect(onComplete).toHaveBeenCalledTimes(1); expect(api.saveTunnelProfile).not.toHaveBeenCalled();
-  });
-  it("never asks Join for a central Tunnel or bootstrap credential", () => {
-    mount({...state,topology:{...state.topology!,server:{kind:"remote",url:"https://main.example"}}});
-    expect(screen.getByText(/main node owner manages/)).toBeInTheDocument();
-    expect(screen.queryByRole("button",{name:"Add ChatGPT Tunnel"})).toBeNull();
-    expect(screen.queryByLabelText("Tunnel ID")).toBeNull();
-    expect(screen.queryByLabelText("API key")).toBeNull();
+beforeEach(() => { vi.resetAllMocks(); localStorage.setItem("webcodex.desktop.locale", "en-US"); clipboard.writeText.mockResolvedValue(undefined); });
+describe("first-run completion", () => {
+  it("offers connections, projects and overview independently after setup", () => {
+    const {onConnection, onProjects, onComplete} = mount();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveFocus();
+    expect(screen.queryByText(/ChatGPT/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", {name: "Connect an AI app"}));
+    expect(onConnection).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", {name: "Projects"}));
+    expect(onProjects).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", {name: "Open overview"}));
+    expect(onComplete).toHaveBeenCalledOnce();
+    expect(api.saveTunnelProfile).not.toHaveBeenCalled();
   });
   it("copies a read-only request with exact IDs and keeps user reports separate from observation", async () => {
     const {rerender}=render(wrap(<FirstReadGuide state={state} />));
@@ -59,6 +45,33 @@ describe("first-run connection completion", () => {
     rerender(wrap(<FirstReadGuide state={{...state,persistent_environment:"other"}} />));
     expect(screen.getByRole("checkbox")).not.toBeChecked();
   });
+  it("verifies a fresh projectless Runner without requiring project registration", async () => {
+    const { rerender } = render(wrap(<FirstReadGuide state={{...state, project: null}} />));
+    expect(screen.getByRole("heading", {name: "Try a read-only check in ChatGPT"})).toBeVisible();
+    expect(screen.queryByText(/Add a Project in Projects/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", {name: "Copy read request"}));
+    await waitFor(() => expect(clipboard.writeText).toHaveBeenCalledExactlyOnceWith(
+      "Use the connected WebCodex app to check Runtime status for Runner real-runner and list its available Projects. Do not create a Project, edit files or run commands.",
+    ));
+    fireEvent.click(screen.getByRole("checkbox", {name: "I saw the Runtime status in ChatGPT"}));
+    expect(screen.getByRole("status")).toHaveTextContent("your confirmation, not an automatically observed connection test");
+    expect(state.chatgpt_activity?.observed).toBe(false);
+    rerender(wrap(<FirstReadGuide state={{...state, project: null, workspace_runner: {...state.workspace_runner!, client_id: "other-runner"}}} />));
+    expect(screen.getByRole("checkbox")).not.toBeChecked();
+    expect(screen.getByText(/check Runtime status for Runner other-runner/)).toBeVisible();
+    expect(screen.queryByText(/Runner real-runner and list/)).toBeNull();
+  });
+
+  it.each(LANGUAGES)("provides a projectless request with the exact Runner in $value", async ({value}) => {
+    localStorage.setItem("webcodex.desktop.locale", value);
+    const {container} = render(wrap(<FirstReadGuide state={{...state, project: null}} />));
+    expect(container).not.toHaveTextContent("completion.");
+    fireEvent.click(screen.getByRole("button"));
+    await waitFor(() => expect(clipboard.writeText).toHaveBeenCalledOnce());
+    expect(clipboard.writeText.mock.calls[0][0]).toContain("real-runner");
+    expect(clipboard.writeText.mock.calls[0][0]).not.toContain("{{runner}}");
+  });
+
   it("does not invent a target from a folder name, wrong Runner, or viewer", () => {
     expect(firstReadTarget({...state,project:{...state.project!,runtime_project_id:null}})).toBeNull();
     expect(firstReadTarget({...state,project:{...state.project!,runtime_project_id:"agent:other:project"}})).toBeNull();

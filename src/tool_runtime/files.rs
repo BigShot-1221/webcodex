@@ -22,7 +22,7 @@ use super::tool_inputs::{
 };
 use super::tool_result::{SuggestedToolCall, ToolResult};
 use super::{file_listing, project_instructions};
-use super::{SearchPatternMode, SearchResultMode, ToolRuntime};
+use super::{SearchPatternMode, SearchProjectTextsQuery, SearchResultMode, ToolRuntime};
 use crate::artifact_policy::{
     canonical_known_mime, export_presentation_mime, mime_is_compatible_with_path,
     ooxml_extension_for_mime, GENERIC_BINARY_MIME, MAX_MCP_IMAGE_BYTES,
@@ -56,35 +56,30 @@ pub(crate) use artifacts::{MAX_PROJECT_ARTIFACT_BYTES, MAX_READ_PROJECT_ARTIFACT
 #[cfg(all(test, windows))]
 pub(crate) use inspection::LIST_TRACKED_STDERR_MAX_CHARS;
 pub(crate) use inspection::{
-    effective_read_file_range, slice_read_file_result, slice_read_file_success_output,
-    ProjectFileReader,
+    build_read_file_success, effective_read_file_range, slice_read_file_range, FileReadFailure,
+    FileReadOutcome, ProjectFileReader,
 };
 #[cfg(test)]
 pub(crate) use inspection::{
     page_file_list_entries, parse_file_list_entries, LIST_TRACKED_SOURCE_MAX_BYTES,
 };
 #[cfg(test)]
-pub(crate) use mutations::{apply_text_edits_to_string, validate_edit_file_path};
+pub(crate) use mutations::validate_edit_file_path;
 use search::search_head_resolution_shell;
 #[cfg(all(test, unix))]
 pub(crate) use search::search_project_text_command_with_head_fallbacks;
 #[cfg(test)]
 pub(crate) use search::{
     resolve_search_head_command, search_agent_timeout_budget, search_project_text_command,
-    search_project_text_output, MAX_SEARCH_CONTEXT_LINES, MAX_SEARCH_GLOBS, MAX_SEARCH_GLOB_BYTES,
+    search_project_text_outcome, MAX_SEARCH_CONTEXT_LINES, MAX_SEARCH_GLOBS, MAX_SEARCH_GLOB_BYTES,
     SEARCH_OUTPUT_BYTE_BUDGET,
 };
 pub(crate) use search::{
-    SearchOptions, SearchRequest, DEFAULT_SEARCH_HEAD_ABSOLUTE_CANDIDATES,
+    SearchOptions, SearchOutcome, DEFAULT_SEARCH_HEAD_ABSOLUTE_CANDIDATES,
     DEFAULT_SEARCH_TIMEOUT_SECS,
 };
 
 // Edit limits and the sensitive-path guard are shared with the Runner binary.
-#[cfg(test)]
-pub(crate) use crate::apply_edits_shared::{
-    canonicalize_apply_text_line_endings, detect_apply_text_line_ending,
-    restore_apply_text_line_endings,
-};
 pub(crate) use crate::apply_edits_shared::{
     is_lowercase_hex_sha256 as is_hex_sha256, is_sensitive_edit_path, MAX_APPLY_FILE_CHANGES,
     MAX_APPLY_TEXT_EDITS, MAX_APPLY_TEXT_EDIT_FIELD_BYTES,

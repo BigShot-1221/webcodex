@@ -104,6 +104,29 @@ capture request context and delegate bounded projections, so moving those adapte
 alone would not eliminate business-semantic duplication. Keep continuation tokens,
 source completeness, validation provenance and retry uncertainty unchanged.
 
+Job validation reconciliation consumes typed Registry candidates and a shared,
+non-serializable Job status observation rather than decoding tool-result JSON.
+The validation verdict has one typed owner and is serialized only at the output
+boundary. Diagnostic payloads retain their existing bounded public/persisted JSON
+format. Status analysis still reads at most 500 log lines per stream and Session
+evidence reads 200 per stream; failed log reads remain incomplete evidence.
+Candidate snapshots retain the complete authorized set, independent of model
+pagination, and the existing snapshot-to-materialization lock and durable
+deduplication markers remain intact.
+
+The retired Job status tool projection is removed; internal tests use the typed
+query and public-output tests exercise the current Job observation path.
+
+Validation and ordinary structured executions share `HiddenJobHandoff` for
+waiting, promotion of the same Job, observation recovery and cancellation cleanup.
+The owner remains armed through terminal snapshot acquisition and projection;
+uncertain process effects retain their original recovery record during publication.
+Validation keeps its 200 ms polling cadence and 200-line terminal log limit per
+stream; ordinary execution keeps its 25 ms cadence and retained terminal snapshot.
+Terminal validation consumes that snapshot directly, without a second log read.
+Tool-specific result interpretation and internal synchronous execution stay with
+their existing adapters.
+
 ## Canonical execution consumers
 
 Mutation observation and Code Mode receipts consume `ExecutionOutcomeFacts`, but
@@ -115,21 +138,9 @@ not discard known execution facts. The shared Browser/Computer terminal helper
 preserves unknown state names and presence-before-type failure-kind fallback.
 Runner raw mutation-receipt validation and audit Job extraction remain separate.
 
-## CI cancellation versus required lane results
-
-The four aggregate jobs use `!cancelled()` as their job-level status guard. GitHub
-[defines cancelled() as workflow cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#cancelled)
-and [re-evaluates job conditions during cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation).
-A concurrency-superseded workflow should stop instead of starting always-running
-aggregates that turn cancelled dependencies into additional failures. This does
-not convert cancellation into success, and does not waive branch protection.
-
-The unchanged aggregate scripts independently require successful required lanes;
-a child result of failure, cancelled, unexpected skipped, or missing is rejected.
-Only a classifier-disabled lane may be skipped. `test_ci_aggregate_cancellation`
-pins those four scheduler guards and runs the actual checked-in Bash bodies over
-these cases. It is local contract evidence, not a hosted scheduler/concurrency
-simulation; final native CI and actual cancellation observations remain separate.
+CI cancellation and aggregate acceptance are owned by the
+[testing policy](../TESTING.md#ci-cancellation-versus-required-lane-results),
+not by ToolRuntime domain decomposition.
 
 ## Out of scope
 

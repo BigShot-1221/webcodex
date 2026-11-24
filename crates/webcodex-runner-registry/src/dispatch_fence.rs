@@ -29,10 +29,22 @@ pub(super) enum PendingDispatchFence {
     Unfenced,
     Project(ProjectDispatchFence),
     McpGateway(McpGatewayDispatchFence),
-    RunnerInstruction { runner_instance_id: String },
-    RunnerConfig { runner_instance_id: String },
-    SshResource { runner_instance_id: String },
-    Skill { runner_instance_id: String },
+    RunnerInstruction {
+        runner_instance_id: String,
+    },
+    RunnerConfig {
+        runner_instance_id: String,
+    },
+    SshResource {
+        runner_instance_id: String,
+    },
+    Skill {
+        runner_instance_id: String,
+    },
+    Computer {
+        runner_instance_id: String,
+        access: Option<crate::RunnerAccess>,
+    },
 }
 
 impl PendingDispatchFence {
@@ -71,6 +83,20 @@ impl PendingDispatchFence {
             | (Self::Skill { runner_instance_id }, RunnerOperation::Skill(_)) => {
                 !runner_instance_id.is_empty()
             }
+            (
+                Self::Computer {
+                    runner_instance_id, ..
+                },
+                RunnerOperation::Computer(op),
+            ) => {
+                use webcodex_core::runner_operation::RunnerComputerOperationKind::*;
+                !runner_instance_id.is_empty()
+                    && (op.control_epoch.is_some()
+                        || matches!(
+                            op.kind,
+                            Control | InputText | AccessibilityTree | KeyInput | Scroll
+                        ))
+            }
             _ => false,
         };
         if valid {
@@ -102,6 +128,98 @@ impl PendingDispatchFence {
         }
         match self {
             Self::Unfenced | Self::McpGateway(_) => None,
+            Self::Computer {
+                runner_instance_id,
+                access,
+            } => {
+                let Some(runner) = runner else {
+                    return Some(
+                        "runner_replaced: Computer target Runner disappeared before dispatch"
+                            .into(),
+                    );
+                };
+                if runner.runner_instance_id != *runner_instance_id {
+                    return Some(
+                        "runner_replaced: Computer target Runner changed before dispatch".into(),
+                    );
+                }
+                if super::access_control::assert_runner_access(access.as_ref(), runner).is_err() {
+                    return Some(
+                        "client_access_denied: Computer target access changed before dispatch"
+                            .into(),
+                    );
+                }
+                use webcodex_core::runner_operation::RunnerComputerOperationKind;
+                if let RunnerOperation::Computer(op) = operation {
+                    if op.control_epoch != runner.computer_control_epoch && op.kind.is_effect() {
+                        return Some("computer_control_changed: local control changed before dispatch; reobserve before another request".into());
+                    }
+                    if op.kind == RunnerComputerOperationKind::Control {
+                        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&op.payload)
+                        else {
+                            return Some(
+                                "invalid_request: invalid computer control payload".into(),
+                            );
+                        };
+                        if payload.get("action").and_then(serde_json::Value::as_str)
+                            == Some("select")
+                        {
+                            return webcodex_core::computer_input_contract::computer_control_capabilities("select")
+                                .iter().any(|feature| !runner.supports(*feature))
+                                .then(|| "capability_unavailable: Computer selection capability changed before dispatch".into());
+                        }
+                    }
+                    if op.kind == RunnerComputerOperationKind::Scroll {
+                        return webcodex_core::computer_scroll_contract::COMPUTER_SCROLL_CAPABILITIES
+                            .iter().any(|feature| !runner.supports(*feature))
+                            .then(|| "capability_unavailable: Computer scroll capability changed before dispatch".into());
+                    }
+                    if op.kind == RunnerComputerOperationKind::KeyInput {
+                        let Ok(input) = serde_json::from_str::<
+                            webcodex_core::computer_input_contract::ComputerKeyInputPayload,
+                        >(&op.payload) else {
+                            return Some(
+                                "invalid_request: invalid computer key input payload".into(),
+                            );
+                        };
+                        if input.validate().is_err() {
+                            return Some(
+                                "invalid_request: invalid computer key input chord".into(),
+                            );
+                        }
+                        return webcodex_core::computer_input_contract::computer_key_input_capabilities(&input.key, &input.modifiers, runner.supports(RunnerFeature::ComputerKeyChords))
+                            .iter().any(|feature| !runner.supports(*feature))
+                            .then(|| "capability_unavailable: Computer key input capability changed before dispatch".into());
+                    }
+                }
+                let feature = match operation {
+                    RunnerOperation::Computer(op) => match op.kind {
+                        RunnerComputerOperationKind::Control => RunnerFeature::ComputerControl,
+                        RunnerComputerOperationKind::InputText => RunnerFeature::ComputerTextInput,
+                        RunnerComputerOperationKind::LaunchApplication => {
+                            RunnerFeature::ComputerApplicationLaunch
+                        }
+                        RunnerComputerOperationKind::WriteClipboard => {
+                            RunnerFeature::ComputerClipboardWrite
+                        }
+                        RunnerComputerOperationKind::PointerMove
+                        | RunnerComputerOperationKind::PointerClick => {
+                            RunnerFeature::ComputerPointerControl
+                        }
+                        RunnerComputerOperationKind::ActivateWindow => {
+                            RunnerFeature::ComputerWindowActivate
+                        }
+                        RunnerComputerOperationKind::ScrollToElement => {
+                            RunnerFeature::ComputerScrollToElement
+                        }
+                        _ => RunnerFeature::ComputerAccessibilityObserve,
+                    },
+                    _ => unreachable!("Computer fence validated above"),
+                };
+                let needs_observation = matches!(operation, RunnerOperation::Computer(op) if op.control_epoch.is_none());
+                (!runner.supports(feature) || (needs_observation && !runner.supports(RunnerFeature::ComputerAccessibilityObserve)))
+                    .then(|| "capability_unavailable: Computer action or post-observation is unavailable before dispatch".into())
+            }
             Self::Project(fence) => fence.rejection(operation, runner),
             Self::Skill { runner_instance_id } => {
                 let Some(runner) = runner else {

@@ -4,6 +4,69 @@
 mod sqlite_runtime_tests;
 
 #[test]
+fn v043_database_opens_with_current_table_and_column_sets() {
+    fn columns(
+        path: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut tables = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap();
+        tables
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|table| {
+                let table = table.unwrap();
+                let mut statement = conn
+                    .prepare("SELECT name FROM pragma_table_info(?1)")
+                    .unwrap();
+                let columns = statement
+                    .query_map([&table], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+                    .unwrap();
+                (table, columns)
+            })
+            .collect()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("v0.4.3.sqlite");
+    let fresh = dir.path().join("fresh.sqlite");
+    rusqlite::Connection::open(&old)
+        .unwrap()
+        .execute_batch(include_str!("test_fixtures/database_v0_4_3.sql"))
+        .unwrap();
+    rusqlite::Connection::open(&old)
+        .unwrap()
+        .execute_batch(
+            "
+        INSERT INTO users(id,username,created_at) VALUES('legacy-owner','owner',0);
+        INSERT INTO oauth_clients(id,client_id,client_secret_hash,name,owner_user_id,created_at)
+        VALUES('legacy-row','legacy-client','fixture','existing integration','legacy-owner',0);
+    ",
+        )
+        .unwrap();
+    let before = columns(&old);
+    let migrated = Database::open(&old).unwrap();
+    let client = migrated
+        .get_oauth_client_by_client_id("legacy-client")
+        .unwrap()
+        .unwrap();
+    assert!(client.dynamic_registration.is_none());
+    assert_eq!(client.owner_user_id.as_deref(), Some("legacy-owner"));
+    drop(migrated);
+    drop(Database::open(&fresh).unwrap());
+    let expected = columns(&fresh);
+    assert_ne!(before, expected, "fixture must exercise schema migration");
+    assert_eq!(columns(&old), expected);
+    // Reopening must be idempotent; column order/defaults are not this contract.
+    drop(Database::open(&old).unwrap());
+    assert_eq!(columns(&old), expected);
+}
+
+#[test]
 fn pairing_capability_migration_preserves_old_codes_without_granting_scopes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy-pairing.sqlite");
@@ -383,6 +446,7 @@ fn purge_stale_auth_rows_removes_dead_material_keeps_live() {
     let client = OAuthClientRecord {
         id: "oc-1".to_string(),
         client_id: "wc_client_test".to_string(),
+        dynamic_registration: None,
         client_secret_hash: "secret-hash".to_string(),
         name: "test".to_string(),
         owner_user_id: Some("u-1".to_string()),
@@ -1036,6 +1100,7 @@ fn oauth_seed_client(db: &Database, user: &UserRecord, name: &str) -> (OAuthClie
     let record = OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id,
+        dynamic_registration: None,
         client_secret_hash: oauth_fixture_hash(&plaintext_secret),
         name: name.to_string(),
         owner_user_id: Some(user.id.clone()),
@@ -1723,7 +1788,7 @@ fn consume_authorization_code_succeeds_once() {
 
     // First consume succeeds.
     let consumed = db
-        .consume_oauth_authorization_code_by_hash(&code_hash, now + 10)
+        .consume_oauth_authorization_code_by_hash(&code_hash, now + 10, None)
         .unwrap();
     let consumed = consumed.expect("first consume should succeed");
     assert_eq!(consumed.used_at, Some(now + 10));
@@ -1775,13 +1840,13 @@ fn consume_authorization_code_second_consume_returns_none() {
     let (_tmp, db, code_hash, _record, now) = seed_consumable_code();
 
     // First consume succeeds.
-    db.consume_oauth_authorization_code_by_hash(&code_hash, now + 10)
+    db.consume_oauth_authorization_code_by_hash(&code_hash, now + 10, None)
         .unwrap()
         .expect("first consume should succeed");
 
     // Second consume returns None.
     let result = db
-        .consume_oauth_authorization_code_by_hash(&code_hash, now + 20)
+        .consume_oauth_authorization_code_by_hash(&code_hash, now + 20, None)
         .unwrap();
     assert!(result.is_none(), "second consume should return None");
 }
@@ -1792,7 +1857,7 @@ fn consume_authorization_code_expired_returns_none() {
 
     // Consume after expiration returns None.
     let result = db
-        .consume_oauth_authorization_code_by_hash(&code_hash, now + 301)
+        .consume_oauth_authorization_code_by_hash(&code_hash, now + 301, None)
         .unwrap();
     assert!(result.is_none(), "expired code should return None");
 }
@@ -1805,7 +1870,7 @@ fn consume_authorization_code_revoked_returns_none() {
     db.revoke_oauth_authorization_code(&record.id, now + 5)
         .unwrap();
     let result = db
-        .consume_oauth_authorization_code_by_hash(&code_hash, now + 10)
+        .consume_oauth_authorization_code_by_hash(&code_hash, now + 10, None)
         .unwrap();
     assert!(result.is_none(), "revoked code should return None");
 }
@@ -1817,7 +1882,7 @@ fn consume_authorization_code_unknown_hash_returns_none() {
     let now = chrono::Utc::now().timestamp();
 
     let result = db
-        .consume_oauth_authorization_code_by_hash("nonexistent-hash", now)
+        .consume_oauth_authorization_code_by_hash("nonexistent-hash", now, None)
         .unwrap();
     assert!(result.is_none(), "unknown hash should return None");
 }
@@ -1887,7 +1952,7 @@ fn exchange_authorization_code_rejects_subject_mismatch_with_consumed_code() {
     };
 
     let err = db
-        .exchange_oauth_authorization_code_for_tokens(&code_hash, now + 10, &access, &refresh)
+        .exchange_oauth_authorization_code_for_tokens(None, &code_hash, now + 10, &access, &refresh)
         .expect_err("subject mismatch must abort exchange");
     assert!(err.to_string().contains("OAuth token subjects must match"));
     let conn = db.conn_for_tests();
@@ -1971,6 +2036,7 @@ fn rotate_refresh_token_rejects_subject_mismatch_with_old_refresh() {
 
     let err = db
         .rotate_oauth_refresh_token(
+            None,
             &old.token_hash,
             &client.client_id,
             now + 10,
@@ -2362,4 +2428,111 @@ fn last_used_at_updates_are_floored_to_one_write_per_window() {
             .last_used_at,
         Some(t0 + floor)
     );
+}
+
+#[test]
+fn batched_purge_is_bounded_per_table_and_never_touches_live_rows() {
+    use crate::models::{ApiKeyRecord, OAuthAccessTokenRecord, OAuthClientRecord, UserRecord};
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("purge-batch.db")).unwrap();
+    let now = 1_700_000_000;
+    db.create_user(&UserRecord {
+        id: "u-batch".to_string(),
+        username: "batcher".to_string(),
+        created_at: now,
+        disabled: 0,
+        display_name: None,
+        role: "user".to_string(),
+        disabled_at: None,
+        updated_at: Some(now),
+    })
+    .unwrap();
+    db.insert_oauth_client(&OAuthClientRecord {
+        id: "oc-batch".to_string(),
+        client_id: "wc_client_batch".to_string(),
+        dynamic_registration: None,
+        client_secret_hash: "secret-hash".to_string(),
+        name: "batch".to_string(),
+        owner_user_id: Some("u-batch".to_string()),
+        owner_project_grant_id: None,
+        owner_shared_key_hash: None,
+        redirect_uris: "https://example.com/cb".to_string(),
+        allowed_scopes: "runtime:read".to_string(),
+        created_at: now,
+        revoked_at: None,
+    })
+    .unwrap();
+
+    let access_token =
+        |id: &str, hash: &str, expires_at: i64, revoked_at: Option<i64>| OAuthAccessTokenRecord {
+            admin_authority: false,
+            id: id.to_string(),
+            token_hash: hash.to_string(),
+            client_id: "wc_client_batch".to_string(),
+            subject_kind: "managed_user".to_string(),
+            subject_id: "u-batch".to_string(),
+            user_id: Some("u-batch".to_string()),
+            scopes: "runtime:read".to_string(),
+            resource: None,
+            shared_key_hash: None,
+            created_at: now,
+            expires_at,
+            revoked_at,
+            last_used_at: None,
+        };
+    let api_key = |id: &str, revoked_at: Option<i64>| ApiKeyRecord {
+        id: id.to_string(),
+        user_id: "u-batch".to_string(),
+        name: id.to_string(),
+        key_prefix: format!("wc_pat_{id}"),
+        created_at: now,
+        last_used_at: None,
+        revoked_at,
+        scopes: "runtime:read".to_string(),
+        expires_at: None,
+        kind: "user".to_string(),
+        allowed_client_id: None,
+    };
+    db.insert_oauth_access_token(&access_token("at-live", "ath-live", now + 3600, None))
+        .unwrap();
+    for index in 0..3 {
+        db.insert_oauth_access_token(&access_token(
+            &format!("at-exp-{index}"),
+            &format!("ath-exp-{index}"),
+            now - 1,
+            None,
+        ))
+        .unwrap();
+    }
+    db.insert_api_key(&api_key("k-live", None), "hash-live")
+        .unwrap();
+    for index in 0..2 {
+        db.insert_api_key(
+            &api_key(&format!("k-rev-{index}"), Some(now - 1)),
+            &format!("hash-rev-{index}"),
+        )
+        .unwrap();
+    }
+
+    // One batch deletes at most one stale row per table.
+    assert_eq!(db.purge_stale_auth_rows_batch(now, 1).unwrap(), 2);
+    assert!(db
+        .get_oauth_access_token_by_hash("ath-live")
+        .unwrap()
+        .is_some());
+    assert!(db.get_api_key_by_hash("hash-live").unwrap().is_some());
+
+    // The backlog shrinks over consecutive bounded batches.
+    assert_eq!(db.purge_stale_auth_rows_batch(now, 1).unwrap(), 2);
+    assert_eq!(db.purge_stale_auth_rows_batch(now, 1).unwrap(), 1);
+    assert_eq!(db.purge_stale_auth_rows_batch(now, 1).unwrap(), 0);
+    assert_eq!(db.purge_stale_auth_rows_batch(now, 1).unwrap(), 0);
+
+    // Live material survives every batch; the full purge has nothing left.
+    assert!(db
+        .get_oauth_access_token_by_hash("ath-live")
+        .unwrap()
+        .is_some());
+    assert!(db.get_api_key_by_hash("hash-live").unwrap().is_some());
+    assert_eq!(db.purge_stale_auth_rows(now).unwrap(), 0);
 }

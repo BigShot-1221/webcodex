@@ -12,6 +12,7 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         protocol_capabilities: ToolProtocolCapabilities,
+        discovery_tools: Option<&std::collections::BTreeSet<String>>,
     ) -> ToolResult {
         match call {
             ToolCall::ListTools {
@@ -29,10 +30,12 @@ impl ToolRuntime {
                 client_id,
                 client_ids,
                 include_projects,
+                projects_offset,
                 summary_only,
                 query,
                 status,
                 limit,
+                offset,
             } => {
                 self.list_runners_with_options(
                     auth,
@@ -40,10 +43,12 @@ impl ToolRuntime {
                         client_id,
                         client_ids,
                         include_projects,
+                        projects_offset,
                         summary_only,
                         query,
                         status,
                         limit,
+                        offset,
                     },
                 )
                 .await
@@ -69,6 +74,7 @@ impl ToolRuntime {
                 include_risk_summary,
             } => {
                 self.tool_manifest(
+                    discovery_tools,
                     auth,
                     tool_name,
                     category,

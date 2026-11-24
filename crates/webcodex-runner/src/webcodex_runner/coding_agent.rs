@@ -6,12 +6,12 @@ use super::projects::load_runner_project_summaries_from_dir;
 use super::shell::canonicalize_existing;
 use super::shutdown::{ActivityTracker, BackgroundThreads};
 use agent_client_protocol_schema::v1::{
-    NewSessionResponse, PromptResponse, RequestPermissionRequest, SessionConfigKind,
-    SessionConfigOption, SessionConfigSelectOptions, SetSessionConfigOptionResponse, StopReason,
+    NewSessionResponse, PromptResponse, SessionConfigKind, SessionConfigOption,
+    SessionConfigSelectOptions, SetSessionConfigOptionResponse, StopReason,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
@@ -29,21 +29,21 @@ use uuid::Uuid;
 #[cfg(all(test, unix))]
 use webcodex_core::coding_agent::CodingAgentCancelRequest;
 use webcodex_core::coding_agent::{
+    validate_coding_agent_run_snapshot, validate_request, CodingAgentConfigValue,
+    CodingAgentDispatchState, CodingAgentEvent, CodingAgentEventKind, CodingAgentExecutionState,
+    CodingAgentObserveResult, CodingAgentProvider, CodingAgentRequest, CodingAgentResponse,
+    CodingAgentResponsePayload, CodingAgentRunInventory, CodingAgentRunSnapshot,
+    CodingAgentRunState, CodingAgentTerminal, CodingAgentUsage,
     CODING_AGENT_MAX_EVENTS_PER_RESPONSE, CODING_AGENT_MAX_INVENTORY_RUNS,
     CODING_AGENT_MAX_RETAINED_EVENTS, CODING_AGENT_STOP_REASON_CANCELLED,
     CODING_AGENT_STOP_REASON_END_TURN, CODING_AGENT_STOP_REASON_MAX_TOKENS,
     CODING_AGENT_STOP_REASON_MAX_TURN_REQUESTS, CODING_AGENT_STOP_REASON_REFUSAL,
-    CodingAgentConfigValue, CodingAgentDispatchState, CodingAgentEvent, CodingAgentEventKind,
-    CodingAgentExecutionState, CodingAgentObserveResult, CodingAgentProvider, CodingAgentRequest,
-    CodingAgentResponse, CodingAgentResponsePayload, CodingAgentRunInventory,
-    CodingAgentRunSnapshot, CodingAgentRunState, CodingAgentTerminal, CodingAgentUsage,
-    validate_coding_agent_run_snapshot, validate_request,
 };
 use webcodex_process::ManagedChild;
 use webcodex_runner_config::paths::paths_equal;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
 const ACP_MESSAGE_MAX_BYTES: usize = 1024 * 1024;
 const ACP_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -614,13 +614,34 @@ impl CodingAgentManager {
                             "fix_input",
                         ),
                     },
-                    None => response_error(
-                        CodingAgentDispatchState::NotStarted,
-                        "unknown_coding_agent_run",
-                        "CodingAgentRun is not retained by this Runner",
-                        "not_found",
-                        "reobserve",
-                    ),
+                    None => match self.store.read_retained_terminal(&request.run_id) {
+                        Ok(Some(record)) => {
+                            CodingAgentResponse::success(CodingAgentResponsePayload::Observe {
+                                observation: CodingAgentObserveResult {
+                                    run: record.snapshot(0),
+                                    events: Vec::new(),
+                                    first_retained_sequence: 1,
+                                    next_sequence: request.after_sequence.unwrap_or(0),
+                                    has_more: false,
+                                    history_lost: true,
+                                },
+                            })
+                        }
+                        Ok(None) => response_error(
+                            CodingAgentDispatchState::NotStarted,
+                            "unknown_coding_agent_run",
+                            "CodingAgentRun is not retained by this Runner",
+                            "not_found",
+                            "reobserve",
+                        ),
+                        Err(error) => response_error(
+                            CodingAgentDispatchState::OutcomeUnknown,
+                            "coding_agent_durable_state_unavailable",
+                            error,
+                            "durable_state_unavailable",
+                            "reconcile",
+                        ),
+                    },
                 }
             }
             CodingAgentRequest::Cancel(request) => {
@@ -631,13 +652,27 @@ impl CodingAgentManager {
                             run: self.request_cancel(&request.run_id, &entry),
                         })
                     }
-                    None => response_error(
-                        CodingAgentDispatchState::NotStarted,
-                        "unknown_coding_agent_run",
-                        "CodingAgentRun is not retained by this Runner",
-                        "not_found",
-                        "reobserve",
-                    ),
+                    None => match self.store.read_retained_terminal(&request.run_id) {
+                        Ok(Some(record)) => {
+                            CodingAgentResponse::success(CodingAgentResponsePayload::Cancel {
+                                run: record.snapshot(0),
+                            })
+                        }
+                        Ok(None) => response_error(
+                            CodingAgentDispatchState::NotStarted,
+                            "unknown_coding_agent_run",
+                            "CodingAgentRun is not retained by this Runner",
+                            "not_found",
+                            "reobserve",
+                        ),
+                        Err(error) => response_error(
+                            CodingAgentDispatchState::OutcomeUnknown,
+                            "coding_agent_durable_state_unavailable",
+                            error,
+                            "durable_state_unavailable",
+                            "reconcile",
+                        ),
+                    },
                 }
             }
             CodingAgentRequest::RespondPermission(request) => {
@@ -729,7 +764,11 @@ impl CodingAgentManager {
         self.cleanup_expired();
         if let Some(existing) = self.runs.lock().unwrap().get(&request.run_id).cloned() {
             let snapshot = existing.snapshot();
-            if snapshot.intent_fingerprint != request.intent_fingerprint {
+            if snapshot.intent_fingerprint != request.intent_fingerprint
+                || snapshot.authority_fingerprint != request.authority_fingerprint
+                || snapshot.runtime_project_id != request.runtime_project_id
+                || snapshot.provider_id != request.provider_id
+            {
                 return response_error(
                     CodingAgentDispatchState::NotStarted,
                     "idempotency_conflict",
@@ -741,6 +780,60 @@ impl CodingAgentManager {
             return CodingAgentResponse::success(CodingAgentResponsePayload::Start {
                 run: snapshot,
             });
+        }
+        // A durable replay fence is resolved before new-run capacity checks.
+        // Never reinsert an archived terminal into the bounded live inventory.
+        match self.store.read_retained_terminal(&request.run_id) {
+            Ok(Some(record)) => {
+                let snapshot = record.snapshot(0);
+                if snapshot.intent_fingerprint != request.intent_fingerprint
+                    || snapshot.authority_fingerprint != request.authority_fingerprint
+                    || snapshot.runtime_project_id != request.runtime_project_id
+                    || snapshot.provider_id != request.provider_id
+                {
+                    return response_error(
+                        CodingAgentDispatchState::NotStarted,
+                        "idempotency_conflict",
+                        "durable run_id belongs to a different CodingAgentRun intent",
+                        "invalid_input",
+                        "fix_input",
+                    );
+                }
+                return CodingAgentResponse::success(CodingAgentResponsePayload::Start {
+                    run: snapshot,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return response_error(
+                    CodingAgentDispatchState::OutcomeUnknown,
+                    "coding_agent_durable_state_unavailable",
+                    error,
+                    "durable_state_unavailable",
+                    "reconcile",
+                );
+            }
+        }
+        match self.store.archive_required() {
+            Ok(true) if request.archive_acknowledged_runs.is_none() => {
+                return response_error(
+                    CodingAgentDispatchState::NotStarted,
+                    "coding_agent_archive_protocol_required",
+                    "archived replay fences require an archive-aware Server",
+                    "configuration",
+                    "reobserve",
+                );
+            }
+            Err(error) => {
+                return response_error(
+                    CodingAgentDispatchState::OutcomeUnknown,
+                    "coding_agent_durable_state_unavailable",
+                    error,
+                    "durable_state_unavailable",
+                    "reconcile",
+                )
+            }
+            _ => {}
         }
         let Some(provider) = self.providers.get(&request.provider_id).cloned() else {
             return response_error(
@@ -802,39 +895,13 @@ impl CodingAgentManager {
                 );
             }
         };
-        match self.store.read(&request.run_id) {
-            Ok(Some(record)) => {
-                let snapshot = record.snapshot(0);
-                if snapshot.intent_fingerprint != request.intent_fingerprint {
-                    return response_error(
-                        CodingAgentDispatchState::NotStarted,
-                        "idempotency_conflict",
-                        "durable run_id belongs to a different CodingAgentRun intent",
-                        "invalid_input",
-                        "fix_input",
-                    );
-                }
-                let entry = Arc::new(RunEntry::new(snapshot.clone()));
-                self.runs
-                    .lock()
-                    .unwrap()
-                    .insert(request.run_id.clone(), entry);
-                return CodingAgentResponse::success(CodingAgentResponsePayload::Start {
-                    run: snapshot,
-                });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return response_error(
-                    CodingAgentDispatchState::OutcomeUnknown,
-                    "coding_agent_durable_state_unavailable",
-                    error,
-                    "durable_state_unavailable",
-                    "reconcile",
-                );
-            }
-        }
-        if let Err(error) = self.enforce_durable_capacity_for_admission(Some(&request.run_id)) {
+        if let Err(error) = self.enforce_durable_capacity_for_admission(
+            Some(&request.run_id),
+            request
+                .archive_acknowledged_runs
+                .as_deref()
+                .unwrap_or_default(),
+        ) {
             return response_error(
                 CodingAgentDispatchState::NotStarted,
                 "coding_agent_retention_capacity_exhausted",
@@ -929,7 +996,7 @@ mod setup;
 mod store;
 
 use permission::permission_outcome_for_acp;
-use permission::{PermissionSlot, permission_result_json};
+use permission::{permission_result_json, PermissionSlot};
 
 use store::{DurableDispatchPhase, DurableRunRecord, DurableRunStore, STORE_SCHEMA_VERSION};
 

@@ -107,7 +107,7 @@ fn continuation_runtime() -> (tempfile::TempDir, Arc<crate::db::Database>, ToolR
     let temp = tempfile::tempdir().unwrap();
     let db =
         Arc::new(crate::db::Database::open(&temp.path().join("agent-continuation.db")).unwrap());
-    let runtime = ToolRuntime::new_for_tests().with_communication_database(db.clone());
+    let runtime = workflow_runtime().with_communication_database(db.clone());
     (temp, db, runtime)
 }
 
@@ -336,13 +336,15 @@ async fn agent_continuation_direct_presentation_reauthorizes_without_binding_or_
         true,
     )
     .await;
-    assert!(matches!(
-        denied,
-        McpOutcome::Forbidden {
-            required_scope: Some(crate::auth::SCOPE_COMMUNICATION_READ),
-            ..
-        }
-    ));
+    let McpOutcome::Ok(denied) = denied else {
+        panic!("fixed credential scope denial must be a failed MCP result");
+    };
+    super::fixed_scope::assert_fixed_scope_failure(
+        &denied,
+        crate::auth::SCOPE_COMMUNICATION_READ,
+        false,
+        "fixed token",
+    );
     no_communication_read.kind = crate::auth::AuthKind::OAuth2Token;
     let oauth_listed = super::super::tools::mcp_tools_list_payload_with_features_for_auth(
         false,
@@ -371,7 +373,7 @@ async fn agent_continuation_direct_presentation_reauthorizes_without_binding_or_
 async fn agent_continuation_app_surface_is_sparse_app_only_without_rendering_bindings() {
     assert_eq!(
         MCP_AGENT_CONTINUATION_UI_RESOURCE_URI,
-        "ui://webcodex/agent-continuation/v22"
+        "ui://webcodex/agent-continuation/v25"
     );
     let (_temp, _db, adaptive) = continuation_runtime();
     let auth = continuation_auth("continuation-surface");
@@ -669,9 +671,15 @@ async fn agent_continuation_app_surface_is_sparse_app_only_without_rendering_bin
             .contains("for (let hop = 0; hop < MAX_ENDPOINT_SUCCESSOR_HOPS; hop++)"),
         "v17 successor recovery must remain explicitly bounded"
     );
+    // Bind Host cache identity and App version rather than hardcoding two versions.
+    let version = MCP_AGENT_CONTINUATION_UI_RESOURCE_URI
+        .rsplit_once("/v")
+        .expect("versioned Agent continuation resource")
+        .1;
+    assert!(version.parse::<u32>().is_ok());
     assert!(
-        MCP_AGENT_CONTINUATION_APP_HTML.contains("version: \"22.0.0\""),
-        "App protocol version must advance with the current resource"
+        MCP_AGENT_CONTINUATION_APP_HTML.contains(&format!("version: \"{version}.0.0\"")),
+        "App version must match its published cache identity"
     );
     assert!(
         MCP_AGENT_CONTINUATION_APP_HTML.contains("const DEBUG_DIAGNOSTICS = false;"),
@@ -713,6 +721,120 @@ async fn agent_continuation_app_surface_is_sparse_app_only_without_rendering_bin
         ),
         "acquire must not reinterpret a business failure as no pending Wake"
     );
+}
+
+#[tokio::test]
+async fn stateless_chatgpt_rotation_reserves_first_mount_window_without_binding() {
+    let (_temp, db, runtime) = continuation_runtime();
+    let owner = continuation_auth("first-mount-route-owner");
+    let agent = create_agent(
+        &runtime,
+        &owner,
+        "first-mount-route-agent",
+        "First Mount Route Agent",
+        "first-mount-route-create",
+    );
+    let original_session = "chatgpt-first-mount-origin";
+    let rotate = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5310)),
+            mcp_2026_window_params(
+                json!({
+                    "name": "rotate_agent_continuation_endpoint",
+                    "arguments": {
+                        "agent_id": agent,
+                        "host": "ChatGPT",
+                        "client_attachment_id": "first-mount-route-view",
+                        "idempotency_key": "first-mount-route-attach"
+                    },
+                }),
+                original_session,
+            ),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(rotate) = rotate else {
+        panic!("the real MCP route did not accept exact authorized rotation");
+    };
+    assert_eq!(rotate["result"]["structuredContent"]["success"], true);
+    let initial = &rotate["result"]["structuredContent"]["output"]["endpoint"];
+    let endpoint = initial["endpoint_id"].as_str().unwrap().to_string();
+    let generation = initial["controller_generation"].as_i64().unwrap();
+    assert_eq!(initial["wake_capable"], false);
+    let expected =
+        crate::client_window::ClientWindow::from_opaque("openai-session", original_session)
+            .unwrap();
+    let persisted = endpoint_client_window_key(&db, &endpoint);
+    assert_eq!(persisted.as_deref(), Some(expected.key()));
+    assert_ne!(persisted.as_deref(), Some(original_session));
+
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_endpoints SET lease_expires_at_unix_ms = 0
+         WHERE endpoint_id = ?1",
+            [&endpoint],
+        )
+        .unwrap();
+    let recovery_args = json!({
+        "name": "recover_agent_continuation_endpoint",
+        "arguments": {
+            "agent_id": agent,
+            "endpoint_id": endpoint,
+            "expected_controller_generation": generation,
+            "binding_id": "wc_host_binding_EREREREREREREREREREREQ"
+        },
+    });
+    let foreign_window = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5311)),
+            mcp_2026_window_params(recovery_args.clone(), "different-window"),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(foreign_window) = foreign_window else {
+        panic!("wrong-window recovery should report a bounded tool error");
+    };
+    assert_eq!(
+        foreign_window["result"]["structuredContent"]["success"],
+        false
+    );
+    assert_eq!(
+        foreign_window["result"]["structuredContent"]["output"]["error_kind"],
+        "host_binding_stale",
+    );
+    let original_window = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5312)),
+            mcp_2026_window_params(recovery_args, original_session),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(original_window) = original_window else {
+        panic!("same-Window first-mount recovery should be authorized");
+    };
+    let result = &original_window["result"]["structuredContent"];
+    assert_eq!(result["success"], true);
+    assert_eq!(
+        result["output"]["endpoint_recovery"]["kind"],
+        "endpoint_replaced"
+    );
+    assert_eq!(
+        result["output"]["agent_continuation"]["host_binding"]["bound"],
+        false
+    );
+    assert_eq!(result["output"]["state_changed"], true);
 }
 
 #[tokio::test]
@@ -922,7 +1044,7 @@ fn restart_recovery_survives_published_projection_output_schema() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("agent-continuation-schema-restart.db");
     let db = Arc::new(crate::db::Database::open(&path).unwrap());
-    let runtime = ToolRuntime::new_for_tests().with_communication_database(db.clone());
+    let runtime = workflow_runtime().with_communication_database(db.clone());
     let owner = continuation_auth("continuation-schema-restart");
     let agent = create_agent(
         &runtime,
@@ -966,7 +1088,7 @@ fn restart_recovery_survives_published_projection_output_schema() {
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
-    let runtime = ToolRuntime::new_for_tests().with_communication_database(reopened);
+    let runtime = workflow_runtime().with_communication_database(reopened);
     let restart =
         runtime.agent_continuation_state(Some(&owner), agent, endpoint, generation, binding_id);
     assert!(restart.success, "{:?}", restart.output);
@@ -1436,9 +1558,14 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
         assert!(!denied_text.contains(&binding_id));
         let unscoped =
             handle_with_app_policy(&runtime, request(), Some(&read_only_owner), true).await;
-        assert!(
-            matches!(unscoped, McpOutcome::Forbidden { .. }),
-            "{name} requires communication:manage even with the exact fence"
+        let McpOutcome::Ok(unscoped) = unscoped else {
+            panic!("{name} requires communication:manage even with the exact fence");
+        };
+        super::fixed_scope::assert_fixed_scope_failure(
+            &unscoped,
+            crate::auth::SCOPE_COMMUNICATION_MANAGE,
+            false,
+            "fixed token",
         );
     }
 
@@ -1953,7 +2080,7 @@ async fn agent_continuation_hidden_kernel_entry_is_fail_closed_without_protocol_
         ToolProtocolCapabilities, ToolTransport,
     };
 
-    let runtime = ToolRuntime::new_for_tests();
+    let runtime = workflow_runtime();
     let auth = continuation_auth("continuation-kernel-gate");
     for transport in [ToolTransport::Mcp, ToolTransport::Api] {
         for name in APP_TOOLS {

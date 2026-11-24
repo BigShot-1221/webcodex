@@ -393,7 +393,50 @@ fn server_status_cache_malformed_notification_clears_stale_readiness() {
 
     cache.record(Some(&json!({"health": "ok"})));
     let error = cache.wait_for_quiescent_ok(Instant::now()).unwrap_err();
-    assert!(matches!(error, LspError::RequestTimeout { .. }));
+    assert_eq!(
+        error,
+        LspError::WorkspaceReadinessTimeout {
+            readiness: LspIndexReadiness::Unknown,
+        }
+    );
+}
+
+#[test]
+fn server_status_readiness_timeout_retains_state_without_permitting_restart() {
+    for (notification, expected, label) in [
+        (None, LspIndexReadiness::Unknown, "unknown"),
+        (
+            Some(json!({"health":"ok"})),
+            LspIndexReadiness::Unknown,
+            "unknown",
+        ),
+        (
+            Some(json!({"health":"ok","quiescent":false})),
+            LspIndexReadiness::Indexing,
+            "indexing",
+        ),
+    ] {
+        // Exercise both an already-expired deadline and a Condvar timeout.
+        for budget in [Duration::ZERO, Duration::from_millis(1)] {
+            let cache = ServerStatusCache::default();
+            if let Some(notification) = &notification {
+                cache.record(Some(notification));
+            }
+            let error = cache
+                .wait_for_quiescent_ok(Instant::now() + budget)
+                .unwrap_err();
+            assert_eq!(
+                error,
+                LspError::WorkspaceReadinessTimeout {
+                    readiness: expected,
+                }
+            );
+            assert!(!error.permits_restart(), "{error}");
+            assert!(error
+                .to_string()
+                .contains(&format!("last_index_state={label}")));
+        }
+    }
 }
 
 #[test]
@@ -1010,6 +1053,12 @@ fn lsp_initialize_uses_constrained_rust_analyzer_profile() {
         params.get("rootUri").and_then(Value::as_str),
         Some(expected_root_uri.as_str()),
         "rootUri must be the canonical project root"
+    );
+
+    assert_eq!(
+        params
+            .pointer("/capabilities/textDocument/documentSymbol/hierarchicalDocumentSymbolSupport"),
+        Some(&json!(true))
     );
 
     let encodings = params
@@ -2007,5 +2056,305 @@ fn fake_server_fixture_uses_the_current_test_executable_directory() {
         use std::os::unix::fs::PermissionsExt;
         let executable = std::fs::metadata(fake).unwrap();
         assert_ne!(executable.permissions().mode() & 0o111, 0);
+    }
+}
+
+#[test]
+fn navigation_distinguishes_indexing_valid_results_and_valid_empty_results() {
+    use webcodex_core::lsp_bridge::{RunnerLspPayload, RunnerLspRequest};
+    let _serial = super::super::serialize_fake_lsp_test();
+    for scenario in ["normal", "definition_null", "workspace_readiness_timeout"] {
+        let fixture = Fixture::new(scenario);
+        fs::create_dir(fixture.root.join("src")).unwrap();
+        fs::write(fixture.root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let server = fixture
+            .supervisor
+            .server_for_test(&fixture.root, LspServerKind::RustAnalyzer)
+            .unwrap();
+        // A round trip drains initialized/status before deterministic cache controls.
+        server
+            .request("fake/echo", json!({}), Duration::from_secs(2))
+            .unwrap();
+        let payload = RunnerLspPayload {
+            project_id: "test".into(),
+            request: RunnerLspRequest::GotoDefinition {
+                path: "src/main.rs".into(),
+                line: 1,
+                column: 4,
+                limit: 10,
+            },
+        };
+        let execute = |deadline| {
+            super::super::navigation::execute_lsp_operation(
+                fs::canonicalize(&fixture.root).unwrap(),
+                &fixture.supervisor,
+                &payload,
+                deadline,
+            )
+        };
+        for (notification, code, diagnostic, readiness) in [
+            (
+                json!({"health":"ok"}),
+                "lsp_request_timeout",
+                "last_index_state=unknown",
+                LspIndexReadiness::Unknown,
+            ),
+            (
+                json!({"health":"ok","quiescent":false}),
+                "lsp_request_timeout",
+                "last_index_state=indexing",
+                LspIndexReadiness::Indexing,
+            ),
+            (
+                json!({"health":"warning","quiescent":true}),
+                "lsp_server_failed",
+                "not ready (warning)",
+                LspIndexReadiness::Unhealthy,
+            ),
+            (
+                json!({"health":"error","quiescent":true}),
+                "lsp_server_failed",
+                "not ready (error)",
+                LspIndexReadiness::Unhealthy,
+            ),
+        ] {
+            server.server_status.record(Some(&notification));
+            let result = execute(Instant::now() + Duration::from_millis(20));
+            assert!(!result.success, "{result:?}");
+            assert!(result.result.is_none(), "{result:?}");
+            let error = result.error.as_ref().unwrap();
+            assert_eq!(error.code, code);
+            assert!(error.message.contains(diagnostic), "{error:?}");
+            assert!(error.message.contains("no navigation result"), "{error:?}");
+            assert!(
+                error
+                    .message
+                    .split("; ")
+                    .any(|part| part == "inspect get_lsp_status"),
+                "{error:?}"
+            );
+            assert!(error.message.contains("search_project_texts"), "{error:?}");
+            assert!(error.message.len() <= 240, "{error:?}");
+            assert_eq!(fixture.starts(), 1, "unready index must not restart LSP");
+            assert!(!fs::read_to_string(&fixture.marker)
+                .unwrap()
+                .contains("request:textDocument/definition"));
+            assert_eq!(
+                fixture
+                    .supervisor
+                    .project_server_status(&fixture.root, LspServerKind::RustAnalyzer)
+                    .unwrap()
+                    .2,
+                readiness
+            );
+        }
+
+        server
+            .server_status
+            .record(Some(&json!({"health":"ok","quiescent":true})));
+        let result = execute(Instant::now() + Duration::from_secs(2));
+        assert!(result.success, "{result:?}");
+        let result = result.result.unwrap();
+        assert_eq!(
+            result["locations"].as_array().unwrap().len(),
+            usize::from(scenario == "normal")
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .project_server_status(&fixture.root, LspServerKind::RustAnalyzer)
+                .unwrap()
+                .2,
+            LspIndexReadiness::Ready
+        );
+    }
+}
+
+#[test]
+fn semantic_document_requests_reapply_readiness_after_restart() {
+    let _serial = super::super::serialize_fake_lsp_test();
+    for method in [
+        "textDocument/definition",
+        "textDocument/references",
+        "textDocument/hover",
+        "textDocument/documentSymbol",
+    ] {
+        let fixture = Fixture::new("workspace_readiness_restart");
+        let error = fixture
+            .supervisor
+            .request_with_document_until(
+                &fixture.root,
+                LspServerKind::RustAnalyzer,
+                "file:///project/main.rs",
+                "rust",
+                "fn main() {}",
+                method,
+                json!({}),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, LspError::WorkspaceNotReady("warning")),
+            "{error}"
+        );
+        assert_eq!(fixture.starts(), 2);
+        assert_eq!(
+            fs::read_to_string(&fixture.marker)
+                .unwrap()
+                .lines()
+                .filter(|line| *line == format!("request:{method}"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn server_status_readiness_invalidations_and_exit_fail_closed() {
+    let cache = ServerStatusCache::default();
+    assert_eq!(cache.readiness(), LspIndexReadiness::Unknown);
+    cache.record(Some(&json!({"health":"ok","quiescent":true})));
+    let epoch = cache.wait_for_quiescent_ok(Instant::now()).unwrap();
+    for invalid in [
+        json!({}),
+        json!({"health":"bogus","quiescent":true}),
+        json!({"health":"ok","quiescent":"true"}),
+    ] {
+        cache.record(Some(&invalid));
+        assert_eq!(cache.readiness(), LspIndexReadiness::Unknown);
+        assert!(matches!(
+            cache.wait_for_quiescent_ok(Instant::now()),
+            Err(LspError::WorkspaceReadinessTimeout {
+                readiness: LspIndexReadiness::Unknown,
+            })
+        ));
+    }
+    cache.record(Some(&json!({"health":"ok","quiescent":true})));
+    assert!(matches!(
+        cache.validate_epoch(epoch),
+        Err(LspError::WorkspaceNotReady(_))
+    ));
+    cache.mark_closed();
+    assert_eq!(cache.readiness(), LspIndexReadiness::Unknown);
+    assert!(matches!(
+        cache.wait_for_quiescent_ok(Instant::now()),
+        Err(LspError::ServerExited)
+    ));
+    assert_eq!(
+        ServerStatusCache::default().readiness(),
+        LspIndexReadiness::Unknown
+    );
+}
+
+#[test]
+fn semantic_navigation_without_readiness_support_keeps_normal_request_contract() {
+    let _serial = super::super::serialize_fake_lsp_test();
+    for kind in [
+        LspServerKind::Pyright,
+        LspServerKind::TypeScriptLanguageServer,
+        LspServerKind::Gopls,
+    ] {
+        let fixture = Fixture::new("normal");
+        let command = LspCommand::new(fake_server_path().as_os_str()).arg("normal");
+        let supervisor = LspSupervisor::new(LspSupervisorConfig {
+            commands: HashMap::from([(kind, command)]),
+            ..Default::default()
+        });
+        supervisor
+            .request_with_document_until(
+                &fixture.root,
+                kind,
+                "file:///project/main.py",
+                "python",
+                "pass",
+                "textDocument/definition",
+                json!({}),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .project_server_status(&fixture.root, kind)
+                .unwrap()
+                .2,
+            LspIndexReadiness::Unsupported
+        );
+    }
+}
+
+#[test]
+fn semantic_navigation_expired_deadline_never_starts_a_new_budget() {
+    let fixture = Fixture::new("normal");
+    let deadline = Instant::now();
+    let error = fixture
+        .supervisor
+        .request_with_document_until(
+            &fixture.root,
+            LspServerKind::RustAnalyzer,
+            "file:///project/main.rs",
+            "rust",
+            "fn main() {}",
+            "textDocument/definition",
+            json!({}),
+            deadline,
+        )
+        .unwrap_err();
+    assert!(matches!(error, LspError::RequestTimeout { .. }));
+    assert_eq!(fixture.starts(), 0);
+}
+
+#[test]
+fn document_symbols_wait_for_readiness_and_preserve_nested_identifier_ranges() {
+    use webcodex_core::lsp_bridge::{RunnerLspPayload, RunnerLspRequest};
+    let _serial = super::super::serialize_fake_lsp_test();
+    for scenario in ["normal", "symbols_empty"] {
+        let fixture = Fixture::new(scenario);
+        fs::create_dir(fixture.root.join("src")).unwrap();
+        fs::write(fixture.root.join("src/main.rs"), "outer {\n\ninner\n}\n").unwrap();
+        let server = fixture
+            .supervisor
+            .server_for_test(&fixture.root, LspServerKind::RustAnalyzer)
+            .unwrap();
+        server
+            .request("fake/echo", json!({}), Duration::from_secs(2))
+            .unwrap();
+        let payload = RunnerLspPayload {
+            project_id: "test".into(),
+            request: RunnerLspRequest::DocumentSymbols {
+                path: "src/main.rs".into(),
+                limit: 10,
+            },
+        };
+        let execute = |deadline| {
+            super::super::navigation::execute_lsp_operation(
+                fs::canonicalize(&fixture.root).unwrap(),
+                &fixture.supervisor,
+                &payload,
+                deadline,
+            )
+        };
+        server
+            .server_status
+            .record(Some(&json!({"health":"ok","quiescent":false})));
+        let pending = execute(Instant::now() + Duration::from_millis(20));
+        assert!(!pending.success);
+        assert_eq!(pending.error.unwrap().code, "lsp_request_timeout");
+        assert!(!fs::read_to_string(&fixture.marker)
+            .unwrap()
+            .contains("request:textDocument/documentSymbol"));
+        server
+            .server_status
+            .record(Some(&json!({"health":"ok","quiescent":true})));
+        let ready = execute(Instant::now() + Duration::from_secs(2));
+        assert!(ready.success, "{ready:?}");
+        let result = ready.result.unwrap();
+        if scenario == "symbols_empty" {
+            assert_eq!(result["symbols"], json!([]));
+        } else {
+            assert_eq!(result["returned_count"], 2);
+            let outer = &result["symbols"][0];
+            assert_eq!(outer["children"][0]["name"], "inner");
+            assert_ne!(outer["range"], outer["selection_range"]);
+        }
     }
 }

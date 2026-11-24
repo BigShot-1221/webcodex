@@ -65,6 +65,8 @@ export const desktopApi = {
   registerSshResource: (request: SshRegisterRequest) => invoke<SshMutationResult>("ssh_resource_register", { request }),
   removeSshResource: (expected: SettingsTarget, observationId: string, name: string) =>
     invoke<SshMutationResult>("ssh_resource_remove", { request: { expected, observation_id: observationId, name } }),
+  connectGemini: (request: {environment_id: string; profile: {id: string; configuration_id: string; revision: number} | null}) =>
+    invoke<DesktopState>("connect_gemini", { request }),
   cloudflareConnection: <T extends CloudflareConnectionStatus | CloudflareOAuthHandoff = CloudflareConnectionStatus>(request: CloudflareConnectionRequest) => invoke<T>("cloudflare_connection", { request }),
   saveTunnelProfile: (request: TunnelProfileRequest) => invoke<DesktopState>("save_tunnel_profile", { request }),
   tunnelProfileAction: (profileId: string, action: TunnelProfileAction, expectedRevision?: number, expectedConfigurationId?: string | null) => invoke<DesktopState>("tunnel_profile_action", { profileId, action, ...(expectedRevision === undefined ? {} : { expectedRevision }), ...(expectedConfigurationId == null ? {} : { expectedConfigurationId }) }),
@@ -105,7 +107,10 @@ export const desktopApi = {
     invoke<DesktopState>("configure_local_setup", {
       request: { projectPath: projectPath ?? null },
     }),
+  inspectLocalMigration: () => invoke<{ fingerprint: string; resuming: boolean }>("inspect_local_migration"),
+  resetLocalMigration: () => invoke<DesktopState>("reset_local_migration"),
   configureEnvironment: (request: {
+    expectedLocalTarget?: { kind: "fresh" } | { kind: "pending"; environment_id: string } | { kind: "legacy"; fingerprint: string };
     serviceScope?: "user" | "system";
     mode: "create" | "join";
     serverUrl?: string | null;

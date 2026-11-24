@@ -3,6 +3,37 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+pub const DEFAULT_ADDR: &str = "127.0.0.1:8080";
+
+fn addr_is_loopback(addr: &str) -> bool {
+    addr.parse::<SocketAddr>()
+        .map(|address| address.ip().is_loopback())
+        .unwrap_or_else(|_| {
+            addr.strip_prefix("localhost:")
+                .and_then(|port| port.parse::<u16>().ok())
+                .is_some()
+        })
+}
+
+/// Read the bootstrap credential without letting an undecodable or blank value
+/// silently disable authentication.
+fn env_token() -> Result<Option<String>, String> {
+    let Some(raw) = std::env::var_os("WEBCODEX_TOKEN") else {
+        return Ok(None);
+    };
+    let value = raw.into_string().map_err(|_| {
+        "WEBCODEX_TOKEN is not valid UTF-8; refusing to start without a usable bootstrap credential"
+            .to_string()
+    })?;
+    if value.trim().is_empty() {
+        return Err(
+            "WEBCODEX_TOKEN is set but empty; refusing to start without a usable bootstrap credential"
+                .to_string(),
+        );
+    }
+    Ok(Some(value))
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub addr: String,
@@ -369,11 +400,11 @@ pub(crate) fn mcp_compact_schemas_override() -> Option<bool> {
     env_flag("WEBCODEX_MCP_COMPACT_SCHEMAS")
 }
 
-/// Opt-in compatibility projection for MCP hosts that expose only text content.
+/// Deployment-wide override for MCP hosts that expose only text content.
 ///
 /// `structuredContent` remains canonical. When enabled, ordinary Runtime tool
 /// results also serialize that same structured value into
-/// `content[0].text`. The default stays compact to avoid duplicating model context.
+/// `content[0].text`. Otherwise the MCP adapter selects the format per request.
 fn mcp_text_json_compat_enabled_from_flag(flag: Option<bool>) -> bool {
     flag.unwrap_or(false)
 }
@@ -439,6 +470,8 @@ pub struct OAuth2Config {
     /// Whether PKCE (S256) is required for authorization code flows. Default
     /// `true`.
     pub require_pkce: bool,
+    /// Stable managed-user ID designated by the operator for open MCP client registration.
+    pub dcr_owner_user_id: Option<String>,
     /// Whether the public shared-key OAuth bridge authorize flow is enabled.
     /// Default `false`.
     pub shared_key_bridge_enabled: bool,
@@ -457,7 +490,16 @@ pub struct OAuth2Config {
     /// Ephemeral share-session fence. A new `webcodex share --auth oauth`
     /// process uses a new value, invalidating every older project-share grant.
     pub project_share_session_id: Option<String>,
+    /// Parent directories this project share may admit new Projects from, on
+    /// demand, for its own project-share OAuth subjects. Empty by default:
+    /// without an explicit grant the exact-path project fence stays in force.
+    pub project_share_roots: Vec<PathBuf>,
 }
+
+/// Upper bound on parent-root grants per share. Keeps the per-token attach and
+/// the path fence bounded; one share with eight parent roots is already far
+/// beyond any real working setup.
+pub const MAX_PROJECT_SHARE_ROOTS: usize = 8;
 
 impl fmt::Debug for OAuth2Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -470,6 +512,7 @@ impl fmt::Debug for OAuth2Config {
                 "authorization_code_ttl_secs",
                 &self.authorization_code_ttl_secs,
             )
+            .field("dcr_owner_configured", &self.dcr_owner_user_id.is_some())
             .field("require_pkce", &self.require_pkce)
             .field("shared_key_bridge_enabled", &self.shared_key_bridge_enabled)
             .field(
@@ -488,6 +531,7 @@ impl fmt::Debug for OAuth2Config {
                 "project_share_session_id",
                 &self.project_share_session_id.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("project_share_roots_count", &self.project_share_roots.len())
             .finish()
     }
 }
@@ -501,11 +545,13 @@ impl Default for OAuth2Config {
             refresh_token_ttl_secs: 2_592_000,
             authorization_code_ttl_secs: 300,
             require_pkce: true,
+            dcr_owner_user_id: None,
             shared_key_bridge_enabled: false,
             trusted_mcp_file_client_ids: Vec::new(),
             trust_loopback_api_token_mcp_file_import: false,
             project_share_grant_id: None,
             project_share_session_id: None,
+            project_share_roots: Vec::new(),
         }
     }
 }
@@ -523,7 +569,82 @@ fn normalize_trusted_mcp_file_client_id(value: &str) -> Option<String> {
     Some(value)
 }
 
+pub(crate) struct RegistrationTarget<'a> {
+    pub owner: &'a str,
+    pub issuer: &'a str,
+    pub fence: Option<webcodex_store::PublicIngressFence>,
+}
+
 impl OAuth2Config {
+    /// Return the RFC 9207 authorization-response issuer when the configured
+    /// public issuer is suitable for Internet OAuth interoperability. Local HTTP
+    /// development keeps legacy redirects and does not advertise issuer binding.
+    pub(crate) fn https_issuer(&self) -> Option<&str> {
+        let issuer = self.issuer.as_deref()?;
+        let parsed = url::Url::parse(issuer).ok()?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return None;
+        }
+        Some(issuer)
+    }
+
+    /// On the dedicated listener only its admitted entry can supply registration
+    /// authority. The private Server's configured owner is never a fallback.
+    pub(crate) fn registration_target<'a>(
+        &'a self,
+        ingress: Option<&'a webcodex_store::PublicIngressEntry>,
+    ) -> Option<RegistrationTarget<'a>> {
+        if !self.enabled
+            || self.project_share_grant_id.is_some()
+            || self.project_share_session_id.is_some()
+        {
+            return None;
+        }
+        let issuer = self.https_issuer()?;
+        match ingress {
+            Some(entry)
+                if entry.active
+                    && entry.admission_open
+                    && !entry.attempt_closed
+                    && entry.oauth_dynamic_registration_enabled
+                    && entry.origin == issuer =>
+            {
+                Some(RegistrationTarget {
+                    owner: &entry.owner_user_id,
+                    issuer,
+                    fence: Some(entry.fence()),
+                })
+            }
+            Some(_) => None,
+            None => Some(RegistrationTarget {
+                owner: self.dcr_owner_user_id.as_deref()?,
+                issuer,
+                fence: None,
+            }),
+        }
+    }
+
+    pub(crate) fn accepts_client_registration(
+        &self,
+        client: &crate::models::OAuthClientRecord,
+        ingress: Option<&webcodex_store::PublicIngressEntry>,
+    ) -> bool {
+        client.dynamic_registration.as_ref().is_none_or(|d| {
+            self.registration_target(ingress).is_some_and(|target| {
+                client.owner_user_id.as_deref() == Some(target.owner)
+                    && d.issuer == target.issuer
+                    && (ingress.is_none()
+                        || webcodex_store::valid_dynamic_client_scopes(&client.allowed_scopes))
+            })
+        })
+    }
+
     pub fn from_env() -> Self {
         let enabled = env_flag("WEBCODEX_OAUTH2_ENABLED").unwrap_or(false);
         // OAuth2-specific issuer takes precedence over the generic public URL.
@@ -579,6 +700,15 @@ impl OAuth2Config {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let project_share_roots = std::env::var("WEBCODEX_OAUTH2_PROJECT_SHARE_ROOTS")
+            .ok()
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .take(MAX_PROJECT_SHARE_ROOTS)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Self {
             issuer,
             enabled,
@@ -586,38 +716,40 @@ impl OAuth2Config {
             refresh_token_ttl_secs,
             authorization_code_ttl_secs,
             require_pkce,
+            dcr_owner_user_id: std::env::var("WEBCODEX_OAUTH2_DCR_OWNER_USER_ID")
+                .ok()
+                .filter(|id| !id.trim().is_empty()),
             shared_key_bridge_enabled,
             trusted_mcp_file_client_ids,
             trust_loopback_api_token_mcp_file_import,
             project_share_grant_id,
             project_share_session_id,
+            project_share_roots,
         }
     }
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        Self {
-            addr: std::env::var("WEBCODEX_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
+    /// Build the runtime configuration, refusing any configuration that would
+    /// expose the Server without authentication.
+    pub fn from_env() -> Result<Self, String> {
+        let config = Self {
+            addr: std::env::var("WEBCODEX_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string()),
             data_dir: std::env::var("WEBCODEX_DATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("./data")),
-            token: std::env::var("WEBCODEX_TOKEN").ok(),
+            token: env_token()?,
             max_text_size: 2 * 1024 * 1024,
             oauth2: OAuth2Config::from_env(),
+        };
+        if !config.is_auth_enabled() {
+            return Err("WEBCODEX_TOKEN is unset; configure a bootstrap credential before starting the Server".to_string());
         }
+        Ok(config)
     }
 
     pub(crate) fn is_loopback_bound(&self) -> bool {
-        self.addr
-            .parse::<SocketAddr>()
-            .map(|address| address.ip().is_loopback())
-            .unwrap_or_else(|_| {
-                self.addr
-                    .strip_prefix("localhost:")
-                    .and_then(|port| port.parse::<u16>().ok())
-                    .is_some()
-            })
+        addr_is_loopback(&self.addr)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -764,6 +896,39 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_configuration_rejects_invalid_tokens_and_remote_binds() {
+        let mut env = crate::test_support::TestEnvGuard::new();
+        env.remove("WEBCODEX_ADDR");
+        env.remove("WEBCODEX_TOKEN");
+        assert!(Config::from_env().is_err());
+        for addr in ["0.0.0.0:8080", "[::]:8080", "192.0.2.1:8080"] {
+            env.set("WEBCODEX_ADDR", addr);
+            assert!(Config::from_env().is_err(), "{addr}");
+        }
+        for addr in ["127.0.0.1:8080", "[::1]:8080", "localhost:8080"] {
+            env.set("WEBCODEX_ADDR", addr);
+            assert!(Config::from_env().is_err(), "{addr}");
+        }
+        for token in ["", " \t\n"] {
+            env.set("WEBCODEX_TOKEN", token);
+            assert!(Config::from_env().is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            env.set("WEBCODEX_TOKEN", std::ffi::OsStr::from_bytes(b"\xff"));
+            assert!(Config::from_env().is_err());
+        }
+        env.set("WEBCODEX_TOKEN", "  valid token  ");
+        env.set("WEBCODEX_ADDR", "0.0.0.0:8080");
+        let config = Config::from_env().unwrap();
+        env.remove("WEBCODEX_ADDR");
+        assert_eq!(Config::from_env().unwrap().addr, "127.0.0.1:8080");
+        assert!(config.validate_token("  valid token  "));
+        assert!(!config.validate_token("valid token"));
+    }
+
+    #[test]
     fn loopback_binding_detection_is_strict() {
         let mut config = (*crate::test_support::test_config(None)).clone();
         for addr in ["127.0.0.1:8090", "[::1]:8090", "localhost:8090"] {
@@ -853,6 +1018,7 @@ mod tests {
     fn oauth2_config_from_env_parses_overrides() {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.set("WEBCODEX_OAUTH2_ENABLED", "true");
+        env.set("WEBCODEX_OAUTH2_DCR_OWNER_USER_ID", "test-owner-id");
         env.set("WEBCODEX_OAUTH2_ISSUER", "https://example.com");
         env.set("WEBCODEX_OAUTH2_ACCESS_TOKEN_TTL_SECS", "1800");
         env.set("WEBCODEX_OAUTH2_REFRESH_TOKEN_TTL_SECS", "86400");
@@ -872,6 +1038,7 @@ mod tests {
 
         let cfg = OAuth2Config::from_env();
         assert!(cfg.enabled);
+        assert_eq!(cfg.dcr_owner_user_id.as_deref(), Some("test-owner-id"));
         assert_eq!(cfg.issuer.as_deref(), Some("https://example.com"));
         assert_eq!(cfg.access_token_ttl_secs, 1800);
         assert_eq!(cfg.refresh_token_ttl_secs, 86400);
@@ -881,6 +1048,7 @@ mod tests {
         assert_eq!(cfg.trusted_mcp_file_client_ids, vec![trusted_a, trusted_b]);
         assert!(cfg.trust_loopback_api_token_mcp_file_import);
 
+        env.remove("WEBCODEX_OAUTH2_DCR_OWNER_USER_ID");
         env.remove("WEBCODEX_OAUTH2_ENABLED");
         env.remove("WEBCODEX_OAUTH2_ISSUER");
         env.remove("WEBCODEX_OAUTH2_ACCESS_TOKEN_TTL_SECS");

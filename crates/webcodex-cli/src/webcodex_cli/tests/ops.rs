@@ -6,6 +6,118 @@ use crate::webcodex_cli::ops::{
 use crate::webcodex_cli::run_ops_command;
 use std::time::Duration;
 
+const OPS_COMMAND_ARGS: &[(&str, &[&str])] = &[
+    ("status", &[]),
+    ("runners", &[]),
+    ("projects", &[]),
+    ("runner", &["--client-id", "fixture-runner"]),
+    ("windows", &["--project", "fixture-project"]),
+    ("smoke-preflight", &["--project", "fixture-project"]),
+    (
+        "diagnose-provider",
+        &["--project", "fixture-project", "--provider", "codex"],
+    ),
+];
+
+fn parsed_ops_common(action: CliAction) -> OpsCommonOptions {
+    match action {
+        CliAction::Ops(command) => match command {
+            OpsCommand::Status(opts) | OpsCommand::Runners(opts) | OpsCommand::Projects(opts) => {
+                opts
+            }
+            OpsCommand::Runner(opts) => opts.common,
+            OpsCommand::Windows(opts) => opts.common,
+            OpsCommand::SmokePreflight(opts) => opts.common,
+            OpsCommand::DiagnoseProvider(opts) => opts.common,
+        },
+        other => panic!("expected ops action, got {other:?}"),
+    }
+}
+
+// A stateful HTTP fixture proves that an operator inventory follows the actual
+// continuation and does not silently treat the first model page as complete.
+#[tokio::test]
+async fn bounded_project_discovery_ops_traverses_all_pages() {
+    use std::io::BufRead as _;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut offsets = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = std::io::BufReader::new(&mut stream);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut body = vec![0u8; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(request["tool"], "list_projects");
+                    assert_eq!(request["params"]["summary_only"], false);
+                    assert_eq!(request["params"]["limit"], 100);
+                    let offset = request["params"]["offset"].as_u64().unwrap();
+                    offsets.push(offset);
+                    let end = (offset + 100).min(211);
+                    let projects = (offset..end)
+                        .map(|index| {
+                            json!({
+                                "id":format!("agent:ops:p{index:03}"),"connected":true,
+                                "agent_status":"online","enabled":true,
+                                "capabilities":{"recommended_for_smoke":false}
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let response = json!({"success":true,"output":{
+                        "projects":projects,"count":end-offset,"matched_count":211,
+                        "offset":offset,"limit":100,"next_offset":(end < 211).then_some(end),
+                        "truncated":end < 211
+                    }})
+                    .to_string();
+                    write!(stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(), response).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fixture accept: {error}"),
+            }
+        }
+        offsets
+    });
+    let mut opts = ops_common_opts(format!("http://{address}"));
+    opts.token = Some("wc_pat_bounded_inventory_fixture".into());
+    opts.json = true;
+    let result = run_ops_command(OpsCommand::Projects(opts)).await;
+    stop_tx.send(()).unwrap();
+    let offsets = server.join().unwrap();
+    assert_eq!(offsets, vec![0, 100, 200]);
+    let output: Value = serde_json::from_str(&result.unwrap().stdout).unwrap();
+    assert_eq!(output["summary"]["count"], 211, "{output}");
+    assert_eq!(output["summary"]["matched_count"], 211);
+    assert_eq!(output["summary"]["truncated"], false);
+}
+
 #[test]
 fn ops_help_entrypoints_print_usage() {
     let cases: &[(&[&str], &[&str])] = &[
@@ -152,33 +264,83 @@ fn ops_unknown_subcommand_is_clear() {
 }
 
 #[test]
-fn ops_common_flags_parse_without_printing_token() {
-    match cli_action([
-        "ops",
-        "status",
+fn ops_commands_share_common_defaults_and_last_value_wins() {
+    let defaults = OpsCommonOptions {
+        server_url: "http://127.0.0.1:8080".into(),
+        server_http: ServerHttpOptions::default(),
+        env_file: None,
+        token_file: None,
+        token: None,
+        json: false,
+        strict: false,
+    };
+    let flags = [
+        "--server-url",
+        "",
         "--server-url",
         "http://runtime.example",
+        "--proxy",
+        "invalid",
+        "--proxy",
+        "http://proxy.example:8080",
         "--env-file",
-        "/tmp/webcodex.env",
+        "old.env",
+        "--env-file",
+        "fixture.env",
         "--token-file",
-        "/tmp/token",
+        "old.token",
+        "--token-file",
+        "fixture.token",
         "--token",
-        "secret-token-value",
+        "",
+        "--token",
+        "fixture-token",
+        "--json",
         "--json",
         "--strict",
-    ]) {
-        CliAction::Ops(OpsCommand::Status(opts)) => {
-            assert_eq!(opts.server_url, "http://runtime.example");
-            assert_eq!(
-                opts.env_file.as_deref(),
-                Some(Path::new("/tmp/webcodex.env"))
-            );
-            assert_eq!(opts.token_file.as_deref(), Some(Path::new("/tmp/token")));
-            assert_eq!(opts.token.as_deref(), Some("secret-token-value"));
-            assert!(opts.json);
-            assert!(opts.strict);
+        "--strict",
+    ];
+    let expected = OpsCommonOptions {
+        server_url: "http://runtime.example".into(),
+        server_http: ServerHttpOptions {
+            proxy: Some("http://proxy.example:8080".into()),
+            no_system_proxy: false,
+        },
+        env_file: Some(PathBuf::from("fixture.env")),
+        token_file: Some(PathBuf::from("fixture.token")),
+        token: Some("fixture-token".into()),
+        json: true,
+        strict: true,
+    };
+    for &(command, required) in OPS_COMMAND_ARGS {
+        let prefix = ["ops", command];
+        assert_eq!(
+            parsed_ops_common(cli_action([prefix.as_slice(), required].concat())),
+            defaults,
+            "{command}"
+        );
+        // Common options can precede or follow command-specific options.
+        for args in [
+            [prefix.as_slice(), &flags[..], required].concat(),
+            [prefix.as_slice(), required, &flags[..]].concat(),
+        ] {
+            assert_eq!(parsed_ops_common(cli_action(args)), expected, "{command}");
         }
-        other => panic!("expected ops status action, got {other:?}"),
+        let args = [
+            prefix.as_slice(),
+            required,
+            &["--no-system-proxy", "--server-url", "--json"],
+        ]
+        .concat();
+        assert_eq!(
+            parsed_ops_common(cli_action(args)),
+            OpsCommonOptions {
+                server_url: "--json".into(), // A value that looks like a flag is still consumed.
+                server_http: direct_server_http(),
+                ..defaults.clone()
+            },
+            "{command}"
+        );
     }
 }
 
@@ -285,14 +447,84 @@ fn ops_runner_requires_exact_client_id() {
 
 #[test]
 fn ops_parser_errors_do_not_leak_token_value() {
-    let secret = "secret-token-value";
-    match cli_action(["ops", "status", "--token", secret, "--bad-flag"]) {
-        CliAction::Exit { code, stderr, .. } => {
-            assert_eq!(code, 2);
-            assert!(stderr.contains("unknown ops status flag: --bad-flag"));
-            assert!(!stderr.contains(secret));
+    let cases: &[(&[&str], &str)] = &[
+        (&["--server-url"], "--server-url requires a value"),
+        (&["--proxy"], "--proxy requires a value"),
+        (&["--env-file"], "--env-file requires a value"),
+        (&["--token-file"], "--token-file requires a value"),
+        (&["--token"], "--token requires a value"),
+        (&["--bad-flag"], "unknown ops {command} flag: --bad-flag"),
+        (&["positional"], "unknown ops {command} flag: positional"),
+        (&["--json", "--help"], "unknown ops {command} flag: --help"),
+        (&["--json", "-h"], "unknown ops {command} flag: -h"),
+        (&["--token", " "], "--token cannot be empty"),
+        (
+            &["--server-url", " ", "--token", ""],
+            "--server-url cannot be empty",
+        ),
+        (
+            &["--proxy", "", "--server-url", ""],
+            "--proxy cannot be empty",
+        ),
+        (
+            &["--proxy", "", "--no-system-proxy"],
+            "--proxy and --no-system-proxy are mutually exclusive",
+        ),
+    ];
+    let secret = "fixture-token-do-not-print";
+    for &(command, required) in OPS_COMMAND_ARGS {
+        for &(flags, error) in cases {
+            // Also check validation precedence when the command's required options are absent.
+            for required in [required, &[][..]] {
+                let args = [&["ops", command, "--token", secret][..], required, flags].concat();
+                match cli_action(args) {
+                    CliAction::Exit {
+                        code,
+                        stdout,
+                        stderr,
+                    } => {
+                        assert_eq!(code, 2, "{command} {flags:?}");
+                        assert!(stdout.is_empty());
+                        assert_eq!(stderr, format!("{}\n", error.replace("{command}", command)));
+                        assert!(!stderr.contains(secret));
+                    }
+                    other => panic!("expected parser error for {command} {flags:?}, got {other:?}"),
+                }
+            }
         }
-        other => panic!("expected parser error, got {other:?}"),
+    }
+}
+
+#[test]
+fn ops_help_only_short_circuits_at_the_start_of_known_commands() {
+    for &(command, _) in OPS_COMMAND_ARGS {
+        let expected = cli_exit(["ops", command, "--help"]).unwrap();
+        for help in ["--help", "-h"] {
+            assert_eq!(
+                cli_exit(["ops", command, help, "--bad-flag"]).unwrap(),
+                expected
+            );
+        }
+    }
+    for (args, error) in [
+        (vec!["ops"], format!("{}\n", ops_usage())),
+        (
+            vec!["ops", "unknown", "--help"],
+            "unknown ops subcommand: unknown\n".into(),
+        ),
+    ] {
+        match cli_action(args) {
+            CliAction::Exit {
+                code,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(code, 2);
+                assert!(stdout.is_empty());
+                assert_eq!(stderr, error);
+            }
+            other => panic!("expected ops usage error, got {other:?}"),
+        }
     }
 }
 
@@ -735,6 +967,10 @@ async fn run_ops_with_routes(
             opts.common.server_url = server_url;
             OpsCommand::SmokePreflight(opts)
         }
+        OpsCommand::DiagnoseProvider(mut opts) => {
+            opts.common.server_url = server_url;
+            OpsCommand::DiagnoseProvider(opts)
+        }
     };
     let output = run_ops_command(command).await.unwrap().stdout;
     stop_tx.send(()).unwrap();
@@ -870,6 +1106,14 @@ async fn run_smoke_preflight_with_projects(
     .stdout;
     stop_tx.send(()).unwrap();
     let requests = handle.join().unwrap();
+    for request in &requests {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        if body["tool"] == "list_projects" {
+            assert_eq!(body["params"]["project"], project);
+            assert_eq!(body["params"]["summary_only"], false);
+        }
+    }
     (output, requests)
 }
 

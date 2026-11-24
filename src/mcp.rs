@@ -1,4 +1,7 @@
 mod app_registry;
+mod cli;
+#[cfg(test)]
+pub(crate) use cli::parse_call_line_for_test;
 mod discovery;
 mod execution_control;
 mod http_metadata;
@@ -7,6 +10,7 @@ mod protocol;
 mod request_policy;
 mod resources;
 mod response;
+pub(crate) mod tool_exposure;
 mod tools;
 mod workbench;
 
@@ -125,6 +129,7 @@ fn work_result_app_internal_tool(tool_name: Option<&str>) -> bool {
 }
 
 fn finalize_mcp_tool_observability(
+    trace: &ToolRequestLifecycle,
     runtime: &ToolRuntime,
     audit: Option<&ActionAudit>,
     audit_event: Option<(
@@ -138,6 +143,7 @@ fn finalize_mcp_tool_observability(
     continuity_eligible: bool,
     outcome_class: &'static str,
 ) {
+    let finalize_started = std::time::Instant::now();
     let transition = live_window_request
         .as_ref()
         .map(crate::tool_runtime::WindowActivityGuard::transition);
@@ -201,6 +207,12 @@ fn finalize_mcp_tool_observability(
     if let Some(active) = live_window_request.take() {
         active.complete(timing, continuity_eligible, evidence_recorded);
     }
+    crate::tool_request_trace::record_phase_latency_for(
+        Some(&trace.correlation_trace_id()),
+        "request_finalize",
+        finalize_started,
+        "completed",
+    );
 }
 
 #[cfg(test)]
@@ -282,6 +294,45 @@ fn log_mcp_computer_app_resource_outcome(
         http_status,
         mcp_error_code,
     );
+}
+
+/// Payload-free measurements of the final MCP tool result, after surface
+/// projection. UTF-8 text bytes and JSON bytes are proxies, never Host tokens.
+/// The existing model_ergonomics metric continues to measure structured results.
+fn mcp_tool_response_audit_summary(
+    result: &Value,
+    surface: request_policy::McpSurface,
+) -> Option<Value> {
+    let content = result.get("content")?.as_array()?;
+    let mut text_utf8_bytes = 0_u64;
+    let mut text_blocks = 0_u64;
+    let mut non_text_blocks = 0_u64;
+    for block in content {
+        if block.get("type")?.as_str()? == "text" {
+            text_utf8_bytes = text_utf8_bytes
+                .checked_add(u64::try_from(block.get("text")?.as_str()?.len()).ok()?)?;
+            text_blocks = text_blocks.checked_add(1)?;
+        } else {
+            non_text_blocks = non_text_blocks.checked_add(1)?;
+        }
+    }
+    let structured_json_bytes = result
+        .get("structuredContent")
+        .map(serialized_json_len)
+        .transpose()
+        .ok()?;
+    Some(json!({
+        "schema_version": 1,
+        "surface": match surface {
+            request_policy::McpSurface::Adaptive => "adaptive",
+            request_policy::McpSurface::Cli => "cli",
+        },
+        "result_json_bytes": serialized_json_len(result).ok()?,
+        "text_utf8_bytes": text_utf8_bytes,
+        "structured_json_bytes": structured_json_bytes,
+        "text_blocks": text_blocks,
+        "non_text_blocks": non_text_blocks,
+    }))
 }
 
 fn mcp_tools_list_audit_summary(
@@ -686,55 +737,91 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             return;
         }
     };
-    let policy_selection = match request_policy::resolve(req.headers(), runtime.mcp_host_policy) {
-        Ok(policy) => policy,
-        Err(message) => {
-            // Reject ambiguous transport preferences before any tool/Job effect.
-            // Do not echo potentially sensitive header values into diagnostics.
-            guard.parsed("request_policy_error");
-            let body = rpc_error(request.id.clone(), -32600, message);
-            let estimated = estimate_json_bytes(&body);
-            guard.response_serialized(400, estimated, Some(false), None, "request_policy_error");
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(Json(body));
-            guard.handler_returned(400, estimated, Some(false), None, "request_policy_error");
-            return;
-        }
-    };
+    let (policy_selection, surface, default_project) =
+        match request_policy::resolve(req.headers(), runtime.mcp_host_policy).and_then(|policy| {
+            let surface = request_policy::resolve_surface(req.headers())?;
+            let project = request_policy::resolve_default_project(req.headers(), surface)?;
+            Ok((policy, surface, project))
+        }) {
+            Ok(selection) => selection,
+            Err(message) => {
+                // Reject ambiguous transport preferences before any tool/Job effect.
+                // Do not echo potentially sensitive header values into diagnostics.
+                guard.parsed("request_policy_error");
+                let body = rpc_error(request.id.clone(), -32600, message);
+                let estimated = estimate_json_bytes(&body);
+                guard.response_serialized(
+                    400,
+                    estimated,
+                    Some(false),
+                    None,
+                    "request_policy_error",
+                );
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.render(Json(body));
+                guard.handler_returned(400, estimated, Some(false), None, "request_policy_error");
+                return;
+            }
+        };
+    let text_json_compat = request_policy::text_json_compat(
+        req.headers(),
+        surface,
+        runtime.runtime_info.mcp_text_json_compat_enabled,
+    );
     let policy = policy_selection.effective;
-    // Clone only the lightweight runtime view when a preference actually differs.
-    // Stores, execution ownership and fences stay shared; policy never mutates
-    // the deployment snapshot or leaks between concurrent requests.
-    let runtime = if policy == runtime.mcp_host_policy {
+    // Equal explicit profiles still have request-header provenance. Clone only
+    // the lightweight view when policy or its diagnostic source differs; shared
+    // stores, execution ownership and the deployment snapshot remain unchanged.
+    let runtime = if policy == runtime.mcp_host_policy
+        && policy_selection.profile_source == runtime.mcp_host_profile_source
+    {
         runtime
     } else {
         Arc::new(
             runtime
                 .as_ref()
                 .clone()
-                .with_request_mcp_host_policy(policy),
+                .with_request_mcp_host_policy(policy_selection),
         )
     };
-    let window = match protocol_era {
-        McpProtocolEra::Legacy => {
-            crate::client_window::mcp_window(req, request.method == "initialize")
-        }
-        McpProtocolEra::Stateless2026 => {
-            crate::client_window::stateless_mcp_window(&request.params)
+    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
+    let window = match crate::client_window::mcp_window(
+        req,
+        &request.params,
+        auth.as_ref(),
+        protocol_era == McpProtocolEra::Legacy,
+        request.method == "initialize",
+    ) {
+        Ok(window) => window,
+        Err(message) => {
+            guard.parsed("client_window_error");
+            let body = rpc_error(request.id.clone(), -32600, message);
+            let estimated = estimate_json_bytes(&body);
+            guard.response_serialized(400, estimated, Some(false), None, "client_window_error");
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(body));
+            guard.handler_returned(400, estimated, Some(false), None, "client_window_error");
+            return;
         }
     };
-    guard.set_client_window(window.identity.as_ref());
+    // A host may list tools on throwaway legacy connections. Preserve the
+    // audit, but do not turn transport-session discovery into a ghost Window.
+    // Explicit ChatGPT/Codex/header Window discovery remains liveness evidence.
+    let observed_window = window
+        .identity
+        .as_ref()
+        .filter(|identity| request.method != "tools/list" || identity.source() != "mcp");
+    guard.set_client_window(observed_window);
     guard.capture_mcp_host_policy(&policy_selection);
     guard.parsed("ok");
     let server_trace_id = guard.correlation_trace_id();
-    let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let window_registry = runtime.window_activity_registry();
     let window_activity_visible = !work_result_app_internal_tool(tool_name.as_deref());
     let mut live_window_request = if window_activity_visible
         && request.id.is_some()
         && matches!(request.method.as_str(), "tools/call" | "tools/list")
     {
-        window.identity.as_ref().map(|identity| {
+        observed_window.map(|identity| {
             window_registry.start_authenticated(
                 identity,
                 &server_trace_id,
@@ -839,7 +926,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     let tools_list_audit = if request.method == "tools/list" && request.id.is_some() {
         Some(
             ActionAudit::start(req, depot, "/mcp", "toolsList")
-                .with_window(window.identity.as_ref(), Some(&server_trace_id)),
+                .with_window(observed_window, Some(&server_trace_id)),
         )
     } else {
         None
@@ -884,7 +971,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             crate::public_ingress_auth::entry(depot).map(|entry| entry.origin.clone()),
             scope_active_trace(
                 active_trace_id,
-                Box::pin(handle_mcp_request_with_lifecycle(
+                Box::pin(handle_mcp_request_for_surface(
                     &runtime,
                     request,
                     auth.as_ref(),
@@ -896,6 +983,9 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                     compact_schemas,
                     server_mcp_apps_enabled,
                     Some(&mut tool_correlation),
+                    surface,
+                    default_project.as_deref(),
+                    text_json_compat,
                 )),
             ),
         ),
@@ -947,6 +1037,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             let timing =
                 guard.handler_returned(500, estimated, Some(false), None, "dispatch_hard_timeout");
             finalize_mcp_tool_observability(
+                &guard,
                 &runtime,
                 audit.as_ref().map(|(audit, _, _)| audit),
                 audit_event,
@@ -1045,7 +1136,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     }
 
     match outcome {
-        McpOutcome::Ok(body) => {
+        McpOutcome::Ok(mut body) => {
             // Protocol success: valid JSON-RPC result envelope.
             // Tool success: only meaningful for tools/call (isError / structuredContent.success).
             let tool_success = body
@@ -1053,8 +1144,14 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                 .and_then(|r| r.get("structuredContent"))
                 .and_then(|s| s.get("success").or_else(|| s.get("ok")))
                 .and_then(|v| v.as_bool());
+            if tool_name.is_some()
+                && tool_success == Some(true)
+                && body["result"]["isError"] != true
+            {
+                crate::cloudflare_ingress::observe_successful_tool_call(depot);
+            }
             let audit_success = tool_success.unwrap_or(true);
-            let audit_event = build_audit_event(
+            let mut audit_event = build_audit_event(
                 audit_success,
                 StatusCode::OK,
                 if audit_success {
@@ -1068,12 +1165,24 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
                 &tool_correlation,
                 Some(&job_correlation),
             );
+            if surface == request_policy::McpSurface::Cli {
+                cli::project_response(tool_name.as_deref(), &mut body);
+            }
+            if let Some((event, _)) = audit_event.as_mut() {
+                if let Some(measurement) = body
+                    .get("result")
+                    .and_then(|result| mcp_tool_response_audit_summary(result, surface))
+                {
+                    event.summary["response_projection"] = measurement;
+                }
+            }
             guard.capture_payload("final_response", &body);
             let estimated = estimate_json_bytes(&body);
             guard.response_serialized(200, estimated, Some(true), tool_success, "ok");
             res.render(Json(body));
             let timing = guard.handler_returned(200, estimated, Some(true), tool_success, "ok");
             finalize_mcp_tool_observability(
+                &guard,
                 &runtime,
                 audit.as_ref().map(|(audit, _, _)| audit),
                 audit_event,
@@ -1100,6 +1209,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             let timing =
                 guard.handler_returned(200, None, Some(true), None, "artifact_export_stream");
             finalize_mcp_tool_observability(
+                &guard,
                 &runtime,
                 audit.as_ref().map(|(audit, _, _)| audit),
                 audit_event,
@@ -1127,6 +1237,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             res.render(Json(body));
             let timing = guard.handler_returned(400, estimated, Some(false), None, "bad_request");
             finalize_mcp_tool_observability(
+                &guard,
                 &runtime,
                 audit.as_ref().map(|(audit, _, _)| audit),
                 audit_event,
@@ -1154,6 +1265,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             res.render(Json(body));
             let timing = guard.handler_returned(404, estimated, Some(false), None, "not_found");
             finalize_mcp_tool_observability(
+                &guard,
                 &runtime,
                 audit.as_ref().map(|(audit, _, _)| audit),
                 audit_event,
@@ -1195,6 +1307,7 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
             res.render(Json(body));
             let timing = guard.handler_returned(403, estimated, Some(false), None, "forbidden");
             finalize_mcp_tool_observability(
+                &guard,
                 &runtime,
                 audit.as_ref().map(|(audit, _, _)| audit),
                 audit_event,
@@ -1260,6 +1373,7 @@ async fn handle_mcp_request(
     }
 }
 
+#[cfg(test)]
 async fn handle_mcp_request_with_lifecycle(
     runtime: &ToolRuntime,
     request: JsonRpcRequest,
@@ -1273,6 +1387,47 @@ async fn handle_mcp_request_with_lifecycle(
     server_mcp_apps_enabled: bool,
     correlation_out: Option<&mut crate::tool_runtime::ToolCallCorrelation>,
 ) -> McpOutcome {
+    handle_mcp_request_for_surface(
+        runtime,
+        request,
+        auth,
+        protocol_era,
+        host_file_import_trust,
+        window,
+        lifecycle,
+        model_ergonomics_out,
+        compact_schemas,
+        server_mcp_apps_enabled,
+        correlation_out,
+        request_policy::McpSurface::Adaptive,
+        None,
+        runtime.runtime_info.mcp_text_json_compat_enabled,
+    )
+    .await
+}
+
+async fn handle_mcp_request_for_surface(
+    runtime: &ToolRuntime,
+    request: JsonRpcRequest,
+    auth: Option<&AuthContext>,
+    protocol_era: McpProtocolEra,
+    host_file_import_trust: HostFileImportTrust,
+    window: Option<&crate::client_window::ClientWindow>,
+    lifecycle: Option<&mut ToolRequestLifecycle>,
+    model_ergonomics_out: Option<&mut Option<ModelErgonomicsRecord>>,
+    compact_schemas: bool,
+    server_mcp_apps_enabled: bool,
+    correlation_out: Option<&mut crate::tool_runtime::ToolCallCorrelation>,
+    surface: request_policy::McpSurface,
+    default_project: Option<&str>,
+    text_json_compat: bool,
+) -> McpOutcome {
+    let server_mcp_apps_enabled =
+        server_mcp_apps_enabled && surface != request_policy::McpSurface::Cli;
+    let exposure = runtime
+        .runtime_info
+        .mcp_tool_exposure
+        .resolve(surface, auth);
     let stateless_2026 = protocol_era == McpProtocolEra::Stateless2026;
     let resource_read_bypasses_runtime_read = request.method == "resources/read"
         && resources::resource_read_bypasses_runtime_read(&request.params);
@@ -1340,17 +1495,36 @@ async fn handle_mcp_request_with_lifecycle(
         // requests. WebCodex supports the stateless tools path required by
         // modern clients while retaining the initialized 2025 tool-only
         // session lifecycle used by 2025-06-18 and ChatGPT 2025-11-25 clients.
-        "server/discover" if stateless_2026 => rpc_result(
-            id,
-            protocol::server_discover_payload(resources::server_capabilities(
+        "server/discover" if stateless_2026 => {
+            let mut payload = protocol::server_discover_payload(resources::server_capabilities(
                 server_mcp_apps_enabled,
-            )),
-        ),
+            ));
+            if surface == request_policy::McpSurface::Cli {
+                payload["instructions"] = cli::initialize_instructions(default_project);
+            }
+            rpc_result(id, payload)
+        }
         "initialize" if !stateless_2026 => {
-            rpc_result(id, protocol::legacy_initialize_payload(&request.params))
+            let mut payload = protocol::legacy_initialize_payload(&request.params);
+            if surface == request_policy::McpSurface::Cli {
+                payload["instructions"] = cli::initialize_instructions(default_project);
+            }
+            rpc_result(id, payload)
         }
         "ping" if !stateless_2026 => rpc_result(id, json!({})),
         "tools/list" => {
+            if surface == request_policy::McpSurface::Cli {
+                let result =
+                    cli::tools_list_with_exposure(auth, default_project.is_some(), exposure);
+                return McpOutcome::Ok(rpc_result(
+                    id,
+                    if stateless_2026 {
+                        response::mcp_stateless_result(result, true)
+                    } else {
+                        result
+                    },
+                ));
+            }
             return tools::handle_list_with_runtime(
                 runtime,
                 id,
@@ -1362,9 +1536,32 @@ async fn handle_mcp_request_with_lifecycle(
             .await;
         }
         "resources/list" if runtime_resource_method => {
-            return resources::handle_list(runtime, id, mcp_app_enabled);
+            let mut outcome = resources::handle_list(runtime, id, mcp_app_enabled);
+            if let McpOutcome::Ok(body) = &mut outcome {
+                if let Some(resources) = body
+                    .pointer_mut("/result/resources")
+                    .and_then(Value::as_array_mut)
+                {
+                    resources.retain(|resource| {
+                        resource["uri"]
+                            .as_str()
+                            .is_some_and(|uri| exposure.allows_resource(uri))
+                    });
+                }
+            }
+            return outcome;
         }
         "resources/read" if runtime_resource_method => {
+            if request.params["uri"]
+                .as_str()
+                .is_some_and(|uri| !exposure.allows_resource(uri))
+            {
+                return McpOutcome::BadRequest(rpc_error(
+                    id,
+                    -32602,
+                    "MCP App resource is unavailable on the configured tool surface",
+                ));
+            }
             return resources::handle_read(
                 runtime,
                 request.params,
@@ -1388,6 +1585,9 @@ async fn handle_mcp_request_with_lifecycle(
                 lifecycle,
                 model_ergonomics_out,
                 correlation_out,
+                surface,
+                default_project,
+                text_json_compat,
             )
             .await;
         }
@@ -1436,3 +1636,72 @@ fn scope_forbidden(
 #[cfg(test)]
 #[path = "mcp_tests.rs"]
 mod tests;
+
+/// Exercise the CLI adapter from the shared local Runner test harness.
+#[cfg(test)]
+pub(crate) async fn cli_call_for_test(
+    runtime: &ToolRuntime,
+    tool: &str,
+    arguments: Value,
+    auth: &AuthContext,
+) -> Value {
+    cli_call_with_model_for_test(runtime, tool, arguments, auth)
+        .await
+        .1
+}
+
+/// Legacy CLI model results already use this surface's recovery routes before
+/// text rendering. Validate them with the same existing Schema route projection.
+#[cfg(test)]
+pub(crate) fn cli_model_output_schema_for_test(tool: &str) -> Value {
+    let mut schema = crate::tool_runtime::registry::output_schema_for_tool(tool);
+    crate::model_surface::project_suggested_tool_call_schema(&mut schema, &|name| {
+        cli::suggested_route(name, false)
+    });
+    schema
+}
+
+/// Observe one actual invocation immediately before and after CLI rendering.
+/// This does not replay effects or construct a replacement Runtime result.
+#[cfg(test)]
+pub(crate) async fn cli_call_with_model_for_test(
+    runtime: &ToolRuntime,
+    tool: &str,
+    arguments: Value,
+    auth: &AuthContext,
+) -> (Value, Value) {
+    let params = if cli::is_direct(tool) {
+        json!({"name":tool,"arguments":arguments})
+    } else {
+        json!({"name":"call_runtime_tool","arguments":{"tool":tool,"arguments":arguments}})
+    };
+    let request = JsonRpcRequest {
+        jsonrpc: Some("2.0".into()),
+        method: "tools/call".into(),
+        id: Some(json!(1)),
+        params,
+    };
+    let outcome = handle_mcp_request_for_surface(
+        runtime,
+        request,
+        Some(auth),
+        McpProtocolEra::Legacy,
+        HostFileImportTrust::Untrusted,
+        None,
+        None,
+        None,
+        true,
+        true,
+        None,
+        request_policy::McpSurface::Cli,
+        None,
+        runtime.runtime_info.mcp_text_json_compat_enabled,
+    )
+    .await;
+    let McpOutcome::Ok(mut body) = outcome else {
+        panic!("{outcome:?}")
+    };
+    let model = body["result"]["structuredContent"].clone();
+    cli::project_response(Some(tool), &mut body);
+    (model, body)
+}

@@ -299,7 +299,7 @@ pub enum WorkResultFileView {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadFilesItem {
-    /// Non-empty project-relative file path.
+    /// Non-empty Project-relative file path or absolute path inside its root.
     #[schemars(length(min = 1))]
     #[serde(deserialize_with = "deserialize_non_empty_read_path")]
     pub path: String,
@@ -325,7 +325,7 @@ pub struct ReadFilesItem {
 /// Canonical search context ceiling shared by Runtime normalization and output schemas.
 pub const MAX_SEARCH_CONTEXT_LINES: usize = 80;
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SearchProjectTextsQuery {
     /// Search pattern. Interpreted as a regular expression by default. For identifiers, source
@@ -338,7 +338,7 @@ pub struct SearchProjectTextsQuery {
     /// literal unless regex syntax is intentional.
     #[serde(default)]
     pub pattern_mode: Option<SearchPatternMode>,
-    /// Optional project-relative directory to scope the search (default: project root).
+    /// Optional Project-relative or in-Project absolute directory (default: root).
     #[serde(default)]
     pub path: Option<String>,
     /// Maximum records to return: matches in matches mode, files in files_with_matches/count modes.
@@ -394,6 +394,9 @@ pub struct ObserveJobsItem {
     #[schemars(length(max = 62))]
     #[serde(default, deserialize_with = "deserialize_optional_observation_token")]
     pub after_observation_token: Option<String>,
+    /// Read forward from the token instead of the latest log tail. Use only for retained-log pagination.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub page: bool,
     /// Compact server-issued continuation selector for one exact prior Job observation state.
     /// Mutually exclusive with a non-empty `job_id`; when supplied, callers must not also supply
     /// `after_observation_token`. Unknown or expired refs fail closed at observation time.
@@ -412,6 +415,7 @@ impl ObserveJobsItem {
             job_id,
             after_observation_token,
             observation_ref: None,
+            page: false,
         }
     }
 }
@@ -431,9 +435,9 @@ pub const MAX_JOB_READINESS_WAIT_SECS: u64 = 45;
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserveJobsWakeOn {
-    #[default]
     Change,
     MeaningfulChange,
+    #[default]
     Terminal,
     AllTerminal,
 }
@@ -543,6 +547,9 @@ where
     }
     let mut selectors = HashSet::with_capacity(items.len());
     for item in &items {
+        if item.page && item.after_observation_token.is_none() && item.observation_ref.is_none() {
+            return Err(serde::de::Error::custom("page requires after_observation_token or observation_ref"));
+        }
         let has_job_id = !item.job_id.is_empty();
         match (has_job_id, item.observation_ref.as_deref()) {
             (false, None) => {
@@ -586,6 +593,7 @@ fn observe_jobs_items_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sch
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                        "page": {"type":"boolean", "default":false, "description":"Read forward from the token for log recovery; default reads the latest incremental tail."},
                         "job_id": {
                             "type": "string",
                             "minLength": 1,
@@ -600,12 +608,17 @@ fn observe_jobs_items_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sch
                         },
                         "observation_ref": {"type": "null"}
                     },
-                    "required": ["job_id"]
+                    "required": ["job_id"],
+                    "allOf": [{"anyOf":[
+                        {"properties":{"page":{"const":false}}},
+                        {"required":["after_observation_token"],"properties":{"after_observation_token":{"type":"string"}}}
+                    ]}]
                 },
                 {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                        "page": {"type":"boolean", "default":false, "description":"Read forward from the saved log cursor instead of the latest tail."},
                         "after_observation_token": {"type": "null"},
                         "observation_ref": {
                             "type": "string",
@@ -1296,7 +1309,7 @@ pub enum ComputerObserveToolCall {
         #[serde(default)]
         limit: Option<usize>,
     },
-    /// Re-resolve a current element without replacing its observation_generation. When action support is unclear, inspect can_press/can_focus/can_input_text before choosing press/focus/input_text. Advisory native state grants no permission or capability and cannot refresh a stale element_id.
+    /// Re-resolve a current element without replacing its observation_generation. When action support is unclear, inspect can_press/can_focus/can_input_text/can_select before choosing press/focus/input_text/select. Windows selected reports target selection; missing selection fields on older Runners mean unknown. Advisory native state grants no permission or capability and cannot refresh a stale element_id.
     ElementState {
         #[schemars(length(min = 1, max = 128))]
         client_id: String,
@@ -1379,6 +1392,26 @@ pub enum ComputerControlToolCall {
         surface_id: String,
         #[schemars(length(min = 1, max = 128))]
         element_id: String,
+        /// Optional bounded fresh tree of this same window after a confirmed
+        /// successful action. Requires independent Computer read authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observe_after: Option<ComputerPostObservation>,
+    },
+    /// Windows native replacement selection of one exact observed ListItem or TabItem.
+    /// SelectionItemPattern.Select clears other selections in the container. Requires
+    /// computer_selection and computer_control; missing capabilities reject before dispatch.
+    /// No add/remove/toggle, focus, activation or observe_after. Target and container must
+    /// remain correlated to the same unprotected window. A selected multi-select item
+    /// still clears its siblings; only proven single selection permits a no-op.
+    /// Use element_state selected after success; success does not imply UI stability.
+    /// After an uncertain attempt observe current state; never blindly replay select.
+    Select {
+        #[schemars(length(min = 1, max = 128))]
+        client_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        surface_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        element_id: String,
     },
     Focus {
         #[schemars(length(min = 1, max = 128))]
@@ -1387,6 +1420,34 @@ pub enum ComputerControlToolCall {
         surface_id: String,
         #[schemars(length(min = 1, max = 128))]
         element_id: String,
+    },
+    /// Scroll one exact observed Windows UIA ScrollPattern container. Requires
+    /// computer_scroll and computer_control. One small/large native increment;
+    /// omitted/null amount selects small. Provider-defined distance is not pixels.
+    /// Inspect element_state scroll axes/percentages: null axis is non-scrollable,
+    /// null object unsupported/protected, omitted field unknown. At a native boundary
+    /// this succeeds without input. position_before/position_after may be unchanged
+    /// or intermediate; they do not prove UI stability or task completion.
+    /// Re-observe content after scrolling. Native attempt/read-back uncertainty is
+    /// outcome_unknown; never replay without reconciliation. Local pause applies.
+    /// No implicit focus/activation. Optional observe_after requests one fresh
+    /// bounded tree of the same window under independent read authority.
+    Scroll {
+        #[schemars(length(min = 1, max = 128))]
+        client_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        surface_id: String,
+        #[schemars(length(min = 1, max = 128))]
+        element_id: String,
+        direction: webcodex_core::computer_scroll_contract::ComputerScrollDirection,
+        /// Omission/null selects one small increment. Native distance is provider-defined.
+        #[schemars(schema_with = "webcodex_core::computer_scroll_contract::computer_scroll_amount_schema")]
+        #[serde(default)]
+        amount: Option<webcodex_core::computer_scroll_contract::ComputerScrollAmount>,
+        /// One fresh bounded tree of the same window after confirmed success,
+        /// including an observed boundary no-op. Requires independent read authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observe_after: Option<ComputerPostObservation>,
     },
     ScrollToElement {
         #[schemars(length(min = 1, max = 128))]
@@ -1401,12 +1462,12 @@ pub enum ComputerControlToolCall {
         client_id: String,
         #[schemars(length(min = 1, max = 128))]
         surface_id: String,
-        /// Exact lowercase navigation key from the closed vocabulary; letters and shortcut strings
-        /// such as Ctrl+P are unsupported. The exact surface must already be foreground/focused.
+        /// Exact canonical key name; Windows supports general single-key chords.
+        /// Shortcut strings such as Ctrl+P are unsupported. The exact surface must already be foreground/focused.
         #[schemars(schema_with = "webcodex_core::computer_input_contract::computer_key_schema")]
         key: String,
         /// Unique canonical modifiers; omission/null means none. Windows maps option to Alt, rejects
-        /// command, option+Tab, option+Escape, and any control+Escape chord. macOS uses the named
+        /// command, option+Tab, option+Escape, control+Escape and control+option+Delete. macOS uses the named
         /// Shift/Control/Option/Command flags. Held/interfering keys can fail native preflight.
         #[schemars(schema_with = "webcodex_core::computer_input_contract::computer_key_modifiers_schema")]
         #[serde(default)]
@@ -1421,6 +1482,8 @@ pub enum ComputerControlToolCall {
         element_id: String,
         #[schemars(length(min = 1, max = 2048))]
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observe_after: Option<ComputerPostObservation>,
     },
     PointerMove {
         #[schemars(length(min = 1, max = 128))]
@@ -1457,13 +1520,24 @@ pub enum ComputerControlToolCall {
 }
 
 impl ComputerControlToolCall {
+    pub fn observe_after(&self) -> Option<&ComputerPostObservation> {
+        match self {
+            Self::Press { observe_after, .. }
+            | Self::InputText { observe_after, .. }
+            | Self::Scroll { observe_after, .. } => observe_after.as_ref(),
+            _ => None,
+        }
+    }
+
     pub const fn action_name(&self) -> &'static str {
         match self {
             Self::LaunchApplication { .. } => "launch_application",
             Self::ActivateWindow { .. } => "activate_window",
             Self::Press { .. } => "press",
+            Self::Select { .. } => "select",
             Self::Focus { .. } => "focus",
             Self::ScrollToElement { .. } => "scroll_to_element",
+            Self::Scroll { .. } => "scroll",
             Self::Key { .. } => "key",
             Self::InputText { .. } => "input_text",
             Self::PointerMove { .. } => "pointer_move",
@@ -1471,6 +1545,19 @@ impl ComputerControlToolCall {
             Self::WriteClipboard { .. } => "write_clipboard",
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ComputerPostObservation {
+    AccessibilityTree {
+        /// Relative tree depth; existing accessibility bounds apply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_depth: Option<usize>,
+        /// Maximum nodes; existing accessibility bounds apply.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_nodes: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]

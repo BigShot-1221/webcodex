@@ -28,7 +28,7 @@ async fn selector_uses_bounded_authoritative_client_id_without_parsing_project_i
         "/private/bad\npath".into(),
         format!("/{}", "x".repeat(MAX_PROJECT_PATH_BYTES)),
     ] {
-        row.project.path = path;
+        row.path = path;
         assert!(project_selector_row(&row).unwrap().path.is_none());
     }
     for client_id in ["x".repeat(MAX_CLIENT_ID_CHARS + 1), "bad\nclient".into()] {
@@ -50,6 +50,7 @@ async fn hosted_runtime_console_uses_ordinary_runtime_and_projects_are_safe() {
     .await;
     let (_tmp, service) = hosted_service(runtime);
     let mut response = TestClient::post("http://localhost/api/runtime-console/projects")
+        .bearer_auth("console-bootstrap-test")
         .json(&serde_json::json!({}))
         .send(&service)
         .await;
@@ -78,6 +79,7 @@ async fn hosted_runtime_console_uses_ordinary_runtime_and_projects_are_safe() {
     }
 
     let mut filtered = TestClient::post("http://localhost/api/runtime-console/projects")
+        .bearer_auth("console-bootstrap-test")
         .json(&serde_json::json!({
             "client_id": "special",
             "query": "webcodex",
@@ -92,6 +94,7 @@ async fn hosted_runtime_console_uses_ordinary_runtime_and_projects_are_safe() {
     assert_eq!(filtered_body["projects"][0]["id"], "agent:special:webcodex");
 
     let invalid_query = TestClient::post("http://localhost/api/runtime-console/projects")
+        .bearer_auth("console-bootstrap-test")
         .json(&serde_json::json!({"query": "   "}))
         .send(&service)
         .await;
@@ -103,21 +106,25 @@ async fn product_routes_reject_unknown_effect_selectors_and_invisible_projects()
     let (_tmp, service) = hosted_service(test_runtime());
     for route in ["extensions", "project-git"] {
         let invalid = TestClient::post(format!("http://localhost/api/runtime-console/{route}"))
+            .bearer_auth("console-bootstrap-test")
             .json(&serde_json::json!({"project":"agent:missing:project","tool":"run_shell"}))
             .send(&service)
             .await;
         assert_eq!(invalid.status_code, Some(StatusCode::BAD_REQUEST));
         let hidden = TestClient::post(format!("http://localhost/api/runtime-console/{route}"))
+            .bearer_auth("console-bootstrap-test")
             .json(&serde_json::json!({"project":"agent:missing:project"}))
             .send(&service)
             .await;
         assert_eq!(hidden.status_code, Some(StatusCode::NOT_FOUND));
     }
     let instruction = TestClient::post("http://localhost/api/runtime-console/instruction")
+            .bearer_auth("console-bootstrap-test")
             .json(&serde_json::json!({"project":"agent:missing:project","source_scope":"runner","path":"/private/secret","fingerprint":"old"}))
             .send(&service).await;
     assert_eq!(instruction.status_code, Some(StatusCode::NOT_FOUND));
     let retarget = TestClient::post("http://localhost/api/runtime-console/plugin-reload")
+            .bearer_auth("console-bootstrap-test")
             .json(&serde_json::json!({"project":"agent:missing:project","plugin":"provider","runner":"other-runner"}))
             .send(&service).await;
     assert_eq!(retarget.status_code, Some(StatusCode::BAD_REQUEST));
@@ -127,6 +134,22 @@ async fn product_routes_reject_unknown_effect_selectors_and_invisible_projects()
 async fn runtime_console_project_projection_preserves_short_ref_and_existing_allowlist() {
     let runtime = test_runtime();
     register_project(&runtime, "special", "webcodex", "/root/git/webcodex", None).await;
+    let mut summary = project("webcodex", "/root/git/webcodex");
+    summary.registration_source = Some("auto_registered".into());
+    summary.lineage = Some(
+        webcodex_core::runner_protocol::RunnerProjectLineage::ManagedWorktreeSource {
+            source_project_id: "webcodex-source".into(),
+            source_root_fingerprint: format!("wc_projroot_{}", "1".repeat(64)),
+            base_sha: "0123456789abcdef0123456789abcdef01234567".into(),
+        },
+    );
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "special",
+        "inst-special",
+        vec![summary],
+    )
+    .await;
     let mut row = runtime
         .query_projects_for_runtime_console(None, None, None, None, 1)
         .await
@@ -135,14 +158,6 @@ async fn runtime_console_project_projection_preserves_short_ref_and_existing_all
         .pop()
         .unwrap();
     row.project_ref = Some("~p118".into());
-    row.project.registration_source = Some("auto_registered".into());
-    row.project.lineage = Some(
-        webcodex_core::runner_protocol::RunnerProjectLineage::ManagedWorktreeSource {
-            source_project_id: "webcodex-source".into(),
-            source_root_fingerprint: "private-root".into(),
-            base_sha: "0123456789abcdef0123456789abcdef01234567".into(),
-        },
-    );
     let projected = project_selector_row(&row).unwrap();
     assert_eq!(projected.project_ref.as_deref(), Some("~p118"));
     let value = serde_json::to_value(projected).unwrap();
@@ -244,6 +259,7 @@ async fn selector_and_session_access_follow_authoritative_project_visibility() {
         .dispatch_with_auth(
             ToolCall::ListProjects {
                 include_git_summary: false,
+                offset: 0,
                 client_id: None,
                 project: None,
                 query: None,
@@ -390,13 +406,32 @@ async fn server_and_runner_overviews_stay_within_caller_authorization_and_safe_p
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        vec!["auth", "mcp_host", "tool_request_trace_mode"]
+        vec![
+            "auth",
+            "mcp_host",
+            "mcp_tool_exposure",
+            "tool_request_trace_mode"
+        ]
     );
     assert!(overview_view.effective_config["auth"]
         .as_object()
         .unwrap()
         .values()
         .all(Value::is_boolean));
+    assert_eq!(
+        overview_view.effective_config["mcp_tool_exposure"]["oauth_client_overrides"],
+        0,
+    );
+    for surface in ["adaptive", "cli"] {
+        assert_eq!(
+            overview_view.effective_config["mcp_tool_exposure"][surface],
+            serde_json::json!({
+                "goals": false,
+                "agent_continuation": false,
+                "job_continuation": false,
+            }),
+        );
+    }
 
     let runner_view = runner_for_auth(&runtime, &auth_a, "client-a", Some(20))
         .await
@@ -471,6 +506,8 @@ async fn computer_session_availability_reaches_only_authorized_overview_and_runn
     let full = runtime
         .dispatch_with_auth(
             ToolCall::ListRunners {
+                projects_offset: 0,
+                offset: 0,
                 query: None,
                 status: None,
                 limit: None,

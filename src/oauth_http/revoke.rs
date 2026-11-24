@@ -22,38 +22,32 @@ pub(crate) async fn oauth_revoke(
     depot: &mut Depot,
     res: &mut Response,
 ) -> Result<(), OAuthTokenError> {
-    let _config = enabled_token_config(depot)?;
+    let config = enabled_token_config(depot)?;
     let form: RevokeRequest = parse_token_form(req).await?;
     let plaintext_token = required_token_parameter(form.token.as_deref(), "token")?;
-    let (db, _) = authenticate_token_client(
+    let (db, client) = authenticate_token_client(
+        req,
         depot,
+        &config,
         form.client_id.as_deref(),
         form.client_secret.as_deref(),
     )
     .await?;
-    let client_id = form.client_id.as_deref().expect("authenticated client_id");
+    let client_id = client.client_id.as_str();
 
     // --- Revoke ---
     let token_hash = hash_token(plaintext_token);
     let now = chrono::Utc::now().timestamp();
 
-    let hint = form.token_type_hint.as_deref().unwrap_or("");
-
-    // Per RFC 7009: if hint is provided and recognized, try only that type.
-    // If hint is missing or unrecognized, try both.
-    match hint {
-        "access_token" => {
-            let _ = db.revoke_oauth_access_token_by_hash_for_client(&token_hash, client_id, now);
-        }
-        "refresh_token" => {
-            let _ = db.revoke_oauth_refresh_token_by_hash_for_client(&token_hash, client_id, now);
-        }
-        _ => {
-            // No hint or unrecognized hint — try both.
-            let _ = db.revoke_oauth_access_token_by_hash_for_client(&token_hash, client_id, now);
-            let _ = db.revoke_oauth_refresh_token_by_hash_for_client(&token_hash, client_id, now);
-        }
-    }
+    let fence = crate::public_ingress_auth::entry(depot).map(|entry| entry.fence());
+    db.revoke_oauth_token_for_client(
+        &token_hash,
+        client_id,
+        form.token_type_hint.as_deref(),
+        now,
+        fence.as_ref(),
+    )
+    .map_err(|_| OAuthTokenError::server_error("revocation unavailable"))?;
 
     // Always return 200 — idempotent, no token state disclosure.
     apply_oauth_no_store_headers(res);

@@ -22,15 +22,19 @@ mod communication;
 mod goals;
 mod http_responses;
 mod overview;
+mod project_inventory_benchmark;
 mod projects;
 mod session_collaboration;
 mod sessions;
 mod window_activity;
 mod window_collaboration;
+mod window_history_benchmark;
+mod window_labels;
 mod window_visibility;
 
 fn project(id: &str, private_path: &str) -> RunnerProjectSummary {
     RunnerProjectSummary {
+        registration_incarnation: Some(uuid::Uuid::new_v4().to_string()),
         id: id.to_string(),
         name: Some(format!("Project {id}")),
         path: private_path.to_string(),
@@ -83,6 +87,7 @@ async fn register_project_with_computer_availability(
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
+                computer_control_epoch: None,
                 computer_session_availability,
                 process_started_at: None,
                 build: None,
@@ -304,11 +309,14 @@ fn test_bootstrap_auth() -> AuthContext {
     auth
 }
 
-fn start_authorized_session(
+async fn start_authorized_session(
     runtime: &ToolRuntime,
     project: &str,
     auth: &AuthContext,
 ) -> crate::tool_runtime::sessions::SessionSummary {
+    let project_identity =
+        crate::test_support::registered_session_project_identity(runtime, project, Some(auth))
+            .await;
     let fingerprint = crate::tool_runtime::workflow_session_authority_fingerprint(Some(auth))
         .expect("stable test authority");
     runtime
@@ -320,13 +328,14 @@ fn start_authorized_session(
                 SessionMode::Normal,
                 SessionGuards::default(),
             )
-            .with_owner_authority_fingerprint(Some(fingerprint)),
+            .with_owner_authority_fingerprint(Some(fingerprint))
+            .with_project_identity(project_identity),
         )
         .unwrap()
 }
 
 fn hosted_service(runtime: Arc<ToolRuntime>) -> (tempfile::TempDir, Service) {
-    let config = crate::test_support::test_config(None);
+    let config = crate::test_support::test_config(Some("console-bootstrap-test"));
     let (tmp, db) = crate::test_support::test_db();
     let router = Router::new()
         .hoop(affix_state::inject(config))

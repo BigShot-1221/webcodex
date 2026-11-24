@@ -251,6 +251,7 @@ class Fixture(Smoke):
             standalone = name == "standalone"
             configuration_id = str(uuid.uuid4())
             records.append({"profile_id": name, "configuration_id": configuration_id,
+                            "oauth_dynamic_registration_enabled": name == "named",
                             "provider": provider, "name": name, "host_mode": "standalone" if standalone else "embedded",
                             "autostart": standalone, "revision": 1, "runtime_revision": 1, "installed": False, "started": False})
             binding = f"WEBCODEX_TUNNEL_PROFILE_ID={name}\nWEBCODEX_TUNNEL_PROVIDER=cloudflare_{'named' if name == 'named' else 'quick'}\n"
@@ -300,6 +301,9 @@ class Fixture(Smoke):
         while time.monotonic() < deadline:
             status = self.control(profile)
             check(status["lifecycle"] != "error", f"Cloudflare admission failed: {status.get('reason_code')}")
+            if status.get("reason_code") == "cloudflare_discovery_pending":
+                time.sleep(.2)
+                continue
             if status["lifecycle"] == "running":
                 check(status["public_origin"], "running origin missing")
                 return status
@@ -430,6 +434,7 @@ class Fixture(Smoke):
         # Start once, then observe that same receipt. Neither transport recovery
         # nor a missing response authorizes replaying the business operation.
         deadline = time.monotonic() + 25
+        check(named["registration_available"] and not named["observed_tool_call"], "initial DCR handoff not ready")
         origin = named["public_origin"]
         marker = self.project_dir / "job-effects.txt"
         release = self.project_dir / "job-release"
@@ -525,15 +530,27 @@ class Fixture(Smoke):
     def run(self):
         self.prepare()
         named = self.start_profile("named")
+        origin = named["public_origin"]
+        status, _, raw = self.public(origin, "/.well-known/oauth-authorization-server")
+        check(status == 200 and json.loads(raw).get("registration_endpoint") == origin + "/oauth/register",
+              "Named DCR discovery missing")
+        status, _, raw = self.public(origin, "/oauth/register", "POST", {
+            "client_name": "Gemini fixture", "redirect_uris": [REDIRECT],
+            "grant_types": ["authorization_code", "refresh_token"], "token_endpoint_auth_method": "client_secret_post"})
+        check(status == 201, "public client registration failed")
+        dynamic, dynamic_tokens = self.authorize("named", named, json.loads(raw))
+        self.project_round_trip(origin, dynamic_tokens["access_token"], "before", "dcr")
         client, tokens = self.authorize("named", named)
-        self.project_round_trip(named["public_origin"], tokens["access_token"], "before", "named")
+        self.project_round_trip(named["public_origin"], tokens["access_token"], "dcr", "named")
         self.boundaries(named["public_origin"], tokens["access_token"])
         check(self.control("named")["observed_authorization"], "used OAuth authorization not observed")
+        check(self.control("named")["observed_tool_call"], "successful tool call not observed")
         old_instance = named["server_instance_id"]
         stop_tree(self.server)
         self.start_server()
         self.wait_ready(self.project, self.owner)
         named = self.start_profile("named")
+        check(named["registration_available"] and not named["observed_tool_call"], "stale call observation after restart")
         check(named["server_instance_id"] != old_instance, "Server restart did not replace instance")
         self.project_round_trip(named["public_origin"], tokens["access_token"], "named", "restarted")
         status, _, raw = self.public(named["public_origin"], "/oauth/token", "POST", {
@@ -541,6 +558,16 @@ class Fixture(Smoke):
             "client_id": client["client_id"], "client_secret": client["client_secret"]}, form=True)
         check(status == 200 and isinstance(json.loads(raw).get("access_token"), str),
               "Named refresh grant did not survive Server restart")
+        status, _, raw = self.public(origin, "/oauth/token", "POST", {
+            "grant_type": "refresh_token", "refresh_token": dynamic_tokens["refresh_token"],
+            "client_id": dynamic["client_id"], "client_secret": dynamic["client_secret"]}, form=True)
+        check(status == 200, "Named DCR refresh did not survive restart")
+        access = json.loads(raw)["access_token"]
+        status, _ = self.mcp(origin, access)
+        check(status == 200, "rotated public access token rejected")
+        status, _, _ = self.public(origin, "/oauth/revoke", "POST", {
+            "token": access, "client_id": dynamic["client_id"], "client_secret": dynamic["client_secret"]}, form=True)
+        check(status == 200 and self.mcp(origin, access)[0] == 401, "DCR token revocation failed")
         self.job_survives_cloudflare_outage(named, tokens["access_token"])
         self.stop_profile("named")
         quick = self.start_profile("quick")
@@ -560,7 +587,7 @@ class Fixture(Smoke):
         self.boundaries(quick2["public_origin"], fresh["access_token"])
         self.stop_profile("quick")
         self.standalone()
-        print("PASS: verified TLS, active-origin OAuth/UI metadata, real Server/Runner, Named S256 OAuth/read/write, Server restart, original Job completes exactly once across network outage, Quick rotation/fresh OAuth, standalone EOF/crash lease, public whitelist and credential boundary")
+        print("PASS: verified TLS, active-origin OAuth/UI metadata, real Server/Runner, Named DCR and manual S256 OAuth/read/write, Server restart, original Job completes exactly once across network outage, Quick rotation/fresh OAuth, standalone EOF/crash lease, public whitelist and credential boundary")
 
     def standalone(self):
         args = ["server", "tunnel", "--provider", "cloudflare_quick", "--runtime-binding",
@@ -621,7 +648,8 @@ def main():
     for binary in ("webcodex-server", "webcodex-runner", "webcodex"):
         check((args.bin_dir / binary).is_file(), "build fixture binaries first: " + binary)
     with tempfile.TemporaryDirectory(prefix="webcodex-cloudflare-oauth-") as directory:
-        fixture = Fixture(args.bin_dir.resolve(), Path(directory))
+        # The private Environment rejects symlink ancestors (including macOS /var).
+        fixture = Fixture(args.bin_dir.resolve(), Path(directory).resolve())
         def deadline(*_):
             raise TimeoutError("overall Cloudflare E2E deadline exceeded")
         signal.signal(signal.SIGALRM, deadline)

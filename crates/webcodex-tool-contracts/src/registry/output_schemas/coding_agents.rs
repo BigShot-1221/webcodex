@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use webcodex_core::coding_agent::{
-    CodingAgentEventKind, CodingAgentExecutionState, CodingAgentPendingPermission,
-    CodingAgentProviderSummary, CodingAgentRunState,
+    CodingAgentEventKind, CodingAgentExecutionState, CodingAgentLiveAcpDiagnostic, CodingAgentPendingPermission,
+    CodingAgentProviderSummary, CodingAgentRunState, CODING_AGENT_MAX_ENV_MAPPINGS,
 };
 
 use crate::schema_generation::typed_host_schema;
@@ -104,26 +104,6 @@ fn common_run_fields() -> Vec<(&'static str, Value)> {
 }
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
-    if name == "inspect_coding_agent_config" {
-        let fields = vec![
-            ("project", schema_type("string", "Exact registered runtime Project id.")),
-            ("provider_id", schema_type("string", "Logical operator-configured provider id.")),
-            ("include_live_acp", schema_type("boolean", "Whether the ephemeral live probe was authorized.")),
-            ("live_probe_scope", schema_type("string", "Whether live currents are from an ephemeral probe or absent.")),
-            ("live_probe_disclaimer", schema_type("string", "Clarifies probe-only currents vs future Runs.")),
-            (
-                "env_presence",
-                json!({
-                    "type":"object",
-                    "maxProperties": webcodex_core::coding_agent::CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES,
-                    "additionalProperties":{"type":"boolean"}
-                }),
-            ),
-            ("config_policy", typed_host_schema::<webcodex_core::coding_agent::CodingAgentConfigPolicyProjection>()),
-            ("live_acp", json!({"anyOf":[typed_host_schema::<webcodex_core::coding_agent::CodingAgentLiveAcpDiagnostic>(), {"type":"null"}]})),
-        ];
-        return Some(wrapped_output_schema(fields));
-    }
     let mut fields = common_run_fields();
     match name {
         "start_coding_agent" => {
@@ -207,6 +187,50 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "True when the Runner accepted the permission choice for the active callback.",
                 ),
             ));
+            Some(wrapped_output_schema(fields))
+        }
+        "diagnose_coding_agent" => {
+            // No Run exists for a diagnostic, so common_run_fields does not
+            // apply: the projection is the bounded diagnostic itself.
+            let fields = vec![
+                (
+                    "project",
+                    schema_type(
+                        "string",
+                        "Exact registered runtime Project id the diagnostic was authorized against.",
+                    ),
+                ),
+                (
+                    "provider_id",
+                    schema_type(
+                        "string",
+                        "Logical operator-configured provider id that was diagnosed.",
+                    ),
+                ),
+                (
+                    "env_presence",
+                    json!({
+                        "type": "object",
+                        "description": "Declared env_from_env destination names mapped to presence booleans read from the running Runner process. Never values and never unrelated environment names.",
+                        "additionalProperties": {"type": "boolean"},
+                        "maxProperties": CODING_AGENT_MAX_ENV_MAPPINGS
+                    }),
+                ),
+                (
+                    "config_policy",
+                    typed_host_schema::<webcodex_core::coding_agent::CodingAgentConfigPolicyProjection>(),
+                ),
+                (
+                    "live_acp",
+                    json!({
+                        "description": "Present only when the request explicitly authorized the live ACP probe; otherwise null.",
+                        "anyOf": [
+                            typed_host_schema::<CodingAgentLiveAcpDiagnostic>(),
+                            {"type": "null"}
+                        ]
+                    }),
+                ),
+            ];
             Some(wrapped_output_schema(fields))
         }
         _ => None,
@@ -335,16 +359,16 @@ mod tests {
     }
 
     #[test]
-    fn inspect_coding_agent_config_output_schema_matches_diagnose_budgets() {
+    fn diagnose_coding_agent_output_schema_matches_diagnose_budgets() {
         use webcodex_core::coding_agent::{
-            CODING_AGENT_MAX_CONFIG_OPTIONS, CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES,
+            CODING_AGENT_MAX_CONFIG_OPTIONS, CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES, CODING_AGENT_MAX_ENV_MAPPINGS,
         };
 
-        let schema = output_schema_for_tool("inspect_coding_agent_config").unwrap();
+        let schema = output_schema_for_tool("diagnose_coding_agent").unwrap();
         let fields = &schema["properties"]["output"]["properties"];
         assert_eq!(
             fields["env_presence"]["maxProperties"],
-            json!(CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES)
+            json!(CODING_AGENT_MAX_ENV_MAPPINGS)
         );
         let policy = &fields["config_policy"]["properties"]["caller_allowed_option_ids"];
         assert_eq!(policy["maxItems"], json!(CODING_AGENT_MAX_CONFIG_POLICY_ENTRIES));

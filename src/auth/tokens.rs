@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use crate::{Config, Database};
-
 #[cfg(test)]
 use salvo::prelude::async_trait;
 
@@ -18,8 +17,16 @@ use super::{bootstrap_context, AuthContext, AuthError, AuthKind};
 /// A `TokenVerifier` validates a bearer token and returns an [`AuthContext`] on
 /// success.
 ///
-/// Production authentication runs on the blocking pool via [`authenticate`];
-/// this trait remains for unit tests.
+/// This trait is the extension point for plugging in alternative verification
+/// strategies. The current implementations are [`PatVerifier`] and
+/// [`OAuth2Verifier`].
+///
+/// ## Design notes
+///
+/// The trait is `Send + Sync` so it can be stored in shared state (e.g. behind
+/// an `Arc`). Implementations receive `&Config` and `Option<&Database>` so they
+/// can perform the full validation chain (bootstrap token check, database
+/// lookup, etc.) without owning those resources.
 #[cfg(test)]
 #[async_trait]
 pub(crate) trait TokenVerifier: Send + Sync {
@@ -31,8 +38,7 @@ pub(crate) trait TokenVerifier: Send + Sync {
     ) -> Result<Option<AuthContext>, String>;
 }
 
-/// PAT / bootstrap verifier — the existing validation logic wrapped in the
-/// [`TokenVerifier`] trait for tests.
+/// PAT / bootstrap verifier — synchronous first step of the bearer chain.
 ///
 /// This verifier handles:
 /// 1. Auth-disabled mode (returns bootstrap)
@@ -40,18 +46,15 @@ pub(crate) trait TokenVerifier: Send + Sync {
 /// 3. Database lookup by SHA-256 hash for API keys and account credentials
 pub(crate) struct PatVerifier;
 
+
 impl PatVerifier {
+    /// Synchronous PAT verifier: the bearer chain runs on the blocking pool
+    /// (see `authenticate`), so the database work must not await anything.
     pub(crate) fn verify_sync(
         config: &Config,
         db: Option<&Arc<Database>>,
         token: &str,
     ) -> Result<Option<AuthContext>, String> {
-        // Auth disabled in development -> bootstrap (full access), identical to
-        // AuthMiddleware's `!config.is_auth_enabled()` branch.
-        if !config.is_auth_enabled() {
-            return Ok(Some(bootstrap_context()));
-        }
-
         // Bootstrap token check (constant-time comparison).
         if config.validate_token(token) {
             return Ok(Some(bootstrap_context()));
@@ -195,6 +198,21 @@ impl TokenVerifier for OAuth2Verifier {
     }
 }
 
+#[cfg(test)]
+impl OAuth2Verifier {
+    /// Async wrapper kept for existing callers/tests; the chain used by the
+    /// request path calls [`Self::verify_for_ingress_sync`] on the blocking
+    /// pool instead.
+    pub(crate) async fn verify_for_ingress(
+        config: &Config,
+        db: Option<&Arc<Database>>,
+        token: &str,
+        ingress: Option<&webcodex_store::PublicIngressEntry>,
+    ) -> Result<Option<AuthContext>, String> {
+        Self::verify_for_ingress_sync(config, db, token, ingress)
+    }
+}
+
 impl OAuth2Verifier {
     pub(crate) fn verify_sync(
         config: &Config,
@@ -204,11 +222,13 @@ impl OAuth2Verifier {
         Self::verify_for_ingress_sync(config, db, token, None)
     }
 
+    /// Synchronous body of the OAuth2 verifier. The verifier chain runs on the
+    /// blocking pool (see `authenticate`), so it must not await anything.
     pub(crate) fn verify_for_ingress_sync(
         config: &Config,
         db: Option<&Arc<Database>>,
         token: &str,
-        ingress: Option<&webcodex_store::PublicIngressFence>,
+        ingress: Option<&webcodex_store::PublicIngressEntry>,
     ) -> Result<Option<AuthContext>, String> {
         // Only handle wc_oat_* tokens. Non-matching tokens are not recognized by
         // this verifier — let PatVerifier try.
@@ -230,7 +250,10 @@ impl OAuth2Verifier {
         let now = chrono::Utc::now().timestamp();
 
         if !db
-            .oauth_access_token_matches_public_ingress(&token_hash, ingress)
+            .oauth_access_token_matches_public_ingress(
+                &token_hash,
+                ingress.map(|entry| entry.fence()).as_ref(),
+            )
             .map_err(|_| "OAuth2 ingress verification unavailable".to_string())?
         {
             return Err("OAuth2 token is not valid for this ingress".to_string());
@@ -265,6 +288,16 @@ impl OAuth2Verifier {
             }
         };
 
+        if !config.oauth2.accepts_client_registration(&client, ingress)
+            || (client.dynamic_registration.is_some()
+                && (at_record.subject_kind != "managed_user"
+                    || client.owner_user_id != at_record.user_id))
+        {
+            return Err(
+                "invalid dynamic OAuth2 registration for this subject or issuer".to_string(),
+            );
+        }
+
         if at_record
             .scopes_vec()
             .iter()
@@ -278,6 +311,7 @@ impl OAuth2Verifier {
         if at_record.admin_authority
             && (at_record.subject_kind != "managed_user"
                 || at_record.shared_key_hash.is_some()
+                || client.dynamic_registration.is_some()
                 || !client.is_managed_user_owned()
                 || client.owner_user_id != at_record.user_id
                 || at_record.user_id.as_deref() != Some(at_record.subject_id.as_str()))
@@ -385,6 +419,7 @@ impl OAuth2Verifier {
                     token_kind: Some(crate::auth::PROJECT_SHARE_OAUTH_TOKEN_KIND.to_string()),
                     allowed_client_id: Some(at_record.client_id.clone()),
                     project_grant_id: Some(grant_id.to_string()),
+                    project_root_scopes: crate::auth::project_share_root_scopes_from_config(config),
                     ..AuthContext::new(AuthKind::OAuth2Token)
                 }
             }
@@ -399,15 +434,6 @@ impl OAuth2Verifier {
         Ok(Some(ctx))
     }
 
-    #[cfg(test)]
-    pub(crate) async fn verify_for_ingress(
-        config: &Config,
-        db: Option<&Arc<Database>>,
-        token: &str,
-        ingress: Option<&webcodex_store::PublicIngressFence>,
-    ) -> Result<Option<AuthContext>, String> {
-        Self::verify_for_ingress_sync(config, db, token, ingress)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,9 +474,11 @@ fn authenticate_sync(
 /// [`crate::auth::authenticate_bearer`].
 pub(crate) async fn authenticate(
     config: Arc<Config>,
-    db: Option<Arc<Database>>,
-    token: String,
+    db: Option<&Arc<Database>>,
+    token: &str,
 ) -> Result<Option<AuthContext>, AuthError> {
+    let db = db.cloned();
+    let token = token.to_owned();
     let join = tokio::task::spawn_blocking(move || authenticate_sync(&config, db.as_ref(), &token))
         .await;
     match join {

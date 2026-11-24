@@ -1,0 +1,5 @@
+completed; exit_code: 0
+stdout:
+Tests passed.
+job_id: wc_job_exact
+observation_token: obs_exact

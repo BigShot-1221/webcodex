@@ -1,6 +1,7 @@
 use crate::{
     current_validation_evidence_for_session, parse_cargo_test_run_metadata,
-    validation_kind_for_tool, validation_summary_for_session_events,
+    validation_kind_for_tool, validation_summary_for_session_events, ValidationReport,
+    ValidationStatus,
 };
 use serde_json::{json, Value};
 use webcodex_core::validation_evidence::{
@@ -703,7 +704,7 @@ fn legacy_persisted_cargo_test_metadata_absence_uses_diagnostics_fallback() {
     drop(store);
 
     let mut ledger_json: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        serde_json::from_str(&sessions::root_test_support::read_ledger(&ledger).unwrap()).unwrap();
     let events = ledger_json["sessions"][0]["events"].as_array_mut().unwrap();
     let finished = events
         .iter_mut()
@@ -716,7 +717,8 @@ fn legacy_persisted_cargo_test_metadata_absence_uses_diagnostics_fallback() {
     output_summary.remove("zero_tests_run");
     std::fs::write(&ledger, serde_json::to_vec(&ledger_json).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 10);
+    // This fixture deliberately imports a modified pre-cutover JSON ledger.
+    let restored = sessions::root_test_support::import_ledger(&ledger, 10, 10);
     let session = restored.summary(&session.session_id, Some(50)).unwrap();
     let validation = validation_summary_for_session(&session);
     let event = &validation["latest"];
@@ -751,7 +753,18 @@ fn validation_summary_exposes_cargo_test_zero_tests_metadata() {
     );
 
     let session = store.summary(&session.session_id, Some(50)).unwrap();
-    let validation = validation_summary_for_session(&session);
+    let report = ValidationReport::from_events(&session, &session.events, 10);
+    let facts = report.facts();
+    assert_eq!(facts.status, Some(ValidationStatus::Inconclusive));
+    assert_eq!(
+        facts.current_evidence_status,
+        Some(ValidationStatus::Inconclusive)
+    );
+    assert!(facts.cargo_test_zero_tests);
+    assert_eq!(facts.successes, 0);
+    assert_eq!(facts.evidence_gap_count, 1);
+    assert_eq!(facts.current_unresolved_failure_count, 0);
+    let validation = report.to_value();
     let event = &validation["latest"];
 
     assert_eq!(validation["status"], "inconclusive");
@@ -1295,7 +1308,37 @@ fn same_validation_identity_success_resolves_failure_without_deleting_history() 
     );
 
     let session = store.summary(&session.session_id, Some(50)).unwrap();
-    let validation = validation_summary_for_session(&session);
+    let report = ValidationReport::from_events(&session, &session.events, 10);
+    let facts = report.facts();
+    assert_eq!(facts.status, Some(ValidationStatus::Mixed));
+    assert_eq!(
+        facts.current_evidence_status,
+        Some(ValidationStatus::Unproven)
+    );
+    assert_eq!(facts.successes, 1);
+    assert_eq!(facts.failures, 1);
+    assert_eq!(facts.resolved_failure_count, 1);
+    assert_eq!(facts.unresolved_failure_count, 0);
+    assert_eq!(facts.current_unresolved_failure_count, 0);
+    assert!(facts.historical_failures_resolved);
+    assert!(!facts.historical_failures_unresolved);
+    let validation = report.to_value();
+    let mut bounded = report.bounded_value(1);
+    assert_eq!(bounded["events"].as_array().unwrap().len(), 1);
+    assert_eq!(bounded["events_total"], 2);
+    assert_eq!(
+        bounded["resolved_failures"],
+        validation["resolved_failures"]
+    );
+    assert_eq!(bounded["current_evidence"], validation["current_evidence"]);
+    // A consumer may trim or decorate its display; neither changes policy facts.
+    bounded["failures"] = json!(0);
+    bounded["current_evidence"]["status"] = json!("passed");
+    assert_eq!(report.facts(), facts);
+    let continuation = report.continuation_snapshot(true);
+    assert_eq!(continuation.status, "unproven");
+    assert_eq!(continuation.resolved_failure_count, 1);
+    assert_eq!(continuation.unresolved_failure_count, 0);
 
     assert_eq!(validation["historical_failures"]["count"], 1);
     assert_eq!(validation["resolved_failures"]["count"], 1);
@@ -2074,12 +2117,12 @@ fn persisted_validation_job_materialization_ids_are_additive_sanitized_and_bound
     drop(store);
 
     let mut ledger_json: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        serde_json::from_str(&sessions::root_test_support::read_ledger(&ledger).unwrap()).unwrap();
     let record = ledger_json["sessions"][0].as_object_mut().unwrap();
     // Missing field remains valid for pre-feature ledgers.
     record.remove("materialized_validation_job_ids");
     std::fs::write(&ledger, serde_json::to_vec(&ledger_json).unwrap()).unwrap();
-    let legacy = SessionStore::with_persistence(&ledger, 10, 10);
+    let legacy = sessions::root_test_support::import_ledger(&ledger, 10, 10);
     assert!(legacy.summary(&session.session_id, None).is_some());
     legacy.flush_persistence();
     drop(legacy);
@@ -2102,7 +2145,14 @@ fn persisted_validation_job_materialization_ids_are_additive_sanitized_and_bound
     );
     std::fs::write(&ledger, serde_json::to_vec(&ledger_json).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 10);
+    let restored_database = dir.path().join("sanitized.sqlite3");
+    let restored = SessionStore::open_database(
+        &restored_database,
+        Some(&ledger),
+        sessions::DEFAULT_SESSION_CACHE_BYTES,
+        10,
+    )
+    .unwrap();
     record_finished_tool(
         &restored,
         &session.session_id,
@@ -2113,8 +2163,11 @@ fn persisted_validation_job_materialization_ids_are_additive_sanitized_and_bound
     );
     restored.flush_persistence();
     drop(restored);
-    let canonical: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    // Verify the committed SQLite result, not the unchanged JSON import source.
+    let canonical: Value = serde_json::from_str(
+        &sessions::root_test_support::read_ledger(dir.path().join("sanitized.json")).unwrap(),
+    )
+    .unwrap();
     let ids = canonical["sessions"][0]["materialized_validation_job_ids"]
         .as_array()
         .unwrap();
@@ -3743,4 +3796,47 @@ fn complete_failure_identity_ignores_log_timing_but_keeps_actual_failure_changes
         json!({"stdout_tail_excerpt":"error with no structured identity","stderr_tail_excerpt":""}),
     );
     assert!(crate::complete_failure_identity_for_session_event(&lossy).is_none());
+}
+
+#[test]
+fn typed_validation_skipped_is_unavailable_in_facts_and_projection() {
+    let report = ValidationReport::skipped();
+    let facts = report.facts();
+    assert_eq!(facts.status, Some(ValidationStatus::Unknown));
+    assert_eq!(
+        facts.current_evidence_status,
+        Some(ValidationStatus::Unknown)
+    );
+    assert!(facts.validation_skipped());
+    assert_eq!(facts.successes, 0);
+    assert_eq!(facts.failures, 0);
+    let projection = report.to_value();
+    assert_eq!(projection, crate::skipped_validation_summary());
+    assert_eq!(projection["reason"], "validation_summary_not_requested");
+    assert_eq!(
+        projection["current_evidence"]["reason"],
+        "validation_summary_not_requested"
+    );
+    assert!(projection["events"].as_array().unwrap().is_empty());
+    assert!(!report.continuation_snapshot(false).requested);
+}
+
+#[test]
+fn typed_validation_blockers_do_not_depend_on_display_event_limit() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    record_validation_failure(&store, &session.session_id, "cargo_check");
+    let summary = store.summary(&session.session_id, Some(50)).unwrap();
+    let report = ValidationReport::from_events(&summary, &summary.events, 0);
+    let facts = report.facts();
+    assert_eq!(facts.current_status(), Some(ValidationStatus::Failed));
+    assert_eq!(facts.failures, 1);
+    assert_eq!(facts.unresolved_failure_count, 1);
+    assert_eq!(facts.current_unresolved_failure_count, 1);
+    let display = report.to_value();
+    assert!(display["events"].as_array().unwrap().is_empty());
+    assert_eq!(display["events_total"], 1);
+    let continuation = report.continuation_snapshot(true);
+    assert_eq!(continuation.status, "failed");
+    assert_eq!(continuation.unresolved_failure_count, 1);
 }

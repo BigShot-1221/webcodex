@@ -78,6 +78,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     match server_binary_action(args) {
+        ServerBinaryAction::MigrateWorkflowSessions { database } => {
+            if !database.is_absolute() {
+                return Err(
+                    std::io::Error::other("migration requires an absolute database path").into(),
+                );
+            }
+            let owner = webcodex_store::OfflineRestoreOwner::acquire(&database)?;
+            match owner.migrate_fork_workflow_sessions()? {
+                Some(backup) => println!("Workflow Session migration committed. Rollback backup: {}", backup.path.display()),
+                None => println!("Workflow Session database already uses the current schema; no migration performed."),
+            }
+            Ok(())
+        }
+        ServerBinaryAction::RestoreForkWorkflowBackup { database, backup } => {
+            if !database.is_absolute() || !backup.is_absolute() {
+                return Err(std::io::Error::other(
+                    "restore requires absolute database and backup paths",
+                )
+                .into());
+            }
+            let owner = webcodex_store::OfflineRestoreOwner::acquire(&database)?;
+            let operation = owner.restore_from_fork_backup(&backup)?;
+            println!("Converted Fork backup installed; Server startup must confirm restore commit. Operation: {operation}");
+            Ok(())
+        }
         ServerBinaryAction::Run {
             stop_on_stdin_eof,
             env_file,

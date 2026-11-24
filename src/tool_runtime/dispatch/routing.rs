@@ -2,32 +2,47 @@
 
 use super::*;
 
-impl ToolRuntime {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn dispatch_authorized_inner(
-        &self,
-        call: ToolCall,
-        auth: Option<&AuthContext>,
-        transport: sessions::SessionTransport,
-        window: Option<&crate::client_window::ClientWindow>,
-        ssh_resource: Option<&str>,
-        validation_assertion_name: Option<&str>,
-        project_resolution: Option<Result<ResolvedProject, ProjectResolverError>>,
-        trusted_recording_session_id: Option<&str>,
-        trusted_recording_session_project: Option<&str>,
-        _logical_invocation_id: Option<&str>,
-        structured_handoff_max_secs: Option<u64>,
-        protocol_capabilities: crate::tool_runtime::kernel::ToolProtocolCapabilities,
+impl AuthorizedDispatch<'_, '_> {
+    pub(super) async fn execute(
+        self,
+        runtime: &ToolRuntime,
         correlation: &mut crate::tool_runtime::window_activity::ToolCallCorrelation,
         bootstrap_context: &mut Option<crate::tool_runtime::coding_task::BootstrapContext>,
     ) -> ToolResult {
+        let Self {
+            call,
+            context,
+            ssh_resource,
+            project_resolution,
+            structured_handoff_max_secs,
+        } = self;
+        let ToolCallContext {
+            auth,
+            window,
+            transport,
+            ..
+        } = context.caller;
+        let transport = transport.into();
+        let protocol_capabilities = context.capabilities;
+        let recorder = &context.recorder;
+        let validation_assertion_name = recorder.expectation.assertion_name.as_deref();
+        let _logical_invocation_id = recorder.logical_invocation_id.as_deref();
+        let trusted_recording_session_id = recorder
+            .recording_session_authorized
+            .then_some(recorder.recording_session_id.as_deref())
+            .flatten();
+        let trusted_recording_session_project = recorder
+            .recording_session_authorized
+            .then_some(recorder.recording_session_project.as_deref())
+            .flatten();
         match call {
             ToolCall::OpenWebcodexWorkbench {
                 client_id,
                 project,
                 session_id,
             } => {
-                self.open_webcodex_workbench(project, session_id, client_id, auth)
+                runtime
+                    .open_webcodex_workbench(project, session_id, client_id, auth)
                     .await
             }
             ToolCall::SearchWebcodexResources {
@@ -39,19 +54,28 @@ impl ToolRuntime {
                 offset,
                 limit,
             } => {
-                self.search_webcodex_resources(
-                    kind, query, project, session_id, offset, limit, client_id, auth,
-                )
-                .await
+                runtime
+                    .search_webcodex_resources(
+                        kind, query, project, session_id, offset, limit, client_id, auth,
+                    )
+                    .await
             }
-            ToolCall::ReadWebcodexResource { uri } => self.read_webcodex_resource(&uri, auth).await,
+            ToolCall::ReadWebcodexResource { uri } => {
+                runtime.read_webcodex_resource(&uri, auth).await
+            }
 
             call @ (ToolCall::ListTools { .. }
             | ToolCall::ListRunners { .. }
             | ToolCall::RuntimeStatus { .. }
             | ToolCall::ReadToolTrace { .. }
             | ToolCall::ToolManifest { .. }) => {
-                self.dispatch_discovery_tool(call, auth, protocol_capabilities)
+                runtime
+                    .dispatch_discovery_tool(
+                        call,
+                        auth,
+                        protocol_capabilities,
+                        context.discovery_tools.as_ref(),
+                    )
                     .await
             }
 
@@ -59,12 +83,13 @@ impl ToolRuntime {
                 limit,
                 include_nonmeaningful,
             } => {
-                self.current_window_activity(window, auth, limit, include_nonmeaningful)
+                runtime
+                    .current_window_activity(window, auth, limit, include_nonmeaningful)
                     .await
             }
 
             call @ (ToolCall::RunnerConfigCheck { .. } | ToolCall::RunnerConfigReload { .. }) => {
-                self.dispatch_runner_config_tool(call, auth).await
+                runtime.dispatch_runner_config_tool(call, auth).await
             }
 
             ToolCall::PluginTool(_) => {
@@ -87,7 +112,7 @@ impl ToolRuntime {
                 priority,
                 requires_ack,
                 delivery_key,
-            } => self.post_peer_message_tool(
+            } => runtime.post_peer_message_tool(
                 peer_id,
                 kind,
                 message,
@@ -133,17 +158,18 @@ impl ToolRuntime {
             | ToolCall::RegisterProject { .. }
             | ToolCall::UnregisterProject { .. }
             | ToolCall::CreateProject { .. }) => {
-                self.dispatch_workflows_authorized(
-                    call,
-                    auth,
-                    transport,
-                    window,
-                    trusted_recording_session_id,
-                    trusted_recording_session_project,
-                    correlation,
-                    bootstrap_context,
-                )
-                .await
+                runtime
+                    .dispatch_workflows_authorized(
+                        call,
+                        auth,
+                        transport,
+                        window,
+                        trusted_recording_session_id,
+                        trusted_recording_session_project,
+                        correlation,
+                        bootstrap_context,
+                    )
+                    .await
             }
 
             #[cfg(feature = "workspace-checkpoints")]
@@ -152,28 +178,29 @@ impl ToolRuntime {
             | ToolCall::WorkspaceCheckpointShow { .. }
             | ToolCall::WorkspaceCheckpointRestore { .. }
             | ToolCall::WorkspaceCheckpointDelete { .. }) => {
-                self.dispatch_workspace_checkpoint_tool(call).await
+                runtime.dispatch_workspace_checkpoint_tool(call).await
             }
             #[cfg(feature = "experimental-code-mode")]
             call @ (ToolCall::CodeModeExec { .. }
             | ToolCall::CodeModeExecEffectful { .. }
             | ToolCall::CodeModeExecMutating { .. }) => {
-                self.dispatch_code_mode_authorized(
-                    call,
-                    auth,
-                    transport,
-                    project_resolution,
-                    _logical_invocation_id,
-                    correlation,
-                )
-                .await
+                runtime
+                    .dispatch_code_mode_authorized(
+                        call,
+                        auth,
+                        transport,
+                        project_resolution,
+                        _logical_invocation_id,
+                        correlation,
+                    )
+                    .await
             }
 
             call @ (ToolCall::CodingAgentStart { .. }
             | ToolCall::CodingAgentObserve { .. }
             | ToolCall::CodingAgentCancel { .. }
             | ToolCall::CodingAgentRespondPermission { .. }
-            | ToolCall::CodingAgentInspectConfig { .. }
+            | ToolCall::CodingAgentDiagnose { .. }
             | ToolCall::RunProcess { .. }
             | ToolCall::JobWriteInput { .. }
             | ToolCall::RunDetachedProcess { .. }
@@ -188,15 +215,16 @@ impl ToolRuntime {
             | ToolCall::ApplyPatch { .. }
             | ToolCall::ApplyUnifiedDiff { .. }
             | ToolCall::RunSkillResource { .. }) => {
-                self.dispatch_execution_authorized(
-                    call,
-                    auth,
-                    ssh_resource,
-                    validation_assertion_name,
-                    project_resolution,
-                    structured_handoff_max_secs,
-                )
-                .await
+                runtime
+                    .dispatch_execution_authorized(
+                        call,
+                        auth,
+                        ssh_resource,
+                        validation_assertion_name,
+                        project_resolution,
+                        structured_handoff_max_secs,
+                    )
+                    .await
             }
 
             ToolCall::BrowserObserve(_) | ToolCall::BrowserAct(_) => ToolResult::err(
@@ -206,7 +234,7 @@ impl ToolRuntime {
                 "Computer gateways must pass action-sensitive specialized governance".to_string(),
             ),
             call @ ToolCall::ComputerSaveSnapshot { .. } => {
-                self.dispatch_computer_tool(call, auth).await
+                runtime.dispatch_computer_tool(call, auth).await
             }
             call @ (ToolCall::SkillLoad { .. }
             | ToolCall::SkillList { .. }
@@ -215,7 +243,8 @@ impl ToolRuntime {
             | ToolCall::SkillInstall { .. }
             | ToolCall::SkillActivate { .. }
             | ToolCall::SkillRemoveRevision { .. }) => {
-                self.dispatch_skills_authorized(call, auth, project_resolution)
+                runtime
+                    .dispatch_skills_authorized(call, auth, project_resolution)
                     .await
             }
 
@@ -230,7 +259,7 @@ impl ToolRuntime {
             | ToolCall::UpdateGoal { .. }
             | ToolCall::AssociateGoalAgentTask { .. }
             | ToolCall::AssociateGoalWorkflowSession { .. }) => {
-                self.dispatch_goals_authorized(call, auth, window).await
+                runtime.dispatch_goals_authorized(call, auth, window).await
             }
 
             call @ (ToolCall::WaitForAgentEvents { .. }
@@ -247,7 +276,7 @@ impl ToolRuntime {
             | ToolCall::ReconcileAgentTaskCodingRun { .. }
             | ToolCall::HeartbeatAgentTaskAttempt { .. }
             | ToolCall::CompleteAgentTaskAttempt { .. }) => {
-                self.dispatch_agent_work_authorized(call, auth).await
+                runtime.dispatch_agent_work_authorized(call, auth).await
             }
 
             call @ (ToolCall::CreateAgentIdentity(_)
@@ -271,7 +300,7 @@ impl ToolRuntime {
             | ToolCall::ConsumeAgentDeliveries(_)
             | ToolCall::BootstrapAgentConversation { .. }
             | ToolCall::ConsumeAgentWake { .. }) => {
-                self.dispatch_agents_authorized(call, auth, window).await
+                runtime.dispatch_agents_authorized(call, auth, window).await
             }
 
             call @ (ToolCall::PresentJobTerminalContinuation { .. }
@@ -280,7 +309,8 @@ impl ToolRuntime {
             | ToolCall::JobTerminalContinuationPrepare { .. }
             | ToolCall::JobTerminalContinuationFinish { .. }
             | ToolCall::JobTerminalContinuationUnbind { .. }) => {
-                self.dispatch_job_continuation_authorized(call, auth, window)
+                runtime
+                    .dispatch_job_continuation_authorized(call, auth, window)
                     .await
             }
 
@@ -290,12 +320,14 @@ impl ToolRuntime {
             | ToolCall::MemoryDelete { .. }
             | ToolCall::MemoryScopeList { .. }
             | ToolCall::MemoryScopePurge { .. }) => {
-                self.dispatch_memory_authorized(call, auth, project_resolution)
+                runtime
+                    .dispatch_memory_authorized(call, auth, project_resolution)
                     .await
             }
 
             call @ ToolCall::ImportConversationFilesToProject { .. } => {
-                self.dispatch_conversation_import_tool(call, auth, transport)
+                runtime
+                    .dispatch_conversation_import_tool(call, auth, transport)
                     .await
             }
 
@@ -319,7 +351,8 @@ impl ToolRuntime {
             | ToolCall::ArtifactUploadFinish { .. }
             | ToolCall::ArtifactUploadAbort { .. }
             | ToolCall::ApplyTextEdits { .. }) => {
-                self.dispatch_file_tool(call, transport, project_resolution, auth)
+                runtime
+                    .dispatch_file_tool(call, transport, project_resolution, auth)
                     .await
             }
 
@@ -331,14 +364,15 @@ impl ToolRuntime {
             | ToolCall::GitReviewSummary { .. }
             | ToolCall::ReviewChanges { .. }
             | ToolCall::GitLog { .. }
-            | ToolCall::ShowChanges { .. }) => self.dispatch_git_tool(call, auth).await,
+            | ToolCall::ShowChanges { .. }) => runtime.dispatch_git_tool(call, auth).await,
 
             call @ (ToolCall::CargoFmt { .. }
             | ToolCall::CargoCheck { .. }
             | ToolCall::CargoTest { .. }
             | ToolCall::ProjectValidate { .. }
             | ToolCall::GoTest { .. }) => {
-                self.dispatch_cargo_tool(call, ssh_resource, auth, structured_handoff_max_secs)
+                runtime
+                    .dispatch_cargo_tool(call, ssh_resource, auth, structured_handoff_max_secs)
                     .await
             }
 
@@ -349,11 +383,14 @@ impl ToolRuntime {
             | ToolCall::WaitForJobTerminal { .. }
             | ToolCall::ListJobs { .. }
             | ToolCall::JobTail { .. }) => {
-                self.dispatch_job_tool(call, auth, ssh_resource, correlation)
+                runtime
+                    .dispatch_job_tool(call, auth, ssh_resource, correlation)
                     .await
             }
 
-            call @ ToolCall::WorkspaceHygieneCheck { .. } => self.dispatch_hygiene_tool(call).await,
+            call @ ToolCall::WorkspaceHygieneCheck { .. } => {
+                runtime.dispatch_hygiene_tool(call).await
+            }
 
             call @ (ToolCall::LspStatus { .. }
             | ToolCall::DocumentSymbols { .. }
@@ -362,7 +399,7 @@ impl ToolRuntime {
             | ToolCall::WorkspaceSymbols { .. }
             | ToolCall::GotoDefinition { .. }
             | ToolCall::FindReferences { .. }
-            | ToolCall::CallHierarchy { .. }) => self.dispatch_lsp_tool(call).await,
+            | ToolCall::CallHierarchy { .. }) => runtime.dispatch_lsp_tool(call).await,
         }
     }
 }

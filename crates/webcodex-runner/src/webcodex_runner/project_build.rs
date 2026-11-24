@@ -12,10 +12,13 @@ use webcodex_core::project_build::{
 };
 use webcodex_core::runner_operation::RunnerJobOperation;
 use webcodex_workspace::project_recipe::{
-    digest_project_cargo_all_packages_provenance, digest_project_recipe_files,
-    project_recipe_provenance_files, resolve_project_recipe_root, ProjectRecipeId,
-    ProjectRecipeResolutionError,
+    digest_project_recipe_files, project_recipe_provenance_files, resolve_project_recipe_root,
+    ProjectRecipeId, ProjectRecipeResolutionError,
 };
+
+#[path = "project_build/rust.rs"]
+mod rust;
+pub(crate) use rust::run_rust_build;
 
 fn unavailable(code: &str, backend: Option<&str>) -> ProjectBuildPlanningResult {
     ProjectBuildPlanningResult::Unavailable {
@@ -83,9 +86,28 @@ pub(crate) fn plan(
     let resolved = resolve_project_recipe_root(&root, request.cwd.as_deref(), hint)
         .map_err(|error| unavailable(map_recipe_error(error), None))?;
     let backend = resolved.recipe;
+    if request.has_rust_options() && backend != ProjectRecipeId::Rust {
+        return Err(unavailable(
+            "build_options_unsupported",
+            Some(backend.as_str()),
+        ));
+    }
     if request.dependency_resolution_policy.is_some() && backend != ProjectRecipeId::Rust {
         return Err(unavailable(
             "dependency_resolution_policy_unsupported",
+            Some(backend.as_str()),
+        ));
+    }
+    let excluded_packages = request
+        .scope
+        .as_ref()
+        .map(webcodex_core::project_build::ProjectBuildScope::normalized_exclude_packages)
+        .transpose()
+        .map_err(|_| unavailable("build_scope_invalid", None))?
+        .unwrap_or_default();
+    if !excluded_packages.is_empty() && backend != ProjectRecipeId::Rust {
+        return Err(unavailable(
+            "workspace_exclusions_unsupported",
             Some(backend.as_str()),
         ));
     }
@@ -125,8 +147,25 @@ pub(crate) fn plan(
             .as_ref()
             .is_some_and(webcodex_core::project_build::ProjectBuildScope::selects_all_packages)
     {
-        digest_project_cargo_all_packages_provenance(&resolved)
+        if !excluded_packages.is_empty() {
+            let (digest, members) =
+                webcodex_workspace::project_recipe::project_cargo_all_packages_provenance(
+                    &resolved,
+                )
+                .map_err(|_| unavailable("build_scope_unavailable", Some(backend.as_str())))?;
+            request
+                .scope
+                .as_ref()
+                .expect("exclusions require scope")
+                .validate_excluded_members(&members)
+                .map_err(|_| unavailable("build_scope_invalid", Some(backend.as_str())))?;
+            digest
+        } else {
+            webcodex_workspace::project_recipe::digest_project_cargo_all_packages_provenance(
+                &resolved,
+            )
             .map_err(|_| unavailable("build_scope_unavailable", Some(backend.as_str())))?
+        }
     } else {
         let provenance_files = if backend == ProjectRecipeId::Python {
             // Packaging requires a manifest even for explicit Python. These

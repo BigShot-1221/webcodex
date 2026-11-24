@@ -238,6 +238,9 @@ impl DesktopCore {
                 .configure_cloudflare_tunnel_profile(
                     &store,
                     &webcodex_environment::CloudflareTunnelProfileRequest {
+                        expected_target: request.expected_target.as_ref(),
+                        oauth_dynamic_registration_enabled: request
+                            .oauth_dynamic_registration_enabled,
                         profile_id: &profile_id,
                         name: Some(&request.name),
                         host_mode: request.host_mode,
@@ -252,7 +255,10 @@ impl DesktopCore {
                 .map_err(super::environment::desktop_error)?;
             return cancellation.check();
         }
-        if request.cloudflare_token.is_some() {
+        if request.cloudflare_token.is_some()
+            || request.expected_target.is_some()
+            || request.oauth_dynamic_registration_enabled.is_some()
+        {
             return Err(connection_missing());
         }
         let tunnel_id = request.tunnel_id.trim();
@@ -290,10 +296,16 @@ impl DesktopCore {
                 ),
             }),
         };
+        let proxy_update = match effective_tunnel_proxy(&self.config.tunnel_proxy)?.url {
+            Some(url) => webcodex_environment::TunnelProxyUpdate::Explicit(
+                webcodex_environment::Secret::new(url),
+            ),
+            None => webcodex_environment::TunnelProxyUpdate::Direct,
+        };
         let native = webcodex_environment::NativeEnvironment::new()
             .map_err(super::environment::desktop_error)?;
         native
-            .configure_tunnel_profile(
+            .configure_tunnel_profile_with_proxy(
                 &store,
                 &profile_id,
                 Some(&request.name),
@@ -301,6 +313,7 @@ impl DesktopCore {
                 Some(request.autostart),
                 request.expected_revision,
                 credentials.as_ref(),
+                &proxy_update,
                 request.host_mode == webcodex_environment::TunnelHostMode::Standalone,
             )
             .await
@@ -762,9 +775,10 @@ fn persistent_connection_projection(
         webcodex_environment::TunnelRuntimeObservation,
     >,
 ) -> TunnelConnectionSnapshot {
-    let server_restart_required = observation
-        .as_ref()
-        .is_ok_and(|status| status.server_restart_required);
+    let server_restart_required = profile.provider == webcodex_environment::TunnelProvider::Openai
+        && observation
+            .as_ref()
+            .is_ok_and(|status| status.server_restart_required);
     let enabled = match profile.host_mode {
         webcodex_environment::TunnelHostMode::Embedded => profile.autostart,
         webcodex_environment::TunnelHostMode::Standalone => observation
@@ -774,6 +788,7 @@ fn persistent_connection_projection(
     let runtime = persistent_runtime_projection(&profile, observation);
     TunnelConnectionSnapshot {
         config: crate::tunnel_config::TunnelProfileConfigSnapshot {
+            oauth_dynamic_registration_enabled: profile.oauth_dynamic_registration_enabled,
             provider: profile.provider.clone(),
             configuration_id: profile.configuration_id.clone(),
             id: profile.profile_id,
@@ -797,12 +812,18 @@ fn persistent_runtime_projection(
         webcodex_environment::TunnelRuntimeObservation,
     >,
 ) -> crate::connections::ConnectionRuntimeSnapshot {
-    let Ok(status) = observation else {
-        return crate::connections::ConnectionRuntimeSnapshot {
-            lifecycle: ConnectionLifecycle::Error,
-            last_error: Some(ConnectionError::StartFailed),
-            ..Default::default()
-        };
+    let status = match observation {
+        Ok(status) => status,
+        Err(error) => {
+            return crate::connections::ConnectionRuntimeSnapshot {
+                lifecycle: ConnectionLifecycle::Error,
+                last_error: Some(ConnectionError::StartFailed),
+                failure_stage: error.stage.or_else(|| Some("tunnel_status".to_string())),
+                reason_code: crate::error::sanitize_safe_identifier(&error.code)
+                    .or_else(|| Some("tunnel_status_unavailable".to_string())),
+                ..Default::default()
+            };
+        }
     };
     if status.profile_id != profile.profile_id
         || status.tunnel_id != profile.tunnel_id
@@ -812,6 +833,8 @@ fn persistent_runtime_projection(
         return crate::connections::ConnectionRuntimeSnapshot {
             lifecycle: ConnectionLifecycle::Error,
             last_error: Some(ConnectionError::StartFailed),
+            failure_stage: Some("tunnel_identity_check".to_string()),
+            reason_code: Some("tunnel_identity_mismatch".to_string()),
             ..Default::default()
         };
     }
@@ -820,9 +843,15 @@ fn persistent_runtime_projection(
         webcodex_environment::service::Ownership::Foreign
             | webcodex_environment::service::Ownership::Unknown
     ) {
+        let reason = match status.service_status.ownership {
+            webcodex_environment::service::Ownership::Foreign => "service_foreignservice",
+            _ => "service_ownershipunknown",
+        };
         return crate::connections::ConnectionRuntimeSnapshot {
             lifecycle: ConnectionLifecycle::Error,
             last_error: Some(ConnectionError::StartFailed),
+            failure_stage: Some("tunnel_service_ownership".to_string()),
+            reason_code: Some(reason.to_string()),
             ..Default::default()
         };
     }
@@ -836,14 +865,32 @@ fn persistent_runtime_projection(
     } else {
         ConnectionLifecycle::Stopped
     };
-    let last_error = if process_started && !ready {
-        Some(if !status.local_mcp_ready {
-            ConnectionError::LocalMcpUnavailable
+    let (last_error, failure_stage, reason_code) = if process_started && !ready {
+        if let Some(diagnostic) = status.diagnostic {
+            (
+                Some(if diagnostic == "local_mcp_unavailable" {
+                    ConnectionError::LocalMcpUnavailable
+                } else {
+                    ConnectionError::TunnelUnavailable
+                }),
+                Some("tunnel_readiness".to_string()),
+                Some(diagnostic),
+            )
+        } else if !status.local_mcp_ready {
+            (
+                Some(ConnectionError::LocalMcpUnavailable),
+                Some("tunnel_readiness".to_string()),
+                Some("local_mcp_unavailable".to_string()),
+            )
         } else {
-            ConnectionError::TunnelUnavailable
-        })
+            (
+                Some(ConnectionError::TunnelUnavailable),
+                Some("tunnel_readiness".to_string()),
+                Some("tunnel_unavailable".to_string()),
+            )
+        }
     } else {
-        None
+        (None, None, None)
     };
     crate::connections::ConnectionRuntimeSnapshot {
         lifecycle,
@@ -861,6 +908,8 @@ fn persistent_runtime_projection(
         process_ready: ready,
         tunnel_ready: process_started.then_some(status.tunnel_ready),
         local_mcp_ready: process_started.then_some(status.local_mcp_ready),
+        failure_stage,
+        reason_code,
         ..Default::default()
     }
 }

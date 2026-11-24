@@ -30,7 +30,7 @@ impl JobReceiptStore for MemoryReceipts {
         if self.fail
             || self
                 .failures_remaining
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| n.checked_sub(1),
@@ -491,10 +491,9 @@ async fn receipts_owner_is_fixed_before_runner_reregistration_and_groups_are_iso
         .await
         .unwrap();
         let job = a
-            .start_job_with_metadata_for_access(
+            .start_job(
                 start_request("echo safe"),
                 "tester".into(),
-                ShellJobStartMetadata::default(),
                 Some(&caller),
                 None,
             )
@@ -553,15 +552,10 @@ async fn receipts_active_hidden_cleanup_and_detached_are_never_saved() {
         ShellJobVisibility::HiddenUntilHandoff,
         ShellJobVisibility::CleanupPending,
     ] {
+        let mut request = start_request("echo hidden");
+        request.context.visibility = visibility;
         let job = a
-            .start_job_with_metadata(
-                start_request("echo hidden"),
-                "tester".into(),
-                ShellJobStartMetadata {
-                    visibility,
-                    ..Default::default()
-                },
-            )
+            .start_job(request, "tester".into(), None, None)
             .await
             .unwrap();
         a.update_job(update(
@@ -785,9 +779,7 @@ async fn receipts_protocol_violation_and_recovery_sweep_capture_final_evidence()
 async fn receipts_validation_provenance_is_restored_only_by_same_instance_inventory() {
     for adapter in ["cargo_test", "node:vitest:test", "node:jest:test"] {
         let validation = || {
-            let mut metadata = cargo_validation_start_metadata(None, None, None)
-                .validation
-                .unwrap();
+            let mut metadata = cargo_validation_metadata(None, None, None);
             if adapter != "cargo_test" {
                 use webcodex_core::project_validation::*;
                 metadata.tool = "project_validate".into();
@@ -913,7 +905,7 @@ async fn receipts_unowned_admission_preserves_only_existing_global_visibility() 
     registration.owner = None;
     a.register(registration).await.unwrap();
     let job = a
-        .start_job(start_request("echo safe"), "bootstrap".into())
+        .start_job(start_request("echo safe"), "bootstrap".into(), None, None)
         .await
         .unwrap();
     a.stop_job(&job.job_id, "bootstrap".into()).await.unwrap();
@@ -1055,7 +1047,7 @@ async fn job_telemetry_contention_omits_snapshot_without_waiting_or_mutating() {
 async fn project_build_artifact_observations_restore_without_replay_or_invented_metadata() {
     use webcodex_core::project_build::ProjectBuildArtifact;
     use webcodex_core::runner_protocol::{ShellCommandExecutionState,ShellJobStructuredExecutionMetadata};
-    for known in [true,false] {
+    for path in [None, Some("dist/existing.whl"), Some("target/dogfood/app")] {
         let store=Arc::new(MemoryReceipts::default());let before=durable(&store).await;
         register(&before,INSTANCE_A,empty_inventory()).await;
         let (job,_)=start_and_take_over(&before,INSTANCE_A).await;
@@ -1066,7 +1058,7 @@ async fn project_build_artifact_observations_restore_without_replay_or_invented_
             record.structured_execution=Some(ShellJobStructuredExecutionMetadata { execution_source:"project_build".into(),language:None,script_bytes:None,arg_count:3,stdin_present:false,validation_identity:None,assertion_name:None,validation_tool:None });
             record.command_execution_state=Some(ShellCommandExecutionState::NotStarted);
         }
-        let observations=known.then(|| vec![ProjectBuildArtifact { path:"dist/existing.whl".into(),bytes:4,sha256:"a".repeat(64),mime_type:Some("application/zip".into()) }]);
+        let observations=path.map(|path| vec![ProjectBuildArtifact { path:path.into(),bytes:4,sha256:"a".repeat(64),mime_type:Some("application/zip".into()) }]);
         let mut terminal=update(INSTANCE_A,&job.job_id,2,"completed",None,true);
         terminal.command_execution_state=Some(ShellCommandExecutionState::Completed);terminal.build_artifacts=observations.clone();
         let completed=before.update_job(terminal).await.unwrap();

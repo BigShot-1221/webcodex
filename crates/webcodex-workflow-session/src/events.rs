@@ -173,6 +173,8 @@ pub fn current_attempt_event_view(summary: &SessionSummary) -> CurrentAttemptEve
         .rposition(|event| event.kind == "task_instruction");
     let (boundary_source, boundary_reason_code) = if boundary_event_index.is_some() {
         ("task_instruction", None)
+    } else if summary.current_instruction.is_some() {
+        ("task_instruction", Some("attempt_history_outside_window"))
     } else if summary.events_truncated {
         ("unavailable", Some("attempt_boundary_evicted"))
     } else {
@@ -274,7 +276,27 @@ pub fn is_tool_call_expectation_metadata_field(field: &str) -> bool {
     shared_is_tool_call_expectation_metadata_field(field)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolFailureSummary {
+    pub expected_count: usize,
+    pub unexpected_count: usize,
+    pub expectation_mismatch_count: usize,
+    pub unexpected_success_count: usize,
+    pub recent_expected: Vec<Value>,
+    pub recent_unexpected: Vec<Value>,
+    pub recent_mismatches: Vec<Value>,
+    pub recent_unexpected_successes: Vec<Value>,
+}
+
 pub fn tool_failure_summary_from_events(events: &[SessionEvent], limit: usize) -> Value {
+    serde_json::to_value(tool_failure_evidence_from_events(events, limit))
+        .expect("tool failure evidence serializes")
+}
+
+pub fn tool_failure_evidence_from_events(
+    events: &[SessionEvent],
+    limit: usize,
+) -> ToolFailureSummary {
     let limit = limit.min(20);
     let mut expected_count = 0usize;
     let mut unexpected_count = 0usize;
@@ -322,16 +344,16 @@ pub fn tool_failure_summary_from_events(events: &[SessionEvent], limit: usize) -
         }
     }
 
-    json!({
-        "expected_count": expected_count,
-        "unexpected_count": unexpected_count,
-        "expectation_mismatch_count": expectation_mismatch_count,
-        "unexpected_success_count": unexpected_success_count,
-        "recent_expected": recent_expected,
-        "recent_unexpected": recent_unexpected,
-        "recent_mismatches": recent_mismatches,
-        "recent_unexpected_successes": recent_unexpected_successes,
-    })
+    ToolFailureSummary {
+        expected_count,
+        unexpected_count,
+        expectation_mismatch_count,
+        unexpected_success_count,
+        recent_expected,
+        recent_unexpected,
+        recent_mismatches,
+        recent_unexpected_successes,
+    }
 }
 
 pub(super) fn actual_failure_kind_for_tool_result(

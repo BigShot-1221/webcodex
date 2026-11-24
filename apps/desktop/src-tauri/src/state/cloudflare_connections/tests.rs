@@ -38,16 +38,28 @@ fn cloudflare_native_actions_require_selected_instance_and_secret_free_status() 
         serde_json::to_value(observed).unwrap()["process_generation"],
         7
     );
-    let request:CloudflareConnectionRequest=serde_json::from_value(serde_json::json!({"action":"start","profile_id":"profile","server_instance_id":"selected-instance","expected_revision":3})).unwrap();
+    let request:CloudflareConnectionRequest=serde_json::from_value(serde_json::json!({"action":"start","profile_id":"profile","server_instance_id":"selected-instance","expected_revision":3,"expected_generation":0,"expected_configuration_id":"configuration"})).unwrap();
     assert_eq!(
         serde_json::to_value(request).unwrap()["server_instance_id"],
         "selected-instance"
     );
-    let status:CloudflareConnectionStatus=serde_json::from_value(serde_json::json!({"profile_id":"profile","server_instance_id":"instance","process_generation":2,"lifecycle":"running","public_origin":"https://public.example","oauth_configured":true,"observed_authorization":false,"configured_revision":3,"applied_revision":3,"local_target":"http://127.0.0.1:1234","reason_code":null,"client_secret":"must-not-project"})).unwrap();
+    let status:CloudflareConnectionStatus=serde_json::from_value(serde_json::json!({"profile_id":"profile","configuration_id":"configuration","server_instance_id":"instance","process_generation":2,"lifecycle":"running","public_origin":"https://public.example","oauth_configured":true,"observed_authorization":false,"configured_revision":3,"applied_revision":3,"local_target":"http://127.0.0.1:1234","reason_code":null,"client_secret":"must-not-project"})).unwrap();
     let projected = serde_json::to_string(&status).unwrap();
     assert!(!projected.contains("client_secret"));
     assert!(!projected.contains("must-not-project"));
     assert!(!status.observed_authorization);
+    assert!(!status.registration_available && !status.observed_tool_call);
+    let mut active = status;
+    active.registration_available = true;
+    active.check_materialized_revision(3);
+    assert!(active.registration_available && active.reason_code.is_none());
+    active.check_materialized_revision(4);
+    assert_eq!(active.registration_available, !cfg!(windows));
+    assert_eq!(
+        active.reason_code.as_deref(),
+        cfg!(windows).then_some("cloudflare_restart_server_required")
+    );
+    assert_eq!(active.process_generation, 2);
 }
 
 #[tokio::test]
@@ -127,6 +139,21 @@ async fn cloudflare_native_http_preserves_only_explicit_ingress_restart_handoff(
             "cloudflare_ingress_not_applied",
         ),
         (
+            "409 Conflict",
+            r#"{"error":"cloudflare_restart_server_required"}"#,
+            "cloudflare_ingress_not_applied",
+        ),
+        (
+            "409 Conflict",
+            r#"{"error":"cloudflare_owner_repair_required"}"#,
+            "cloudflare_owner_repair_required",
+        ),
+        (
+            "409 Conflict",
+            r#"{"error":"private-response-body"}"#,
+            "cloudflare_control_unavailable",
+        ),
+        (
             "500 Internal Server Error",
             canonical,
             "cloudflare_control_unavailable",
@@ -173,6 +200,73 @@ async fn cloudflare_native_http_preserves_only_explicit_ingress_restart_handoff(
         assert_eq!(error.code, expected_code);
         let projected = serde_json::to_string(&error).unwrap();
         assert!(!projected.contains("private-response-body"));
+        assert!(!projected.contains("test-private-bootstrap"));
+        fixture.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cloudflare_native_http_distinguishes_auth_conflict_server_error_and_stage() {
+    for (http_status, expected_code, expected_http) in [
+        (
+            "401 Unauthorized",
+            "cloudflare_authentication_failed",
+            401u16,
+        ),
+        ("403 Forbidden", "cloudflare_authentication_failed", 403u16),
+        ("409 Conflict", "cloudflare_control_unavailable", 409u16),
+        (
+            "503 Service Unavailable",
+            "cloudflare_control_unavailable",
+            503u16,
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            socket.read(&mut request).await.unwrap();
+            let body = r#"{"error":"PRIVATE_CF_SECRET"}"#;
+            let response = format!(
+                "HTTP/1.1 {http_status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let error = control_response(
+            &client,
+            &format!("http://{address}/api/connections/cloudflare"),
+            &Secret::new("test-private-bootstrap".into()),
+            &CloudflareConnectionRequest::Status {
+                profile_id: "cf-profile-1".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, expected_code);
+        let diag = error.diagnostic_ref().unwrap();
+        assert_eq!(diag.http_status, Some(expected_http));
+        assert_eq!(diag.stage.as_deref(), Some("cloudflare_status"));
+        assert_eq!(diag.resource_id.as_deref(), Some("cf-profile-1"));
+        if expected_http == 409 {
+            assert!(
+                !diag.retry_allowed,
+                "an unknown conflict must not replay a write"
+            );
+            assert_eq!(
+                diag.safe_action,
+                crate::error::SafeRecoveryAction::ObserveBeforeRetry
+            );
+        }
+        let projected = serde_json::to_string(&error).unwrap();
+        assert!(!projected.contains("PRIVATE_CF_SECRET"));
         assert!(!projected.contains("test-private-bootstrap"));
         fixture.await.unwrap();
     }

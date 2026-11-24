@@ -389,7 +389,7 @@ async fn wait_for_mcp_agent_request(
 #[tokio::test]
 async fn mcp_tools_list_uses_adaptive_inventory_in_both_schema_modes() {
     for compact in [false, true] {
-        let runtime = test_runtime_with_mcp_settings(compact, true);
+        let runtime = with_workflow_tools(test_runtime_with_mcp_settings(compact, true));
         let outcome = handle_mcp_request(
             &runtime,
             rpc("tools/list", Some(Value::from(3)), json!({})),
@@ -607,6 +607,7 @@ async fn hidden_extensions_keep_exact_manifest_and_gateway_execution() {
         .register_with_auth(
             crate::test_support::current_runner_registration(RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 client_id: "hidden-extension-runner".to_string(),
                 runner_instance_id: "inst".to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -632,6 +633,7 @@ async fn hidden_extensions_keep_exact_manifest_and_gateway_execution() {
         "hidden-extension-runner",
         "inst",
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: "demo".to_string(),
             name: None,
             path: tmp.path().display().to_string(),
@@ -1286,6 +1288,7 @@ fn mcp_file_import_trust_distinguishes_exact_tier1_from_active_oauth_tier2() {
     let make_client = |name: &str, redirect_uris: &str| crate::models::OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: crate::auth::generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: crate::auth::hash_token("test-secret"),
         name: name.to_string(),
         owner_user_id: Some(user.id.clone()),
@@ -1432,6 +1435,7 @@ async fn project_artifact_image_call_returns_native_image_for_remote_agent_proje
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 client_id: client_id.to_string(),
                 runner_instance_id: runner_instance_id.to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -1459,6 +1463,7 @@ async fn project_artifact_image_call_returns_native_image_for_remote_agent_proje
         client_id,
         runner_instance_id,
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: project_name.to_string(),
             name: Some(project_name.to_string()),
             path: "/remote/session-atlas".to_string(),
@@ -1897,7 +1902,11 @@ fn mcp_tools_list_inputs_equal_canonical_except_descriptions_and_host_file_overl
                 expected["properties"]["openaiFileIdRefs"]["items"]["required"] =
                     json!(["download_url", "file_id"]);
             }
-            let mut expected_description = canonical.description.clone();
+            let mut expected_description = if name == "work_on_project" {
+                crate::mcp::discovery::bootstrap_description(false)
+            } else {
+                canonical.description.clone()
+            };
             if name == "get_runtime_status" {
                 assert_eq!(expected["properties"]["compact"]["default"], false);
                 expected["properties"]["compact"]["default"] = json!(true);
@@ -1906,12 +1915,20 @@ fn mcp_tools_list_inputs_equal_canonical_except_descriptions_and_host_file_overl
                     " MCP defaults to sparse status; compact=false opts into full diagnostics.",
                 );
             }
+            if name == "list_projects" {
+                assert_eq!(expected["properties"]["summary_only"]["default"], false);
+                expected["properties"]["summary_only"]["default"] = json!(true);
+                expected["properties"]["summary_only"]["description"] = json!("MCP defaults to a Project identity/path/state summary. Set false for revision, shell, policy and smoke capabilities.");
+            }
             if name == "observe_jobs" {
+                assert_eq!(expected["properties"]["wake_on"]["default"], "terminal");
+                expected["properties"]["wake_on"]["default"] = json!("meaningful_change");
+                expected["properties"]["wake_on"]["description"] = json!("MCP defaults to meaningful_change (ignores pure heartbeats). Set change for all updates; terminal/all_terminal for completion. Missing tokens return an immediate baseline.");
                 assert_eq!(expected["properties"]["summary_only"]["default"], false);
                 expected["properties"]["summary_only"]["default"] = json!(true);
                 expected["properties"]["summary_only"]["description"] = json!("MCP defaults to compact proven-success validation logs. Set false to expand retained logs from the original cursor. Failures, unknown results and ordinary commands keep full evidence.");
                 expected_description
-                    .push_str(" MCP defaults summary_only=true; set false for full retained logs.");
+                    .push_str(" MCP defaults: wake_on=meaningful_change, summary_only=true.");
             }
             let mut actual = tool["inputSchema"].clone();
             if compact {
@@ -2012,7 +2029,12 @@ async fn mcp_compact_preserves_stateless_wrappers_app_metadata_and_exact_manifes
         };
         let output = &value["result"]["structuredContent"]["output"];
         let canonical = specs.iter().find(|spec| spec.name == name).unwrap();
-        assert_eq!(output["description"], canonical.description, "{name}");
+        let expected_description = if name == "work_on_project" {
+            crate::mcp::discovery::bootstrap_description(true)
+        } else {
+            canonical.description.clone()
+        };
+        assert_eq!(output["description"], expected_description, "{name}");
         assert_eq!(output["input_schema"], canonical.input_schema, "{name}");
         assert!(
             output.get("output_schema").is_none(),
@@ -2501,6 +2523,150 @@ fn mcp_compact_common_copy_respects_tool_and_argument_boundaries() {
 }
 
 #[test]
+fn mcp_execution_descriptions_share_canonical_source_across_surfaces() {
+    let surfaces = [
+        mcp_tools_list_payload_with_compact(false),
+        mcp_tools_list_payload_with_compact(true),
+        crate::mcp::cli::tools_list(None, false),
+    ];
+    for name in [
+        "run_process",
+        "run_shell",
+        "run_script",
+        "run_job",
+        "run_detached_process",
+        "observe_jobs",
+        "list_jobs",
+        "wait_for_job_readiness",
+    ] {
+        let definition = webcodex_tool_contracts::lookup_tool_definition(name).unwrap();
+        let canonical = definition.model_spec.unwrap().description;
+        let mut descriptor = json!({
+            "name": name,
+            "description": canonical,
+            "inputSchema": webcodex_tool_contracts::input_schema_for_tool(name),
+        });
+        crate::mcp::discovery::compact_tool(&mut descriptor);
+        assert_eq!(descriptor["description"], canonical, "{name}");
+        assert!(canonical.chars().count() <= crate::mcp::discovery::TOOL_DESCRIPTION_MAX_CHARS);
+        for (surface_index, surface) in surfaces.iter().enumerate() {
+            if let Some(tool) = surface["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+            {
+                // MCP changes the canonical observer's wake_on and summary_only defaults.
+                // Keep these adapter differences without copying its L0 contract.
+                let expected = if surface_index == 2 && name == "run_shell" {
+                    let description = tool["description"].as_str().unwrap();
+                    for fact in [
+                        "50s",
+                        "observe_jobs",
+                        "Never replay uncertain effects",
+                        "Permissions and Host approval apply",
+                        "kills the process tree",
+                    ] {
+                        assert!(description.contains(fact), "{description}");
+                    }
+                    assert!(!description.contains("Session"));
+                    continue;
+                } else if surface_index == 2 && name == "observe_jobs" {
+                    // CLI's observer uses the canonical terminal-wait default,
+                    // but its log contract is surface-specific: latest incremental
+                    // tails, with explicit page=true for forward recovery.
+                    assert_eq!(
+                        tool["inputSchema"]["properties"]["wake_on"]["default"],
+                        "terminal"
+                    );
+                    assert!(tool["inputSchema"]["properties"]
+                        .get("summary_only")
+                        .is_none());
+                    let description = tool["description"].as_str().unwrap();
+                    for fact in [
+                        "owned Jobs",
+                        "wait_secs",
+                        "default terminal",
+                        "change/meaningful_change need a token",
+                        "Reuse opaque tokens unchanged",
+                        "latest incremental logs",
+                        "page=true recovers forward",
+                        "Follow continuations on the same Job",
+                        "never rerun commands to observe",
+                        "Terminal is not success",
+                        "permission to replay uncertain effects",
+                    ] {
+                        assert!(description.contains(fact), "{fact}: {description}");
+                    }
+                    assert!(!description.contains("Session"));
+                    assert!(
+                        description.chars().count()
+                            <= crate::mcp::discovery::TOOL_DESCRIPTION_MAX_CHARS
+                    );
+                    continue;
+                } else if name == "observe_jobs" {
+                    assert_eq!(
+                        tool["inputSchema"]["properties"]["wake_on"]["default"],
+                        "meaningful_change"
+                    );
+                    assert_eq!(
+                        tool["inputSchema"]["properties"]["summary_only"]["default"],
+                        true
+                    );
+                    format!(
+                        "{canonical} MCP defaults: wake_on=meaningful_change, summary_only=true."
+                    )
+                } else {
+                    canonical.to_owned()
+                };
+                assert!(
+                    expected.chars().count() <= crate::mcp::discovery::TOOL_DESCRIPTION_MAX_CHARS,
+                    "{name}"
+                );
+                assert_eq!(tool["description"], expected, "{name}");
+            }
+        }
+    }
+    let process = webcodex_tool_contracts::lookup_tool_definition("run_process")
+        .unwrap()
+        .model_spec
+        .unwrap()
+        .description;
+    assert!(process.contains(
+        "stdin pipe via keyed write_job_input, no PTY/SSH/initial stdin/structured validation evidence"
+    ));
+    let detached = webcodex_tool_contracts::lookup_tool_definition("run_detached_process")
+        .unwrap()
+        .model_spec
+        .unwrap()
+        .description;
+    for boundary in [
+        "supervisor-owned",
+        "before payload start",
+        "identity and lifetime fence",
+        "expired keys never authorize retry",
+        "outcome_unknown never authorizes redispatch",
+        "No shell, script or SSH fallback",
+    ] {
+        assert!(detached.contains(boundary), "{boundary}");
+    }
+    let asynchronous = webcodex_tool_contracts::lookup_tool_definition("run_job")
+        .unwrap()
+        .model_spec
+        .unwrap()
+        .description;
+    for boundary in [
+        "stable job_id, including while queued",
+        "same execution when pending",
+        "Runner replacement does not inherit",
+        "Pending or outcome_unknown",
+        "never redispatch",
+    ] {
+        assert!(asynchronous.contains(boundary), "{boundary}");
+    }
+}
+
+#[test]
 fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
     use crate::mcp::discovery::{
         bound_description, compact_tool, INPUT_DESCRIPTION_MAX_CHARS, TOOL_DESCRIPTION_MAX_CHARS,
@@ -2542,17 +2708,18 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
         (
             "project_build",
             vec![
-                "Build Rust/Go/Python/Node via Runner argv",
+                "Build Rust/Go/Python/Node",
                 "no installs",
-                "Rust/Go: packages/all_packages, locked",
-                "Rust dependency_resolution_policy=offline adds Cargo --offline",
+                "profile/targets/artifact_policy=observe",
+                "no creation/correctness/freshness proof",
+                "scope.exclude_packages",
+                "all_packages=true",
+                "project_workspace_exclusions_v1",
+                "dependency_resolution_policy=offline",
                 "not OS sandbox",
-                "others reject",
-                "Python: pyproject.toml, -m build --no-isolation; no scope",
-                "Node: declared script; no scope/policy; hooks may write/network",
-                "Artifacts don't prove correctness",
-                "same durable Job",
-                "observe_jobs, never retry/redispatch",
+                "Other scope/policy: read_tool_manifest",
+                "Scripts may write/network",
+                "Pending same Job: observe_jobs, never retry/redispatch",
             ],
         ),
         (
@@ -2560,11 +2727,14 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
             vec![
                 "Validate Rust/Go/Python/Node",
                 "no installs",
-                "Only structured evidence proves counts",
-                "Vitest/Jest require project_validation_node_json_v1",
-                "Scripts may write/use network",
-                "same Job; observe_jobs, never retry",
-                "Scope/filter/policy: read_tool_manifest",
+                "scope.exclude_packages",
+                "all_packages=true",
+                "project_workspace_exclusions_v1",
+                "Structured evidence proves counts",
+                "Vitest/Jest need project_validation_node_json_v1",
+                "Scripts may write/network",
+                "Pending same Job; observe_jobs, never retry",
+                "Other scope/filter/policy: read_tool_manifest",
             ],
         ),
         (
@@ -2631,7 +2801,7 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
         };
         let description = descriptor["description"].as_str().unwrap();
         if name == "project_build" {
-            assert_eq!(description, "Build Rust/Go/Python/Node via Runner argv; no installs. Rust/Go: packages/all_packages, locked. Rust dependency_resolution_policy=offline adds Cargo --offline (not OS sandbox); others reject. Python: pyproject.toml, -m build --no-isolation; no scope. Node: declared script; no scope/policy; hooks may write/network. Artifacts don't prove correctness. Pending: same durable Job; observe_jobs, never retry/redispatch.");
+            assert_eq!(description, "Build Rust/Go/Python/Node; no installs. Rust profile/targets/artifact_policy=observe: no creation/correctness/freshness proof. Rust scope.exclude_packages needs all_packages=true + project_workspace_exclusions_v1. Rust dependency_resolution_policy=offline: Cargo only, not OS sandbox. Other scope/policy: read_tool_manifest. Scripts may write/network. Pending same Job: observe_jobs, never retry/redispatch.");
             assert!(!description.contains("artifact contract"));
         }
         for phrase in phrases {
@@ -2639,9 +2809,22 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
         }
     }
     for tool in tools {
-        assert!(
-            tool["description"].as_str().unwrap().chars().count() <= TOOL_DESCRIPTION_MAX_CHARS
-        );
+        if tool["name"] == "work_on_project" {
+            let canonical = webcodex_tool_contracts::lookup_tool_definition("work_on_project")
+                .unwrap()
+                .model_spec
+                .unwrap()
+                .description;
+            assert!(tool["description"].as_str().unwrap().starts_with(canonical));
+            assert_eq!(
+                tool["description"],
+                crate::mcp::discovery::bootstrap_description(false)
+            );
+        } else {
+            assert!(
+                tool["description"].as_str().unwrap().chars().count() <= TOOL_DESCRIPTION_MAX_CHARS
+            );
+        }
     }
     assert!(description_chars(&compact) < description_chars(&full));
     let long = "Read foo.rs with v0.4.0. ".to_string() + &"Additional detail. ".repeat(100);
@@ -2749,7 +2932,7 @@ fn discovery_is_app_only(tool: &Value) -> bool {
         .is_some_and(|visibility| visibility.iter().any(|value| value == "app"))
 }
 
-fn model_visible_discovery_projection(result: &Value) -> Value {
+pub(super) fn model_visible_discovery_projection(result: &Value) -> Value {
     let tools = result["tools"]
         .as_array()
         .unwrap()
@@ -2903,6 +3086,50 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
         marginal_cost
     }
 
+    // Individual Host review requires these nine formerly lazy manifest
+    // contracts in tools/list. Charge only their measured descriptor cost;
+    // retain every existing product ceiling for the rest of the inventory.
+    // Explicit names and finite per-tool/aggregate caps prevent this allowance
+    // from silently admitting other Direct operations or unlimited schema growth.
+    fn host_review_marginal_allowance(model_tools: &[Value]) -> usize {
+        const NAMES: &[&str] = &[
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "list_agent_identities",
+            "prepare_goal_workflow",
+            "get_goal",
+            "checkpoint_goal",
+            "update_goal",
+            "bootstrap_agent_conversation",
+            "consume_agent_wake",
+        ];
+        let total = model_tools
+            .iter()
+            .filter_map(|tool| {
+                let name = tool["name"].as_str()?;
+                if !NAMES.contains(&name) {
+                    return None;
+                }
+                assert!(webcodex_tool_contracts::lookup_tool_definition(name)
+                    .unwrap()
+                    .requires_individual_host_review());
+                let cost =
+                    serde_json::to_vec(tool).unwrap().len() + usize::from(model_tools.len() > 1);
+                assert!(
+                    cost <= 8 * 1024,
+                    "{name} Host-review descriptor cost {cost} exceeds 8 KiB"
+                );
+                eprintln!("MCP_HOST_REVIEW_DESCRIPTOR {name} bytes={cost}");
+                Some(cost)
+            })
+            .sum::<usize>();
+        assert!(
+            total <= 32 * 1024,
+            "nine Host-review descriptors cost {total} exceeds 32 KiB"
+        );
+        total
+    }
+
     // Only the new Rust project_build offline input receives a marginal budget;
     // canonical/full ToolSpecs and unrelated model-facing tools keep their
     // previous ceilings. Count its compact schema key, value and delimiter.
@@ -2914,9 +3141,10 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
             return 0;
         };
         assert!(
-            tool["description"].as_str().is_some_and(
-                |description| description.contains("dependency_resolution_policy=offline")
-            ),
+            tool["description"]
+                .as_str()
+                .is_some_and(|description| description
+                    .contains("Rust dependency_resolution_policy=offline: Cargo only")),
             "compact project_build discovery must advertise offline dependency resolution"
         );
         let Some(policy) = tool.pointer("/inputSchema/properties/dependency_resolution_policy")
@@ -2931,6 +3159,95 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
             "project_build offline field cost {marginal_cost} bytes exceeds 256 byte allowance ceiling"
         );
         marginal_cost
+    }
+
+    // Charge only the three new Rust build inputs and this tool's added
+    // guidance. Keep every pre-existing surface ceiling unchanged; the explicit
+    // per-tool caps prevent this from becoming an unbounded general allowance.
+    fn project_build_rust_options_marginal_allowance(model_tools: &[Value]) -> usize {
+        let Some(tool) = model_tools
+            .iter()
+            .find(|tool| tool["name"] == "project_build")
+        else {
+            return 0;
+        };
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        let mut schema_cost = 0;
+        for field in ["profile", "targets", "artifact_policy"] {
+            let value = properties
+                .get(field)
+                .expect("Rust build input must remain discoverable");
+            schema_cost += serde_json::to_vec(field).unwrap().len()
+                + 1
+                + serde_json::to_vec(value).unwrap().len()
+                + 1;
+        }
+        assert!(
+            schema_cost <= 1280,
+            "Rust build options schema cost {schema_cost} exceeds 1280 bytes"
+        );
+        let description = tool["description"].as_str().unwrap();
+        for field in ["profile", "targets", "artifact_policy=observe"] {
+            assert!(description.contains(field));
+        }
+        let guidance_cost = description.len().saturating_sub(415);
+        assert!(
+            guidance_cost <= 256,
+            "Rust build options guidance cost {guidance_cost} exceeds 256 bytes"
+        );
+        schema_cost + guidance_cost
+    }
+
+    // Exclusion support adds one bounded scope field and its all-packages schema
+    // branch to each Rust-capable project tool. Measure that per-tool marginal
+    // descriptor cost while retaining the existing global model ceilings.
+    fn project_exclusions_schema_marginal_allowance(model_tools: &[Value]) -> usize {
+        fn has_exclusion_requirement(value: &Value) -> bool {
+            value["required"].as_array().is_some_and(|required| {
+                required
+                    .iter()
+                    .any(|name| name.as_str() == Some("exclude_packages"))
+            })
+        }
+        fn restore_pre_exclusion_schema(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    object.remove("exclude_packages");
+                    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut)
+                    {
+                        required.retain(|name| name.as_str() != Some("exclude_packages"));
+                    }
+                    for child in object.values_mut() {
+                        restore_pre_exclusion_schema(child);
+                    }
+                }
+                Value::Array(items) => {
+                    items.retain(|child| !has_exclusion_requirement(child));
+                    for child in items {
+                        restore_pre_exclusion_schema(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let old_descriptions = [
+            ("project_build", "Build Rust/Go/Python/Node via Runner argv; no installs. Rust/Go: packages/all_packages, locked. Rust dependency_resolution_policy=offline adds Cargo --offline (not OS sandbox); others reject. Python: pyproject.toml, -m build --no-isolation; no scope. Node: declared script; no scope/policy; hooks may write/network. Artifacts don't prove correctness. Pending: same durable Job; observe_jobs, never retry/redispatch."),
+            ("project_validate", "Validate Rust/Go/Python/Node; lint requires scripts.lint (no fallback); no installs. Only structured evidence proves counts. Vitest/Jest require project_validation_node_json_v1. Scripts may write/use network. Pending: same Job; observe_jobs, never retry. Scope/filter/policy: read_tool_manifest."),
+        ];
+        ["project_build", "project_validate"].into_iter().map(|name| {
+            let Some(tool) = model_tools.iter().find(|tool| tool["name"] == name) else { return 0 };
+            let mut baseline = tool["inputSchema"].clone();
+            restore_pre_exclusion_schema(&mut baseline);
+            let full_bytes = serde_json::to_vec(&tool["inputSchema"]).unwrap().len();
+            let baseline_bytes = serde_json::to_vec(&baseline).unwrap().len();
+            let schema_delta = full_bytes.saturating_sub(baseline_bytes);
+            let old = old_descriptions.iter().find(|(tool_name, _)| *tool_name == name).unwrap().1;
+            let current = tool["description"].as_str().unwrap();
+            let guidance_delta = serde_json::to_vec(current).unwrap().len().saturating_sub(serde_json::to_vec(old).unwrap().len());
+            let cost = schema_delta + guidance_delta;
+            assert!(cost <= 1024, "{name} exclusion schema/guidance marginal cost {cost} exceeds 1024 byte per-tool ceiling");
+            cost
+        }).sum()
     }
 
     // The explicit Node lint action adds a closed schema variant and provenance.
@@ -2997,12 +3314,28 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
                 } else {
                     0
                 };
+                let project_exclusions_schema_marginal_byte_budget = if compact {
+                    project_exclusions_schema_marginal_allowance(model_tools)
+                } else {
+                    0
+                };
                 let model_byte_budget = model_max_bytes
                     + NODE_LINT_SCHEMA_ALLOWANCE_BYTES
                     + if app_enabled { 4_000 } else { 0 }
                     + experimental_code_mode_byte_budget
                     + project_format_marginal_byte_budget
-                    + project_build_offline_marginal_byte_budget;
+                    + if compact {
+                        project_build_rust_options_marginal_allowance(model_tools)
+                    } else {
+                        0
+                    }
+                    + project_build_offline_marginal_byte_budget
+                    + project_exclusions_schema_marginal_byte_budget
+                    + if compact {
+                        host_review_marginal_allowance(model_tools)
+                    } else {
+                        0
+                    };
                 // Raw transport includes private App bridge descriptors and Host
                 // presentation metadata. Keep a coarse overhead ceiling so transport
                 // cannot grow silently, but do not force model guidance to pay for it.
@@ -3132,10 +3465,11 @@ async fn list_jobs_direct_descriptor_preserves_read_only_contract_and_recovery_g
             assert_eq!(input, expected);
             let description = descriptor["description"].as_str().unwrap();
             for phrase in [
-                "continue independent work",
+                "not the normal continuation step",
                 "observe_jobs",
                 "stdout/stderr",
                 "AND",
+                "do not list first or poll inventory",
             ] {
                 assert!(description.contains(phrase), "{description}");
             }
@@ -3366,6 +3700,7 @@ async fn mcp_tools_call_rejects_legacy_reserved_session_id_before_dispatch() {
         other => panic!("expected invalid-params BadRequest, got {other:?}"),
     };
     let message = value["error"]["message"].as_str().unwrap();
+    assert!(!message.contains(&session.session_id));
     assert!(message.contains("_session_id"));
     assert!(message.contains("current contract"));
     assert_eq!(value["error"]["data"]["error_kind"], "stale_tool_contract");
@@ -3398,6 +3733,7 @@ async fn mcp_read_files_ignores_inapplicable_context_ack_without_consuming_it() 
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -3425,6 +3761,7 @@ async fn mcp_read_files_ignores_inapplicable_context_ack_without_consuming_it() 
         client_id,
         runner_instance_id,
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: project_name.to_string(),
             name: Some(project_name.to_string()),
             path: "/remote/repo".to_string(),
@@ -3632,7 +3969,7 @@ async fn mcp_tools_call_rejects_legacy_session_alias_before_recording_or_dispatc
         other => panic!("expected invalid-params BadRequest, got {other:?}"),
     };
     assert!(value["error"]["message"].as_str().is_some_and(|message| {
-        message.contains("_session_id") && message.contains("current contract")
+        message.contains("_session_id") && message.contains("current contract") && !message.contains(&canonical.session_id)
     }));
     assert_eq!(value["error"]["data"]["error_kind"], "stale_tool_contract");
     assert_eq!(value["error"]["data"]["execution_state"], "not_started");
@@ -3819,6 +4156,7 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -3848,6 +4186,7 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
         "mcp-client",
         "inst",
         vec![RunnerProjectSummary {
+            registration_incarnation: None,
             id: "demo".to_string(),
             name: Some("demo".to_string()),
             path: "/tmp/mcp-demo".to_string(),
@@ -3960,6 +4299,489 @@ async fn mcp_show_changes_distinguishes_recording_session_id_from_query_session_
 }
 
 #[tokio::test]
+async fn managed_worktree_project_grant_admission_preserves_exact_and_root_authority() {
+    const GRANT: &str = "wc_pgrant_r4aaaaaaaaaaaaaa";
+    const CLIENT: &str = "r4-grant-runner";
+    const INSTANCE: &str = "inst-r4-grant";
+    const PROJECT: &str = "source-a";
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source-a");
+    let granted_root = fixture.path().join("granted");
+    let inside = granted_root.join("source-b");
+    let outside = fixture.path().join("outside");
+    for path in [&source, &inside, &outside] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let source = source.canonicalize().unwrap();
+    let granted_root = granted_root.canonicalize().unwrap();
+    let inside = inside.canonicalize().unwrap();
+    let outside = outside.canonicalize().unwrap();
+    let fingerprint = format!("wc_projroot_{}", "1".repeat(64));
+    let runtime = test_runtime();
+    let runner_auth = crate::auth::AuthContext {
+        username: Some("local-owner".into()),
+        role: Some("agent".into()),
+        token_kind: Some("agent".into()),
+        allowed_client_id: Some(CLIENT.into()),
+        project_grant_id: Some(GRANT.into()),
+        ..crate::auth::AuthContext::new(crate::auth::AuthKind::AgentToken)
+    };
+    let access = crate::runner_http::runner_access_from_auth(Some(&runner_auth)).unwrap();
+    let mut caps = RunnerCapabilities::default();
+    caps.set(
+        crate::runner_protocol::RunnerCapabilityId::ManagedWorktree,
+        true,
+    );
+    runtime
+        .runner_registry
+        .register_with_auth(
+            crate::test_support::current_runner_registration(RunnerRegisterRequest {
+                computer_session_availability: None,
+                computer_control_epoch: None,
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                client_id: CLIENT.into(),
+                runner_instance_id: INSTANCE.into(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: Some(CLIENT.into()),
+                owner: Some("local-owner".into()),
+                hostname: None,
+                host_context: None,
+                capabilities: caps,
+                policy: None,
+            }),
+            Some(&access),
+        )
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        CLIENT,
+        INSTANCE,
+        vec![RunnerProjectSummary {
+            registration_incarnation: None,
+            id: PROJECT.into(),
+            name: Some(PROJECT.into()),
+            path: source.to_string_lossy().into_owned(),
+            allow_patch: true,
+            kind: Some("repo".into()),
+            registration_source: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: Some(fingerprint.clone()),
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 1,
+            shell_profile: None,
+        }],
+    )
+    .await;
+    let auth = crate::auth::AuthContext {
+        role: Some("project".into()),
+        scopes: crate::auth::PROJECT_SHARE_OAUTH_SCOPES
+            .iter()
+            .map(|scope| (*scope).into())
+            .collect(),
+        token_kind: Some(crate::auth::PROJECT_SHARE_OAUTH_TOKEN_KIND.into()),
+        allowed_client_id: Some("project-share-oauth-client".into()),
+        project_grant_id: Some(GRANT.into()),
+        project_root_scopes: vec![granted_root.clone()],
+        ..crate::auth::AuthContext::new(crate::auth::AuthKind::OAuth2Token)
+    };
+
+    for (path, expected_roots) in [(&source, false), (&inside, true)] {
+        let call = runtime.prepare_managed_worktree(
+            CLIENT.into(),
+            path.to_string_lossy().into_owned(),
+            None,
+            "r4-operation".into(),
+            None,
+            Some(PROJECT.into()),
+            Some(fingerprint.clone()),
+            Some(&auth),
+        );
+        tokio::pin!(call);
+        let request = tokio::select! {
+            result = &mut call => panic!("authorized path must dispatch to Runner: {result:?}"),
+            request = wait_for_mcp_agent_request(&runtime.runner_registry, CLIENT, INSTANCE, "managed worktree") => request,
+        };
+        assert_eq!(request.kind, "prepare_managed_worktree");
+        let payload: Value = serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["path"], path.to_string_lossy().as_ref());
+        assert_eq!(payload["expected_source_project_id"], PROJECT);
+        assert_eq!(payload["expected_source_root_fingerprint"], fingerprint);
+        if expected_roots {
+            assert_eq!(
+                payload["project_root_scopes"],
+                json!([granted_root.to_string_lossy()])
+            );
+        } else {
+            assert!(payload.get("project_root_scopes").is_none(), "{payload}");
+        }
+        runtime
+            .runner_registry
+            .complete(RunnerResultRequest {
+                client_id: CLIENT.into(),
+                runner_instance_id: INSTANCE.into(),
+                request_id: request.request_id,
+                exit_code: Some(0),
+                stdout: Some(
+                    json!({
+                        "outcome": "managed_worktree_created",
+                        "registered": true,
+                        "agent_project_id": "managed-1",
+                        "path": "/tmp/worktree",
+                        "name": "managed-1",
+                        "allow_patch": true,
+                        "disabled": false,
+                        "kind": "repo",
+                        "registration_source": "managed_worktree",
+                        "description": "",
+                    })
+                    .to_string(),
+                ),
+                stderr: Some(String::new()),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: Some(1),
+                error: None,
+            })
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut call)
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+    }
+    let denied = runtime
+        .prepare_managed_worktree(
+            CLIENT.into(),
+            outside.to_string_lossy().into_owned(),
+            None,
+            "r4-denied".into(),
+            None,
+            None,
+            None,
+            Some(&auth),
+        )
+        .await;
+    assert!(!denied.success);
+    assert_eq!(denied.output["error_kind"], "project_registry_scope_denied");
+    assert!(runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: CLIENT.into(),
+            runner_instance_id: INSTANCE.into(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    // The Runner republishes root_fingerprint=None while its project directory
+    // is temporarily unresolvable. An exact-path authorized source then has
+    // neither grant roots nor a usable identity anchor, so the request must
+    // fail closed on the existing Reobserve contract instead of going out
+    // unanchored.
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        CLIENT,
+        INSTANCE,
+        vec![RunnerProjectSummary {
+            registration_incarnation: None,
+            id: PROJECT.into(),
+            name: Some(PROJECT.into()),
+            path: source.to_string_lossy().into_owned(),
+            allow_patch: true,
+            kind: Some("repo".into()),
+            registration_source: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: None,
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 1,
+            shell_profile: None,
+        }],
+    )
+    .await;
+    let unanchored = runtime
+        .prepare_managed_worktree(
+            CLIENT.into(),
+            source.to_string_lossy().into_owned(),
+            None,
+            "r5-unanchored".into(),
+            None,
+            None,
+            None,
+            Some(&auth),
+        )
+        .await;
+    assert!(!unanchored.success, "{unanchored:?}");
+    assert_eq!(
+        unanchored.output["error_kind"],
+        "managed_worktree_source_identity_unavailable"
+    );
+    assert_eq!(unanchored.output["state_changed"], false);
+    assert!(runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: CLIENT.into(),
+            runner_instance_id: INSTANCE.into(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    // An ordinary non-project-scoped credential (the Runner's own AgentToken:
+    // a transport credential, not a model subject) never hits the exact-path
+    // fence and carries no grant roots. Its fresh managed-worktree request
+    // without expected identity keeps the pre-existing dispatch behavior —
+    // the Runner resolves the source identity itself.
+    let ordinary = runtime.prepare_managed_worktree(
+        CLIENT.into(),
+        source.to_string_lossy().into_owned(),
+        None,
+        "r6-ordinary".into(),
+        None,
+        None,
+        None,
+        Some(&runner_auth),
+    );
+    tokio::pin!(ordinary);
+    let request = tokio::select! {
+        result = &mut ordinary => {
+            panic!("ordinary credential must keep dispatching without identity: {result:?}")
+        }
+        request = wait_for_mcp_agent_request(&runtime.runner_registry, CLIENT, INSTANCE, "managed worktree") => request,
+    };
+    let payload: Value = serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
+    assert!(
+        payload.get("expected_source_project_id").is_none(),
+        "{payload}"
+    );
+    assert!(
+        payload.get("expected_source_root_fingerprint").is_none(),
+        "{payload}"
+    );
+    assert!(payload.get("project_root_scopes").is_none(), "{payload}");
+    runtime
+        .runner_registry
+        .complete(RunnerResultRequest {
+            client_id: CLIENT.into(),
+            runner_instance_id: INSTANCE.into(),
+            request_id: request.request_id,
+            exit_code: Some(0),
+            stdout: Some(
+                json!({
+                    "outcome": "managed_worktree_created",
+                    "registered": true,
+                    "agent_project_id": "managed-1",
+                    "path": "/tmp/worktree",
+                    "name": "managed-1",
+                    "allow_patch": true,
+                    "disabled": false,
+                    "kind": "repo",
+                    "registration_source": "managed_worktree",
+                    "description": "",
+                })
+                .to_string(),
+            ),
+            stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut ordinary)
+        .await
+        .unwrap();
+    assert!(result.success, "{result:?}");
+
+    // A caller-supplied complete identity keeps precedence over the missing
+    // inventory fingerprint: the request goes out anchored by that identity
+    // (the Runner revalidates it) and without grant roots.
+    let anchored = runtime.prepare_managed_worktree(
+        CLIENT.into(),
+        source.to_string_lossy().into_owned(),
+        None,
+        "r5-caller-anchored".into(),
+        None,
+        Some(PROJECT.into()),
+        Some(fingerprint.clone()),
+        Some(&auth),
+    );
+    tokio::pin!(anchored);
+    let request = tokio::select! {
+        result = &mut anchored => {
+            panic!("caller-anchored identity must still dispatch to Runner: {result:?}")
+        }
+        request = wait_for_mcp_agent_request(&runtime.runner_registry, CLIENT, INSTANCE, "managed worktree") => request,
+    };
+    let payload: Value = serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
+    assert_eq!(payload["expected_source_project_id"], PROJECT);
+    assert_eq!(payload["expected_source_root_fingerprint"], fingerprint);
+    assert!(payload.get("project_root_scopes").is_none(), "{payload}");
+    runtime
+        .runner_registry
+        .complete(RunnerResultRequest {
+            client_id: CLIENT.into(),
+            runner_instance_id: INSTANCE.into(),
+            request_id: request.request_id,
+            exit_code: Some(0),
+            stdout: Some(
+                json!({
+                    "outcome": "managed_worktree_created",
+                    "registered": true,
+                    "agent_project_id": "managed-1",
+                    "path": "/tmp/worktree",
+                    "name": "managed-1",
+                    "allow_patch": true,
+                    "disabled": false,
+                    "kind": "repo",
+                    "registration_source": "managed_worktree",
+                    "description": "",
+                })
+                .to_string(),
+            ),
+            stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut anchored)
+        .await
+        .unwrap();
+    assert!(result.success, "{result:?}");
+}
+
+#[tokio::test]
+async fn project_share_root_scope_admits_new_directories_without_weakening_other_credentials() {
+    const GRANT_A: &str = "wc_pgrant_rootsaaaaaaaaaaaa";
+    const CLIENT_A: &str = "project-roots-runner";
+    const INSTANCE_A: &str = "inst-project-roots";
+
+    let base =
+        std::env::temp_dir().join(format!("wc-share-roots-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(base.join("fresh-dir")).expect("fixture directories");
+    let sibling = format!("{}-extra", base.display());
+    std::fs::create_dir_all(&sibling).expect("sibling fixture");
+    let root_canonical = base.canonicalize().expect("canonical fixture root");
+
+    let runtime = test_runtime();
+    let runner_auth = crate::auth::AuthContext {
+        username: Some("local-owner".to_string()),
+        role: Some("agent".to_string()),
+        token_kind: Some("agent".to_string()),
+        allowed_client_id: Some(CLIENT_A.to_string()),
+        project_grant_id: Some(GRANT_A.to_string()),
+        ..crate::auth::AuthContext::new(crate::auth::AuthKind::AgentToken)
+    };
+    let access = crate::runner_http::runner_access_from_auth(Some(&runner_auth)).unwrap();
+    runtime
+        .runner_registry
+        .register_with_auth(
+            crate::test_support::current_runner_registration(RunnerRegisterRequest {
+                computer_session_availability: None,
+                computer_control_epoch: None,
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                client_id: CLIENT_A.to_string(),
+                runner_instance_id: INSTANCE_A.to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: Some(CLIENT_A.to_string()),
+                owner: Some("local-owner".to_string()),
+                hostname: None,
+                host_context: None,
+                capabilities: RunnerCapabilities::default(),
+                policy: None,
+            }),
+            Some(&access),
+        )
+        .await
+        .unwrap();
+
+    let share_oauth = crate::auth::AuthContext {
+        role: Some("project".to_string()),
+        scopes: crate::auth::PROJECT_SHARE_OAUTH_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect(),
+        token_kind: Some(crate::auth::PROJECT_SHARE_OAUTH_TOKEN_KIND.to_string()),
+        allowed_client_id: Some("project-share-oauth-client".to_string()),
+        project_grant_id: Some(GRANT_A.to_string()),
+        project_root_scopes: vec![root_canonical.clone()],
+        ..crate::auth::AuthContext::new(crate::auth::AuthKind::OAuth2Token)
+    };
+    assert!(share_oauth.is_oauth_project_subject());
+
+    // Inside the granted root, an unregistered directory opens the on-demand
+    // path instead of denying: the fence returns None and the caller proceeds
+    // to the ordinary idempotent project-op.
+    let admitted = runtime
+        .project_scoped_visible_project_for_exact_path(
+            CLIENT_A,
+            &base.join("fresh-dir").to_string_lossy(),
+            Some(&share_oauth),
+        )
+        .await
+        .expect("in-root path must not be scope-denied");
+    assert!(admitted.is_none(), "no registration exists yet");
+
+    // Outside the granted root the fence stays closed.
+    let outside = runtime
+        .project_scoped_visible_project_for_exact_path(CLIENT_A, &sibling, Some(&share_oauth))
+        .await;
+    assert!(outside.is_err(), "prefix sibling must stay denied");
+    let parent = runtime
+        .project_scoped_visible_project_for_exact_path(
+            CLIENT_A,
+            root_canonical.parent().unwrap().to_str().unwrap(),
+            Some(&share_oauth),
+        )
+        .await;
+    assert!(parent.is_err(), "root parent must stay denied");
+
+    // A project credential (non-OAuth share subject) never inherits the grant:
+    // its root scope list is empty by construction, so the same path denies.
+    let project_credential = crate::auth::shared_key::project_credential_context(GRANT_A);
+    let denied = runtime
+        .project_scoped_visible_project_for_exact_path(
+            CLIENT_A,
+            &base.join("fresh-dir").to_string_lossy(),
+            Some(&project_credential),
+        )
+        .await;
+    assert!(
+        denied.is_err(),
+        "project credential must not inherit the parent-root grant"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+    std::fs::remove_dir_all(&sibling).ok();
+}
+
+#[tokio::test]
 async fn project_grant_authority_is_identical_for_project_credential_and_share_oauth_across_direct_and_gateway(
 ) {
     const GRANT_A: &str = "wc_pgrant_aaaaaaaaaaaaaaaa";
@@ -3984,6 +4806,7 @@ async fn project_grant_authority_is_identical_for_project_credential_and_share_o
     let registration = |client_id: &str, instance_id: &str| {
         crate::test_support::current_runner_registration(RunnerRegisterRequest {
             computer_session_availability: None,
+            computer_control_epoch: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -4002,6 +4825,7 @@ async fn project_grant_authority_is_identical_for_project_credential_and_share_o
         })
     };
     let project = |id: &str, path: &str| RunnerProjectSummary {
+        registration_incarnation: None,
         id: id.to_string(),
         name: Some(id.to_string()),
         path: path.to_string(),
@@ -4362,7 +5186,7 @@ async fn mcp_tools_call_unknown_tool_is_bad_request() {
 }
 
 #[tokio::test]
-async fn mcp_2026_control_sidecars_gateway_strip_and_closed_schema() {
+async fn mcp_2026_control_sidecars_require_reviewed_operations_and_keep_closed_schema() {
     let temp = tempfile::tempdir().unwrap();
     let db =
         std::sync::Arc::new(crate::db::Database::open(&temp.path().join("sidecars.db")).unwrap());
@@ -4388,8 +5212,8 @@ async fn mcp_2026_control_sidecars_gateway_strip_and_closed_schema() {
         "summary": "already inspected", "idempotency_key": "checkpoint"
     }}});
     let mut arguments = json!({
-        "tool": "get_goal",
-        "arguments": {"goal_id": goal_id},
+        "tool": "list_projects",
+        "arguments": {},
         "_wc": {"control": control.clone()}
     });
     let outcome = handle_mcp_request(
@@ -4402,18 +5226,23 @@ async fn mcp_2026_control_sidecars_gateway_strip_and_closed_schema() {
         None,
     )
     .await;
-    let McpOutcome::Ok(value) = outcome else {
-        panic!("expected structured success")
+    let McpOutcome::BadRequest(value) = outcome else {
+        panic!("review-required Goal mutation must use its own callable")
     };
-    let result = &value["result"]["structuredContent"];
-    assert_eq!(result["success"], true, "{value}");
-    assert_eq!(result["output"]["goal"]["summary"]["revision"], 2);
-    assert_eq!(result["output"]["control"]["before"]["replayed"], false);
-    assert_eq!(result["output"]["control"]["before"]["revision"], 2);
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("direct_host_review_required: 'checkpoint_goal'"));
+    assert_eq!(
+        runtime
+            .get_goal(None, goal_id.as_str().unwrap().to_string())
+            .output["goal"]["summary"]["revision"],
+        1
+    );
 
     arguments = json!({
-        "tool": "get_goal",
-        "arguments": {"goal_id": goal_id, "_wc": {"control": control.clone()}}
+        "tool": "list_projects",
+        "arguments": {"_wc": {"control": control.clone()}}
     });
     let rejected_inner = handle_mcp_request(
         &runtime,
@@ -4439,8 +5268,8 @@ async fn mcp_2026_control_sidecars_gateway_strip_and_closed_schema() {
             "tools/call",
             Some(json!(603)),
             mcp_2026_params(json!({"name": "call_runtime_tool", "arguments": {
-                "tool": "get_goal",
-                "arguments": {"goal_id": goal_id},
+                "tool": "list_projects",
+                "arguments": {},
                 "_wc": {"control": {"before": {"unknown_private_value": {}}}}
             }})),
         ),
@@ -4472,33 +5301,15 @@ async fn mcp_2026_control_sidecars_gateway_strip_and_closed_schema() {
     );
 }
 
-#[test]
-fn compact_bootstrap_description_teaches_explicit_context_and_reuse() {
-    use crate::mcp::discovery::compact_tool;
-    let mut tool = json!({"name": "work_on_project", "description": "placeholder", "inputSchema": {"properties":{"_wc":{}}}});
-    compact_tool(&mut tool);
-    let description = tool["description"].as_str().unwrap();
-    for phrase in [
-        "_wc.context=[\"project.instructions\",\"webcodex.workflow\"]",
-        "project.instructions includes AGENTS.md/CLAUDE.md",
-        "Reuse complete instructions",
-        "branch/HEAD/status",
-        "semantic navigation",
-        "sufficient catalogs",
-        "stale/incomplete",
-    ] {
-        assert!(
-            description.contains(phrase),
-            "missing {phrase}: {description}"
-        );
-    }
-    assert!(!description.contains("Defaults return"));
-    assert!(!description.contains("context_request"));
-}
-
 #[tokio::test]
-async fn compact_bootstrap_guidance_matches_advertised_context_capability() {
+async fn compact_bootstrap_reuses_canonical_description_with_request_local_context_schema() {
     let runtime = test_runtime_with_mcp_settings(true, false);
+    let canonical = webcodex_tool_contracts::lookup_tool_definition("work_on_project")
+        .unwrap()
+        .model_spec
+        .unwrap()
+        .description;
+    let schema = webcodex_tool_contracts::input_schema_for_tool("work_on_project");
     for modern in [false, true] {
         let params = if modern {
             mcp_2026_params(json!({}))
@@ -4516,29 +5327,38 @@ async fn compact_bootstrap_guidance_matches_advertised_context_capability() {
             .iter()
             .find(|tool| tool["name"] == "work_on_project")
             .unwrap();
-        assert_eq!(
-            tool.pointer("/inputSchema/properties/_wc").is_some(),
-            modern
-        );
-        let description = tool["description"].as_str().unwrap();
-        assert!(description.contains(if modern {
-            "File/data/diagnostic/coding work"
-        } else {
-            "file, data, diagnostic or coding work"
-        }));
-        assert!(description.contains("Git optional"));
-        assert!(description.contains("session_id"));
-        assert!(description.contains("stale/incomplete"));
-        assert_eq!(description.contains("_wc.context"), modern);
-        let extension_description = tool["inputSchema"]["properties"]["include_extension_catalog"]
-            ["description"]
-            .as_str()
-            .expect("compact extension catalog guidance");
-        assert!(extension_description.contains("Catalog true fresh/first Project"));
-        assert!(extension_description.contains("complete/sufficient retained catalog"));
+        assert!(tool.pointer("/inputSchema/properties/_wc").is_some());
         if !modern {
-            assert!(description.contains("read_files"));
+            super::cli::business_schema_without_sidecars(&tool["inputSchema"]);
         }
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.starts_with(canonical));
+        assert_eq!(
+            description,
+            crate::mcp::discovery::bootstrap_description(modern)
+        );
+        assert_eq!(description.contains("_wc.context"), modern);
+        assert_eq!(description.contains("read_files"), !modern);
+        let arguments =
+            json!({"name":"read_tool_manifest","arguments":{"tool_name":"work_on_project"}});
+        let params = if modern {
+            mcp_2026_params(arguments)
+        } else {
+            arguments
+        };
+        let McpOutcome::Ok(manifest) =
+            handle_mcp_request(&runtime, rpc("tools/call", Some(json!(8001)), params), None).await
+        else {
+            panic!("exact bootstrap Manifest");
+        };
+        assert_eq!(
+            manifest["result"]["structuredContent"]["output"]["description"],
+            description
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["include_extension_catalog"]["default"],
+            schema["properties"]["include_extension_catalog"]["default"]
+        );
     }
 }
 
@@ -4576,7 +5396,14 @@ async fn mcp_compact_general_workflow_preserves_recovery_and_business_schemas() 
             let full = lists[0].iter().find(|tool| tool["name"] == name).unwrap();
             let compact = lists[1].iter().find(|tool| tool["name"] == name).unwrap();
             let description = compact["description"].as_str().unwrap();
-            assert!(description.chars().count() <= TOOL_DESCRIPTION_MAX_CHARS);
+            if name == "work_on_project" {
+                assert_eq!(
+                    description,
+                    crate::mcp::discovery::bootstrap_description(modern)
+                );
+            } else {
+                assert!(description.chars().count() <= TOOL_DESCRIPTION_MAX_CHARS);
+            }
             assert_eq!(compact["annotations"], full["annotations"], "{name}");
             let mut schemas = [full["inputSchema"].clone(), compact["inputSchema"].clone()];
             for schema in &mut schemas {
@@ -4590,39 +5417,36 @@ async fn mcp_compact_general_workflow_preserves_recovery_and_business_schemas() 
                 for phrase in [
                     "literal argv",
                     "shell grammar",
-                    "same Job",
+                    "returned Job",
                     "continuation",
-                    "never redispatch",
-                    "independent work",
-                    "when blocked",
-                    "wait_for_job_readiness",
-                    "observe_jobs",
-                    "failures",
-                    "outcome_unknown requires observation.",
+                    "Never redispatch",
+                    "observe_jobs for Job recovery",
+                    "outcome_unknown",
+                    "replacement cannot inherit",
                 ] {
                     assert!(description.contains(phrase), "{name}: missing {phrase}");
                 }
-                assert!(description.ends_with("outcome_unknown requires observation."));
+                assert_eq!(description, full["description"].as_str().unwrap());
             }
             if name == "edit_project_files" {
                 for phrase in [
                     "one change per file",
                     "expected_read_revision",
-                    "fail closed on ambiguity",
-                    "1-based inclusive",
-                    "from that snapshot",
-                    "preflight transactionally",
+                    "can omit revision",
+                    "write/delete/rename",
+                    "positional/bulk",
+                    "reject stale",
+                    "preflight",
                     "Runner rechecks source",
+                    "Ambiguity fails closed",
                     "read_files recovery",
-                    "outcome_unknown: observe before another write",
-                    "task-appropriate validation.",
+                    "Unknown effects: inspect before writing",
                 ] {
                     assert!(
                         description.contains(phrase),
                         "missing {phrase}: {description}"
                     );
                 }
-                assert!(description.ends_with("task-appropriate validation."));
             }
         }
     }
@@ -4670,4 +5494,206 @@ async fn mcp_published_validation_success_sparse_schema_contract() {
             "project_validate"
         );
     }
+}
+
+#[tokio::test]
+async fn mcp_skill_safe_continuation_executes_projected_gateway_and_preserves_legacy_admission() {
+    use webcodex_workspace::file_read_range::{self, EffectiveRange};
+
+    // Drive the real MCP/kernel path; only the Runner's bounded file I/O is a fixture.
+    async fn call_with_skill_runner(runtime: &ToolRuntime, params: Value) -> Value {
+        let call = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
+                auth.is_bootstrap = true;
+                handle_mcp_request(
+                    &runtime,
+                    rpc("tools/call", Some(json!(9120)), params),
+                    Some(&auth),
+                )
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !call.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "MCP Skill fixture timed out"
+            );
+            let request = runtime
+                .runner_registry
+                .poll(RunnerPollRequest {
+                    client_id: "mcp-skill-pages".to_string(),
+                    runner_instance_id: "inst".to_string(),
+                })
+                .await
+                .unwrap();
+            let Some(request) = request else {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                continue;
+            };
+            let stdout = match request.kind.as_str() {
+                "file_skill_list_packages" => json!({
+                    "format": "webcodex.skill_package_list.v1", "entries": [{"name": "paged", "kind": "dir"}], "truncated": false,
+                }),
+                "file_skill_read_file" => {
+                    let path = std::path::Path::new(request.cwd.as_deref().unwrap())
+                        .join(request.path.as_deref().unwrap());
+                    let start = request.start_line.unwrap();
+                    let limit = request.end_line.unwrap() - start + 1;
+                    let read = file_read_range::read_range_with_budget(
+                        &path,
+                        EffectiveRange::new(Some(start), Some(limit)),
+                        request.max_bytes.unwrap(),
+                    )
+                    .unwrap();
+                    json!({
+                        "format": "webcodex.skill_file_read.v1", "content": read.content, "sha256": read.sha256,
+                        "file_bytes": std::fs::metadata(&path).unwrap().len(), "total_lines": read.total_lines,
+                        "start_line": read.start_line, "limit": read.limit, "returned_lines": read.returned_lines,
+                        "end_line": read.end_line, "has_more": read.has_more, "next_start_line": read.next_start_line,
+                    })
+                }
+                other => panic!("unexpected MCP Skill Runner operation: {other}"),
+            };
+            runtime
+                .runner_registry
+                .complete(RunnerResultRequest {
+                    client_id: "mcp-skill-pages".to_string(),
+                    runner_instance_id: "inst".to_string(),
+                    request_id: request.request_id,
+                    exit_code: Some(0),
+                    stdout: Some(stdout.to_string()),
+                    stderr: Some(String::new()),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    duration_ms: Some(1),
+                    error: None,
+                })
+                .await
+                .unwrap();
+        }
+        let outcome = call.await.unwrap();
+        let McpOutcome::Ok(value) = outcome else {
+            panic!("MCP Skill call failed: {outcome:?}");
+        };
+        assert_eq!(value["result"]["isError"], false, "{value}");
+        value["result"]["structuredContent"]["output"].clone()
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join(".agents/skills/paged");
+    std::fs::create_dir_all(&directory).unwrap();
+    let definition = format!(
+        "---\nname: paged\ndescription: Paged MCP guidance\n---\n{}",
+        (0..405)
+            .map(|n| format!("guidance-{n}\n"))
+            .collect::<String>()
+    );
+    std::fs::write(directory.join("SKILL.md"), &definition).unwrap();
+    let runtime = test_runtime_with_mcp_settings(false, false);
+    runtime
+        .runner_registry
+        .register(crate::test_support::runner_registration(
+            "mcp-skill-pages",
+            "inst",
+            RunnerCapabilities {
+                file_read: true,
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "mcp-skill-pages",
+        "inst",
+        vec![serde_json::from_value::<RunnerProjectSummary>(
+            json!({"id": "demo", "path": root.path(), "updated_at": 1}),
+        )
+        .unwrap()],
+    )
+    .await;
+    let project = crate::tool_runtime::runner_project_runtime_id("mcp-skill-pages", "demo");
+    for modern in [false, true] {
+        let params = if modern {
+            mcp_2026_params(json!({}))
+        } else {
+            json!({})
+        };
+        let outcome =
+            handle_mcp_request(&runtime, rpc("tools/list", Some(json!(9119)), params), None).await;
+        let McpOutcome::Ok(value) = outcome else {
+            panic!("Skill discovery failed: {outcome:?}");
+        };
+        let schema = &value["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "load_skill")
+            .unwrap()["outputSchema"];
+        let serialized = schema.to_string();
+        assert_eq!(serialized.contains("\"suggested_call\""), modern);
+        if modern {
+            assert!(serialized.contains("\"const\":\"call_runtime_tool\""));
+            assert!(serialized.contains("\"const\":\"read_skill_file\""));
+        }
+    }
+    let load = json!({"name": "load_skill", "arguments": {"project": project, "name": "paged"}});
+    let first = call_with_skill_runner(&runtime, mcp_2026_params(load.clone())).await;
+    let suggested = &first["suggested_call"];
+    assert_eq!(suggested["tool"], "call_runtime_tool");
+    assert_eq!(suggested["follow_up_kind"], "mechanically_followable");
+    assert_eq!(suggested["arguments"]["tool"], "read_skill_file");
+    let inner = &suggested["arguments"]["arguments"];
+    assert_eq!(
+        inner,
+        &json!({
+            "project": project, "skill_id": first["skill_id"], "path": "SKILL.md", "start_line": 401, "limit": 400,
+            "expected_definition_revision": first["definition_revision"], "expected_resource_sha256": first["sha256"],
+        })
+    );
+    let last = call_with_skill_runner(
+        &runtime,
+        mcp_2026_params(json!({"name": suggested["tool"], "arguments": suggested["arguments"]})),
+    )
+    .await;
+    assert_eq!(last["has_more"], false);
+    assert!(last.get("suggested_call").is_none());
+    assert_eq!(last["sha256"], first["sha256"]);
+    assert_eq!(
+        format!(
+            "{}\n{}",
+            first["text"].as_str().unwrap(),
+            last["text"].as_str().unwrap()
+        ),
+        definition.trim_end_matches('\n')
+    );
+
+    let legacy = call_with_skill_runner(&runtime, load).await;
+    assert_eq!(legacy["has_more"], true);
+    assert!(legacy.get("suggested_call").is_none());
+    let denied = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(9121)),
+            json!({
+                "name": suggested["tool"], "arguments": suggested["arguments"],
+            }),
+        ),
+        None,
+    )
+    .await;
+    let McpOutcome::Ok(denied) = denied else {
+        panic!("expected structured legacy gateway denial: {denied:?}");
+    };
+    assert_eq!(denied["result"]["isError"], true);
+    let rejection = &denied["result"]["structuredContent"];
+    assert_eq!(rejection["success"], false);
+    assert_eq!(rejection["output"]["error_kind"], "unknown_tool");
+    assert_eq!(rejection["output"]["execution_state"], "not_started");
+    assert_eq!(rejection["output"]["state_changed"], false);
+    assert!(rejection["output"].get("text").is_none());
 }

@@ -4,15 +4,17 @@ WebCodex uses the word **session** for two independent systems. They share
 casual vocabulary only. They must not be merged, cross-wired, or inferred from
 each other.
 
-The default durable event tail retains up to 2,000 events per Session, while
-one model-facing summary remains capped at 200 events (50 by default). These are
-independent bounds: longer forensic/recovery retention does not enlarge one model
-response, and the ledger remains a bounded tail rather than an archive. If
-`retention_truncated` is true, event-derived summary counts describe the retained
-ledger rather than claiming lifetime-complete history.
+Workflow Session events and messages are stored incrementally in SQLite, with
+no automatic count-based history expiry. A Session materialization loads at
+most 2,000 recent events, while a model-facing summary remains capped at 200
+events (50 by default). These limits bound reads and working memory, not durable
+history. `events_truncated` indicates a partial projection; `retention_truncated`
+identifies actual missing history, including truncation before migration. Neither
+flag authorizes replay of effects.
+
 Executable constraints that agents must obey live in
 [`AGENTS.md`](../../AGENTS.md); this document is the Workflow Sessions domain
-source linked from §6. Standing architecture summary:
+source linked from §5. Standing architecture summary:
 [`architecture-decisions.md`](architecture-decisions.md) §1.
 
 ---
@@ -21,7 +23,7 @@ source linked from §6. Standing architecture summary:
 
 | Formal name | Casual aliases (avoid in design) | Implementation home |
 |---|---|---|
-| **Workflow Session** | coding session, tool ledger session, `wc_sess_*` session | `tool_runtime::sessions` |
+| **Workflow Session** | coding session, tool ledger session, `wc_sess_*` session | `webcodex-workflow-session` owns the domain/store; `tool_runtime::sessions` adapts runtime calls |
 | **Action Audit Session** | HTTP action session, audit session, operator action trail | Internal module `action_audit_sessions` (SQLite table still named `action_sessions` for compatibility) |
 
 When writing code, docs, or reviews, prefer the formal names above. If a
@@ -31,7 +33,63 @@ statement is true for only one kind, name that kind explicitly.
 
 ## ClientWindow is not a third session type
 
-Adapters may derive a bounded, domain-separated `ClientWindow` from host-owned window metadata such as `_meta["openai/session"]`. The raw host value is never persisted or exposed. A principal-scoped `wc_peer_*` id may be derived from the hashed Window for lightweight collaboration routing, but neither identity is a Workflow Session selector, Project authority, credential, model-context-retention proof, implicit recorder, model-turn id, or liveness proof. Stateless MCP still never treats caller-supplied `Mcp-Session-Id` as hidden continuity.
+Adapters derive a bounded, domain-separated `ClientWindow` only from explicit
+supported host/transport identity. Raw values are hashed immediately and never
+persisted or exposed as Window identity. A principal-scoped `wc_peer_*` id may be
+derived from the hashed Window for lightweight collaboration routing. Neither
+identity selects a Workflow Session or Project, grants credential authority,
+proves model-context retention or a model turn, or supplies an implicit recorder.
+
+### MCP identity selection
+
+The HTTP adapter uses one resolver for both protocol eras, before tool audit,
+live Window activity and tool dispatch. The first present supported source wins:
+
+| Priority | Source | Validation and identity |
+|---|---|---|
+| 1 | `params._meta["openai/session"]` | Preserve the existing ChatGPT v1 hash and historical trimming; the trimmed value must contain 1–256 printable ASCII bytes without spaces. |
+| 2 | `params._meta.threadId` | Exact 1–256 printable ASCII bytes without spaces or trimming; scoped to the verified authentication identity below. |
+| 3 | `X-WebCodex-Client-Window` | Exactly one header matching ASCII `[A-Za-z0-9._:-]{1,256}`, without trimming; scoped as below. |
+| 4 | Legacy `Mcp-Session-Id` | Legacy protocol only, using the existing format validation and v1 transport hash. This is not an issued-session registry check. |
+| 5 | No supported source | No Window affinity; ordinary tools remain available under their normal authority. |
+
+All supplied supported host metadata and the custom header are validated, even
+when a higher-priority source would win. An invalid/non-string supported
+metadata value or invalid/duplicate custom header rejects the request before
+tool effects, with a bounded error that does not echo the raw value. Unknown
+`_meta.windowId` and `_meta.sessionId` are not identity hints. Stateless MCP 2026
+ignores caller-supplied legacy `Mcp-Session-Id`; it never creates transport
+continuity from that header.
+
+New Codex/header keys use a separate hash domain and length-prefixed source,
+scope components and raw identity. They cannot collide with legacy ChatGPT
+keys or with each other through ambiguous component concatenation.
+
+| Verified authentication context | Scope for a new Codex/header key |
+|---|---|
+| Managed OAuth | Authenticated user ID plus OAuth client ID; access-token rotation preserves the Window key. |
+| API token | API-key ID; different credentials remain separate, including credentials of one user. |
+| Project credential or project-share OAuth | Exact ProjectGrant ID. |
+| Direct shared key or its OAuth bridge | The existing shared-key hash under one fixed shared-key scope kind. This identifies the credential, not individual holders of the same key. |
+| Anonymous, bootstrap, missing or incomplete supported identity | No Window is created; valid metadata does not reject otherwise authorized tools and does not fall back to guessed authority or a lower-priority Window source. |
+
+This stable Window scope does not change `runtime_observation_principal`.
+Peer and observation authorization retains its existing principal boundary,
+including token-scoped managed OAuth attribution. Project and Session access
+still pass their ordinary independent authorization checks.
+
+Legacy `initialize` still issues a protocol session ID when needed even if a
+higher-priority host Window wins; the issued header and the selected Window are
+separate facts. A legacy transport-only `tools/list` retains its ActionAudit
+entry without Window binding or live Window activity, avoiding discovery-only
+ghost windows. Explicit ChatGPT, Codex or custom-header `tools/list` remains
+Window liveness evidence. True legacy `tools/call` retains the transport fallback.
+
+Claude Code can supply the custom header through the optional
+`scripts/claude_window_headers.py` helper. Its Linux automatic identity describes
+a native Claude process, not an individual conversation; other platforms use an
+explicit ID. The helper integration and limits are documented separately in
+`docs/CLAUDE_WINDOW_IDENTITY.md` when that optional helper is installed.
 
 Window correlation supports ActionAudit, agent-loop observations, bounded Peer awareness/messaging, and other explicitly designed non-authority features, while ordinary coding continuity remains the canonical Workflow Session lifecycle. `work_on_project(session_id=...)` resumes only that exact authorized Session; omission creates a fresh Session. Credentials, Project ids, windows, connections, Peer ids, and prior requests never select a Workflow Session implicitly.
 
@@ -77,7 +135,7 @@ Workflow Session lifecycle is independent from the durable `wc_goal_*` Goal doma
 
 ### Storage and ownership
 
-A `session_ref` is only a short model selector. The Server owns a durable mapping scoped to the authenticated principal and pins the ref to one exact canonical Workflow Session incarnation. Resolving it produces the canonical `wc_sess_*` before business authorization/dispatch; the ordinary Project visibility, Session authority, lifecycle, and guard checks then run unchanged. The ref is not a credential, bearer capability, recorder identity, or "current/recent Session" inference. If the pinned Session disappears or its exact incarnation cannot be proven, the old ref fails closed and is never recycled or silently retargeted. When the caller's own ref still pins that exact incarnation and a retention tombstone for that canonical id is still present, resolution returns `session_retention_expired` for that canonical id and does not continue the call. A foreign, malformed, missing, incarnation-mismatched, or already-aged-out ref remains `unknown_session_ref` and is never rewritten. Canonical Session ids remain authoritative for persistence, audit, diagnostics, internal joins, and explicit API/CLI consumers.
+A `session_ref` is only a short model selector. The Server owns a durable mapping scoped to the authenticated principal and pins the ref to one exact canonical Workflow Session incarnation. Resolving it produces the canonical `wc_sess_*` before business authorization/dispatch; the ordinary Project visibility, Session authority, lifecycle, and guard checks then run unchanged. The ref is not a credential, bearer capability, recorder identity, or "current/recent Session" inference. If the pinned Session disappears or its exact incarnation cannot be proven, the old ref fails closed and is never recycled or silently retargeted. When the caller's own ref still pins that exact incarnation and a retention tombstone for that canonical id is still present, resolution returns `session_retention_expired` for that canonical id and does not continue the call. A foreign, malformed, missing, or incarnation-mismatched ref remains `unknown_session_ref` and is never rewritten. Canonical Session ids remain authoritative for persistence, audit, diagnostics, internal joins, and explicit API/CLI consumers.
 
 For exact `work_on_project` checkout resume, `session_id + instruction` is sufficient: the shared startup engine authorizes the selected Session, obtains its bound canonical Project, and runs ordinary current Project resolution/authorization and the same Session/Project, lifecycle, capability and recorder fences. An explicit Project must still match. Fresh work and managed-worktree mode require an explicit Project source. An unscoped Session cannot supply one. Neither missing/Closed/inaccessible Session state nor recorder/Window identity selects a replacement. Session refs continue to pin Session incarnation; Project refs separately pin canonical Project/root identity. This convenience does not add a historical filesystem snapshot or change either identity contract.
 
@@ -85,22 +143,37 @@ The original Window's `workflow.resume` discovery emits an optional `project_ref
 
 Model-facing `session_id` input schemas must admit `~sN` wherever the kernel accepts a Session selector, including exact resume and card presentation. Canonical-id-only input regexes would let a strict Host reject the ref before resolution. This does not widen output `session_id`, persisted IDs, or other identity domains: outputs retain canonical identity, and the separate `session_ref` field carries the selector. Unknown, malformed, foreign, or stale refs still fail in the existing resolver and authorization path. A retained Closed Session follows the same lifecycle rules as its canonical id: historical reads may succeed, but a selector never reopens it or permits a mutation denied to the canonical id.
 
-Canonical Session identity/retention is separate from in-memory residency. `Active` and `Closed` are business lifecycle states; hot/cold residency and LRU ordering never transition or delete an Active identity. The `hot_session_capacity_target` bounds expanded records using the existing access order; zero permits one mutation target. Overflow compacts older records into canonical JSON **retained in RAM**, not disk-backed paging. Exact mutations hydrate the selected Active record under the store lock. Queries materialize temporary snapshots without promoting history scans. Startup sanitizes one disk row at a time and retains Active and Closed rows Cold. Live round trips preserve instruction snapshots and replay metadata without rerunning disk-restore sanitization. This is a count-based working-set target, not a hard heap-byte limit; Cold bytes, metadata, in-flight snapshots and live instruction bodies remain allocated. See [Active Session residency](../implementation/session-active-residency.md).
+Canonical Session identity and history are separate from in-memory residency.
+Active and Closed Sessions, events and messages persist in domain tables in the
+configured SQLite `webcodex.db`, with no automatic count or idle expiry. Closing,
+cache eviction and restart never recycle a canonical id or `~sN`. Imported legacy
+tombstones preserve owner-scoped `session_retention_expired` evidence; no new
+count-based tombstones are created. Storage failures remain unavailable/uncertain,
+not permission to infer another Session.
 
-Closed historical rows use an independent bounded retention policy. Closed Sessions are coldified to compact durable JSON and remain queryable while retained; mutation remains denied and retention never reopens them. `historical_session_retention_limit` bounds retained Closed history only. When that explicit historical policy removes an old Closed row, the v2 ledger keeps a row-local `retention_tombstone` for that exact canonical id, owning principal, and incarnation fingerprint, together with an `expiry_ordinal` that stores only relative expiration order. A restored ordinal with no greater successor is compacted, before the next allocation, into a dense increasing range over the retained tombstones; canonical id, owner, and incarnation stay the same, and the oldest tombstone remains the eviction victim. Tombstones share `historical_session_retention_limit` as a separate ceiling and do not count as retained, closed, hot, or cold Sessions. A later lookup by the owning principal returns `session_retention_expired` and does not reopen the Session. Any other principal receives `unknown_session_id`, the same result as an id that was never present. After a tombstone ages out, that id is no longer distinguishable from one that was never present. Active Sessions are never removed or tombstoned to satisfy hot capacity. An older v2 reader ignores tombstone rows and keeps Session rows. The compatibility `max_sessions` status field now aliases the hot capacity target and must not be interpreted as permission to delete durable Active Sessions.
+Current state and history use separate rows. A mutation writes only dirty Session
+state and event/message deltas in one SQLite WAL transaction. The dedicated writer
+coalesces ordinary changes for 20 ms. Explicit generation barriers await successful
+commits asynchronously; already committed observations do not write. New Session
+success, restart-safe message delivery, completion/assignment evidence and
+observation tokens retain their durability boundaries. Cancellation does not
+rollback an accepted mutation or grant permission to replay an effect.
 
-Access recency is maintained by a store-owned ordered index with separate Closed
-eligibility; it is not business lifecycle or activity. Exact reads update that
-index without appending ledger events or scheduling a write. The background
-whole-ledger writer coalesces ordinary asynchronous dirty marks for at most a
-fixed 20 ms scheduling window from the first pending mark. Progress never resets
-that deadline. Explicit generation flushes and shutdown bypass coalescing, while
-preserving existing write ordering and persistence-error reporting. I/O can take
-longer; this is neither a fsync nor a power-loss guarantee. Ledger version 2 and
-its per-cycle full snapshot format are unchanged. Implementation evidence and
-tradeoffs: [SessionStore access and writes](../implementation/session-store-access-and-write-scheduling.md).
+Startup retains compact current-state metadata and committed revision locators.
+Reads materialize temporary records; clean expanded records use an estimated
+16 MiB cache target. Dirty state cannot be evicted to an older disk image. The
+2,000-event recent window and Console's default 100 activities are working-set
+and response limits; older event rows remain on disk. The latest task instruction
+remains current state independently of the event window. New runtime requests
+apply async backpressure when deferred changes accumulate or persistence fails.
+This is not a hard RSS ceiling: the identity index, instructions, dirty/in-flight
+state and one selected Session's full message board can add memory.
 
-Per-Session event and message tails remain independently bounded (`DEFAULT_MAX_EVENTS_PER_SESSION` and `DEFAULT_MAX_MESSAGES_PER_SESSION`); preserving a canonical Active identity does not turn its event/message history into an unbounded archive. The persistence wire shape remains ledger version 2. A retention tombstone is an additional row-local object in the same `sessions` array, not a Session row and not a new ledger version. Existing Session rows already deleted by an older Server cannot be reconstructed by upgrading: tombstones apply only to Closed rows removed after this behavior is present.
+Existing JSON-v2 history imports once with an atomic marker, preserving the source
+file and previous loss evidence. Unsupported or structurally corrupt input fails
+startup rather than publishing a partial/empty store. The original JSON stops
+receiving updates after cutover. Current storage, recovery, metrics and operational
+limits: [Session storage and residency](../implementation/session-active-residency.md).
 
 `recording_session_id` remains a separate provenance contract. It may explicitly carry the same principal-scoped `session_ref` returned for that exact Session; Runtime canonicalizes the ref before recorder authorization and durable provenance recording. This does not make recorder provenance a business Session target, and omission never selects a recorder implicitly or creates sticky recorder context.
 
@@ -156,7 +229,9 @@ Project scope is fail-closed. An explicit project-scoped business Session or rec
 The JSON ledger restores only the current version-2 top-level shape and canonical current Session rows. Pre-current ledger versions are rejected rather than migrated. Within v2, fields explicitly declared optional/default may be absent and restore conservatively. The retired `context_revision` members are accepted only through explicit read-only compatibility sinks and are never restored into live Session state or re-emitted. A `retention_tombstone` object is a recognized non-Session row in the v2 `sessions` array. A malformed tombstone drops that row only. Unknown members on a Session row still fail that row closed. A live Session row wins over a tombstone with the same canonical id. General `ClientWindow` support remains available to explicitly designed non-Workflow observations; Workflow Sessions do not use it for selection or authority.
 Optional explicit control mutations may also use the Stateless MCP 2026
 [`_wc.control` sidecar contract](control-sidecars.md). Each phase admits one mutation
-with its canonical authority and replay fences; standalone tools remain valid.
+with its canonical authority and replay fences. Operations requiring individual
+Host review must use their standalone callable; their sidecar forms are rejected
+before any effect.
 
 ### Assignment-fenced todo completion
 
@@ -217,6 +292,19 @@ and without promoting external reports into Session revision or native execution
 truth. No handoff generation or replacement model-context revision is introduced or
 returned.
 
+Internally, closeout gathers typed validation, Job, failure, and review evidence
+before producing presentation JSON. Closeout pairs a bounded Session summary
+(up to 200 events) with the existing Session fence; a display limit does not
+change the captured counts or failure actionability. Handoff retains its initial
+task snapshot while enriching validation evidence. Concurrent task corrections
+make that observation incomplete and require an explicit reread; they do not
+silently replace the captured task. `finish_coding_task`
+reuses the evidence collected by handoff instead of gathering a second Session
+and validation view. Continuation decisions use the same typed report, including
+Job-enriched validation identities and latest-observation details. Passive startup
+and WorkResult projections remain read-only and do not claim a live snapshot fence
+for historical evidence.
+
 Collaboration is independent: `ack_session_message_ids` still proves exact
 ACK-required Session/Peer message ids, while `session_attention.ack_ref` is the
 compact exact-set form carrying accepted Session ACK evidence plus messages newly
@@ -238,7 +326,7 @@ A no-token call establishes the current baseline and returns no historical messa
 
 Retention correctness does not infer continuity from deque length or position. Retained messages keep their latest internal observation revisions and the Session persists a low-watermark for removed observation history, including non-FIFO completion retention holes. `history_lost=true` tells callers when a cursor predates state that can no longer be reconstructed. With pagination, a token advances only through the last returned change while `has_more=true`. Observation-token issuance fences the ledger generation containing the cursor revision, so tokens issued by the current implementation remain valid across Server restart when the Session itself restores.
 
-`delivery_key` replay is likewise durable but bounded by message retention rather than an unbounded global idempotency ledger. While the keyed Session or Peer message remains retained, exact same-payload retries return the original `message_id` across Server restart and conflicting key reuse fails closed. Once the corresponding retained message/replay metadata is evicted by the existing bounded retention policy, that old key is no longer promised as replay authority.
+Session `delivery_key` replay persists with the message and has no automatic count expiry. Exact same-payload retries return the original `message_id` across Server restart; conflicting key reuse fails closed. Peer messages remain a distinct domain with their existing bounded retention policy; changing Session storage does not extend Peer replay authority.
 
 Waiting uses process-local notification only as a wake signal; durable revision state remains the truth. No Session-store or persistence-writer mutex is held across the bounded await, unrelated Session mutation can only cause a spurious recheck, and timeout is a successful unchanged result rather than a tool failure.
 
@@ -551,28 +639,11 @@ the authoritative Project root. Skill bodies, Plugin schemas, bindings, native
 paths, commands, environments, and provider identities are not projected; using
 a selected Plugin still requires `plugin_tool describe` before `call`.
 
-Startup selection is strict and ordered:
-
-The durable projection stores only:
-
-The canonical hash input is the principal kind/id, transport, already-hashed
-stable window identity, resolved project, and already-hashed canonical
-repository root. It uses fixed field order and length prefixes under
-`webcodex.workflow-current-binding.v1`. Raw MCP session ids, hosted
-conversation ids, cookies, credentials, authorization headers, and repository
-paths never enter this projection, and neither binding hashes nor component
-hashes are returned to the model.
-
-The binding field is an additive, serde-defaulted field in ledger version 1, so
-older ledgers load it as empty without migration and keep their existing
-Session events/messages. Restore accepts only bounded, lowercase SHA-256 keys
-that reference known active `wc_sess_*` records. Malformed, duplicate,
-conflicting, missing, closed, project-mismatched-on-lookup, and excess entries
-are discarded without rejecting valid Session data. Internal status exposes
-only bounded counts (`durable_binding_count`, `restored_binding_count`,
-`discarded_binding_count`) and never a binding key.
-
-This durable binding remains Workflow Session state and is separate from ActionAudit/window observations. It does not create a second coding-task lifecycle, and window correlation never infers or mutates a Workflow Session.
+Session selection uses the explicit selectors in `work_on_project`; a ClientWindow
+or ActionAudit correlation never silently restores a current Workflow Session.
+The retired `durable_current_bindings` ledger member is not a compatibility
+projection: strict import rejects it, as covered by
+[`current_ledger_rejects_retired_top_level_binding_member`](../../crates/webcodex-workflow-session/src/session_lifecycle_tests.rs).
 
 ### Current lifecycle contract
 
@@ -609,14 +680,15 @@ a `finish_coding_task` verdict.
   A fresh session reports
   `status = not_applicable`, `reason_code = fresh_session`.
 - **Attempt boundary:** the attempt window is segmented by the most recent
-  `task_instruction` retained in the ledger window. When that instruction has
-  been evicted by the bounded event limit, the boundary is reported as
-  `source = unavailable`, `reason_code = attempt_boundary_evicted`, and
-  `event_range.complete = false` — the projection never masquerades a truncated
-  retained window as `session_start` with `complete = true`.
+  `task_instruction`. Its current-state projection survives leaving the recent
+  event window. If intervening events are outside that window, the boundary
+  remains known but `reason_code = attempt_history_outside_window` and
+  `event_range.complete = false`. Previously imported history with no recoverable
+  instruction retains `attempt_boundary_evicted`; a partial window never becomes
+  `session_start` with `complete = true`.
 - **Exploration workset:** `attempt.exploration` projects only successful,
   structured evidence from focused `read_files`, `search_project_texts`, and
-  typed LSP navigation calls. The existing ledger retains only a bounded set
+  typed LSP navigation calls. Each event retains only a bounded set
   of validated project-relative paths; it never retains search patterns or
   previews, file contents, symbol/hover/diagnostic bodies, arbitrary result
   JSON, shell commands/output, or the absolute repository root for this
@@ -624,8 +696,8 @@ a `finish_coding_task` verdict.
   Enumeration tools such as `read_project_overview`, `list_project_files`, and
   `list_project_tracked_files`, Git diff lists, failed calls, error text, and
   shell output are not exploration evidence. The workset is segmented by the
-  same attempt boundary; when that boundary was evicted,
-  `exploration.complete = false` as well.
+  same attempt boundary; when that boundary falls outside the loaded
+  window or was lost before migration, `exploration.complete = false` as well.
 - **Continuation reuse, not execution:** automatic continuation, explicit
   resume, read-only to normal mode upgrades, and ledger restoration reuse the
   prior attempt's workset. Startup returns at most 3 paths in
@@ -650,7 +722,7 @@ a `finish_coding_task` verdict.
   `insufficient_scope_identity`, `validation_not_requested`). Count deltas are
   signed integers (a decrease in passed tests yields a negative `passed_delta`);
   zero-test success never resolves a prior test failure.
-- **Async terminal validation evidence:** structured validation Job metadata carries the same opaque `validation_target_id` as the originating validation attempt. When an authorized validation-summary or Runtime Console Session read observes a retained terminal Job, WebCodex idempotently materializes one bounded `validation_job_terminal` event in that exact Workflow Session before projecting validation state. Idempotence does not depend on that event remaining in the 200-event Session FIFO: the version-1 ledger also persists a serde-defaulted exact Job-id marker set bounded to the Runner authoritative terminal inventory limit (64), and a new materialization evicts only markers absent from the current terminal-candidate snapshot. The marker check, marker insertion, and event append commit under one Session-store mutation, so concurrent reconcilers append at most once and restart restoration keeps the same suppression identity. Terminal reconciliation also serializes authoritative candidate-snapshot acquisition through marker/event materialization within one runtime: a later snapshot cannot commit first, so an older snapshot never gains eviction authority over a marker established from newer inventory. Synthetic evidence uses the authoritative Job `finished_at`; reconciliation never advances Session activity to the wall-clock read time. This is recovery/materialization only: it never re-runs validation, never treats acceptance/handoff as terminal success, and never exposes raw Job output. A later terminal success for the same structured target can therefore resolve an older retained failure even after the acceptance event is gone; the materialized terminal evidence then follows normal Session persistence/retention across Server restart.
+- **Async terminal validation evidence:** structured validation Job metadata carries the same opaque `validation_target_id` as the originating validation attempt. When an authorized validation-summary or Runtime Console Session read observes a retained terminal Job, WebCodex idempotently materializes one bounded `validation_job_terminal` event in that exact Workflow Session before projecting validation state. Idempotence does not depend on that event remaining in the 200-event Session FIFO: the SQLite Session current-state row also persists a serde-defaulted exact Job-id marker set bounded to the Runner authoritative terminal inventory limit (64), and a new materialization evicts only markers absent from the current terminal-candidate snapshot. The marker check, marker insertion, and event append commit under one Session-store mutation, so concurrent reconcilers append at most once and restart restoration keeps the same suppression identity. Terminal reconciliation also serializes authoritative candidate-snapshot acquisition through marker/event materialization within one runtime: a later snapshot cannot commit first, so an older snapshot never gains eviction authority over a marker established from newer inventory. Synthetic evidence uses the authoritative Job `finished_at`; reconciliation never advances Session activity to the wall-clock read time. This is recovery/materialization only: it never re-runs validation, never treats acceptance/handoff as terminal success, and never exposes raw Job output. A later terminal success for the same structured target can therefore resolve an older retained failure even after the acceptance event is gone; the materialized terminal evidence then follows normal Session persistence/retention across Server restart.
 - **Cargo test-count postconditions:** a `cargo_test` caller may require a
   bounded minimum count with `require_tests` / `min_tests`. These are
   request-scoped evidence assertions: they are persisted with local and Runner
@@ -714,11 +786,11 @@ normalized to 1–20; titles are redacted and capped at 240 Unicode characters a
 the JSON output at 32 KiB. Offset pagination is not a frozen snapshot. Short refs
 remain principal-scoped selectors. The caller must explicitly choose a returned
 identity; discovery never starts, resumes, or selects recent work. Closed history
-can be read, while mutation still requires an Active Session. A retention
-tombstone is not a retained Session: `list_sessions` omits it from rows and
-totals, does not mint a `session_ref` for it, and has no expired lifecycle
-filter. Exact expired identity is visible only to a later lookup that already
-holds that canonical id or the matching principal-scoped ref.
+can be read, while mutation still requires an Active Session. An imported
+legacy-retention tombstone is not a retained Session: `list_sessions` omits it
+from rows and totals and does not mint a new `session_ref`. No new count-based
+tombstones are created. An already-expired legacy identity is visible only to
+an authorized lookup holding its canonical id or owner-scoped ref.
 
 Built-in workflow guidance instructs models to save agreed decisions and current
 progress/remaining work through explicit `post_session_message` calls at recovery
@@ -1009,7 +1081,7 @@ part of this contract.
 | Internal module | `action_audit_sessions` (crate-private; formerly the module path `action_sessions`) |
 | HTTP handlers | `audit_http` under `/api/audit/*` |
 | Persistence | SQLite tables `action_sessions` and `action_events` |
-| Related types | `ActionSessionRecord`, `ActionEventRecord`, DB helpers in `db/audit.rs` |
+| Related types | `ActionSessionRecord`, `ActionEventRecord`, DB helpers in [`webcodex-store/src/audit.rs`](../../crates/webcodex-store/src/audit.rs) |
 
 ### Lifecycle (sketch)
 
@@ -1033,7 +1105,7 @@ This lifecycle is **orthogonal** to Workflow Session start/finish tools.
 - Not a coding / workflow session
 - Not a substitute for canonical coding-startup / `work_on_project` evidence
 - Not an input to `read_session_summary`, message board, or `finish_coding_task`
-- Not automatically correlated to any `wc_sess_*`
+- Not an implicit Workflow Session selector; explicit authorized observation links do not merge lifecycles
 
 ---
 
@@ -1042,7 +1114,7 @@ This lifecycle is **orthogonal** to Workflow Session start/finish tools.
 The two systems:
 
 - Use different ID namespaces
-- Use different storage backends
+- Use independent domain stores and tables in the configured SQLite database
 - Expose different APIs (runtime tools / MCP vs `/api/audit/*`)
 - Define different open/close and failure semantics
 
@@ -1070,11 +1142,19 @@ identity rules, and blur security/guard boundaries. Keep two implementations.
 
 ---
 
-## 5. Future association (explicit only)
+## 5. Explicit observation correlation
 
-The standing optional-correlation contract is:
+The implemented Window-to-Workflow Session relation records an already authorized
+`recording` or successful `work_on_project` observation. It is many-to-many and
+supports history/navigation; it is never a Session selector, recorder, ownership
+lease, or cross-domain transaction. The same database and an explicit link do
+not make the Action Audit Session lifecycle control Workflow Session lifecycle.
+See [ClientWindow](#clientwindow-is-not-a-third-session-type) for identity selection
+and [storage and ownership](#storage-and-ownership) for recorder authorization.
 
-Until that design is implemented, code must treat the systems as unlinked.
+The typed producers are [`src/action_audit.rs`](../../src/action_audit.rs) and the
+[MCP call adapters](../../src/mcp/tools/call/specialized.rs); the Workflow Session
+store remains in its independent crate.
 
 ---
 
@@ -1100,7 +1180,7 @@ renamed without an explicit compatibility migration:
 - Table: `action_sessions`
 - Table: `action_events`
 - Index: `idx_action_sessions_status_last_event`
-- Column names and migration history in `db/schema.rs` / `db/audit.rs`
+- Column names and migration history in [`webcodex-store/src/schema.rs`](../../crates/webcodex-store/src/schema.rs) / [`audit.rs`](../../crates/webcodex-store/src/audit.rs)
 
 ### HTTP routes
 
@@ -1117,8 +1197,9 @@ renamed without an explicit compatibility migration:
   including coverage plus credential-kind/OAuth-client usage summaries
 - Workflow tool fields: `session_id`, `recording_session_id`, session mode
   values `normal` / `read_only`. A pre-0.4 persisted v2 row containing
-  `mode = "inspect"` is malformed under the current enum and is discarded
-  row-closed without reinterpreting it as `normal`.
+  `mode = "inspect"` is malformed under the current enum. The one-time legacy
+  import fails atomically; it neither drops only that row nor reinterprets it as
+  `normal`. See [`legacy_inspect_v2_row_rejects_atomic_import`](../../crates/webcodex-workflow-session/src/session_lifecycle_tests.rs).
 - Error kinds such as `unknown_session_id` and `session_retention_expired`
 
 ### MCP and Runtime API tool surface
@@ -1134,7 +1215,7 @@ renamed without an explicit compatibility migration:
 | Layer | Current clarity practice |
 |---|---|
 | Docs / design | Prefer **Workflow Session** and **Action Audit Session** |
-| Rust module path | `tool_runtime::sessions` vs `action_audit_sessions` |
+| Rust ownership | `webcodex-workflow-session` plus the `tool_runtime::sessions` adapter, versus `action_audit_sessions` plus `webcodex-store` audit persistence |
 | SQLite / HTTP / JSON | Keep existing `action_sessions` / `session_id` names for compatibility |
 
 Renaming a **crate-private** module path does not change wire contracts.
@@ -1143,6 +1224,23 @@ Renaming tables, routes, or serialized field names does.
 ---
 
 ## 8. Quick decision guide
+
+| Need | Owning domain and operation | What it does not establish |
+| --- | --- | --- |
+| Recover saved instructions, decisions and validation | Exact Workflow Session; `read_session_handoff`, then explicit `work_on_project(session_id, instruction)` | Current source validity or permission to repeat uncertain effects |
+| Inspect an HTTP/MCP activity trail | Action Audit and authorized Window activity reads | A business Session or recorder |
+| Correlate activity from one supported Host window | Adapter-derived `ClientWindow` | A model turn, retained model context, Project authority or a worker lease |
+| Learn whether an accepted command finished | Same Job; `observe_jobs` | A new execution or proof that a failed transport never dispatched |
+| Continue durable Agent work | Exact Agent/Endpoint/Wake or TaskAttempt contract | Inherited Workflow Session, Runner or filesystem access |
+
+Implementation entry points are the
+[Workflow Session crate](../../crates/webcodex-workflow-session/src/lib.rs),
+[Session database](../../crates/webcodex-workflow-session/src/persistence/database.rs),
+[ClientWindow resolver](../../src/client_window.rs), and
+[Action Audit Session adapter](../../src/action_audit_sessions.rs).
+[SQLite writer tests](../../crates/webcodex-workflow-session/src/store/writer/sqlite_tests.rs)
+and [MCP Window tests](../../src/mcp_tests/http_transport/client_window.rs) exercise
+these storage and identity boundaries.
 
 ---
 

@@ -6,6 +6,8 @@ Desktop starts and maintains the local WebCodex runtime; you describe the work i
 
 For contributor workflows—frontend/Tauri development, source runtime resolution, NSIS/DMG packaging, and native smoke tests—see [Desktop development](DESKTOP_DEVELOPMENT.md).
 
+On a fresh installation, click **Get started**. Desktop prepares this computer under your signed-in account, observes both services and opens Connections. Add folders later in **Projects**. Open **Settings → Runtime and services** for alternate roles, custom binaries and service controls. [Windows acceptance checklist](desktop-windows-acceptance.md)
+
 ## Runtime project inventory
 
 **Projects** shows Runtime Projects observed on the current Runner, including Git branches, active Sessions, and recent activity. **Add local folder** is an optional shortcut for explicitly authorizing and registering another folder on this computer, not a prerequisite for model-driven work. Runtime Project identity remains the authorization, routing, persistence, audit, and Session boundary, but it is not a Desktop setup resource that users need to maintain.
@@ -43,16 +45,17 @@ never mean zero usage; ordinary request-dispatch queues are separate.
 
 In **Settings → Runtime & services → Runner job capacity**, Desktop-managed local
 Runners can save **Maximum concurrent jobs** as a whole number from **1 to 64**.
-The default remains **4**. The saved value and current effective limit are shown
-separately. **Save for next restart** only writes the exact local Runner's
-configuration, preserves unrelated settings, and rejects a conflicting edit.
-It does not hot-reload or restart services.
+The default for an omitted setting is **32**; explicit saved values are preserved. The saved value and current effective limit are shown
+separately. **Save and apply** stages the exact local Runner configuration, preserves
+unrelated settings, then validates and reloads with a generation fence. A definite
+rejection restores only an unchanged candidate; an uncertain result requires
+reconciliation and is never blindly retried or rolled back. Running Jobs continue.
 
-Choose **Restart Runner…** when ready and confirm the interruption warning.
+**Restart Runner…** remains a separate operation with an interruption warning.
 Restarting applies the saved Runner configuration and may interrupt Jobs,
 browser sessions, and handoffs. Desktop reuses its existing owned-process or
 persistent-service restart path. Remote and independently managed Runners remain
-read-only; their actual operator must edit the configuration and restart them.
+read-only; their actual operator must edit and apply their configuration.
 A restart is not reported as applying the saved limit until fresh Runner status
 reports that limit.
 
@@ -66,21 +69,21 @@ Upgrading a legacy Desktop-owned environment preserves its Server, Runner identi
 
 ## First use
 
-1. Launch WebCodex Desktop and choose **Create main node** or **Join main node**. Ordinary creation runs separate Server and local Runner services; ordinary joining connects this computer’s Runner to an existing Server. An initial Project is optional; skipping it keeps the Runner enabled. Confirm setup before persistent services or system authorization are requested; merely opening Desktop never binds a fresh machine to a local Server.
-2. Start describing work in ChatGPT. When a request identifies a workspace path, the runtime resolves or registers that Project automatically within the Runner's allowed scope. Later launches observe saved persistent services rather than silently restarting stopped components.
+1. On a new computer, click **Get started** to prepare one local Server and Runner under your signed-in account. You do not need an initial Project. Settings retains alternate setup roles and service controls.
+2. Open **Connect an AI app**, **Projects**, or the overview. Once an AI app is connected, describe the work there. When a request identifies a workspace path, the runtime resolves or registers that Project automatically within the Runner's allowed scope. Later launches observe saved persistent services rather than silently restarting stopped components.
 3. **Projects** shows Runtime Projects that have appeared. To add a local folder manually, choose **Add local folder**, select it, and confirm **Authorize and add folder**. This explicitly adds access to that folder and its subfolders through the existing local Runner; Server and Tunnel credentials are reused. Viewer-only connections cannot add local folders.
 4. Configure **OpenAI Secure Tunnel** only when external ChatGPT reachability is needed. Tunnel setup controls connectivity; it does not define Project authority.
 5. A real observed project call verifies prior client use, not current host presence.
 
-For **Join main node**, enter a direct Server URL reachable from this computer and a one-time pairing code in the protected input. ChatGPT uses OpenAI Tunnel separately; a Tunnel address or the main node’s loopback URL is not the additional Runner’s endpoint. You do not need the main node’s Tunnel key or bootstrap credential. Saved connections reuse their identity. **Advanced** retains explicit Server-only and viewer-only setup; reopening setup preserves an existing environment’s role and startup ownership.
+For **Connect to another computer**, enter a direct Server URL reachable from this computer and a one-time pairing code in the protected input. ChatGPT uses OpenAI Tunnel separately; a Tunnel address or the main node’s loopback URL is not the additional Runner’s endpoint. You do not need the main node’s Tunnel key or bootstrap credential. Saved connections reuse their identity. **Advanced** retains explicit Server-only and viewer-only setup; reopening setup preserves an existing environment’s role and startup ownership.
 
-For temporary sharing of one project, expand **Advanced**, choose Quick Share and a connection provider. Quick Share keeps its own explicit project selection and temporary lifecycle.
+For temporary sharing of one project, open **All setup options → Advanced**, choose Quick Share and a connection provider. Quick Share keeps its own explicit project selection and temporary lifecycle.
 
 ## Add another device
 
 On a saved local Server environment, open **Projects → Add device** (also available before any device has appeared). Opening the dialog does not issue a code. Supply a Server URL reachable from the other machine, then explicitly choose **Create invitation**. The existing Core and Server authorization decide whether issuance is allowed; the advertised URL never selects the issuance target. No listener, firewall or service settings are changed.
 
-The ten-minute, single-use code is masked by default. **Show code** and each copy action require a click. Install WebCodex on the other machine, choose **Join main node**, and enter that URL and code. Its initial Project can be skipped. Closing the dialog, changing environment or ending the local display period clears the displayed code; closing does not revoke the Server invitation. Failed or uncertain requests are not retried automatically.
+The ten-minute, single-use code is masked by default. **Show code** and each copy action require a click. Install WebCodex on the other machine, choose **Connect to another computer**, and enter that URL and code. Its initial Project can be skipped. Closing the dialog, changing environment or ending the local display period clears the displayed code; closing does not revoke the Server invitation. Failed or uncertain requests are not retried automatically.
 
 Choose **View devices and projects** to refresh the existing authorized inventory. Invitation creation, a Runner appearing online, and a real ChatGPT Project read are separate observations. Projects remain on their owning machines; identical names and paths are distinguished by Runner and Project identities.
 
@@ -102,6 +105,35 @@ Projects lists working folders before **Devices**. Runner reads files and runs c
 Activity separates **Tool calls**, **Workflow Sessions**, and **Service events**. Call sources show their latest call and open the full history. **Call completed** describes execution, not ChatGPT receipt. Sessions show progress, running jobs, and outstanding items; **Open** does not imply running. Check results use readable states, without duplicate job counts or empty attention items. HTTP delivery evidence and internal identifiers remain in details.
 
 Home and the sidebar show the **Local Runner** status and count locally ready Tunnels without claiming current ChatGPT presence. Project session counts describe open sessions. On platforms without native permission probing, desktop access settings explain the missing probe and point to desktop sign-in and the Projects session status; missing permission evidence does not imply unavailable desktop tools.
+
+## Connect ChatGPT
+
+Open **Connections → Connect ChatGPT**, enter the OpenAI Tunnel ID and API key, and click **Save**. The app-specific form keeps the provider and local Server ownership selected; optional name and startup settings are under **Advanced**. The advanced **Add connection** editor remains available for custom configuration. If saving shows **Restart Server**, apply the saved settings using that explicit action and wait for the connection to become ready. Saving credentials alone does not prove that the Tunnel or ChatGPT is connected.
+
+In ChatGPT, add or connect WebCodex using the same Tunnel ID and choose no authentication. Keep the API key in Desktop. See the [installation guide](desktop-install.md) for the current ChatGPT creation steps. **Using ChatGPT** provides a read-only Runtime-status request for the exact local Runner even when no Project exists; with a known Project it offers a file-read request. A user confirmation remains separate from observed tool activity.
+
+## Connect Gemini on the web
+
+Desktop must first establish and verify a Cloudflare HTTPS tunnel. The exact **public MCP address**, for example `https://<your-actual-quick-host>.trycloudflare.com/mcp`, appears in the Gemini connection card only after verification. If the card says **No verified public MCP address yet**, check its reason and start/recover the Cloudflare connection first. Do not paste `http://127.0.0.1:<local-port>` or an unrelated Server homepage into Gemini. Manual OAuth client credentials in Advanced settings are not needed for Gemini DCR.
+
+Open **Connections → Connect Gemini**. ChatGPT (OpenAI Secure Tunnel) and Gemini (Cloudflare + OAuth) can stay connected to the same local WebCodex Server simultaneously. If Desktop detects an existing local setup, click **Check existing setup**. Desktop checks ownership, project inventory, legacy bindings and active work before recording a migration. Review the service interruption before choosing **Save and switch services**. An interrupted migration uses its saved recovery record; if an earlier attempt left no installed background services, Desktop offers **Clear unfinished record and recheck**. On a new computer, choose **Prepare this computer → Get started**. Both paths return to Gemini. For a remote Server, configure Gemini on its host or obtain the MCP address from its owner.
+
+1. Click **Connect Gemini**. Desktop reuses the selected Cloudflare profile or creates a Quick connection, enables app registration and starts it. An interactive start can install the pinned, SHA-256-verified component. Wait for the verified address. Older Servers may need one explicit restart to load the private ingress listener.
+2. Click **Copy MCP address** and **Open Gemini**. In Gemini on the web, go to **Settings → Connected Apps → Custom apps**, add the address and click **Next**. Some accounts show Connected Apps under Personal Intelligence. Follow the redirect to WebCodex, check the address, use **Copy WebCodex sign-in credential** in Desktop, confirm the clipboard action and paste it only into that WebCodex sign-in page. This is the connection owner’s user credential. Approve the requested access. Gemini's form needs only the MCP address.
+3. Type `@` in Gemini, select the app and ask “Show my WebCodex Runtime status.” Desktop shows observed OAuth use and successful MCP tool calls on this run separately. Continue using the tools in chat. Gemini may ask you to confirm write actions. [Google’s custom app guide](https://support.google.com/gemini/answer/17209137)
+
+For a **long-term connection**, open **Other Cloudflare connections → Use a fixed address**. Select an existing Named connection to reuse its credentials. For a new one, enter the Cloudflare Tunnel ID, fixed HTTPS origin and Tunnel token, choose the Server or a separate service as owner, and select the startup preference. In Cloudflare, route the hostname to the local forwarding target under **Advanced connection settings**. One Cloudflare connection can be active per Server. When switching, stop the active connection and explicitly select which one starts automatically in its editor.
+
+| What you see | How to continue |
+| --- | --- |
+| Owner or Runner unavailable | Open Runtime settings and check the local Server and its owner’s Runner. If `cloudflared` is missing, click **Connect Gemini** to download a verified binary automatically, or install version 2025.4.0 or later manually and start the connection again. |
+| Sign-in information temporarily unavailable | Leave the connection running. WebCodex automatically checks the public sign-in metadata again. |
+| Address pending or fixed address unreachable | Wait for startup and public verification. For Named, check the Cloudflare hostname route against the displayed local forwarding target, then reconnect. If copying fails, select and copy the address shown. |
+| Custom apps missing | Google currently requires a personal account, age 18 or older in the US, English and Gemini History enabled. Work and school accounts are currently ineligible for this entry point. Check the current Google help and the options available to your account. |
+| Sign-in canceled or authorization pending | Reopen the app in Gemini, finish authorization and request Runtime status. For debugging, inspect the Event Log in Developer Mode. [Google’s debugging guide](https://developers.google.com/connected-apps/mcp/dev-mode/usage) |
+| Window closed or tunnel restarted | Persistent services run independently. Reopening Desktop reads the current status. After stopping and rebuilding Quick, copy the new address, add it in Gemini and authorize again. Named retains valid grants for the same configuration, owner and fixed origin. |
+
+To pause access, click **Stop** in Desktop. To unlink the app from Google, open its details in Gemini’s Connected Apps and click **Disconnect**. To revoke all dynamically registered clients for this connection, edit it in Desktop, turn off **Allow automatic OAuth client registration**, save and apply the configuration. [Google’s disconnection instructions](https://support.google.com/gemini/answer/17209137)
 
 ## Connections and recovery
 
@@ -148,7 +180,7 @@ If the local Server exits during startup, expand the error's **Details**. Deskto
 
 **Settings** groups controls into General, Files & permissions, Network, Runtime, Troubleshooting, and About & updates. Selecting a category shows its configuration directly. Switching categories preserves network and tracing drafts without saving or restarting services. General contains language, appearance, and launch at login; Files & permissions contains allowed Runner folders and macOS Computer Use permissions. You can also switch language at the bottom of the sidebar. Supported languages are 简体中文, 繁體中文, English, 日本語, 한국어, Deutsch, and Français. The selection is remembered across restarts, and activity times follow the selected locale. System tray menus follow the selected language, including background startup. Raw backend diagnostics remain in English; the operating system controls native file-picker language.
 
-Closing the window hides Desktop in the menu bar or system tray. Persistent Server, Runner, and Tunnel services continue independently of that window, including when Desktop quits. **Quit WebCodex** ends Desktop and processes it directly owns, such as a temporary Quick Share and legacy Desktop-owned runtime or regular Tunnel. Use the explicit Diagnostics controls for Core-managed local services; they appear only for components this computer owns. A viewer has no local Runner control, and a Server-only computer has no Runner control. A custom legacy service can be observed through its Server connection without Desktop taking over its lifecycle. The legacy Desktop-managed runtime stop in Settings → Runtime also updates its saved startup preference; it does not stop an independent service.
+Closing the window hides Desktop in the menu bar or system tray. On macOS, turn on **Hide Dock icon when window is closed** in the menu bar menu to also remove the Dock icon while the window is closed. Persistent Server, Runner, and Tunnel services continue independently of that window, including when Desktop quits. **Quit WebCodex** ends Desktop and processes it directly owns, such as a temporary Quick Share and legacy Desktop-owned runtime or regular Tunnel. Use the explicit Diagnostics controls for Core-managed local services; they appear only for components this computer owns. A viewer has no local Runner control, and a Server-only computer has no Runner control. A custom legacy service can be observed through its Server connection without Desktop taking over its lifecycle. The legacy Desktop-managed runtime stop in Settings → Runtime also updates its saved startup preference; it does not stop an independent service.
 
 Use **⌘ + 1–6** on macOS or **Ctrl + 1–6** on Windows to switch between Home, Projects, Activity, Connections, Extensions, and Settings; **⌘ / Ctrl + 7** opens Runtime Console and **⌘ / Ctrl + ,** opens Settings. Hold ⌘ or Ctrl briefly to show each page's number in the sidebar. Navigation shortcuts also work inside inputs and language selectors; ordinary typing and text-editing shortcuts remain available. Installed builds do not reload the window on F5 or ⌘ / Ctrl + R, so unsaved drafts are not lost; the page context menu appears only for selected text and editable fields. Use Tab to focus controls and Enter to activate them; Settings categories support Up/Down arrows and Home/End.
 
@@ -160,3 +192,10 @@ A Full Runtime consists of the Server, Runner, and the Runner's observed Project
 Desktop restart resumes the saved Server/Runner identity and Connections without registering a Project. Concrete Runtime Projects appear when model-driven work resolves a workspace path. A complete online Runner inventory is authoritative for those registrations; Desktop may reconcile stale display history, but the normal Desktop UI does not mutate Project registration state.
 
 Project directories, Git files, and Runner policy remain separate concerns: lazy Project registration creates or reuses runtime identity for an already-authorized path and does not broaden `allowed_roots`.
+
+## Local Computer activity and pause
+
+On Windows, the native tray shows Computer observation/control activity and offers
+**Pause Computer Control** for the saved local Runner. Observation remains available
+while control is paused. See [Local Computer Control](agent/computer-local-control.md)
+for resume, optional edge hints, shortcuts, and execution boundaries.

@@ -162,6 +162,7 @@ fn runtime_shutdown_wakes_and_joins_reload_listener() {
 
 fn test_project(id: &str) -> RunnerProjectSummary {
     RunnerProjectSummary {
+        registration_incarnation: None,
         id: id.to_string(),
         name: Some(id.to_string()),
         path: format!("/tmp/{}", id),
@@ -600,6 +601,7 @@ fn start_concurrent_polling_server(
 
 fn sync_file_request(request_id: &str) -> RunnerRequest {
     RunnerRequest {
+        computer_control_epoch: None,
         login: false,
         shell: None,
         request_id: request_id.to_string(),
@@ -635,6 +637,7 @@ fn sync_file_request(request_id: &str) -> RunnerRequest {
 #[cfg(unix)]
 fn polling_shell_request(request_id: &str, cwd: &Path, command: String) -> RunnerRequest {
     RunnerRequest {
+        computer_control_epoch: None,
         login: false,
         shell: None,
         request_id: request_id.to_string(),

@@ -5,6 +5,10 @@ on:
     branches:
       - main
       - 'release/**'
+      - 'feat/computer-key-chords'
+      - 'feat/computer-bounded-scroll'
+      - 'feat/computer-local-control'
+      - 'feat/computer-scroll-observe-after'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   merge_group:
@@ -216,12 +220,21 @@ jobs:
       - name: Check Debian package lifecycle harness
         # Fake package steps and local child processes; no native matrix acceptance.
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_deb_lifecycle_acceptance
+      - name: Check Claude window header helper
+        # Synthetic process fixtures and explicit test IDs; no Claude credentials.
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_claude_window_headers
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Ensure test inventory dependency
         run: |
           if ! command -v rg >/dev/null 2>&1; then
-            sudo apt-get update
+            # Ubuntu CI tools come from the official Ubuntu archive. Hosted
+            # runners may add unrelated APT sources that fail (for example 403).
+            ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+            if [ ! -f "$ubuntu_sources" ]; then
+              ubuntu_sources=/etc/apt/sources.list
+            fi
+            sudo apt-get update -o "Dir::Etc::sourcelist=$ubuntu_sources" -o "Dir::Etc::sourceparts=-"
             sudo apt-get install --no-install-recommends -y ripgrep
           fi
       - name: Check test inventory contract
@@ -301,6 +314,19 @@ jobs:
       - name: Preflight static model guidance before server Cargo build
         if: matrix.shard == 'server'
         run: python3 scripts/check_builtin_guidance_contract.py
+      - name: Ensure Runtime search fixture dependency
+        if: matrix.shard == 'server'
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            # Ubuntu CI tools come from the official Ubuntu archive. Hosted
+            # runners may add unrelated APT sources that fail (for example 403).
+            ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+            if [ ! -f "$ubuntu_sources" ]; then
+              ubuntu_sources=/etc/apt/sources.list
+            fi
+            sudo apt-get update -o "Dir::Etc::sourcelist=$ubuntu_sources" -o "Dir::Etc::sourceparts=-"
+            sudo apt-get install --no-install-recommends -y ripgrep
+          fi
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -312,6 +338,14 @@ jobs:
         env:
           CI_RUST_SHARD: ${{ matrix.shard }}
         run: python3 scripts/ci_rust_test.py --report target/ci-test-reports/${{ matrix.shard }}.json -- cargo test --locked ${{ matrix.packages }}
+      # The ordinary server suite above tests serde_json's default map. Runner
+      # dependencies enable preserve_order in combined production builds; both
+      # configurations must satisfy the same checked-in CLI text snapshots.
+      - name: Check CLI text with combined-build JSON ordering
+        if: matrix.shard == 'server'
+        env:
+          CI_RUST_SHARD: cli-preserve-order
+        run: python3 scripts/ci_rust_test.py --report target/ci-test-reports/cli-preserve-order.json -- cargo test --locked -p webcodex --features serde_json/preserve_order cli
       - name: Run real Clippy smoke regression
         if: matrix.shard == 'runner'
         run: cargo test --locked -p webcodex-runner --features runner-real-process-tests --bin webcodex-runner runner_real_process_rust_clippy_warnings_pass_and_correctness_fails -- --ignored
@@ -355,7 +389,13 @@ jobs:
       - name: Ensure Python tooling test dependencies
         run: |
           if ! command -v rg >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
-            sudo apt-get update
+            # Ubuntu CI tools come from the official Ubuntu archive. Hosted
+            # runners may add unrelated APT sources that fail (for example 403).
+            ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+            if [ ! -f "$ubuntu_sources" ]; then
+              ubuntu_sources=/etc/apt/sources.list
+            fi
+            sudo apt-get update -o "Dir::Etc::sourcelist=$ubuntu_sources" -o "Dir::Etc::sourceparts=-"
             sudo apt-get install --no-install-recommends -y ripgrep zstd
           fi
       - name: Test opt-in knowledge and Skill acceptance evidence
@@ -368,6 +408,8 @@ jobs:
           scripts.tests.test_agent_knowledge_fixture
           scripts.tests.test_agent_knowledge_evidence
           scripts.tests.test_agent_knowledge_benchmark
+      - name: Test bounded read-only continuation evidence
+        run: python3 -B -m unittest scripts.tests.test_continuation_capture scripts.tests.test_continuation_snapshot
       - name: Test optional Codex observation adapter
         run: python3 -m unittest discover -s integrations/codex -p 'test_*.py' -v
       - name: Test optional project knowledge provider
@@ -717,6 +759,10 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+      - name: Test user-session task identity collisions and native Task Scheduler roundtrip
+        run: |
+          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File scripts/tests/test_windows_user_service_identity.ps1 -NativeRoundtrip
+          if ($LASTEXITCODE -ne 0) { throw "Windows user-session task ownership regression failed" }
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -739,28 +785,26 @@ jobs:
           retention-days: 7
       - name: Run Windows library and CLI tests
         run: cargo test --locked -p webcodex-runner-config -p webcodex-process -p webcodex-cli
-      - name: Test user-session task ownership after Windows account normalization
-        run: |
-          & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File scripts/tests/test_windows_user_service_identity.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Windows user-session task ownership regression failed" }
       - name: Run Windows unified upgrade transactions including native v0.4.3 fixture
         run: |
           cargo test --locked -p webcodex-environment --lib upgrade::
           if ($LASTEXITCODE -ne 0) { throw "Windows upgrade tests failed" }
           cargo test --locked -p webcodex-environment --lib service::windows::
           if ($LASTEXITCODE -ne 0) { throw "Windows service tests failed" }
+          cargo test --locked -p webcodex-environment --lib service::windows_user::
+          if ($LASTEXITCODE -ne 0) { throw "Windows user task host or PID tests failed" }
       - name: Test Computer helper ownership and native Task Scheduler roundtrip
         run: |
           cargo test --locked -p webcodex-environment --lib session_service::
           if ($LASTEXITCODE -ne 0) { throw "Computer helper ownership tests failed" }
           cargo test --locked -p webcodex-environment --lib windows_helper_task_scheduler_roundtrip_is_owned -- --ignored
           if ($LASTEXITCODE -ne 0) { throw "Computer helper Task Scheduler roundtrip failed" }
-      - name: Run Windows server-owned Tunnel heartbeat tests
+      - name: Test Windows Tunnel heartbeat contention and recovery
         run: |
           cargo test --locked -p webcodex-environment --lib tunnel::health_tests
-          if ($LASTEXITCODE -ne 0) { throw "Windows Tunnel health tests failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Windows Tunnel health file tests failed" }
           cargo test --locked -p webcodex --lib server_tunnels
-          if ($LASTEXITCODE -ne 0) { throw "Windows server-owned Tunnel tests failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Windows Tunnel heartbeat supervision tests failed" }
       - name: Test Windows unified installer routing and Desktop build freshness
         run: python -m unittest scripts.tests.test_prepare_windows_unified_installer scripts.tests.test_desktop_runtime_manifest scripts.tests.test_desktop_frontend_build
       - name: Test optional Codex observation adapter on Windows

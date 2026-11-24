@@ -1,0 +1,8 @@
+isError: true
+ERROR: Command execution outcome is unknown: runner went offline: transport disconnected before returning a result.
+The command may have started or produced side effects, but WebCodex did not receive a terminal result.
+Do not automatically retry a potentially side-effecting command.
+Retry guidance: inspect the actual Job, process, service, or target state as appropriate before deciding whether retry is safe.
+outcome_unknown
+Effects may be incomplete or unknown; inspect target state before retrying.
+failure_kind: outcome_unknown

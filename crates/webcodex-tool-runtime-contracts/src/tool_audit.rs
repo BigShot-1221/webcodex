@@ -111,6 +111,10 @@ mod computer_privacy_tests;
 #[path = "tool_audit/tests/browser_privacy.rs"]
 mod browser_privacy_tests;
 
+#[cfg(test)]
+#[path = "tool_audit/tests/request_fields.rs"]
+mod request_fields_tests;
+
 /// Audit-safe projection over the canonical typed request.
 ///
 /// This policy intentionally remains outside the structural input contract: it
@@ -119,16 +123,176 @@ pub trait ToolCallAuditProjection {
     fn session_log_arguments(&self) -> Value;
 }
 
+// Each listed field is an explicit audit allowlist entry. Generate both the
+// typed binding and its JSON key from that one name; never serialize the whole
+// request. Unlisted fields stay private, including fields added to a variant.
+// Custom redaction/summary arms remain ordinary Rust below the field list.
+// The combined match has no fallback, so new ToolCall variants require a policy.
+macro_rules! project_audit_arguments {
+    ($call:expr;
+        fields {
+            $( $(#[$attr:meta])* $variant:ident { $($field:ident),* $(,)? } ),* $(,)?
+        }
+        $($custom:tt)*
+    ) => {
+        match $call {
+            $(
+                $(#[$attr])*
+                ToolCall::$variant { $($field,)* .. } => serde_json::json!({
+                    $(stringify!($field): $field),*
+                }),
+            )*
+            $($custom)*
+        }
+    };
+}
+
 impl ToolCallAuditProjection for ToolCall {
     fn session_log_arguments(&self) -> Value {
-        match self {
+        project_audit_arguments! { self;
+            fields {
+                SearchWebcodexResources { kind, offset, limit },
+                CodingAgentCancel { run_id },
+                CodingAgentDiagnose { project, provider_id, include_live_acp },
+                OpenSessionShell { project, session_id, cwd, shell },
+                SessionShellStatus { project, session_id, shell_id },
+                CloseSessionShell { project, session_id, shell_id },
+                StopJob { project, job_id, confirm },
+                WaitForJobTerminal { job_id },
+                PresentJobTerminalContinuation { wait_id },
+                JobTerminalContinuationBind { wait_id },
+                JobTerminalContinuationState { wait_id },
+                JobTerminalContinuationPrepare { wait_id },
+                JobTerminalContinuationUnbind { wait_id },
+                JobTerminalContinuationFinish { wait_id, attempt_id, outcome },
+                DeleteProjectFiles { project, paths },
+                GitRestorePaths { project, paths },
+                DiscardUntracked { project, paths },
+                GitStatus { project },
+                ReadFiles { project, items, with_line_numbers },
+                PresentAgentContinuation {
+                    agent_continuation_ref,
+                    agent_id,
+                    endpoint_id,
+                    expected_controller_generation,
+                },
+                AgentContinuationBind { agent_id, endpoint_id, expected_controller_generation },
+                AgentContinuationRecoverEndpoint {
+                    agent_id,
+                    endpoint_id,
+                    expected_controller_generation,
+                },
+                AgentContinuationState { agent_id, endpoint_id, expected_controller_generation },
+                AgentContinuationWakeAcquire {
+                    agent_id,
+                    endpoint_id,
+                    expected_controller_generation,
+                },
+                AgentContinuationUnbind { agent_id, endpoint_id, expected_controller_generation },
+                AgentContinuationWakePrepare {
+                    agent_id,
+                    endpoint_id,
+                    expected_controller_generation,
+                    wake_id,
+                    attempt_id,
+                },
+                AgentContinuationWakeFinish {
+                    agent_id,
+                    endpoint_id,
+                    expected_controller_generation,
+                    wake_id,
+                    attempt_id,
+                    outcome,
+                },
+                SkillReadFile {
+                    project,
+                    skill_id,
+                    path,
+                    start_line,
+                    limit,
+                    expected_definition_revision,
+                    expected_package_revision,
+                    expected_resource_sha256,
+                },
+                ListProjectFiles { project, path, limit, offset },
+                ProjectOverview { project, path, max_depth, limit },
+                LspStatus { project },
+                DocumentSymbols { project, path, limit },
+                DocumentDiagnostics { project, path, limit },
+                Hover { project, path, line, column },
+                GotoDefinition { project, path, line, column, limit },
+                FindReferences { project, path, line, column, include_declaration, limit },
+                CallHierarchy { project, path, line, column, direction, depth, limit },
+                ShowChanges {
+                    project,
+                    include_diff,
+                    max_hunks,
+                    max_hunk_lines,
+                    session_event_limit,
+                },
+                TransferProjectArtifact {
+                    source_project,
+                    source_path,
+                    destination_project,
+                    destination_path,
+                    overwrite,
+                },
+                PresentSpreadsheet { project, path },
+                ReadProjectArtifactMetadata { project, path, allow_missing },
+                ArtifactUploadFinish { project, path, upload_id },
+                ArtifactUploadAbort { project, path, upload_id },
+                #[cfg(feature = "workspace-checkpoints")]
+                WorkspaceCheckpointList { project, limit },
+                #[cfg(feature = "workspace-checkpoints")]
+                WorkspaceCheckpointShow { project, checkpoint_id, include_diff_stat },
+                #[cfg(feature = "workspace-checkpoints")]
+                WorkspaceCheckpointRestore { project, checkpoint_id, confirm },
+                #[cfg(feature = "workspace-checkpoints")]
+                WorkspaceCheckpointDelete { project, checkpoint_id, confirm },
+                RecordExternalObservation { project, session_id },
+                ListExternalObservations { project, session_id },
+                ListSessionMessages { session_id, kind, status, message_id, reply_to, limit },
+                SessionDiscussionSummary { session_id, limit },
+                SessionHandoffSummary {
+                    session_id,
+                    project,
+                    include_workspace,
+                    include_checkpoints,
+                    include_validation,
+                    diagnostic,
+                    limit,
+                },
+                SessionHandoffState { project, session_id },
+                FinishCodingTask {
+                    project,
+                    session_id,
+                    outputs,
+                    summary_only,
+                    include_diff,
+                    include_workspace,
+                    include_hygiene,
+                    include_handoff,
+                    include_validation_summary,
+                },
+                PresentWorkResult { project, session_id },
+                WorkResultState { project, session_id },
+                WorkResultActivityDetail { project, server_trace_id },
+                ChangesFileDiff { project, session_id, snapshot_id, path },
+                ListTools { category, features, summary_only, limit },
+                ListSessions { project, lifecycle, offset, limit },
+                SessionSummary { session_id, limit },
+                CloseSession { session_id },
+                ValidationSummary { project, session_id, limit },
+                GetSessionAssignment { session_id, message_id },
+                ListProjectTrackedFiles { project, path, globs, depth, limit, offset },
+                UnregisterProject { project, expected_revision },
+                RunnerConfigCheck { client_id },
+                RunnerConfigReload { client_id, expected_generation },
+                CurrentWindowActivity { limit, include_nonmeaningful },
+                WorkspaceHygieneCheck { project, max_findings, include_tracked },
+            }
+
             Self::OpenWebcodexWorkbench { .. } => serde_json::json!({"workbench_open":true}),
-            Self::SearchWebcodexResources {
-                kind,
-                offset,
-                limit,
-                ..
-            } => serde_json::json!({"kind":kind,"offset":offset,"limit":limit}),
             Self::ReadWebcodexResource { .. } => serde_json::json!({"resource_read":true}),
 
             #[cfg(feature = "experimental-code-mode")]
@@ -238,9 +402,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "token_present": after_observation_token.is_some(),
                 "wait_secs": wait_secs,
             }),
-            Self::CodingAgentCancel { run_id } => serde_json::json!({
-                "run_id": run_id,
-            }),
             Self::CodingAgentRespondPermission {
                 run_id,
                 permission_request_token,
@@ -249,15 +410,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "run_id": run_id,
                 "permission_request_token_present": !permission_request_token.is_empty(),
                 "option_id_bytes": option_id.len(),
-            }),
-            Self::CodingAgentInspectConfig {
-                project,
-                provider_id,
-                include_live_acp,
-            } => serde_json::json!({
-                "project": project,
-                "provider_id": provider_id,
-                "include_live_acp": include_live_acp,
             }),
             Self::RunScript {
                 project,
@@ -333,17 +485,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "purpose": purpose,
                 "shell": shell,
             }),
-            Self::OpenSessionShell {
-                project,
-                session_id,
-                cwd,
-                shell,
-            } => serde_json::json!({
-                "project": project,
-                "session_id": session_id,
-                "cwd": cwd,
-                "shell": shell,
-            }),
             Self::SessionShellExec {
                 project,
                 session_id,
@@ -359,20 +500,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "command_summary": command_preview(command),
                 "timeout_secs": timeout_secs,
                 "purpose": purpose,
-            }),
-            Self::SessionShellStatus {
-                project,
-                session_id,
-                shell_id,
-            }
-            | Self::CloseSessionShell {
-                project,
-                session_id,
-                shell_id,
-            } => serde_json::json!({
-                "project": project,
-                "session_id": session_id,
-                "shell_id": shell_id,
             }),
             Self::BrowserObserve(call) => browser_observe_audit_projection(call),
             Self::BrowserAct(call) => browser_act_audit_projection(call),
@@ -395,16 +522,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "region_present": region.is_some(),
                 "max_width": max_width,
                 "max_height": max_height,
-            }),
-            Self::StopJob {
-                project,
-                job_id,
-                confirm,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "job_id": job_id,
-                "confirm": confirm,
             }),
             Self::ObserveJobs {
                 items,
@@ -441,26 +558,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "unique_jobs": job_ids.iter().collect::<std::collections::HashSet<_>>().len(),
                 "wait_secs": wait_secs,
             }),
-            Self::WaitForJobTerminal { job_id, .. } => serde_json::json!({
-                "job_id": job_id,
-            }),
-            Self::PresentJobTerminalContinuation { wait_id }
-            | Self::JobTerminalContinuationBind { wait_id, .. }
-            | Self::JobTerminalContinuationState { wait_id, .. }
-            | Self::JobTerminalContinuationPrepare { wait_id, .. }
-            | Self::JobTerminalContinuationUnbind { wait_id, .. } => serde_json::json!({
-                "wait_id": wait_id,
-            }),
-            Self::JobTerminalContinuationFinish {
-                wait_id,
-                attempt_id,
-                outcome,
-                ..
-            } => serde_json::json!({
-                "wait_id": wait_id,
-                "attempt_id": attempt_id,
-                "outcome": outcome,
-            }),
             Self::ApplyUnifiedDiff {
                 project,
                 deny_sensitive_paths,
@@ -469,12 +566,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "project": project,
                 "diff_present": true,
                 "deny_sensitive_paths": deny_sensitive_paths,
-            }),
-            Self::DeleteProjectFiles { project, paths, .. }
-            | Self::GitRestorePaths { project, paths, .. }
-            | Self::DiscardUntracked { project, paths, .. } => serde_json::json!({
-                "project": project,
-                "paths": paths,
             }),
             Self::GitCommitPaths {
                 project,
@@ -491,9 +582,6 @@ impl ToolCallAuditProjection for ToolCall {
                     "message_present": true,
                 })
             }
-            Self::GitStatus { project, .. } => serde_json::json!({
-                "project": project,
-            }),
             Self::GitReviewSummary {
                 project,
                 base_commit,
@@ -729,16 +817,6 @@ impl ToolCallAuditProjection for ToolCall {
                     "sync_wait_secs": sync_wait_secs,
                 }),
             ),
-            Self::ReadFiles {
-                project,
-                items,
-                with_line_numbers,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "items": items,
-                "with_line_numbers": with_line_numbers,
-            }),
             Self::PrepareGoalWorkflow {
                 session_id,
                 title,
@@ -1091,81 +1169,6 @@ impl ToolCallAuditProjection for ToolCall {
                 }),
             ),
 
-            Self::PresentAgentContinuation {
-                agent_continuation_ref,
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-            } => serde_json::json!({
-                "agent_continuation_ref": agent_continuation_ref,
-                "agent_id": agent_id,
-                "endpoint_id": endpoint_id,
-                "expected_controller_generation": expected_controller_generation,
-            }),
-            Self::AgentContinuationBind {
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                ..
-            }
-            | Self::AgentContinuationRecoverEndpoint {
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                ..
-            }
-            | Self::AgentContinuationState {
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                ..
-            }
-            | Self::AgentContinuationWakeAcquire {
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                ..
-            }
-            | Self::AgentContinuationUnbind {
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                ..
-            } => serde_json::json!({
-                "agent_id": agent_id,
-                "endpoint_id": endpoint_id,
-                "expected_controller_generation": expected_controller_generation,
-            }),
-            Self::AgentContinuationWakePrepare {
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                wake_id,
-                attempt_id,
-                ..
-            } => serde_json::json!({
-                "agent_id": agent_id,
-                "endpoint_id": endpoint_id,
-                "expected_controller_generation": expected_controller_generation,
-                "wake_id": wake_id,
-                "attempt_id": attempt_id,
-            }),
-            Self::AgentContinuationWakeFinish {
-                agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                wake_id,
-                attempt_id,
-                outcome,
-                ..
-            } => serde_json::json!({
-                "agent_id": agent_id,
-                "endpoint_id": endpoint_id,
-                "expected_controller_generation": expected_controller_generation,
-                "wake_id": wake_id,
-                "attempt_id": attempt_id,
-                "outcome": outcome,
-            }),
             Self::DetachAgentEndpoint(input) => typed_communication_request_audit(
                 CommunicationRequestAudit::DetachEndpoint,
                 &serde_json::json!({"endpoint_id": input.endpoint_id}),
@@ -1396,24 +1399,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "limit": limit,
                 "expected_catalog_revision": expected_catalog_revision,
             }),
-            Self::SkillReadFile {
-                project,
-                skill_id,
-                path,
-                start_line,
-                limit,
-                expected_definition_revision,
-                expected_package_revision,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "skill_id": skill_id,
-                "path": path,
-                "start_line": start_line,
-                "limit": limit,
-                "expected_definition_revision": expected_definition_revision,
-                "expected_package_revision": expected_package_revision,
-            }),
             Self::SkillVersions {
                 project,
                 skill_key,
@@ -1488,30 +1473,6 @@ impl ToolCallAuditProjection for ToolCall {
                     "session_id": session_id,
                 }),
             ),
-            Self::ListProjectFiles {
-                project,
-                path,
-                limit,
-                offset,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "limit": limit,
-                "offset": offset,
-            }),
-            Self::ProjectOverview {
-                project,
-                path,
-                max_depth,
-                limit,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "max_depth": max_depth,
-                "limit": limit,
-            }),
             Self::SearchProjectTexts {
                 project, queries, ..
             } => serde_json::json!({
@@ -1534,103 +1495,10 @@ impl ToolCallAuditProjection for ToolCall {
                 "max_reads": max_reads,
                 "with_line_numbers": with_line_numbers,
             }),
-            Self::LspStatus { project, .. } => serde_json::json!({
-                "project": project,
-            }),
-            Self::DocumentSymbols {
-                project,
-                path,
-                limit,
-                ..
-            }
-            | Self::DocumentDiagnostics {
-                project,
-                path,
-                limit,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "limit": limit,
-            }),
-            Self::Hover {
-                project,
-                path,
-                line,
-                column,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "line": line,
-                "column": column,
-            }),
             Self::WorkspaceSymbols { project, limit, .. } => serde_json::json!({
                 "project": project,
                 "query_present": true,
                 "limit": limit,
-            }),
-            Self::GotoDefinition {
-                project,
-                path,
-                line,
-                column,
-                limit,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "line": line,
-                "column": column,
-                "limit": limit,
-            }),
-            Self::FindReferences {
-                project,
-                path,
-                line,
-                column,
-                include_declaration,
-                limit,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "line": line,
-                "column": column,
-                "include_declaration": include_declaration,
-                "limit": limit,
-            }),
-            Self::CallHierarchy {
-                project,
-                path,
-                line,
-                column,
-                direction,
-                depth,
-                limit,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "line": line,
-                "column": column,
-                "direction": direction,
-                "depth": depth,
-                "limit": limit,
-            }),
-            Self::ShowChanges {
-                project,
-                include_diff,
-                max_hunks,
-                max_hunk_lines,
-                session_event_limit,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "include_diff": include_diff,
-                "max_hunks": max_hunks,
-                "max_hunk_lines": max_hunk_lines,
-                "session_event_limit": session_event_limit,
             }),
             Self::WriteProjectFile {
                 project,
@@ -1674,19 +1542,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "overwrite": overwrite,
                 "session_id": session_id,
             }),
-            Self::TransferProjectArtifact {
-                source_project,
-                source_path,
-                destination_project,
-                destination_path,
-                overwrite,
-            } => serde_json::json!({
-                "source_project": source_project,
-                "source_path": source_path,
-                "destination_project": destination_project,
-                "destination_path": destination_path,
-                "overwrite": overwrite,
-            }),
             Self::AcceptArtifactHandoff {
                 grant_id,
                 destination_project,
@@ -1699,10 +1554,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "destination_path": destination_path,
                 "overwrite": overwrite,
                 "idempotency_key_present": !idempotency_key.is_empty(),
-            }),
-            Self::PresentSpreadsheet { project, path } => serde_json::json!({
-                "project": project,
-                "path": path,
             }),
             Self::ProjectArtifact {
                 project,
@@ -1721,16 +1572,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "offset": offset,
                 "length": length,
                 "expected_sha256_present": expected_sha256.as_ref().is_some_and(|v| !v.is_empty()),
-            }),
-            Self::ReadProjectArtifactMetadata {
-                project,
-                path,
-                allow_missing,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "allow_missing": allow_missing,
             }),
             Self::ReadProjectArtifact {
                 project,
@@ -1778,22 +1619,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "upload_id": upload_id,
                 "offset": offset,
                 "content_base64_present": true,
-            }),
-            Self::ArtifactUploadFinish {
-                project,
-                path,
-                upload_id,
-                ..
-            }
-            | Self::ArtifactUploadAbort {
-                project,
-                path,
-                upload_id,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "upload_id": upload_id,
             }),
             Self::ApplyPatch {
                 project,
@@ -1870,55 +1695,6 @@ impl ToolCallAuditProjection for ToolCall {
                     "validation_status": validation_status,
                 })
             }
-            #[cfg(feature = "workspace-checkpoints")]
-            Self::WorkspaceCheckpointList { project, limit, .. } => serde_json::json!({
-                "project": project,
-                "limit": limit,
-            }),
-            #[cfg(feature = "workspace-checkpoints")]
-            Self::WorkspaceCheckpointShow {
-                project,
-                checkpoint_id,
-                include_diff_stat,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "checkpoint_id": checkpoint_id,
-                "include_diff_stat": include_diff_stat,
-            }),
-            #[cfg(feature = "workspace-checkpoints")]
-            Self::WorkspaceCheckpointRestore {
-                project,
-                checkpoint_id,
-                confirm,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "checkpoint_id": checkpoint_id,
-                "confirm": confirm,
-            }),
-            #[cfg(feature = "workspace-checkpoints")]
-            Self::WorkspaceCheckpointDelete {
-                project,
-                checkpoint_id,
-                confirm,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "checkpoint_id": checkpoint_id,
-                "confirm": confirm,
-            }),
-            Self::RecordExternalObservation {
-                project,
-                session_id,
-                ..
-            }
-            | Self::ListExternalObservations {
-                project,
-                session_id,
-            } => serde_json::json!({
-                "project": project, "session_id": session_id,
-            }),
             Self::PostSessionMessage {
                 session_id,
                 kind,
@@ -1954,21 +1730,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "tags_count": tags.len(),
                 "priority": priority,
                 "requires_ack": requires_ack,
-            }),
-            Self::ListSessionMessages {
-                session_id,
-                kind,
-                status,
-                message_id,
-                reply_to,
-                limit,
-            } => serde_json::json!({
-                "session_id": session_id,
-                "kind": kind,
-                "status": status,
-                "message_id": message_id,
-                "reply_to": reply_to,
-                "limit": limit,
             }),
             Self::ObserveSessionMessages {
                 session_id,
@@ -2008,34 +1769,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "priority": priority,
                 "completion_id": bounded_completion_key_fingerprint(Some(completion_key)),
                 "assignment_fence_present": true,
-            }),
-            Self::SessionDiscussionSummary { session_id, limit } => serde_json::json!({
-                "session_id": session_id,
-                "limit": limit,
-            }),
-            Self::SessionHandoffSummary {
-                session_id,
-                project,
-                include_workspace,
-                include_checkpoints,
-                include_validation,
-                diagnostic,
-                limit,
-            } => serde_json::json!({
-                "session_id": session_id,
-                "project": project,
-                "include_workspace": include_workspace,
-                "include_checkpoints": include_checkpoints,
-                "include_validation": include_validation,
-                "diagnostic": diagnostic,
-                "limit": limit,
-            }),
-            Self::SessionHandoffState {
-                project,
-                session_id,
-            } => serde_json::json!({
-                "project": project,
-                "session_id": session_id,
             }),
             Self::StartSession {
                 project,
@@ -2084,27 +1817,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "session_id": session_id,
                 "execution_context": execution_context.audit_summary(),
             }),
-            Self::FinishCodingTask {
-                project,
-                session_id,
-                outputs,
-                summary_only,
-                include_diff,
-                include_workspace,
-                include_hygiene,
-                include_handoff,
-                include_validation_summary,
-            } => serde_json::json!({
-                "project": project,
-                "session_id": session_id,
-                "outputs": outputs,
-                "summary_only": summary_only,
-                "include_diff": include_diff,
-                "include_workspace": include_workspace,
-                "include_hygiene": include_hygiene,
-                "include_handoff": include_handoff,
-                "include_validation_summary": include_validation_summary,
-            }),
             Self::PresentDocx { project, path } => {
                 serde_json::json!({"project": project, "path": path})
             }
@@ -2115,48 +1827,20 @@ impl ToolCallAuditProjection for ToolCall {
                     "path": path,
                 })
             }
-            Self::PresentWorkResult {
-                project,
-                session_id,
-            }
-            | Self::WorkResultState {
-                project,
-                session_id,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "session_id": session_id,
-            }),
-            Self::WorkResultActivityDetail {
-                project,
-                server_trace_id,
-            } => serde_json::json!({
-                "project": project,
-                "server_trace_id": server_trace_id,
-            }),
             Self::WorkResultSendMessage {
                 project,
                 session_id,
                 message,
                 delivery_key,
                 kind,
+                priority,
             } => serde_json::json!({
                 "kind": kind,
+                "priority": priority,
                 "project": project,
                 "session_id": session_id,
                 "message_chars": message.chars().count(),
                 "delivery_key_present": !delivery_key.is_empty(),
-            }),
-            Self::ChangesFileDiff {
-                project,
-                session_id,
-                snapshot_id,
-                path,
-            } => serde_json::json!({
-                "project": project,
-                "session_id": session_id,
-                "snapshot_id": snapshot_id,
-                "path": path,
             }),
             Self::ResolveWorkspace {
                 path, query, limit, ..
@@ -2175,6 +1859,7 @@ impl ToolCallAuditProjection for ToolCall {
                 project,
                 query,
                 limit,
+                offset,
                 summary_only,
                 include_git_summary,
             } => serde_json::json!({
@@ -2183,6 +1868,7 @@ impl ToolCallAuditProjection for ToolCall {
                 "query_present": query.is_some(),
                 "query_length": query.as_deref().map(|value| value.chars().count()).unwrap_or_default(),
                 "limit": limit,
+                "offset": offset,
                 "summary_only": summary_only,
                 "include_git_summary": include_git_summary,
             }),
@@ -2190,16 +1876,19 @@ impl ToolCallAuditProjection for ToolCall {
                 client_id,
                 client_ids,
                 include_projects,
+                projects_offset,
                 summary_only,
                 query,
                 status,
                 limit,
+                offset,
             } => serde_json::json!({
                 "client_id_present": client_id.is_some(),
                 "client_ids_count": client_ids.as_ref().map(Vec::len).unwrap_or_default(),
                 "include_projects": include_projects,
+                "projects_offset": projects_offset,
                 "summary_only": summary_only,
-                "query_present": query.is_some(), "status": status, "limit": limit,
+                "query_present": query.is_some(), "status": status, "limit": limit, "offset": offset,
             }),
             Self::ListJobs {
                 limit,
@@ -2227,51 +1916,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "intent": intent,
                 "include_recommended_flows": include_recommended_flows,
                 "include_risk_summary": include_risk_summary,
-            }),
-            Self::ListTools {
-                category,
-                features,
-                summary_only,
-                limit,
-            } => serde_json::json!({
-                "category": category,
-                "features": features,
-                "summary_only": summary_only,
-                "limit": limit,
-            }),
-            Self::ListSessions {
-                project,
-                lifecycle,
-                offset,
-                limit,
-            } => serde_json::json!({
-                "project": project,
-                "lifecycle": lifecycle,
-                "offset": offset,
-                "limit": limit,
-            }),
-            Self::SessionSummary { session_id, limit } => serde_json::json!({
-                "session_id": session_id,
-                "limit": limit,
-            }),
-            Self::CloseSession { session_id } => serde_json::json!({
-                "session_id": session_id,
-            }),
-            Self::ValidationSummary {
-                project,
-                session_id,
-                limit,
-            } => serde_json::json!({
-                "project": project,
-                "session_id": session_id,
-                "limit": limit,
-            }),
-            Self::GetSessionAssignment {
-                session_id,
-                message_id,
-            } => serde_json::json!({
-                "session_id": session_id,
-                "message_id": message_id,
             }),
             Self::RunDetachedProcess {
                 project,
@@ -2303,23 +1947,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "token_present": after_observation_token.is_some(),
                 "wait_secs": wait_secs,
             }),
-            Self::ListProjectTrackedFiles {
-                project,
-                path,
-                globs,
-                depth,
-                limit,
-                offset,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "path": path,
-                "globs": globs,
-                "depth": depth,
-                "limit": limit,
-                "offset": offset,
-            }),
-
             Self::RegisterProject {
                 client_id,
                 id,
@@ -2337,13 +1964,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "description_bytes": description.as_ref().map(String::len).unwrap_or_default(),
                 "allow_patch": allow_patch,
                 "overwrite": overwrite,
-            }),
-            Self::UnregisterProject {
-                project,
-                expected_revision,
-            } => serde_json::json!({
-                "project": project,
-                "expected_revision": expected_revision,
             }),
             Self::CreateProject {
                 client_id,
@@ -2368,16 +1988,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "git_init": git_init,
                 "adopt_existing_empty": adopt_existing_empty,
                 "overwrite": overwrite,
-            }),
-            Self::RunnerConfigCheck { client_id } => serde_json::json!({
-                "client_id": client_id,
-            }),
-            Self::RunnerConfigReload {
-                client_id,
-                expected_generation,
-            } => serde_json::json!({
-                "client_id": client_id,
-                "expected_generation": expected_generation,
             }),
             Self::PluginTool(plugin) => serde_json::json!({
                 "action": plugin.action,
@@ -2417,23 +2027,6 @@ impl ToolCallAuditProjection for ToolCall {
                 "compact": compact,
                 "summary_only": summary_only,
                 "client_id_present": client_id.is_some(),
-            }),
-            Self::CurrentWindowActivity {
-                limit,
-                include_nonmeaningful,
-            } => serde_json::json!({
-                "limit": limit,
-                "include_nonmeaningful": include_nonmeaningful,
-            }),
-            Self::WorkspaceHygieneCheck {
-                project,
-                max_findings,
-                include_tracked,
-                ..
-            } => serde_json::json!({
-                "project": project,
-                "max_findings": max_findings,
-                "include_tracked": include_tracked,
             }),
         }
     }

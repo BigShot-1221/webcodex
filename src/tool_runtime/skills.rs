@@ -3,9 +3,7 @@ use super::runtime_metrics::{
     observe_skill_source, RuntimeMetrics, SkillSourceMetricObservation, SkillSourceMetricOperation,
     SkillSourceMetricOutcomeClass, SkillSourceMetricSource,
 };
-use super::startup_catalog::{
-    bounded_extension_description, StartupSkillEntry, StartupSkillsCatalog,
-};
+use super::startup_catalog::{StartupSkillEntry, StartupSkillsCatalog};
 use super::{ExecutionPurpose, SuggestedToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::json_measurement::serialized_json_len;
@@ -51,6 +49,31 @@ const DEFAULT_SKILL_LIST_LIMIT: usize = 20;
 const DEFAULT_SKILL_READ_LINES: usize = 200;
 const SKILL_PACKAGE_LIST_FORMAT: &str = "webcodex.skill_package_list.v1";
 const SKILL_FILE_READ_FORMAT: &str = "webcodex.skill_file_read.v1";
+
+/// Build one canonical advisory edge from the already validated read snapshot.
+/// No Session is inferred, and the usual tool admission/authority gates still apply.
+fn append_skill_read_continuation(output: &mut Value, limit: usize) {
+    if output["has_more"] != true {
+        return;
+    }
+    let mut arguments = json!({
+        "project": output["project"],
+        "skill_id": output["skill_id"],
+        "path": output["skill_path"],
+        "start_line": output["next_start_line"],
+        "limit": limit,
+        "expected_definition_revision": output["definition_revision"],
+        "expected_resource_sha256": output["sha256"],
+    });
+    if !output["package_revision"].is_null() {
+        arguments["expected_package_revision"] = output["package_revision"].clone();
+    }
+    output["suggested_call"] = serde_json::to_value(SuggestedToolCall::mechanically_followable(
+        "read_skill_file",
+        arguments,
+    ))
+    .expect("SuggestedToolCall serialization is infallible");
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SkillDescriptor {
@@ -597,6 +620,7 @@ impl ToolRuntime {
         limit: usize,
         user_expected_package_revision: Option<&str>,
         user_expected_definition_revision: Option<&str>,
+        expected_resource_sha256: Option<&str>,
     ) -> ToolResult {
         let skill_id = resolved.skill_id();
         let source = resolved.source();
@@ -701,6 +725,13 @@ impl ToolRuntime {
             SkillSourceMetricOutcomeClass::Success,
             None,
         );
+        if expected_resource_sha256.is_some_and(|expected| expected != read.sha256) {
+            return skill_error(
+                "skill_resource_changed",
+                &project.resolved_id,
+                Some(json!({"skill_id": skill_id, "skill_path": path})),
+            );
+        }
         let (name, package_revision, definition_revision, trust) = match &read.skill {
             RunnerSkillDescriptor::Configured {
                 name,
@@ -724,7 +755,7 @@ impl ToolRuntime {
                 "operator_installed_guidance",
             ),
         };
-        let output = json!({
+        let mut output = json!({
             "project": project.resolved_id,
             "skill_id": skill_id,
             "name": name,
@@ -741,6 +772,7 @@ impl ToolRuntime {
             "has_more": read.has_more,
             "next_start_line": read.next_start_line,
         });
+        append_skill_read_continuation(&mut output, limit);
         if serialized_json_len(&output)
             .map(|bytes| bytes > MAX_SKILL_READ_RESULT_BYTES)
             .unwrap_or(true)
@@ -865,6 +897,7 @@ impl ToolRuntime {
         &self,
         project: &ResolvedProject,
         auth: Option<&AuthContext>,
+        relevance: &super::surface::discovery::TaskRelevance,
     ) -> StartupSkillsCatalog {
         let catalog = match self.discover_skills(project, auth).await {
             Ok(catalog) => catalog,
@@ -876,16 +909,17 @@ impl ToolRuntime {
             .map(|skill| StartupSkillEntry {
                 skill_id: skill.descriptor.skill_id.clone(),
                 name: skill.descriptor.name.clone(),
-                description: bounded_extension_description(&skill.descriptor.description),
+                description: skill.descriptor.description.clone(),
                 source_scope: skill.descriptor.source_scope.to_string(),
                 trust: skill.descriptor.trust.to_string(),
                 name_conflict: skill.descriptor.name_conflict,
             })
             .collect();
-        StartupSkillsCatalog::available(
+        StartupSkillsCatalog::available_for_task(
             catalog.catalog_revision,
             catalog.discovery_truncated,
             entries,
+            relevance,
         )
     }
 
@@ -1013,6 +1047,7 @@ impl ToolRuntime {
                 MAX_SKILL_READ_LINES,
                 expected_package_revision.as_deref(),
                 Some(&expected_definition_revision),
+                None,
             )
             .await;
         if !read.success {
@@ -1148,6 +1183,7 @@ impl ToolRuntime {
                 Some(MAX_SKILL_READ_LINES),
                 Some(descriptor.definition_revision.clone()),
                 descriptor.package_revision.clone(),
+                None,
                 auth,
             )
             .await;
@@ -1234,6 +1270,7 @@ impl ToolRuntime {
         limit: Option<usize>,
         expected_definition_revision: Option<String>,
         expected_package_revision: Option<String>,
+        expected_resource_sha256: Option<String>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         if !valid_skill_id(&skill_id) {
@@ -1275,6 +1312,16 @@ impl ToolRuntime {
         {
             return skill_error(
                 "skill_package_revision_invalid",
+                &project.resolved_id,
+                Some(json!({"skill_id": skill_id})),
+            );
+        }
+        if expected_resource_sha256
+            .as_deref()
+            .is_some_and(|hash| !is_lower_sha256(hash))
+        {
+            return skill_error(
+                "skill_resource_sha256_invalid",
                 &project.resolved_id,
                 Some(json!({"skill_id": skill_id})),
             );
@@ -1326,6 +1373,7 @@ impl ToolRuntime {
                         limit,
                         expected_package_revision.as_deref(),
                         expected_definition_revision.as_deref(),
+                        expected_resource_sha256.as_deref(),
                     )
                     .await;
             }
@@ -1442,7 +1490,17 @@ impl ToolRuntime {
                 );
             }
         }
-        let output = json!({
+        if expected_resource_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != read.sha256)
+        {
+            return skill_error(
+                "skill_resource_changed",
+                &project.resolved_id,
+                Some(json!({"skill_id": skill_id, "skill_path": resource_path})),
+            );
+        }
+        let mut output = json!({
             "project": project.resolved_id,
             "skill_id": skill_id,
             "name": name,
@@ -1460,6 +1518,7 @@ impl ToolRuntime {
             "has_more": read.has_more,
             "next_start_line": read.next_start_line,
         });
+        append_skill_read_continuation(&mut output, limit);
         if serialized_json_len(&output)
             .map(|bytes| bytes > MAX_SKILL_READ_RESULT_BYTES)
             .unwrap_or(true)

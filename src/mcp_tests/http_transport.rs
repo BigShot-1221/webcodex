@@ -1,4 +1,6 @@
 use super::*;
+#[path = "http_transport/client_window.rs"]
+mod client_window;
 #[path = "http_transport/metadata_trace.rs"]
 mod metadata_trace;
 #[path = "http_transport/work_result_thread.rs"]
@@ -110,6 +112,7 @@ async fn stateless_observation_runner_registry() -> Arc<crate::runner_http::Runn
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -135,6 +138,7 @@ async fn stateless_observation_runner_registry() -> Arc<crate::runner_http::Runn
         "inst-mcp-observation",
         vec![
             crate::runner_protocol::RunnerProjectSummary {
+                registration_incarnation: Some(uuid::Uuid::new_v4().to_string()),
                 id: "shared".to_string(),
                 name: Some("Shared observation project".to_string()),
                 path: "/tmp/mcp-observation-shared".to_string(),
@@ -154,6 +158,7 @@ async fn stateless_observation_runner_registry() -> Arc<crate::runner_http::Runn
                 shell_profile: None,
             },
             crate::runner_protocol::RunnerProjectSummary {
+                registration_incarnation: Some(uuid::Uuid::new_v4().to_string()),
                 id: "foreign".to_string(),
                 name: Some("Foreign observation project".to_string()),
                 path: "/tmp/mcp-observation-foreign".to_string(),
@@ -259,7 +264,17 @@ fn full_trace_dir_with_payload(
     panic!("missing full-trace payload phase {phase} matching this request");
 }
 
-fn start_mcp_fixture_session(runtime: &ToolRuntime, project: Option<&str>, title: &str) -> String {
+async fn start_mcp_fixture_session(
+    runtime: &ToolRuntime,
+    project: Option<&str>,
+    title: &str,
+) -> String {
+    let project_identity = match project {
+        Some(project) => {
+            crate::test_support::registered_session_project_identity(runtime, project, None).await
+        }
+        None => None,
+    };
     let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
     auth.is_bootstrap = true;
     let fingerprint = crate::tool_runtime::workflow_session_authority_fingerprint(Some(&auth))
@@ -273,7 +288,8 @@ fn start_mcp_fixture_session(runtime: &ToolRuntime, project: Option<&str>, title
                 crate::tool_runtime::SessionMode::Normal,
                 crate::tool_runtime::sessions::SessionGuards::default(),
             )
-            .with_owner_authority_fingerprint(Some(fingerprint)),
+            .with_owner_authority_fingerprint(Some(fingerprint))
+            .with_project_identity(project_identity),
         )
         .unwrap()
         .session_id
@@ -439,6 +455,28 @@ async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
     .await;
     assert_eq!(status, StatusCode::OK, "{listed}");
     assert!(listed["result"]["tools"].is_array(), "{listed}");
+
+    // A later unrelated request in the same Window: trace persistence is
+    // asynchronous, so the tools/list row is not guaranteed to be last.
+    let mut params = mcp_2026_params(json!({"name": "get_runtime_status", "arguments": {}}));
+    params["_meta"]["openai/session"] = json!(raw_window);
+    let (status, body) = stateless_2026_jsonrpc(
+        &service,
+        "secret",
+        Some(MCP_STATELESS_PROTOCOL_VERSION),
+        Some("tools/call"),
+        Some("get_runtime_status"),
+        None,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 54,
+            "method": "tools/call",
+            "params": params,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
     crate::tool_request_trace::flush_full_trace_writer();
 
     let mut trace_ids = BTreeSet::new();
@@ -492,10 +530,10 @@ async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
         }
     }
 
-    assert_eq!(traced_requests, 2, "expected one parsed event per request");
+    assert_eq!(traced_requests, 3, "expected one parsed event per request");
     assert_eq!(
         trace_ids.len(),
-        2,
+        3,
         "requests must keep distinct trace identities"
     );
     assert_eq!(
@@ -534,7 +572,7 @@ async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
     };
-    assert_eq!(durable_rows.len(), 3);
+    assert_eq!(durable_rows.len(), 4);
     let durable_debug = format!("{durable_rows:?}");
     assert!(
         !durable_debug.contains(raw_window),
@@ -545,13 +583,24 @@ async fn stateless_full_trace_correlates_only_hashed_openai_window_body() {
         .map(|row| row.2.as_str())
         .collect::<BTreeSet<_>>();
     assert_eq!(durable_keys.len(), 1);
-    assert_eq!(durable_rows.last().unwrap().0, "toolsList");
-    assert_eq!(
-        durable_rows.last().unwrap().1.as_deref(),
-        Some("mcp_tools_list")
+    // Persistence is asynchronous, so the last row is not the tools/list row.
+    // Match the request by identity and require exactly one match, then keep
+    // every invariant the positional assertion used to cover.
+    let list_rows = durable_rows
+        .iter()
+        .filter(|row| row.0 == "toolsList")
+        .collect::<Vec<_>>();
+    assert_eq!(list_rows.len(), 1, "{durable_rows:?}");
+    assert_eq!(list_rows[0].1.as_deref(), Some("mcp_tools_list"));
+    assert_eq!(list_rows[0].8, 0);
+    assert!(list_rows[0].9.is_none());
+    assert!(
+        list_rows[0]
+            .4
+            .as_deref()
+            .is_some_and(|trace_id| !trace_ids.contains(trace_id)),
+        "the tools/list row must not belong to a tools/call trace: {durable_rows:?}"
     );
-    assert_eq!(durable_rows.last().unwrap().8, 0);
-    assert!(durable_rows.last().unwrap().9.is_none());
 }
 
 #[tokio::test]
@@ -934,6 +983,7 @@ async fn authority_probe(
     forwarded_host: Option<&str>,
 ) -> StatusCode {
     let mut request = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
         .add_header("host", host, true)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -955,7 +1005,7 @@ async fn authority_probe(
 
 #[tokio::test]
 async fn http_mcp_rejects_dns_rebinding_authority_before_jsonrpc_dispatch() {
-    let config = test_config(None);
+    let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
@@ -985,7 +1035,7 @@ async fn http_mcp_rejects_dns_rebinding_authority_before_jsonrpc_dispatch() {
 
 #[tokio::test]
 async fn http_mcp_accepts_loopback_authorities_without_requiring_origin() {
-    let config = test_config(None);
+    let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
@@ -1003,7 +1053,7 @@ async fn http_mcp_accepts_loopback_authorities_without_requiring_origin() {
 async fn http_mcp_accepts_configured_public_authority_and_matching_origin() {
     let mut env = crate::test_support::TestEnvGuard::new();
     env.set("WEBCODEX_PUBLIC_URL", "https://mcp.example.test");
-    let config = test_config(None);
+    let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
@@ -1043,7 +1093,7 @@ async fn http_mcp_accepts_configured_public_authority_and_matching_origin() {
 
 #[tokio::test]
 async fn http_mcp_rejects_malformed_host_and_origin() {
-    let config = test_config(None);
+    let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
@@ -1157,7 +1207,7 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime.clone()));
 
-    let session_id = start_mcp_fixture_session(&runtime, None, "ACK dogfood");
+    let session_id = start_mcp_fixture_session(&runtime, None, "ACK dogfood").await;
 
     let (status, post_body) = stateless_2026_tool_call(
         &service,
@@ -1549,7 +1599,7 @@ async fn http_mcp_2026_explicit_handoff_without_context_ack_body() {
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime.clone()));
-    let session_id = start_mcp_fixture_session(&runtime, None, "explicit recovery");
+    let session_id = start_mcp_fixture_session(&runtime, None, "explicit recovery").await;
     let (status, posted) = stateless_2026_tool_call(
         &service,
         "secret",
@@ -1643,9 +1693,9 @@ async fn http_mcp_2026_collaboration_completion_preserves_explicit_recorder_prov
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime.clone()));
 
-    let coordinator_id = start_mcp_fixture_session(&runtime, None, "Coordinator C");
-    let worker_id = start_mcp_fixture_session(&runtime, None, "Worker W");
-    let replay_worker_id = start_mcp_fixture_session(&runtime, None, "Replay worker X");
+    let coordinator_id = start_mcp_fixture_session(&runtime, None, "Coordinator C").await;
+    let worker_id = start_mcp_fixture_session(&runtime, None, "Worker W").await;
+    let replay_worker_id = start_mcp_fixture_session(&runtime, None, "Replay worker X").await;
 
     let (status, posted_body) = stateless_2026_tool_call(
         &service,
@@ -1697,7 +1747,8 @@ async fn http_mcp_2026_collaboration_completion_preserves_explicit_recorder_prov
     assert_eq!(forged_body["error"]["code"], -32602);
     assert!(forged_body["error"]["message"]
         .as_str()
-        .is_some_and(|message| message.contains("unknown field `author_session_id`")));
+        .is_some_and(|message| message.contains("unknown field")
+            && !message.contains("wc_sess_forged_should_not_win")));
 
     let completion_arguments = with_mcp_recording_session(
         json!({
@@ -1961,19 +2012,22 @@ async fn http_mcp_2026_observe_session_messages_preserves_stateless_delta_contra
     // The assertions below still exercise project resolution and immutable recorder authority
     // through the real stateless collaboration calls.
     let coordinator_id =
-        start_mcp_fixture_session(&runtime, Some(&shared_project), "Observation coordinator C");
+        start_mcp_fixture_session(&runtime, Some(&shared_project), "Observation coordinator C")
+            .await;
     let worker_id =
-        start_mcp_fixture_session(&runtime, Some(&shared_project), "Observation worker W");
+        start_mcp_fixture_session(&runtime, Some(&shared_project), "Observation worker W").await;
     let second_coordinator_id = start_mcp_fixture_session(
         &runtime,
         Some(&shared_project),
         "Observation coordinator C2",
-    );
+    )
+    .await;
     let foreign_worker_id = start_mcp_fixture_session(
         &runtime,
         Some(&foreign_project),
         "Foreign observation worker W2",
-    );
+    )
+    .await;
 
     let pre_baseline_body_marker = "pre-baseline-history-must-not-replay";
     let (status, pre_baseline_body) = stateless_2026_tool_call(

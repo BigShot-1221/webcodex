@@ -178,7 +178,16 @@ async fn failed_resume_cannot_restore_a_stale_starting_baseline() {
         assert_eq!(state.readiness.runner, RunnerReadiness::Error);
         assert_eq!(state.readiness.exposure, ExposureReadiness::Error);
         assert!(!state.readiness.runtime_ready);
-        assert_eq!(state.runtime_error, Some(error));
+        // The operation now attaches bounded correlation metadata to the
+        // same failure. Compare the semantic error and assert the new context,
+        // rather than requiring byte equality with the unenriched source.
+        let actual = state.runtime_error.as_ref().expect("failed resume error");
+        assert_eq!(actual.code, error.code);
+        assert_eq!(actual.message, error.message);
+        assert_eq!(actual.next_action, error.next_action);
+        let diagnostic = actual.diagnostic_ref().expect("safe diagnostic");
+        assert!(diagnostic.operation_id.is_some());
+        assert!(diagnostic.generation.is_some());
         assert!(state.current_operation.is_none());
     }
 }
@@ -365,6 +374,8 @@ async fn tunnel_configuration_edit_does_not_change_runner_generation_or_mcp_desi
         .unwrap();
     let state = app
         .save_tunnel_profile(crate::tunnel_config::TunnelProfileRequest {
+            expected_target: None,
+            oauth_dynamic_registration_enabled: None,
             provider: webcodex_environment::TunnelProvider::Openai,
             cloudflare_token: None,
             id: None,
@@ -379,6 +390,8 @@ async fn tunnel_configuration_edit_does_not_change_runner_generation_or_mcp_desi
         .unwrap();
     let connection = &state.connections.profiles[0].config;
     app.save_tunnel_profile(crate::tunnel_config::TunnelProfileRequest {
+        expected_target: None,
+        oauth_dynamic_registration_enabled: None,
         provider: webcodex_environment::TunnelProvider::Openai,
         cloudflare_token: None,
         id: Some(connection.id.clone()),

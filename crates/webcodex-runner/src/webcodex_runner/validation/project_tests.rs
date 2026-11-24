@@ -177,6 +177,7 @@ fn project_node_validation_rejects_other_actions_and_options() {
     request.scope = Some(ProjectValidationScope {
         packages: vec!["app".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     assert!(matches!(
         project::plan(&policy, &registry, &request),
@@ -335,6 +336,7 @@ fn project_validation_recipe_step_and_identity_preserve_normalized_selection() {
             req.scope = Some(ProjectValidationScope {
                 packages: packages.into_iter().map(str::to_string).collect(),
                 all_packages: false,
+                exclude_packages: Vec::new(),
             });
             req.dependency_policy = Some(ProjectDependencyPolicy {
                 mode: ProjectDependencyMode::Locked,
@@ -475,6 +477,7 @@ fn project_validation_package_scope_maps_through_canonical_operations() {
         req.scope = Some(ProjectValidationScope {
             packages: packages.into_iter().map(str::to_string).collect(),
             all_packages: false,
+            exclude_packages: Vec::new(),
         });
         let (plan, _) = project::plan(&policy, &registry, &req).unwrap();
         assert_eq!(plan.adapter, adapter);
@@ -531,6 +534,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     format.scope = Some(ProjectValidationScope {
         packages: vec!["package-a".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     assert!(matches!(
         project::plan(&policy, &registry, &format),
@@ -542,6 +546,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     invalid_rust.scope = Some(ProjectValidationScope {
         packages: vec!["-bad".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     assert!(matches!(
         project::plan(&policy, &registry, &invalid_rust),
@@ -554,6 +559,7 @@ fn project_validation_package_scope_fails_closed_when_action_or_backend_scope_is
     invalid_go.scope = Some(ProjectValidationScope {
         packages: vec!["not-relative".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     assert!(matches!(
         project::plan(&policy, &registry, &invalid_go),
@@ -788,6 +794,7 @@ fn project_validation_python_pytest_detects_explicit_and_auto_and_fences_config(
     req.scope = Some(ProjectValidationScope {
         packages: vec!["tests".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     assert!(
         matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable {code,..}) if code == "validation_scope_unsupported")
@@ -795,6 +802,7 @@ fn project_validation_python_pytest_detects_explicit_and_auto_and_fences_config(
     req.scope = Some(ProjectValidationScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     assert!(
         matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable {code,..}) if code == "validation_scope_unsupported")
@@ -888,6 +896,7 @@ fn project_validation_all_packages_target_member_change_fails_queue_fence() {
     req.scope = Some(ProjectValidationScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project::plan(&policy, &registry, &req).unwrap();
     assert!(plan.step.args.iter().any(|arg| arg == "--workspace"));
@@ -930,6 +939,7 @@ fn project_validation_all_packages_member_symlink_retarget_fails_queue_fence() {
     req.scope = Some(ProjectValidationScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project::plan(&policy, &registry, &req).unwrap();
     let operation = start_project_validation_operation(&plan, &cwd);
@@ -965,6 +975,7 @@ fn project_validation_all_packages_recursive_glob_cycle_fails_queue_fence() {
     req.scope = Some(ProjectValidationScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project::plan(&policy, &registry, &req).unwrap();
     let operation = start_project_validation_operation(&plan, &cwd);
@@ -991,6 +1002,7 @@ fn project_validation_all_packages_parent_workspace_appearance_fails_queue_fence
     req.scope = Some(ProjectValidationScope {
         packages: Vec::new(),
         all_packages: true,
+        exclude_packages: Vec::new(),
     });
     let (plan, cwd) = project::plan(&policy, &registry, &req).unwrap();
     let operation = start_project_validation_operation(&plan, &cwd);
@@ -1034,6 +1046,7 @@ fn project_validation_all_packages_rejects_excluded_recipe_cwd() {
         req.scope = Some(ProjectValidationScope {
             packages: Vec::new(),
             all_packages: true,
+            exclude_packages: Vec::new(),
         });
         assert!(
             matches!(project::plan(&policy, &registry, &req), Err(ProjectValidationPlanningResult::Unavailable { code, .. }) if code == "validation_scope_unavailable")
@@ -1334,7 +1347,22 @@ fn rust_clippy_plan_identity_and_queue_fence() {
         .contains("validation_plan_stale"));
     let mut offline = req;
     offline.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
-    assert!(project::plan(&policy, &registry, &offline).is_err());
+    let (offline_plan, _) = project::plan(&policy, &registry, &offline).unwrap();
+    assert_eq!(
+        offline_plan.step.args,
+        [
+            "clippy",
+            "--offline",
+            "--all-targets",
+            "--",
+            "-D",
+            "clippy::correctness"
+        ]
+    );
+    assert_ne!(
+        offline_plan.validation_target_id,
+        substituted.validation_target_id.unwrap()
+    );
 }
 
 #[test]
@@ -1360,6 +1388,7 @@ fn rust_clippy_workspace_scope_and_locked_policy_are_fenced() {
     scoped.scope = Some(ProjectValidationScope {
         packages: vec!["b".into(), "a".into(), "a".into()],
         all_packages: false,
+        exclude_packages: Vec::new(),
     });
     let selected = project::plan(&policy, &registry, &scoped).unwrap().0;
     assert_eq!(
@@ -1380,6 +1409,7 @@ fn rust_clippy_workspace_scope_and_locked_policy_are_fenced() {
     scoped.scope = Some(ProjectValidationScope {
         packages: vec![],
         all_packages: true,
+        exclude_packages: vec!["b".into()],
     });
     scoped.dependency_policy = Some(ProjectDependencyPolicy {
         mode: ProjectDependencyMode::Locked,
@@ -1392,6 +1422,8 @@ fn rust_clippy_workspace_scope_and_locked_policy_are_fenced() {
             "--locked",
             "--all-targets",
             "--workspace",
+            "--exclude",
+            "b",
             "--",
             "-D",
             "clippy::correctness"
@@ -1399,8 +1431,45 @@ fn rust_clippy_workspace_scope_and_locked_policy_are_fenced() {
     );
     assert!(all.step.is_project_workspace_cargo());
     assert_ne!(all.validation_target_id, selected.validation_target_id);
+    let mut offline = scoped.clone();
+    offline.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
+    let offline_plan = project::plan(&policy, &registry, &offline).unwrap().0;
+    assert_eq!(
+        offline_plan.step.args,
+        [
+            "clippy",
+            "--locked",
+            "--offline",
+            "--all-targets",
+            "--workspace",
+            "--exclude",
+            "b",
+            "--",
+            "-D",
+            "clippy::correctness"
+        ]
+    );
+    assert_ne!(offline_plan.validation_target_id, all.validation_target_id);
+    project::fence(
+        &policy,
+        &registry,
+        &start_project_validation_operation(&offline_plan, &root),
+    )
+    .unwrap();
     let operation = start_project_validation_operation(&all, &root);
     project::fence(&policy, &registry, &operation).unwrap();
+
+    for excluded in [
+        vec!["missing".to_string()],
+        vec!["a".to_string(), "b".to_string()],
+    ] {
+        scoped.scope = Some(ProjectValidationScope {
+            packages: vec![],
+            all_packages: true,
+            exclude_packages: excluded,
+        });
+        assert!(project::plan(&policy, &registry, &scoped).is_err());
+    }
     fs::write(
         root.join("a/Cargo.toml"),
         "[package]\nname='a'\nversion='0.2.0'\nedition='2021'\n",
@@ -1409,6 +1478,11 @@ fn rust_clippy_workspace_scope_and_locked_policy_are_fenced() {
     assert!(project::fence(&policy, &registry, &operation)
         .unwrap_err()
         .contains("validation_plan_stale"));
+    scoped.scope = Some(ProjectValidationScope {
+        packages: vec![],
+        all_packages: true,
+        exclude_packages: vec!["b".into()],
+    });
     let changed = project::plan(&policy, &registry, &scoped).unwrap().0;
     assert_ne!(
         all.provenance.manifest_digest,
@@ -1420,4 +1494,78 @@ fn rust_clippy_workspace_scope_and_locked_policy_are_fenced() {
     fs::write(root.join("nested/Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
     scoped.cwd = Some("nested".into());
     assert!(project::plan(&policy, &registry, &scoped).is_err());
+}
+
+#[test]
+fn rust_clippy_offline_provenance_survives_recovery_and_rejects_policy_drift() {
+    let (_tmp, root, registry, policy) = fixture("Cargo.toml");
+    for hint in [
+        ProjectValidationAdapter::Rust,
+        ProjectValidationAdapter::Auto,
+    ] {
+        for locked in [false, true] {
+            let mut req = request(ProjectValidationAction::Lint);
+            req.adapter = hint;
+            req.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
+            req.dependency_policy = locked.then_some(ProjectDependencyPolicy {
+                mode: ProjectDependencyMode::Locked,
+            });
+            let (plan, _) = project::plan(&policy, &registry, &req).unwrap();
+            assert!(plan.step.args.contains(&"--offline".into()));
+            assert_eq!(plan.step.args.contains(&"--locked".into()), locked);
+            let recovered: ProjectValidationPlan =
+                serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+            let operation = start_project_validation_operation(&recovered, &root);
+            project::fence(&policy, &registry, &operation).unwrap();
+            let mut drifted = plan.clone();
+            drifted.step.args.retain(|arg| arg != "--offline");
+            assert!(project::fence(
+                &policy,
+                &registry,
+                &start_project_validation_operation(&drifted, &root)
+            )
+            .is_err());
+            let mut drifted = plan.clone();
+            drifted.provenance.request.dependency_resolution_policy = None;
+            assert!(project::fence(
+                &policy,
+                &registry,
+                &start_project_validation_operation(&drifted, &root)
+            )
+            .is_err());
+            let mut online = req.clone();
+            online.dependency_resolution_policy = None;
+            let online = project::plan(&policy, &registry, &online).unwrap().0;
+            assert_ne!(plan.validation_target_id, online.validation_target_id);
+            assert_ne!(
+                plan.provenance.invocation_digest,
+                online.provenance.invocation_digest
+            );
+        }
+    }
+    for hint in [
+        ProjectValidationAdapter::Node,
+        ProjectValidationAdapter::Go,
+        ProjectValidationAdapter::Python,
+    ] {
+        let mut req = request(ProjectValidationAction::Lint);
+        req.adapter = hint;
+        req.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
+        assert!(project::plan(&policy, &registry, &req).is_err());
+    }
+}
+
+#[test]
+fn rust_clippy_offline_auto_rejects_resolved_node_before_execution() {
+    let (_tmp, root, registry, policy) = fixture("package.json");
+    fs::write(
+        root.join("package.json"),
+        r#"{"scripts":{"lint":"echo lint"}}"#,
+    )
+    .unwrap();
+    let mut req = request(ProjectValidationAction::Lint);
+    req.dependency_resolution_policy = Some(ProjectDependencyResolutionPolicy::Offline);
+    assert!(matches!(project::plan(&policy, &registry, &req),
+        Err(ProjectValidationPlanningResult::Unavailable { code, detected_backend })
+            if code == "dependency_resolution_policy_unsupported" && detected_backend.as_deref() == Some("node")));
 }

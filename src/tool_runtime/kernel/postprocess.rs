@@ -62,7 +62,9 @@ impl PostRecordResponse<'_> {
         if let Some(control) = self.control.take() {
             control.decorate_result(&mut result);
         }
-        if crate::tool_runtime::tool_definition::is_model_visible_tool_name(self.tool_name) {
+        if !self.capabilities.execution_only
+            && crate::tool_runtime::tool_definition::is_model_visible_tool_name(self.tool_name)
+        {
             let reply_started = std::time::Instant::now();
             runtime.add_window_model_reply_sidecar(
                 &mut result,
@@ -81,7 +83,9 @@ impl PostRecordResponse<'_> {
             );
         }
         plan.project(&mut result);
-        self.add_recorder_gap_hint(&mut result);
+        if !self.capabilities.execution_only {
+            self.add_recorder_gap_hint(&mut result);
+        }
         if self.tool_name == "read_tool_manifest" {
             crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut result);
         }
@@ -122,7 +126,9 @@ impl PostRecordResponse<'_> {
             }
         }
         let enrichment_deadline = crate::tool_runtime::optional_enrichment::deadline();
-        if crate::tool_runtime::tool_definition::is_model_visible_tool_name(self.tool_name) {
+        if !self.capabilities.execution_only
+            && crate::tool_runtime::tool_definition::is_model_visible_tool_name(self.tool_name)
+        {
             let peer_project = self
                 .correlation
                 .resolved_project
@@ -149,17 +155,19 @@ impl PostRecordResponse<'_> {
         if self.tool_name == "observe_jobs" {
             crate::tool_runtime::observe_jobs::sparsify_observe_jobs_model_result(&mut result);
         }
-        runtime
-            .add_passive_job_attention_until(
-                &mut result,
-                self.tool_name,
-                self.correlation.resolved_project.as_deref(),
-                self.correlation.business_session_id.as_deref(),
-                self.context.window,
-                self.context.auth,
-                enrichment_deadline,
-            )
-            .await;
+        if !self.capabilities.execution_only {
+            runtime
+                .add_passive_job_attention_until(
+                    &mut result,
+                    self.tool_name,
+                    self.correlation.resolved_project.as_deref(),
+                    self.correlation.business_session_id.as_deref(),
+                    self.context.window,
+                    self.context.auth,
+                    enrichment_deadline,
+                )
+                .await;
+        }
         if let Some(projection) = execution_control {
             projection.project(&mut result);
         }
@@ -194,17 +202,38 @@ impl PostRecordResponse<'_> {
 }
 
 fn canonical_audit_output(tool_name: &str, output: &Value) -> Option<Value> {
-    match tool_name {
-        "project_build" | "run_process" | "run_script" | "run_skill_resource" | "run_shell"
-        | "project_validate" | "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test" => Some(
-            crate::tool_runtime::tool_audit::canonical_execution_audit_result_for_tool(
-                tool_name, output,
-            ),
-        ),
-        "edit_project_files" | "read_files" | "search_project_texts" | "wait_for_job_readiness" => {
+    use webcodex_tool_contracts::{ToolAuditExecutionDetail, ToolAuditResultPolicy};
+
+    let policy = webcodex_tool_contracts::lookup_tool_definition(tool_name)?.audit_policy();
+    match policy.result {
+        ToolAuditResultPolicy::Fields(_) | ToolAuditResultPolicy::Semantic(_) => {
             Some(session_log_result_for_tool(tool_name, output))
         }
-        _ => None,
+        ToolAuditResultPolicy::CanonicalLedgerEvidence
+            if policy.execution.detail != ToolAuditExecutionDetail::Omit =>
+        {
+            Some(
+                crate::tool_runtime::tool_audit::canonical_execution_audit_result_for_tool(
+                    tool_name, output,
+                ),
+            )
+        }
+        // These domain projections rewrite audit-safe canonical evidence.
+        // Execution eligibility and privacy projections above belong exclusively
+        // to ToolDefinition; this list is only for canonical result compaction.
+        ToolAuditResultPolicy::CanonicalLedgerEvidence
+            if matches!(
+                tool_name,
+                "edit_project_files"
+                    | "read_files"
+                    | "search_project_texts"
+                    | "observe_jobs"
+                    | "wait_for_job_readiness"
+            ) =>
+        {
+            Some(session_log_result_for_tool(tool_name, output))
+        }
+        ToolAuditResultPolicy::CanonicalLedgerEvidence => None,
     }
 }
 

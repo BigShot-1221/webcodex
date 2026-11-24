@@ -1,13 +1,13 @@
 //! In-run ACP permission callback coordination (wait, respond, fail-closed).
 
-use super::protocol::bounded_text;
 use super::*;
 use agent_client_protocol_schema::v1::RequestPermissionRequest;
 use serde_json::Value;
 use uuid::Uuid;
 use webcodex_core::coding_agent::{
-    CODING_AGENT_MAX_PERMISSION_OPTIONS, CODING_AGENT_PERMISSION_REQUEST_TOKEN_PREFIX,
-    CodingAgentPendingPermission, CodingAgentPermissionOptionSummary, validate_pending_permission,
+    validate_pending_permission, CodingAgentPendingPermission, CodingAgentPermissionOptionSummary,
+    CODING_AGENT_MAX_PERMISSION_OPTIONS, CODING_AGENT_MAX_PERMISSION_TITLE_BYTES,
+    CODING_AGENT_PERMISSION_REQUEST_TOKEN_PREFIX,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,19 @@ impl Default for PermissionSlot {
     }
 }
 
+fn permission_title(value: &str) -> String {
+    const MAX: usize = CODING_AGENT_MAX_PERMISSION_TITLE_BYTES;
+    if value.len() <= MAX {
+        return value.to_owned();
+    }
+    let suffix = "…";
+    let mut end = MAX - suffix.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &value[..end])
+}
+
 impl PermissionSlot {
     pub(super) fn open_from_acp(
         &self,
@@ -61,15 +74,17 @@ impl PermissionSlot {
         let tool_call_id = params
             .pointer("/toolCall/toolCallId")
             .and_then(Value::as_str)
-            .map(bounded_text)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "ACP permission tool_call_id is invalid".to_string())?;
+            .ok_or_else(|| "ACP permission tool_call_id is invalid".to_string())?
+            .to_owned();
+        // ACP permission requests carry a ToolCallUpdate, not a full ToolCall.
+        // The title is optional display metadata, never an authorization identity.
         let title = params
             .pointer("/toolCall/title")
             .and_then(Value::as_str)
-            .map(bounded_text)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "ACP permission title is invalid".to_string())?;
+            .filter(|value| !value.trim().is_empty())
+            .map(permission_title)
+            .unwrap_or_else(|| "ACP tool call (title not provided)".to_string());
         let mut options = Vec::new();
         let option_values = params
             .get("options")
@@ -82,23 +97,26 @@ impl PermissionSlot {
             let option_id = option
                 .get("optionId")
                 .and_then(Value::as_str)
-                .map(bounded_text)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| "ACP permission option is invalid".to_string())?;
+                .ok_or_else(|| "ACP permission option is invalid".to_string())?
+                .to_owned();
             let name = option
                 .get("name")
                 .and_then(Value::as_str)
-                .map(bounded_text)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| "ACP permission option is invalid".to_string())?;
+                .ok_or_else(|| "ACP permission option is invalid".to_string())?
+                .to_owned();
             let kind = option
                 .get("kind")
                 .and_then(Value::as_str)
-                .map(bounded_text)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| "ACP permission option is invalid".to_string())?;
-            if option_id.is_empty() || name.is_empty() || kind.is_empty() {
-                return Err("ACP permission option is invalid".to_string());
+                .ok_or_else(|| "ACP permission option is invalid".to_string())?
+                .to_owned();
+            if options
+                .iter()
+                .any(|option: &CodingAgentPermissionOptionSummary| option.option_id == option_id)
+            {
+                return Err("ACP permission option identity is duplicated".to_string());
             }
             options.push(CodingAgentPermissionOptionSummary {
                 option_id,
@@ -109,11 +127,9 @@ impl PermissionSlot {
         if options.is_empty() || options.len() > CODING_AGENT_MAX_PERMISSION_OPTIONS {
             return Err("ACP permission options are invalid".to_string());
         }
-        {
-            let slot = self.active.lock().unwrap();
-            if slot.is_some() {
-                return Err("ACP permission callback already active".to_string());
-            }
+        let mut slot = self.active.lock().unwrap();
+        if slot.is_some() {
+            return Err("ACP permission callback already active".to_string());
         }
         let generation = self
             .generation
@@ -132,7 +148,6 @@ impl PermissionSlot {
             options,
         };
         validate_pending_permission(&pending)?;
-        let mut slot = self.active.lock().unwrap();
         *slot = Some(ActivePermission {
             pending: pending.clone(),
             rpc_id,

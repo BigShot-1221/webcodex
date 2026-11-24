@@ -1,0 +1,4 @@
+==> src/main.rs:1-1 of 20 (read_revision 7)
+fn main() {}
+more lines available
+next: read_files items=[{"expected_read_revision":7,"path":"src/main.rs","start_line":2}] project="agent:mini:webcodex"

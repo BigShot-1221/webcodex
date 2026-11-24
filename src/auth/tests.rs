@@ -286,7 +286,6 @@ fn gate_router(config: Arc<crate::Config>, db: Arc<crate::Database>) -> Router {
                 .push(Router::with_path("tools/call").post(echo_ok))
                 .push(Router::with_path("future/authenticated-route").post(echo_ok))
                 .push(Router::with_path("runtime-console/projects").post(echo_ok))
-                .push(Router::with_path("shell/job").post(echo_ok))
                 .push(Router::with_path("audit/sessions").post(echo_ok))
                 .push(Router::with_path("audit/session").post(echo_ok))
                 .push(Router::with_path("audit/stats").post(echo_ok))
@@ -633,7 +632,7 @@ async fn gate_unauthorized_response_is_json_not_html() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn pat_verifier_bootstrap_when_auth_disabled() {
+async fn pat_verifier_rejects_when_bootstrap_token_is_missing() {
     let config = crate::Config {
         addr: "127.0.0.1:0".to_string(),
         data_dir: PathBuf::from("./data"),
@@ -643,9 +642,10 @@ async fn pat_verifier_bootstrap_when_auth_disabled() {
     };
     let verifier = PatVerifier;
     let result = verifier.verify(&config, None, "anything").await.unwrap();
-    let ctx = result.expect("should return bootstrap context");
-    assert!(ctx.is_bootstrap);
-    assert_eq!(ctx.kind, AuthKind::Bootstrap);
+    assert!(
+        result.is_none(),
+        "missing credential must not grant bootstrap"
+    );
 }
 
 #[tokio::test]
@@ -1129,6 +1129,7 @@ async fn oauth2_verifier_accepts_current_project_share_and_preserves_project_ide
     let client = crate::models::OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: hash_token(&secret),
         name: "project-share".to_string(),
         owner_user_id: None,
@@ -1195,6 +1196,7 @@ async fn oauth2_verifier_rejects_stale_project_share_session() {
     let client = crate::models::OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: hash_token(&generate_oauth_client_secret()),
         name: "project-share".to_string(),
         owner_user_id: None,
@@ -1506,7 +1508,7 @@ async fn shared_key_fallback_gated_by_env_and_prefix() {
     });
 
     // Shared-key disabled (default): unknown non-wc token → None (reject).
-    let r = authenticate_bearer(config.clone(), None, Some("my-key")).await;
+    let r = authenticate_bearer(&config, None, Some("my-key")).await;
     assert!(
         r.is_none(),
         "unknown token should be rejected when shared-key disabled"
@@ -1514,13 +1516,13 @@ async fn shared_key_fallback_gated_by_env_and_prefix() {
 
     // A remote bind needs an explicit shared-key opt-in.
     env.enable_direct_shared_key();
-    let r = authenticate_bearer(config.clone(), None, Some("my-key")).await;
+    let r = authenticate_bearer(&config, None, Some("my-key")).await;
     assert!(
         r.is_none(),
         "remote shared-key fallback must require opt-in"
     );
     env.enable_remote_shared_key();
-    let r = authenticate_bearer(config.clone(), None, Some("my-key")).await;
+    let r = authenticate_bearer(&config, None, Some("my-key")).await;
     assert!(r.is_some(), "non-wc token should be accepted as shared-key");
     let ctx = r.unwrap();
     assert!(ctx.is_shared_key());
@@ -1534,15 +1536,15 @@ async fn shared_key_fallback_gated_by_env_and_prefix() {
         "wc_acct_invalid",
         "wc_oat_invalid",
     ] {
-        let r = authenticate_bearer(config.clone(), None, Some(token)).await;
+        let r = authenticate_bearer(&config, None, Some(token)).await;
         assert!(r.is_none(), "{token} must not fall back to shared-key");
     }
 
     // Empty or whitespace-only bearer values must not become sha256("")
     // shared-key groups.
-    let r = authenticate_bearer(config.clone(), None, Some("")).await;
+    let r = authenticate_bearer(&config, None, Some("")).await;
     assert!(r.is_none(), "empty token must be rejected");
-    let r = authenticate_bearer(config.clone(), None, Some("   \t")).await;
+    let r = authenticate_bearer(&config, None, Some("   \t")).await;
     assert!(r.is_none(), "whitespace token must be rejected");
 }
 
@@ -1633,7 +1635,7 @@ async fn shared_key_fallback_and_oauth_bridge_flags_are_independent() {
 
     env.enable_oauth2_shared_key_bridge();
     assert!(crate::OAuth2Config::from_env().shared_key_bridge_enabled);
-    let r = authenticate_bearer(config.clone(), None, Some("my-key")).await;
+    let r = authenticate_bearer(&config, None, Some("my-key")).await;
     assert!(
         r.is_none(),
         "OAuth bridge flag must not enable direct Bearer shared-key fallback"
@@ -1643,7 +1645,7 @@ async fn shared_key_fallback_and_oauth_bridge_flags_are_independent() {
     env.enable_direct_shared_key();
     env.enable_remote_shared_key();
     assert!(!crate::OAuth2Config::from_env().shared_key_bridge_enabled);
-    let r = authenticate_bearer(config.clone(), None, Some("my-key")).await;
+    let r = authenticate_bearer(&config, None, Some("my-key")).await;
     assert!(
         r.is_some_and(|ctx| ctx.is_shared_key()),
         "direct shared-key fallback must not require OAuth bridge"
@@ -1669,7 +1671,7 @@ async fn authenticate_returns_none_for_unknown_token_with_db() {
         oauth2: crate::OAuth2Config::default(),
     };
     let (_tmp, db) = gate_test_db();
-    let result = authenticate(Arc::new(config), Some(db), "wc_pat_bogus".to_string())
+    let result = authenticate(Arc::new(config.clone()), Some(&db), "wc_pat_bogus")
         .await
         .unwrap();
     assert!(result.is_none(), "unknown token should return None");
@@ -1681,7 +1683,7 @@ async fn authenticate_returns_api_token_for_valid_user_pat() {
     let (_tmp, db) = gate_test_db();
     let user = gate_seed_user(&db, "alice");
     let token = gate_mint_user_token(&db, &user);
-    let result = authenticate(config.clone(), Some(db.clone()), token)
+    let result = authenticate(config.clone(), Some(&db), &token)
         .await
         .unwrap();
     let ctx = result.expect("should return auth context");
@@ -1696,7 +1698,7 @@ async fn authenticate_returns_agent_token_for_valid_agent_token() {
     let (_tmp, db) = gate_test_db();
     let user = gate_seed_user(&db, "alice");
     let token = gate_mint_agent_token(&db, &user, "alice-laptop");
-    let result = authenticate(config.clone(), Some(db.clone()), token)
+    let result = authenticate(config.clone(), Some(&db), &token)
         .await
         .unwrap();
     let ctx = result.expect("should return auth context");
@@ -1711,7 +1713,7 @@ async fn authenticate_returns_account_credential_for_valid_credential() {
     let (_tmp, db) = gate_test_db();
     let user = gate_seed_user(&db, "alice");
     let credential = gate_mint_account_credential(&db, &user);
-    let result = authenticate(config.clone(), Some(db.clone()), credential)
+    let result = authenticate(config.clone(), Some(&db), &credential)
         .await
         .unwrap();
     let ctx = result.expect("should return auth context");
@@ -1727,7 +1729,7 @@ async fn authenticate_rejects_disabled_user_pat() {
     let token = gate_mint_user_token(&db, &user);
     db.set_user_disabled(&user.id, true, chrono::Utc::now().timestamp())
         .unwrap();
-    let result = authenticate(config.clone(), Some(db.clone()), token).await;
+    let result = authenticate(config.clone(), Some(&db), &token).await;
     assert!(result.is_err(), "disabled user should return Err");
 }
 
@@ -1754,7 +1756,7 @@ async fn authenticate_rejects_expired_token() {
         allowed_client_id: None,
     };
     db.insert_api_key(&record, &hash).unwrap();
-    let result = authenticate(config.clone(), Some(db.clone()), plaintext).await;
+    let result = authenticate(config.clone(), Some(&db), &plaintext).await;
     assert!(result.is_err(), "expired token should return Err");
 }
 
@@ -1768,7 +1770,7 @@ async fn authenticate_oauth2_stub_does_not_break_pat_fallback() {
     let user = gate_seed_user(&db, "alice");
     let token = gate_mint_user_token(&db, &user);
     // authenticate runs PatVerifier first, which should succeed.
-    let result = authenticate(config.clone(), Some(db.clone()), token)
+    let result = authenticate(config.clone(), Some(&db), &token)
         .await
         .unwrap();
     assert!(
@@ -1784,9 +1786,24 @@ async fn authenticate_oauth2_stub_does_not_break_pat_fallback() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+async fn tokenless_http_rejects_bootstrap_on_all_listener_addresses() {
+    let _env = AuthEnvGuard::auth_required();
+    for address in ["127.0.0.1:8080", "[::1]:8080", "0.0.0.0:8080", "[::]:8080"] {
+        let (_tmp, db) = gate_test_db();
+        let mut config = (*gate_test_config(None)).clone();
+        config.addr = address.to_string();
+        let service = salvo::Service::new(gate_router(Arc::new(config), db));
+        for token in [None, Some("untrusted")] {
+            let (status, _) = gate_send(&service, "/api/runtime/status", token).await;
+            assert_eq!(status, salvo::http::StatusCode::UNAUTHORIZED, "{address}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn authenticate_bearer_bootstrap_and_no_token() {
     let _env = AuthEnvGuard::auth_required();
-    // Auth disabled → bootstrap.
+    // Missing bootstrap credentials must not grant authority.
     let config = Arc::new(crate::Config {
         addr: "127.0.0.1:0".to_string(),
         data_dir: PathBuf::from("./data"),
@@ -1794,23 +1811,27 @@ async fn authenticate_bearer_bootstrap_and_no_token() {
         max_text_size: 2 * 1024 * 1024,
         oauth2: crate::OAuth2Config::default(),
     });
-    let ctx = authenticate_bearer(config.clone(), None, Some("anything"))
+    assert!(
+        authenticate_bearer(&config, None, Some("anything"))
+            .await
+            .is_none()
+    );
+    assert!(authenticate_bearer(&config, None, None)
         .await
-        .expect("auth disabled should return bootstrap");
-    assert!(ctx.is_bootstrap);
+        .is_none());
 
     // Valid bootstrap token → bootstrap.
     let config = Arc::new(crate::Config {
         token: Some("secret".to_string()),
         ..(*config).clone()
     });
-    let ctx = authenticate_bearer(config.clone(), None, Some("secret"))
+    let ctx = authenticate_bearer(&config, None, Some("secret"))
         .await
         .expect("bootstrap token should return bootstrap");
     assert!(ctx.is_bootstrap);
 
     // No token → None.
-    let result = authenticate_bearer(config, None, None).await;
+    let result = authenticate_bearer(&config, None, None).await;
     assert!(result.is_none(), "no token should return None");
 }
 
@@ -1828,7 +1849,7 @@ async fn authenticate_bearer_rejects_account_credential() {
         .unwrap()
         .unwrap();
     assert!(record.last_used_at.is_none(), "precondition");
-    let result = authenticate_bearer(config.clone(), Some(db.clone()), Some(&credential)).await;
+    let result = authenticate_bearer(&config, Some(&db), Some(&credential)).await;
     assert!(
         result.is_none(),
         "account credentials must be rejected on Runner transport"
@@ -1858,7 +1879,7 @@ async fn authenticate_bearer_rejects_oauth2_access_token() {
     let (at, plaintext) =
         gate_seed_shared_key_oauth_access_token(&db, &client, "runtime:read", "test-hash-a");
     assert!(at.last_used_at.is_none(), "precondition");
-    let result = authenticate_bearer(config.clone(), Some(db.clone()), Some(&plaintext)).await;
+    let result = authenticate_bearer(&config, Some(&db), Some(&plaintext)).await;
     assert!(
         result.is_none(),
         "OAuth2 access tokens must be rejected on Runner transport (QUIC)"
@@ -1916,7 +1937,7 @@ async fn authenticate_bearer_accepts_and_rejects_by_token_type() {
     ];
 
     for (label, token, should_succeed) in &cases {
-        let result = authenticate_bearer(config.clone(), Some(db.clone()), *token).await;
+        let result = authenticate_bearer(&config, Some(&db), *token).await;
         if *should_succeed {
             assert!(result.is_some(), "{label}: expected Some, got None");
         } else {
@@ -1962,12 +1983,13 @@ async fn unknown_token_rejection_survives_concurrent_guarded_mode_toggles() {
             !allow_anonymous_enabled(),
             "round {round}: open-anonymous mode leaked into an auth_required window"
         );
-        let unknown = authenticate_bearer(config.clone(), None, Some("canary-unknown-key")).await;
+        let unknown =
+            authenticate_bearer(&config, None, Some("canary-unknown-key")).await;
         assert!(
             unknown.is_none(),
             "round {round}: unknown token was accepted as a shared key"
         );
-        let missing = authenticate_bearer(config.clone(), None, None).await;
+        let missing = authenticate_bearer(&config, None, None).await;
         assert!(
             missing.is_none(),
             "round {round}: missing token was accepted anonymously"
@@ -2126,7 +2148,6 @@ async fn oauth2_scope_gate_matrix() {
     for (scopes, path) in [
         ("runtime:read", "/api/runtime/status"),
         ("project:read", "/api/runtime-console/projects"),
-        ("job:run", "/api/shell/job"),
     ] {
         let (_tmp, service, token) = gate_oauth2_token_with_scopes(scopes).await;
         let (status, body) = gate_send(&service, path, Some(&token)).await;
@@ -2135,7 +2156,7 @@ async fn oauth2_scope_gate_matrix() {
     // …every other surface stays closed with insufficient_scope, including
     // the OAuth authorize page, the Runner transport, and unknown routes
     // (fail closed).
-    let insufficient: [(&str, &str, Option<&str>); 6] = [
+    let insufficient: [(&str, &str, Option<&str>); 5] = [
         (
             "project:read",
             "/api/runtime/status",
@@ -2146,7 +2167,6 @@ async fn oauth2_scope_gate_matrix() {
             "/api/runtime-console/projects",
             Some(SCOPE_PROJECT_READ),
         ),
-        ("project:write", "/api/shell/job", Some(SCOPE_JOB_RUN)),
         ("runtime:read", "/oauth/authorize", None),
         ("runtime:read", "/api/shell/agent/register", None),
         ("runtime:read", "/api/future/authenticated-route", None),
@@ -2195,11 +2215,7 @@ async fn api_token_obeys_declared_scope_and_unknown_route_policy() {
     );
     let service = Service::new(gate_router(config, db));
 
-    for path in [
-        "/api/runtime/status",
-        "/api/runtime-console/projects",
-        "/api/shell/job",
-    ] {
+    for path in ["/api/runtime/status", "/api/runtime-console/projects"] {
         let (status, body) = gate_send(&service, path, Some(&user_token)).await;
         assert_eq!(status, StatusCode::OK, "{} body: {:?}", path, body);
     }
@@ -2570,13 +2586,17 @@ async fn auth_middleware_no_challenge_when_oauth2_disabled() {
 }
 
 /// Structural proof that the verifier chain's database work crosses the
-/// blocking boundary: with the store's writer connection held on a dedicated
-/// thread, the current-thread runtime must still schedule work (including a
-/// timer heartbeat) while authentication waits on the lock. If database work
-/// ran inline on the runtime thread, the holder's bounded wait expires without
-/// the heartbeat and the assertion fails instead of the test deadlocking.
-#[tokio::test(flavor = "current_thread")]
-async fn authenticate_database_work_runs_on_the_blocking_pool() {
+/// blocking boundary. The main test thread holds the store's writer
+/// connection while the auth chain runs on a separate thread's single-thread
+/// runtime with a heartbeat task: the heartbeat can only fire while the
+/// writer lock is still held if the runtime thread stayed free — i.e. the
+/// database work ran on the blocking pool. With inline database work (the
+/// pre-fix behavior) the runtime thread blocks inside the task poll, the
+/// heartbeat never fires, and the bounded wait below fails the test
+/// deterministically; unwinding drops the lock, the leaked probe finishes,
+/// and the process exits normally instead of hanging.
+#[test]
+fn authenticate_database_work_runs_on_the_blocking_pool() {
     use std::sync::mpsc;
     use std::time::Duration;
     let config = gate_test_config(Some("secret"));
@@ -2584,52 +2604,42 @@ async fn authenticate_database_work_runs_on_the_blocking_pool() {
     let user = gate_seed_user(&db, "alice");
     let token = gate_mint_user_token(&db, &user);
 
-    let (locked_tx, locked_rx) = mpsc::channel();
-    let (heartbeat_tx, heartbeat_rx) = mpsc::channel();
-    let (heartbeat_observed_tx, heartbeat_observed_rx) = mpsc::channel();
-    let db_holder = db.clone();
-    let holder = std::thread::spawn(move || {
-        let _guard = db_holder.conn_for_tests();
-        locked_tx.send(()).unwrap();
-        let heartbeat_while_locked = heartbeat_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-        heartbeat_observed_tx
-            .send(heartbeat_while_locked)
-            .expect("lock holder must report heartbeat observation");
+    let (started, started_rx) = mpsc::channel();
+    let (responsive, responsive_rx) = mpsc::channel::<()>();
+    let db_worker = db.clone();
+    let guard = db.conn_for_tests();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("auth probe runtime");
+        runtime.block_on(async move {
+            started.send(()).expect("probe start signal");
+            // Fires only if this runtime thread stays free while the auth
+            // chain waits for the writer lock.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = responsive.send(());
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                authenticate(config, Some(&db_worker), &token).await
+            })
+            .await
+            .expect("auth chain must finish once the lock is released")
+        })
     });
-    locked_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("writer lock holder must acquire the store connection");
 
-    let db_task = db.clone();
-    let token = token.to_string();
-    let task = tokio::spawn(async move {
-        authenticate(config.clone(), Some(db_task), token).await
-    });
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::time::sleep(Duration::from_millis(50)),
-    )
-    .await
-    .expect("runtime thread must stay responsive while auth waits for the store lock");
-    heartbeat_tx
-        .send(())
-        .expect("heartbeat must reach lock holder while connection remains locked");
-    let heartbeat_while_locked = heartbeat_observed_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("lock holder must report whether heartbeat arrived");
-    holder
-        .join()
-        .expect("writer lock holder thread must not panic");
-    assert!(
-        heartbeat_while_locked,
-        "runtime must make progress while the store connection remains locked; \
-         inline database work prevents the heartbeat from reaching the holder"
-    );
-    let result = tokio::time::timeout(Duration::from_secs(5), task)
-        .await
-        .expect("authenticate must complete once the store lock is released")
-        .unwrap()
-        .expect("valid token must authenticate");
-    let context = result.expect("valid token must yield a context");
+    started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("auth probe must start");
+    responsive_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("runtime thread must stay responsive while the writer lock is held; inline database work deadlocks it");
+    drop(guard);
+
+    let result = worker.join().expect("auth probe thread must not panic");
+    let context = result
+        .expect("valid token must authenticate")
+        .expect("valid token must yield a context");
     assert_eq!(context.username.as_deref(), Some("alice"));
 }

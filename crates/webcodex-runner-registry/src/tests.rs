@@ -1,6 +1,7 @@
 use crate::projects::RunnerLookupError;
 use crate::protocol::AcceptedRunnerProtocol;
 use crate::registry::{MAX_SHARED_KEY_RUNNERS_PER_GROUP, SHARED_KEY_OFFLINE_TTL_SECS};
+use crate::test_support::runner_registration_request;
 use crate::validation::{validate_file_request, validate_run_request, MAX_RUN_STDIN_BYTES};
 use crate::*;
 use std::sync::Arc;
@@ -42,6 +43,7 @@ fn agent_auth_context(
 
 fn project_summary(id: &str, path: &str) -> RunnerProjectSummary {
     RunnerProjectSummary {
+        registration_incarnation: None,
         id: id.to_string(),
         name: Some(id.to_string()),
         path: path.to_string(),
@@ -67,44 +69,22 @@ fn runner_registration(
     runner_instance_id: &str,
     _projects: Vec<RunnerProjectSummary>,
 ) -> RunnerRegisterRequest {
-    RunnerRegisterRequest {
-        computer_session_availability: None,
-        process_started_at: None,
-        build: None,
-        job_concurrency_limit: None,
-        job_inventory: None,
-        coding_agent_providers: None,
-        coding_agent_inventory: None,
-        client_id: client_id.to_string(),
-        runner_instance_id: runner_instance_id.to_string(),
-        runner_protocol_generation: RUNNER_PROTOCOL_GENERATION_V2,
-        display_name: None,
-        owner: None,
-        hostname: None,
-        host_context: None,
-        capabilities: async_job_capabilities(),
-        policy: None,
-    }
+    runner_registration_request(
+        client_id.to_string(),
+        runner_instance_id.to_string(),
+        RUNNER_PROTOCOL_GENERATION_V2,
+        async_job_capabilities(),
+    )
 }
 
 fn shell_job_start_request(
     client_id: &str,
     command: &str,
     timeout_secs: Option<u64>,
-) -> ShellJobOpRequest {
-    ShellJobOpRequest {
-        login: false,
-        op: "start".to_string(),
-        client_id: Some(client_id.to_string()),
-        cwd: None,
-        command: Some(command.to_string()),
-        timeout_secs,
-        job_id: None,
-        since_stdout_line: None,
-        since_stderr_line: None,
-        tail_lines: None,
-        limit: None,
-        codex: None,
+) -> JobStartRequest {
+    JobStartRequest {
+        timeout_secs: timeout_secs.unwrap_or(120),
+        ..JobStartRequest::shell(client_id, command)
     }
 }
 
@@ -291,6 +271,7 @@ mod computer_accessibility;
 mod computer_control;
 #[path = "tests/computer_observe.rs"]
 mod computer_observe;
+mod computer_post_observation;
 #[path = "tests/computer_snapshot_artifact.rs"]
 mod computer_snapshot_artifact;
 #[path = "tests/computer_text_input.rs"]

@@ -1,183 +1,175 @@
-use super::super::{SessionPersistence, SessionStore};
+use super::super::SessionStore;
+use super::tests::persistent_fixture;
 use super::*;
-use serde_json::Value;
-use std::path::Path;
-use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::time::Duration;
+use crate::{
+    ListSessionMessagesFilter, PostSessionMessageInput, SessionMessageDelivery, SessionMessageKind,
+    SessionMessagePriority,
+};
+use std::future::{poll_fn, Future};
+use std::sync::mpsc;
+use std::task::Poll;
 
-use crate::{PostSessionMessageInput, SessionMessageDelivery, SessionMessageKind, SessionMessagePriority};
-
-const CANCELLATION_SURVIVOR_TEXT: &str = "must survive cancellation";
-
-fn count_persisted_messages_with_text(
-    ledger: &Path,
-    session_id: &str,
-    message_text: &str,
-) -> Option<usize> {
-    let bytes = std::fs::read(ledger).ok()?;
-    let raw: Value = serde_json::from_slice(&bytes).ok()?;
-    let sessions = raw.get("sessions")?.as_array()?;
-    let record = sessions
-        .iter()
-        .find(|record| record.get("session_id").and_then(Value::as_str) == Some(session_id))?;
-    let messages = record.get("messages")?.as_array()?;
-    Some(
-        messages
-            .iter()
-            .filter(|message| {
-                message.get("message").and_then(Value::as_str) == Some(message_text)
-            })
-            .count(),
-    )
-}
-
-fn sync_fallback_store(path: &std::path::Path) -> SessionStore {
-    let mut store = SessionStore::new_in_memory_with_limits(16, 16, 20);
-    store.inner.lock().unwrap().persistence = Some(SessionPersistence {
-        path: path.to_path_buf(),
-        restored_sessions: 0,
-        last_persist_error: None,
-        database: None,
-        durable_db_path: None,
-    });
-    store.writer = None;
-    store
-}
-
-fn persistent_writer_fixture(window: Duration) -> (tempfile::TempDir, SessionStore) {
-    let temporary = tempfile::tempdir().unwrap();
-    let mut store = SessionStore::new_in_memory_with_limits(16, 16, 20);
-    store.inner.lock().unwrap().persistence = Some(SessionPersistence {
-        path: temporary.path().join("sessions.json"),
-        restored_sessions: 0,
-        last_persist_error: None,
-        database: None,
-        durable_db_path: None,
-    });
-    store.writer = LedgerWriterGuard::spawn_with_window(
-        store.inner.clone(),
-        store.persistence_write_mutex.clone(),
-        window,
-    );
-    assert!(store.writer.is_some());
-    (temporary, store)
-}
-
-#[tokio::test]
-async fn async_flush_registers_waiter_before_writer_completion_notify() {
-    let (_temporary, store) = persistent_writer_fixture(Duration::from_secs(60));
-    let writer = store.writer.as_ref().expect("persistent writer").clone();
-    let hold = Arc::new((Mutex::new(true), Condvar::new()));
-    writer.install_pre_completion_hold(Arc::clone(&hold));
-    let (registered_tx, registered_rx) = mpsc::channel();
-    writer.set_flush_wait_registered_sender(registered_tx);
-
-    store.start_session(None, Some("hold-reg".to_string()));
-    let generation = writer
-        .mark_dirty()
-        .expect("persistent writer must admit dirty mark");
-
-    let flush = {
-        let writer = Arc::clone(&writer);
-        tokio::spawn(async move { writer.flush_through(generation).await })
-    };
-    tokio::task::spawn_blocking(move || {
-        registered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("flush waiter must register before writer completion notify")
-    })
-    .await
-    .expect("registration waiter join");
-    {
-        let mut blocked = hold.0.lock().unwrap();
-        *blocked = false;
-        hold.1.notify_all();
-    }
-    tokio::time::timeout(Duration::from_secs(5), flush)
-        .await
-        .expect("flush must not hang after notify once waiter was registered")
-        .expect("flush task join");
-}
-
-#[tokio::test]
-async fn async_flush_through_waits_exact_generation() {
-    let (_temporary, store) = persistent_writer_fixture(Duration::from_secs(60));
-    let worker = store.clone();
-    let session_id = worker.start_session(None, None).session_id;
-    store
-        .persist_after_mutation_durable()
-        .await
-        .expect("async durable barrier");
-    assert!(store.contains_session(&session_id));
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn cancelled_durable_wait_does_not_skip_admitted_fallback_write() {
-    let temporary = tempfile::tempdir().unwrap();
-    let ledger = temporary.path().join("sessions.json");
-    let store = sync_fallback_store(&ledger);
-    let session = store.start_session(None, Some("async-cancel".to_string()));
-    let delivery = SessionMessageDelivery {
-        sender_scope: "d".repeat(64),
-        delivery_key: "cancel-key".to_string(),
-    };
-    let input = PostSessionMessageInput {
-        session_id: session.session_id.clone(),
-        kind: SessionMessageKind::Progress,
-        message: CANCELLATION_SURVIVOR_TEXT.to_string(),
+fn delivery_input(session_id: &str) -> PostSessionMessageInput {
+    PostSessionMessageInput {
+        session_id: session_id.to_owned(),
+        kind: SessionMessageKind::Note,
+        message: "durable delivery".to_owned(),
         tags: Vec::new(),
         reply_to: None,
         priority: SessionMessagePriority::Normal,
-    };
+    }
+}
 
-    // Hold the same mutex the admitted blocking write will take so cancellation
-    // cannot complete persistence until we release it. In-memory visibility after
-    // yield proves spawn_blocking was scheduled: post_message is synchronous and
-    // complete_durable_mutation has no await before spawning the write.
-    let write_guard = store
-        .persistence_write_mutex
-        .lock()
-        .expect("session persistence mutex poisoned");
-    let worker = store.clone();
-    let session_id = session.session_id.clone();
-    let handle = tokio::spawn(async move {
-        worker
-            .post_message_with_ack_and_delivery(input, false, Some(delivery))
-            .await
+fn delivery(key: &str) -> Option<SessionMessageDelivery> {
+    Some(SessionMessageDelivery {
+        sender_scope: "a".repeat(64),
+        delivery_key: key.to_owned(),
+    })
+}
+
+// Hold disk admission on another thread, with a watchdog so a regression that
+// blocks the current-thread executor fails instead of hanging the test suite.
+fn block_writes(store: &SessionStore) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let mutex = Arc::clone(&store.persistence_write_mutex);
+    let (ready, started) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let join = std::thread::spawn(move || {
+        let _guard = mutex.lock().unwrap();
+        ready.send(()).unwrap();
+        released
+            .recv_timeout(Duration::from_secs(10))
+            .expect("async request blocked its executor before releasing the write gate");
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if store
-                .list_messages(&session_id, Default::default())
-                .map(|messages| !messages.is_empty())
-                .unwrap_or(false)
-            {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
+    started.recv_timeout(Duration::from_secs(10)).unwrap();
+    (release, join)
+}
+
+async fn assert_pending(future: std::pin::Pin<&mut impl Future>) {
+    let mut future = future;
+    poll_fn(|context| {
+        assert!(future.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_delivery_keeps_notification_and_restart_safe_replay() {
+    {
+        let (temporary, store) = persistent_fixture(Duration::from_secs(60));
+        let session_id = store.start_session(None, None).session_id;
+        store.flush_persistence();
+        let mut notifications = store.message_observation_notify.subscribe();
+        let (release, write_gate) = block_writes(&store);
+        let mut pending = Box::pin(store.post_message_with_ack_and_delivery(
+            delivery_input(&session_id),
+            false,
+            delivery("cancelled"),
+        ));
+        assert_pending(pending.as_mut()).await;
+
+        // This unrelated task must run while durability is still blocked.
+        assert_eq!(tokio::spawn(async { 42 }).await.unwrap(), 42);
+        assert!(notifications.has_changed().unwrap());
+        notifications.changed().await.unwrap();
+        let messages = store
+            .list_messages(&session_id, ListSessionMessagesFilter::default())
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        let message_id = messages[0].message_id.clone();
+
+        drop(pending);
+        release.send(()).unwrap();
+        write_gate.join().unwrap();
+        // Observe the already scheduled write; do not create a replacement
+        // dirty generation that could hide cancellation losing the first write.
+        let writer = store.writer.as_ref().unwrap();
+        let generation = writer.shared.state.lock().unwrap().dirty_generation;
+        writer.flush_through(generation).await.unwrap();
+        assert!(store.status().last_persist_error.is_none());
+        drop(store);
+
+        let restored =
+            SessionStore::with_persistence(temporary.path().join("sessions.json"), 16, 20);
+        let replay = restored
+            .post_message_with_ack_and_delivery(
+                delivery_input(&session_id),
+                false,
+                delivery("cancelled"),
+            )
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert!(!replay.state_changed);
+        assert_eq!(replay.message.message_id, message_id);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_flush_waits_only_for_its_generation_and_handles_precompleted_writes() {
+    let shared = Arc::new(LedgerWriterShared {
+        state: Mutex::new(LedgerWriterState::default()),
+        cvar: Condvar::new(),
+        completed: tokio::sync::Notify::new(),
+        fatal: tokio::sync::watch::channel(None).0,
+    });
+    let writer = LedgerWriterGuard {
+        shared: Arc::clone(&shared),
+        join: Mutex::new(None),
+    };
+    let first = 1;
+    writer.notify_generation(first).unwrap();
+    let mut first_wait = Box::pin(writer.flush_through(first));
+    assert_pending(first_wait.as_mut()).await;
+    let mut same_generation_wait = Box::pin(writer.flush_through(first));
+    assert_pending(same_generation_wait.as_mut()).await;
+    let second = 2;
+    writer.notify_generation(second).unwrap();
+    let mut second_wait = Box::pin(writer.flush_through(second));
+    assert_pending(second_wait.as_mut()).await;
+
+    shared.state.lock().unwrap().writes_completed = first;
+    shared.completed.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        first_wait.await.unwrap();
+        same_generation_wait.await.unwrap();
     })
     .await
-    .expect("in-memory message must appear while write mutex is held");
-    handle.abort();
-    let _ = handle.await;
-    drop(write_guard);
+    .expect("all waiters for the completed generation must wake");
+    assert_pending(second_wait.as_mut()).await;
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if count_persisted_messages_with_text(&ledger, &session_id, CANCELLATION_SURVIVOR_TEXT)
-                .is_some_and(|count| count == 1)
-            {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("admitted fallback write must finish after releasing write mutex");
+    shared.state.lock().unwrap().writes_completed = second;
+    shared.completed.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(10), second_wait)
+        .await
+        .expect("later generation must wake when its write finishes")
+        .unwrap();
+    // No retained notification is necessary once the predicate already holds.
+    writer.flush_through(first).await.unwrap();
+    writer.flush_through(second).await.unwrap();
+}
 
-    let count =
-        count_persisted_messages_with_text(&ledger, &session.session_id, CANCELLATION_SURVIVOR_TEXT)
-        .expect("ledger must contain persisted session after fallback write");
-    assert_eq!(count, 1);
+#[tokio::test(flavor = "current_thread")]
+async fn request_admission_applies_async_backpressure_and_preserves_failed_evidence() {
+    let (_temporary, store) = persistent_fixture(Duration::from_secs(60));
+    let id = store.start_session(None, None).session_id;
+    store.flush().await.unwrap();
+    let (release, gate) = block_writes(&store);
+    for n in 0..260 {
+        super::tests::append_read_fixture(&store, &id, n);
+    }
+    let mut admission = Box::pin(store.prepare_request());
+    assert_pending(admission.as_mut()).await;
+    assert_eq!(tokio::spawn(async { 42 }).await.unwrap(), 42);
+    release.send(()).unwrap();
+    gate.join().unwrap();
+    admission.await.unwrap();
+    store.set_persistence_failure_for_test(true);
+    super::tests::append_read_fixture(&store, &id, 999);
+    assert!(store.flush().await.is_err());
+    assert!(store.prepare_request().await.is_err());
+    assert_eq!(store.summary(&id, Some(1)).unwrap().events_total, 522);
+    store.set_persistence_failure_for_test(false);
+    store.prepare_request().await.unwrap();
+    assert!(store.status().last_persist_error.is_none());
 }

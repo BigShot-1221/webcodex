@@ -24,6 +24,7 @@ fn apply_text_edits_request(
         });
     }
     RunnerRequest {
+        computer_control_epoch: None,
         login: false,
         shell: None,
         request_id: "req-apply-text-edits".to_string(),
@@ -456,14 +457,11 @@ fn file_apply_text_edits_allows_public_dotenv_template_but_rejects_env() {
             }),
         ),
     );
-    assert_eq!(denied.exit_code, None, "{denied:?}");
-    assert!(
-        denied
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("sensitive")),
-        "{denied:?}"
-    );
+    let denied = line_edit_json(denied);
+    assert_eq!(denied["state_changed"], false);
+    assert_eq!(denied["execution_state"], "not_started");
+    assert_eq!(denied["error_kind"], "invalid_path");
+    assert!(denied["error"].as_str().unwrap().contains("sensitive"));
     assert_eq!(
         std::fs::read_to_string(tmp.path().join(".env")).unwrap(),
         "KEY=secret\n"
@@ -688,7 +686,11 @@ fn file_apply_text_edits_replace_exact_writes_atomically() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
     let file = tmp.path().join("target.txt");
-    std::fs::write(&file, "old\n").unwrap();
+    let old_block =
+        "    fn old_a() {\n        todo!()\n    }\n    fn old_b() {\n        todo!()\n    }";
+    let new_block =
+        "    fn new_a() -> u32 {\n        1\n    }\n    fn new_b() -> u32 {\n        2\n    }";
+    std::fs::write(&file, format!("mod foo {{\n{old_block}\n}}\n")).unwrap();
 
     let out = line_edit_json(handle_file_request(
         &policy,
@@ -697,7 +699,7 @@ fn file_apply_text_edits_replace_exact_writes_atomically() {
             "target.txt",
             serde_json::json!({
                 "edits": [
-                    {"kind": "replace_exact", "old_text": "old", "new_text": "new"}
+                    {"kind": "replace_exact", "old_text": old_block, "new_text": new_block}
                 ]
             }),
         ),
@@ -705,8 +707,209 @@ fn file_apply_text_edits_replace_exact_writes_atomically() {
     assert_eq!(out["changed"], true);
     assert_eq!(out["would_change"], true);
     assert_eq!(out["changed_paths"][0], "target.txt");
+    assert_eq!(out["applied_count"], 1);
+    assert_eq!(out["files"][0]["edits"][0]["kind"], "replace_exact");
     assert!(out["files"][0]["edits"][0].get("match_ranges").is_none());
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("mod foo {{\n{new_block}\n}}\n")
+    );
+}
+
+#[test]
+fn file_apply_text_edits_uses_dirty_worktree_instead_of_git_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_managed_worktree_repo(tmp.path());
+    let policy = project_policy(tmp.path());
+    let file = tmp.path().join("hello.txt");
+    let head = managed_git(tmp.path(), &["rev-parse", "HEAD"]);
+    let head_content = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(&file, "keep-before\nuser-wip\nkeep-after\n").unwrap();
+    let request = apply_text_edits_request(
+        tmp.path(),
+        "hello.txt",
+        serde_json::json!({
+            "recovery_metadata_version": 1,
+            "changes": [{"kind":"edit","path":"hello.txt","edits":[
+                {"kind":"replace_exact","old_text":"user-wip","new_text":"user-wip-plus-agent"}
+            ]}]
+        }),
+    );
+    let out = line_edit_json(handle_file_request(&policy, &request));
+    assert_eq!(out["changed"], true);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "keep-before\nuser-wip-plus-agent\nkeep-after\n"
+    );
+    assert_eq!(managed_git(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        managed_git(tmp.path(), &["show", "HEAD:hello.txt"]),
+        head_content.trim()
+    );
+    assert_eq!(
+        managed_git(tmp.path(), &["show", ":hello.txt"]),
+        head_content.trim()
+    );
+    assert_eq!(
+        managed_git(tmp.path(), &["diff", "--name-only"]),
+        "hello.txt"
+    );
+
+    // The same edit cannot match the committed content: the dirty worktree was
+    // the actual baseline, not a silent reset or a synthetic test-only plan.
+    std::fs::write(&file, &head_content).unwrap();
+    let rejected = line_edit_json(handle_file_request(&policy, &request));
+    assert_eq!(rejected["error_kind"], "edit_conflict");
+    assert_eq!(
+        rejected["conflict_recovery"]["conflict_kind"],
+        "match_not_found"
+    );
+    assert_eq!(rejected["state_changed"], false);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), head_content);
+}
+
+#[test]
+fn file_apply_text_edits_replace_range_preserves_line_endings_utf8_and_eof() {
+    for (case, original, replacement, expected) in [
+        ("lf_utf8", "α\nβ\nγ\n", "BETA\n", "α\nBETA\nγ\n"),
+        ("crlf", "a\r\nb\r\nc", "B\nC\n", "a\r\nB\r\nC\r\nc"),
+        ("utf8_eof", "a\nβ", "Ω", "a\nΩ"),
+        ("delete", "a\nb\nc\n", "", "a\nc\n"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = project_policy(tmp.path());
+        let file = tmp.path().join("target.txt");
+        std::fs::write(&file, original).unwrap();
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                tmp.path(),
+                "target.txt",
+                serde_json::json!({"edits":[{
+                    "kind":"replace_range", "new_text":replacement,
+                    "line_scope":{"start_line":2,"end_line":2}
+                }]}),
+            ),
+        ));
+        assert_eq!(out["changed"], true, "{case}: {out}");
+        assert_eq!(
+            out["files"][0]["edits"][0]["kind"], "replace_range",
+            "{case}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected, "{case}");
+    }
+}
+
+#[test]
+fn file_apply_text_edits_replace_range_uses_one_snapshot_and_rejects_overlap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let file = tmp.path().join("target.txt");
+    let original = "a\nb\nc\nd\ne\n";
+    std::fs::write(&file, original).unwrap();
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({"edits":[
+                {"kind":"replace_range","new_text":"B\nEXTRA\n","line_scope":{"start_line":2,"end_line":2}},
+                {"kind":"replace_range","new_text":"D\n","line_scope":{"start_line":4,"end_line":4}}
+            ]}),
+        ),
+    ));
+    assert_eq!(out["changed"], true);
+    assert_eq!(out["files"][0]["edits"].as_array().unwrap().len(), 2);
+    assert_eq!(out["files"][0]["edits"][1]["old_start_line"], 4);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "a\nB\nEXTRA\nc\nD\ne\n"
+    );
+
+    std::fs::write(&file, original).unwrap();
+    let overlap = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({
+                "recovery_metadata_version":1,
+                "changes":[{"kind":"edit","path":"target.txt","expected_sha256":sha256_hex_bytes(original.as_bytes()),"edits":[
+                    {"kind":"replace_range","new_text":"X\n","line_scope":{"start_line":2,"end_line":3}},
+                    {"kind":"replace_range","new_text":"Y\n","line_scope":{"start_line":3,"end_line":4}}
+                ]}]
+            }),
+        ),
+    ));
+    assert_eq!(overlap["error_kind"], "edit_conflict");
+    assert_eq!(
+        overlap["conflict_recovery"]["conflict_kind"],
+        "overlapping_edits"
+    );
+    assert_eq!(overlap["edit_index"], 1);
+    assert_eq!(overlap["state_changed"], false);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+}
+
+#[test]
+fn file_apply_text_edits_replace_range_rejects_invalid_or_out_of_bounds_lines() {
+    for (case, start_line, end_line) in [("zero", 0, 1), ("reversed", 3, 2), ("past_eof", 2, 4)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = project_policy(tmp.path());
+        let file = tmp.path().join("target.txt");
+        let original = "a\nb\nc\n";
+        std::fs::write(&file, original).unwrap();
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                tmp.path(),
+                "target.txt",
+                serde_json::json!({"edits":[{
+                    "kind":"replace_range", "new_text":"x",
+                    "line_scope":{"start_line":start_line,"end_line":end_line}
+                }]}),
+            ),
+        ));
+        assert_eq!(out["error_kind"], "edit_conflict", "{case}: {out}");
+        assert_eq!(out["state_changed"], false, "{case}");
+        assert_eq!(out["edit_index"], 0, "{case}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original, "{case}");
+    }
+}
+
+#[test]
+fn file_apply_text_edits_rejects_ambiguous_insert_anchors_without_write() {
+    for kind in ["insert_before", "insert_after"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = project_policy(tmp.path());
+        let file = tmp.path().join("target.txt");
+        std::fs::write(&file, "tag\ntag\n").unwrap();
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                tmp.path(),
+                "target.txt",
+                serde_json::json!({
+                    "recovery_metadata_version":1,
+                    "changes":[{"kind":"edit","path":"target.txt","edits":[
+                        {"kind":kind,"anchor_text":"tag","new_text":"x"}
+                    ]}]
+                }),
+            ),
+        ));
+        assert_eq!(out["error_kind"], "edit_conflict", "{kind}: {out}");
+        assert_eq!(
+            out["conflict_recovery"]["conflict_kind"], "multiple_matches",
+            "{kind}"
+        );
+        assert_eq!(out["conflict_recovery"]["match_count"], 2, "{kind}");
+        assert_eq!(out["state_changed"], false, "{kind}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "tag\ntag\n",
+            "{kind}"
+        );
+    }
 }
 
 #[test]
@@ -1072,44 +1275,49 @@ fn file_apply_text_edits_lf_accepts_crlf_edits_and_preserves_lf() {
 }
 
 #[test]
-fn file_apply_text_edits_mixed_line_endings_abort_entire_batch() {
-    let tmp = tempfile::tempdir().unwrap();
-    let policy = project_policy(tmp.path());
-    let first = tmp.path().join("first.txt");
-    let mixed = tmp.path().join("mixed.txt");
-    std::fs::write(&first, b"alpha\r\n").unwrap();
-    std::fs::write(&mixed, b"beta\r\ngamma\n").unwrap();
-    let hash = |path: &Path| sha256_hex_bytes(&std::fs::read(path).unwrap());
+fn file_apply_text_edits_unsupported_line_endings_abort_entire_batch() {
+    for (content, reason) in [
+        (&b"beta\r\ngamma\n"[..], "mixed LF and CRLF"),
+        (&b"beta\rgamma\r"[..], "bare CR"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = project_policy(tmp.path());
+        let first = tmp.path().join("first.txt");
+        let unsupported = tmp.path().join("unsupported.txt");
+        std::fs::write(&first, b"alpha\r\n").unwrap();
+        std::fs::write(&unsupported, content).unwrap();
+        let hash = |path: &Path| sha256_hex_bytes(&std::fs::read(path).unwrap());
 
-    let out = line_edit_json(handle_file_request(
-        &policy,
-        &apply_text_edits_request(
-            tmp.path(),
-            "first.txt",
-            serde_json::json!({
-                "changes": [
-                    {
-                        "kind": "edit",
-                        "path": "first.txt",
-                        "expected_sha256": hash(&first),
-                        "edits": [{"kind": "replace_exact", "old_text": "alpha\n", "new_text": "ALPHA\n"}]
-                    },
-                    {
-                        "kind": "edit",
-                        "path": "mixed.txt",
-                        "expected_sha256": hash(&mixed),
-                        "edits": [{"kind": "replace_exact", "old_text": "beta\n", "new_text": "BETA\n"}]
-                    }
-                ]
-            }),
-        ),
-    ));
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                tmp.path(),
+                "first.txt",
+                serde_json::json!({
+                    "changes": [
+                        {
+                            "kind": "edit",
+                            "path": "first.txt",
+                            "expected_sha256": hash(&first),
+                            "edits": [{"kind": "replace_exact", "old_text": "alpha\n", "new_text": "ALPHA\n"}]
+                        },
+                        {
+                            "kind": "edit",
+                            "path": "unsupported.txt",
+                            "expected_sha256": hash(&unsupported),
+                            "edits": [{"kind": "replace_exact", "old_text": "beta\n", "new_text": "BETA\n"}]
+                        }
+                    ]
+                }),
+            ),
+        ));
 
-    assert_eq!(out["error_kind"], "edit_conflict");
-    assert_eq!(out["change_index"], 1);
-    assert!(out["error"].as_str().unwrap().contains("mixed LF and CRLF"));
-    assert_eq!(std::fs::read(&first).unwrap(), b"alpha\r\n");
-    assert_eq!(std::fs::read(&mixed).unwrap(), b"beta\r\ngamma\n");
+        assert_eq!(out["error_kind"], "edit_conflict");
+        assert_eq!(out["change_index"], 1);
+        assert!(out["error"].as_str().unwrap().contains(reason));
+        assert_eq!(std::fs::read(&first).unwrap(), b"alpha\r\n");
+        assert_eq!(std::fs::read(&unsupported).unwrap(), content);
+    }
 }
 
 #[test]
@@ -1741,6 +1949,43 @@ fn file_apply_text_edits_line_scope_supports_all_exact_edit_kinds() {
         std::fs::read_to_string(&file).unwrap(),
         "REPLACE\nBEFORE+\nbefore\nafter\nAFTER+\n"
     );
+    for (kind, edit, expected) in [
+        (
+            "replace_exact",
+            serde_json::json!({"kind":"replace_exact","old_text":"dup","new_text":"SECOND"}),
+            "head\ndup\nmid\nSECOND\ntail\n",
+        ),
+        (
+            "delete_exact",
+            serde_json::json!({"kind":"delete_exact","old_text":"dup\n"}),
+            "head\ndup\nmid\ntail\n",
+        ),
+        (
+            "insert_before",
+            serde_json::json!({"kind":"insert_before","anchor_text":"dup\n","new_text":"BEFORE\n"}),
+            "head\ndup\nmid\nBEFORE\ndup\ntail\n",
+        ),
+        (
+            "insert_after",
+            serde_json::json!({"kind":"insert_after","anchor_text":"dup\n","new_text":"AFTER\n"}),
+            "head\ndup\nmid\ndup\nAFTER\ntail\n",
+        ),
+    ] {
+        let original = "head\ndup\nmid\ndup\ntail\n";
+        std::fs::write(&file, original).unwrap();
+        let mut edit = edit;
+        edit["line_scope"] = serde_json::json!({"start_line":4,"end_line":4});
+        let scoped = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                tmp.path(),
+                "target.txt",
+                serde_json::json!({"edits":[edit]}),
+            ),
+        ));
+        assert_eq!(scoped["changed"], true, "{kind}: {scoped}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected, "{kind}");
+    }
 }
 
 #[test]
@@ -1831,4 +2076,89 @@ fn file_apply_text_edits_scoped_dry_run_uses_same_resolution_without_write() {
     assert_eq!(out["changed"], false);
     assert_eq!(out["would_change"], true);
     assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+}
+
+#[test]
+fn file_apply_text_edits_write_is_revision_fenced_and_transactional() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let path = tmp.path().join("whole.txt");
+    std::fs::write(&path, "original\n").unwrap();
+    let sha = sha256_hex_bytes(b"original\n");
+    for guard in [serde_json::Value::Null, serde_json::json!("a".repeat(64))] {
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                tmp.path(),
+                "whole.txt",
+                serde_json::json!({"changes":[{"kind":"write", "path":"whole.txt", "content":"replacement", "expected_sha256":guard}]}),
+            ),
+        ));
+        assert!(out.get("error_kind").is_some(), "{out}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+    }
+    let batch = serde_json::json!({"changes":[{"kind":"write", "path":"whole.txt", "content":"replacement", "expected_sha256":sha}, {"kind":"delete", "path":"missing.txt", "expected_sha256":sha}]});
+    let failed = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(tmp.path(), "whole.txt", batch),
+    ));
+    assert!(failed.get("error_kind").is_some());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "original\n");
+    // Empty content is a valid overwrite; write never creates a missing file.
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "whole.txt",
+            serde_json::json!({"changes":[{"kind":"write", "path":"whole.txt", "content":"", "expected_sha256":sha}]}),
+        ),
+    ));
+    assert_eq!(out["changed"], true, "{out}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    assert_eq!(out["files"][0]["new_sha256"], sha256_hex_bytes(b""));
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "missing.txt",
+            serde_json::json!({"changes":[{"kind":"write", "path":"missing.txt", "content":"new", "expected_sha256":sha}]}),
+        ),
+    ));
+    assert!(out.get("error_kind").is_some());
+    assert!(!tmp.path().join("missing.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_text_edits_symlink_escape_is_a_transactional_no_effect_refusal() {
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), project.path().join("escape")).unwrap();
+    std::fs::write(project.path().join("unchanged.txt"), "old").unwrap();
+    for allow_outside in [false, true] {
+        let mut policy = project_policy(project.path());
+        if allow_outside {
+            policy.allowed_roots.push(outside.path().to_path_buf());
+        }
+        let out = line_edit_json(handle_file_request(
+            &policy,
+            &apply_text_edits_request(
+                project.path(),
+                "escape/new.txt",
+                serde_json::json!({"changes":[
+                    {"kind":"create","path":"new-inside.txt","content":"not committed"},
+                    {"kind":"create","path":"escape/new.txt","content":"not committed"}
+                ]}),
+            ),
+        ));
+        assert_eq!(out["state_changed"], false);
+        assert_eq!(out["execution_state"], "not_started");
+        assert_eq!(out["error_kind"], "path_policy_rejected");
+        assert!(!outside.path().join("new.txt").exists());
+        assert!(!project.path().join("new-inside.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("unchanged.txt")).unwrap(),
+            "old"
+        );
+    }
 }

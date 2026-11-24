@@ -139,15 +139,14 @@ pub(super) fn validate_runner_job_context_operation(
             if !operation.provenance.is_valid() {
                 return Err("project build Job provenance is invalid".to_string());
             }
-            let canonical = webcodex_core::project_build::canonical_project_build_process(
-                &operation.provenance.backend,
-                &operation.provenance.request,
-            )
-            .map_err(str::to_string)?;
-            if canonical != operation.process
-                || webcodex_core::project_build::project_build_invocation_digest(&operation.process)
-                    != operation.provenance.invocation_digest
-            {
+            // Use the same canonical process and digest contract as the typed
+            // plan. Node builds may select npm, pnpm, yarn or bun from the
+            // Runner-owned manifest; project_build::fence checks that source.
+            let plan = webcodex_core::project_build::ProjectBuildPlan {
+                provenance: operation.provenance.clone(),
+                process: operation.process.clone(),
+            };
+            if !plan.is_valid() {
                 return Err("project build Job process does not match provenance".to_string());
             }
         }
@@ -372,7 +371,9 @@ impl JobManager {
             } else {
                 None
             };
-            let queue_locally = immediate_failure.is_none() && reserved >= self.max_concurrent;
+            let queue_locally = immediate_failure.is_none()
+                && (reserved >= self.concurrency_limit()
+                    || !lock_unpoison(&self.queued).is_empty());
             let slot_reserved = immediate_failure.is_none() && !queue_locally;
             let now = chrono::Utc::now()
                 .timestamp()
@@ -436,6 +437,7 @@ impl JobManager {
             },
         );
         if queue_locally {
+            self.start_available_queued();
             return;
         }
         self.start_now(start);
@@ -463,9 +465,10 @@ impl JobManager {
         }
     }
 
-    pub(super) fn start_available_queued(&self) {
+    pub(crate) fn start_available_queued(&self) {
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
+                // Shutdown owns cancellation and terminalization of these entries.
                 return;
             }
             let next = {
@@ -485,7 +488,7 @@ impl JobManager {
                                 && runner_job_is_active(&job.snapshot.status)
                         })
                         .count();
-                    if reserved < self.max_concurrent {
+                    if reserved < self.concurrency_limit() {
                         selected = Some(idx);
                         break;
                     }

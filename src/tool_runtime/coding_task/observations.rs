@@ -16,7 +16,7 @@ impl ToolRuntime {
         summary: &sessions::SessionSummary,
         pre_instruction_summary: Option<&sessions::SessionSummary>,
         continuation_kind: &'static str,
-        jobs: &Value,
+        jobs: ContinuationJobSnapshot,
         workspace_conflicts: bool,
     ) -> Value {
         // Fresh new session: nothing to continue from.
@@ -34,19 +34,9 @@ impl ToolRuntime {
         if projection_summary.events.is_empty() {
             return not_applicable_continuation_feedback_value("empty_session");
         }
-        let projection_summary = self.refresh_validation_source_summary(projection_summary);
-        let validation = crate::tool_runtime::validation_events::validation_summary_from_events(
-            &projection_summary.events,
-            20,
-        );
-        let current_validation =
-            crate::tool_runtime::validation_events::current_validation_evidence_for_session(
-                &projection_summary,
-                20,
-            );
-        let raw_tool_failures = tool_failure_summary_from_events(&projection_summary.events, 10);
-        let reconciliation =
-            reconcile_closeout_evidence(&raw_tool_failures, &projection_summary, &validation);
+        let evidence = self.passive_closeout_session_evidence(projection_summary, 20);
+        let projection_summary = &evidence.summary;
+        let validation = evidence.validation.historical_value();
         let (discussion, _) = self.discussion_snapshot(&summary.session_id);
         continuation_feedback_value(ContinuationFeedbackInput {
             session_summary: &projection_summary,
@@ -57,9 +47,9 @@ impl ToolRuntime {
             suggest_exploration_continuity: true,
             workspace_conflicts,
             hooks: continuation_projection_hooks(),
-            current_validation: continuation_validation_snapshot(&current_validation),
+            current_validation: evidence.validation.continuation_snapshot(true),
             tool_failures: ContinuationToolFailureSnapshot::new(
-                &reconciliation.actionable_unexpected_event_ids,
+                &evidence.failures.actionable_unexpected_event_ids,
             ),
         })
     }
@@ -68,7 +58,6 @@ impl ToolRuntime {
         &self,
         project: &str,
         git: &Value,
-        warnings: &mut Vec<Value>,
     ) -> Option<String> {
         if git.get("available").and_then(Value::as_bool) != Some(true) {
             return None;
@@ -121,10 +110,6 @@ impl ToolRuntime {
             {
                 return Some(tree);
             }
-            warnings.push(json!({
-                "kind": "git_baseline_unavailable",
-                "message": "Git HEAD was observed but its baseline tree could not be resolved",
-            }));
             return None;
         }
 
@@ -144,10 +129,6 @@ impl ToolRuntime {
             )
             .await;
         if !symbolic_head.success {
-            warnings.push(json!({
-                "kind": "git_baseline_unavailable",
-                "message": "Git baseline could not distinguish an unborn HEAD from an unavailable HEAD",
-            }));
             return None;
         }
 
@@ -169,19 +150,10 @@ impl ToolRuntime {
         {
             return Some(tree);
         }
-        warnings.push(json!({
-            "kind": "git_baseline_unavailable",
-            "message": "Unborn Git repository could not create its repository-native empty tree baseline",
-        }));
         None
     }
 
-    pub(super) async fn coding_startup_git_summary(
-        &self,
-        project: &str,
-        include_recent_commits: bool,
-    ) -> (Value, Vec<Value>) {
-        let mut warnings = Vec::new();
+    pub(super) async fn coding_startup_git_summary(&self, project: &str) -> Value {
         let mut output = json!({
             "available": false,
             "branch": Value::Null,
@@ -189,7 +161,6 @@ impl ToolRuntime {
             "clean": Value::Null,
             "changed_files_count": 0,
             "counts": {},
-            "recent_commits": [],
             "warnings": [],
         });
 
@@ -197,12 +168,6 @@ impl ToolRuntime {
             let result = self
                 .show_changes(project.to_string(), None, Some(false), None, None, None)
                 .await;
-            if !result.success {
-                warnings.push(json!({
-                    "kind": "git_status_unavailable",
-                    "message": result.error,
-                }));
-            }
             output["available"] = json!(result
                 .output
                 .get("git_available")
@@ -248,34 +213,7 @@ impl ToolRuntime {
             output["show_changes"] = result.output;
         }
 
-        if include_recent_commits {
-            let result = self
-                .git_log(project.to_string(), None, Some(5), None, None)
-                .await;
-            if result.success {
-                output["recent_commits"] = result
-                    .output
-                    .get("commits")
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
-                output["recent_commits_truncated"] = result
-                    .output
-                    .get("truncated")
-                    .cloned()
-                    .unwrap_or(json!(false));
-            } else {
-                warnings.push(json!({
-                    "kind": "recent_commits_unavailable",
-                    "message": result.error,
-                }));
-                output["recent_commits"] = json!([]);
-                output["recent_commits_truncated"] = json!(false);
-            }
-        } else if let Some(object) = output.as_object_mut() {
-            object.remove("recent_commits");
-        }
-
-        (output, warnings)
+        output
     }
 
     /// Deterministic repository structure overview for the coding startup

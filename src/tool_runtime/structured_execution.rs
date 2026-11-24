@@ -9,8 +9,9 @@ use crate::auth::AuthContext;
 use crate::runner_http::RunnerRegistry;
 use crate::runner_protocol::{
     ShellCommandExecutionState, ShellJobInfo, ShellRunResponse, PROCESS_TIMEOUT_MAX_SECS,
-    SCRIPT_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS,
-    STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
+    RAW_SHELL_JOB_TIMEOUT_DEFAULT_SECS, RAW_SHELL_JOB_TIMEOUT_MAX_SECS, SCRIPT_TIMEOUT_MAX_SECS,
+    STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -30,7 +31,97 @@ pub(crate) struct StructuredExecutionBudget {
     pub(crate) sync_wait_secs: u64,
 }
 
+/// Timeout evidence shared by execution receipts and their lightweight notice.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExecutionTimeoutEvidence {
+    requested_timeout_secs: u64,
+    effective_timeout_secs: u64,
+    pub(crate) source: &'static str,
+    pub(crate) runner_policy_known: bool,
+}
+
+impl std::fmt::Display for ExecutionTimeoutEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.runner_policy_known {
+            return write!(
+                formatter,
+                "{}s dispatch budget (requested {}); Runner policy unavailable and may further limit execution",
+                self.effective_timeout_secs, self.requested_timeout_secs
+            );
+        }
+        let source = match self.source {
+            "runner_policy" => "runner policy",
+            _ => "tool limit",
+        };
+        write!(
+            formatter,
+            "{}s (requested {}; capped by {source})",
+            self.effective_timeout_secs, self.requested_timeout_secs
+        )
+    }
+}
+
+/// Resolve the last-registered machine ceiling before dispatch. The Runner
+/// still enforces its live policy; this can only narrow the tool budget.
+/// A legacy Runner without policy metadata leaves the actual ceiling unknown.
+pub(crate) async fn apply_runner_timeout_cap(
+    registry: &RunnerRegistry,
+    client_id: &str,
+    auth: Option<&AuthContext>,
+    requested_timeout_secs: Option<u64>,
+    mut budget: StructuredExecutionBudget,
+) -> (StructuredExecutionBudget, ExecutionTimeoutEvidence) {
+    let requested = requested_timeout_secs.unwrap_or(STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS);
+    let policy_max = registry
+        .get_runner_view_for_auth(
+            client_id,
+            crate::runner_http::runner_access_from_auth(auth).as_ref(),
+        )
+        .await
+        .and_then(|view| view.policy.map(|policy| policy.max_timeout_secs.max(1)));
+    let cap_source = if policy_max.is_some_and(|max| max <= budget.effective_timeout_secs) {
+        "runner_policy"
+    } else {
+        "tool_limit"
+    };
+    if let Some(max) = policy_max {
+        budget.effective_timeout_secs = budget.effective_timeout_secs.min(max);
+        budget.sync_wait_secs = budget.sync_wait_secs.min(budget.effective_timeout_secs);
+    }
+    let source = if policy_max.is_none() {
+        "runner_policy_unknown"
+    } else if budget.effective_timeout_secs < requested {
+        cap_source
+    } else {
+        "request"
+    };
+    let evidence = ExecutionTimeoutEvidence {
+        requested_timeout_secs: requested,
+        effective_timeout_secs: budget.effective_timeout_secs,
+        source,
+        runner_policy_known: policy_max.is_some(),
+    };
+    (budget, evidence)
+}
+
+pub(crate) fn add_timeout_cap_notice(result: &mut ToolResult, evidence: ExecutionTimeoutEvidence) {
+    if result.success
+        && result.output["terminal"] == false
+        && (!evidence.runner_policy_known
+            || evidence.effective_timeout_secs < evidence.requested_timeout_secs)
+    {
+        result.output["timeout"] = json!(evidence.to_string());
+    }
+}
+
 impl StructuredExecutionBudget {
+    pub(crate) fn resolve_raw_shell_job(timeout_secs: Option<i64>) -> Result<Self, String> {
+        let requested = timeout_secs.unwrap_or(RAW_SHELL_JOB_TIMEOUT_DEFAULT_SECS as i64);
+        let timeout_secs =
+            u64::try_from(requested).map_err(|_| "timeout_secs must be at least 1".to_string())?;
+        Self::resolve_with_timeout_max(Some(timeout_secs), None, RAW_SHELL_JOB_TIMEOUT_MAX_SECS)
+    }
+
     pub(crate) fn resolve_process(timeout_secs: Option<u64>) -> Result<Self, String> {
         Self::resolve_with_timeout_max(timeout_secs, None, PROCESS_TIMEOUT_MAX_SECS)
     }
@@ -101,12 +192,39 @@ pub(crate) async fn await_structured_job_result(
     terminal_result: fn(&ShellJobInfo, String, String, u64) -> ToolResult,
 ) -> Result<ToolResult, StructuredJobHandoffFailure> {
     let wait = sync_wait_limit.min(Duration::from_secs(budget.sync_wait_secs));
-    match await_hidden_structured_job(clients.clone(), job_id, wait, auth.cloned()).await? {
-        HiddenStructuredJobWait::Terminal {
-            job,
-            stdout,
-            stderr,
-        } => {
+    let mut handoff = HiddenJobHandoff::new(
+        clients.clone(),
+        job_id,
+        crate::runner_http::runner_access_from_auth(auth),
+    );
+    let result = match handoff.wait(wait, Duration::from_millis(25), None).await? {
+        HiddenStructuredJobWait::Terminal(observation) => {
+            let job = observation.job;
+            let stdout = observation.stdout_tail;
+            let stderr = observation.stderr_tail;
+            // Preserve the execution-only compact output/recovery contract from
+            // main when consuming a typed terminal snapshot.
+            let truncated = job.stdout_log_truncated
+                || job.stderr_log_truncated
+                || observation.stdout_truncated
+                || observation.stderr_truncated
+                || [&stdout, &stderr].iter().any(|stream| {
+                    stream.chars().count() > super::helpers::COMMAND_STDIO_TAIL_CHARS
+                        || stream.lines().count() > super::helpers::COMMAND_OUTPUT_MAX_LINES
+                });
+            // Preserve a terminal Job's recovery evidence if publication is cancelled.
+            // Short conclusive results stay guarded until deletion completes.
+            if truncated
+                || matches!(
+                    job.command_execution_state,
+                    Some(
+                        ShellCommandExecutionState::OutcomeUnknown
+                            | ShellCommandExecutionState::TimedOut
+                    )
+                )
+            {
+                handoff.disarm();
+            }
             let mut result = terminal_result(&job, stdout, stderr, budget.effective_timeout_secs);
             add_structured_continuation_facts(
                 &mut result,
@@ -114,7 +232,15 @@ pub(crate) async fn await_structured_job_result(
                 budget.sync_wait_secs,
                 true,
             );
-            finalize_hidden_terminal_projection(&clients, auth, &job, &mut result, budget).await;
+            finalize_hidden_terminal_projection(
+                &clients,
+                auth,
+                &job,
+                &mut result,
+                budget,
+                truncated,
+            )
+            .await;
             Ok(result)
         }
         HiddenStructuredJobWait::Continued {
@@ -164,7 +290,9 @@ pub(crate) async fn await_structured_job_result(
                 "continuation": continuation,
             })))
         }
-    }
+    };
+    handoff.disarm();
+    result
 }
 
 /// Entry-specific diagnostic wording; it never selects lifecycle or retry state.
@@ -333,11 +461,7 @@ pub(crate) fn structured_response_result(
 }
 
 pub(crate) enum HiddenStructuredJobWait {
-    Terminal {
-        job: ShellJobInfo,
-        stdout: String,
-        stderr: String,
-    },
+    Terminal(StructuredJobObservation),
     Continued {
         observation: StructuredJobObservation,
         execution_state: &'static str,
@@ -448,9 +572,9 @@ impl StructuredJobHandoffFailure {
 
 /// Finalize a hidden terminal projection without destroying recovery evidence.
 ///
-/// Conclusive terminal executions keep the existing sync-first behavior and are
-/// removed after their result is projected. `outcome_unknown` is intentionally
-/// different: effects may have occurred, so publish the same durable Job and
+/// Small conclusive terminal executions are removed after projection. Truncated
+/// output retains the same Job for paged log recovery without command replay.
+/// For `outcome_unknown`, effects may have occurred, so publish the same Job and
 /// attach its exact observation continuation. If publication itself cannot be
 /// proven, retain the hidden terminal record rather than deleting evidence.
 pub(crate) async fn finalize_hidden_terminal_projection(
@@ -459,8 +583,14 @@ pub(crate) async fn finalize_hidden_terminal_projection(
     job: &ShellJobInfo,
     result: &mut super::ToolResult,
     budget: StructuredExecutionBudget,
+    truncated: bool,
 ) {
-    if job.command_execution_state != Some(ShellCommandExecutionState::OutcomeUnknown) {
+    let retain = truncated
+        || matches!(
+            job.command_execution_state,
+            Some(ShellCommandExecutionState::OutcomeUnknown | ShellCommandExecutionState::TimedOut)
+        );
+    if !retain {
         clients
             .remove_projected_hidden_terminal_job_record(&job.job_id)
             .await;
@@ -468,10 +598,10 @@ pub(crate) async fn finalize_hidden_terminal_projection(
     }
 
     let access = crate::runner_http::runner_access_from_auth(auth);
-    let Ok(public_job) = clients
-        .promote_hidden_job(access.as_ref(), &job.job_id)
-        .await
-    else {
+    let publication = clients
+        .retain_terminal_job_logs(access.as_ref(), &job.job_id)
+        .await;
+    let Ok(public_job) = publication else {
         return;
     };
 
@@ -485,21 +615,25 @@ pub(crate) async fn finalize_hidden_terminal_projection(
     result.output["job_id"] = serde_json::json!(public_job.job_id);
     result.output["job_status"] = serde_json::json!(public_job.status);
     result.output["activity"] =
-        serde_json::to_value(public_job.activity).unwrap_or(serde_json::Value::Null);
-    if let Some(observation_token) = public_job.observation_token.as_deref() {
-        result.output["observation_token"] = serde_json::json!(observation_token);
+        serde_json::to_value(&public_job.activity).unwrap_or(serde_json::Value::Null);
+    if let Some(token) = public_job.observation_token.as_deref() {
+        result.output["observation_token"] = json!(token);
     }
-    result.output["continuation"] =
-        super::jobs::observe_job_continuation(&job.job_id, public_job.observation_token.as_deref());
+    result.output["continuation"] = if truncated {
+        super::jobs::observe_job_log_page(&public_job, true)
+    } else {
+        super::jobs::observe_job_continuation(&job.job_id, public_job.observation_token.as_deref())
+    };
 }
 
 /// Re-observe/promote the same durable record, never a replacement execution.
 /// A terminal race belongs to the initiating call; an unprojectable hidden or
 /// cleanup-pending record stays private and keeps its cleanup guard armed.
-pub(crate) async fn recover_hidden_structured_job(
+async fn recover_hidden_structured_job(
     clients: &RunnerRegistry,
     access: Option<&RunnerAccess>,
     job_id: &str,
+    terminal_tail_lines: Option<usize>,
 ) -> Result<HiddenStructuredJobWait, StructuredJobHandoffFailure> {
     if let Ok(job) = clients.promote_hidden_job(access, job_id).await {
         if !super::jobs::is_terminal_job_status(&job.status) {
@@ -507,7 +641,9 @@ pub(crate) async fn recover_hidden_structured_job(
                 public_job: Some(job),
             });
         }
-        if let Ok(terminal) = hidden_terminal_snapshot(clients, access, job_id).await {
+        if let Ok(terminal) =
+            hidden_terminal_snapshot(clients, access, job_id, terminal_tail_lines).await
+        {
             return Ok(terminal);
         }
     }
@@ -517,80 +653,7 @@ pub(crate) async fn recover_hidden_structured_job(
     Err(StructuredJobHandoffFailure::unresolved(clients, access, job_id).await)
 }
 
-pub(crate) async fn await_hidden_structured_job(
-    clients: Arc<RunnerRegistry>,
-    job_id: String,
-    sync_wait: Duration,
-    auth: Option<AuthContext>,
-) -> Result<HiddenStructuredJobWait, StructuredJobHandoffFailure> {
-    let access = crate::runner_http::runner_access_from_auth(auth.as_ref());
-    let mut guard = HiddenJobCleanupGuard::new(clients.clone(), job_id.clone(), access.clone());
-    let attempt: Result<HiddenStructuredJobWait, String> = async {
-        let deadline = std::time::Instant::now() + sync_wait;
-        loop {
-            if let Ok(job) = clients
-                .get_hidden_job_for_auth(access.as_ref(), &job_id)
-                .await
-            {
-                if crate::tool_runtime::jobs::is_terminal_job_status(&job.status) {
-                    let terminal =
-                        hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
-                    guard.disarm();
-                    return Ok(terminal);
-                }
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-
-        let promoted = clients.promote_hidden_job(access.as_ref(), &job_id).await?;
-        if crate::tool_runtime::jobs::is_terminal_job_status(&promoted.status) {
-            let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
-            guard.disarm();
-            return Ok(terminal);
-        }
-        let observation = structured_job_observation(&clients, access.as_ref(), &job_id).await?;
-        if crate::tool_runtime::jobs::is_terminal_job_status(&observation.job.status) {
-            let terminal = hidden_terminal_snapshot(&clients, access.as_ref(), &job_id).await?;
-            guard.disarm();
-            return Ok(terminal);
-        }
-        let (execution_state, command_started) = continued_execution_state(
-            observation.job.status.as_str(),
-            observation.job.started_at.is_some(),
-        );
-        guard.disarm();
-        Ok(HiddenStructuredJobWait::Continued {
-            observation,
-            execution_state,
-            command_started,
-        })
-    }
-    .await;
-    let result = match attempt {
-        Ok(result) => Ok(result),
-        Err(_) => {
-            Box::pin(recover_hidden_structured_job(
-                &clients,
-                access.as_ref(),
-                &job_id,
-            ))
-            .await
-        }
-    };
-    if result.is_ok()
-        || result
-            .as_ref()
-            .is_err_and(|failure| failure.has_public_continuation())
-    {
-        guard.disarm();
-    }
-    result
-}
-
-fn continued_execution_state(status: &str, started: bool) -> (&'static str, bool) {
+pub(crate) fn continued_execution_state(status: &str, started: bool) -> (&'static str, bool) {
     // Recovery is a Server observation overlay, not Runner lifecycle truth, and
     // does not prove that execution is presently running.
     if status == "recovering" {
@@ -618,28 +681,51 @@ async fn hidden_terminal_snapshot(
     clients: &RunnerRegistry,
     access: Option<&RunnerAccess>,
     job_id: &str,
+    tail_lines: Option<usize>,
 ) -> Result<HiddenStructuredJobWait, String> {
-    let (job, stdout, stderr, _, _) = clients
-        .hidden_job_log_for_auth(access, job_id, None)
+    let (job, stdout, stderr, next_stdout_line, next_stderr_line) = clients
+        .hidden_job_log_for_auth(access, job_id, tail_lines)
         .await?;
-    Ok(HiddenStructuredJobWait::Terminal {
-        job,
-        stdout: stdout.unwrap_or_default(),
-        stderr: stderr.unwrap_or_default(),
-    })
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
+    Ok(HiddenStructuredJobWait::Terminal(
+        StructuredJobObservation {
+            stdout_truncated: super::jobs::agent_log_stream_incomplete(
+                job.stdout_log_truncated,
+                job.stdout_retained_from_line,
+                stdout.lines().count(),
+                next_stdout_line,
+            ),
+            stderr_truncated: super::jobs::agent_log_stream_incomplete(
+                job.stderr_log_truncated,
+                job.stderr_retained_from_line,
+                stderr.lines().count(),
+                next_stderr_line,
+            ),
+            job,
+            stdout_tail: stdout,
+            stderr_tail: stderr,
+            stdout_lines: next_stdout_line.saturating_sub(1),
+            stderr_lines: next_stderr_line.saturating_sub(1),
+        },
+    ))
 }
 
 /// Cancels an initially hidden Job if the initiating future is dropped before
 /// it can return either a terminal projection or a public continuation.
-struct HiddenJobCleanupGuard {
+pub(super) struct HiddenJobHandoff {
     clients: Arc<RunnerRegistry>,
     job_id: String,
     access: Option<RunnerAccess>,
     armed: bool,
 }
 
-impl HiddenJobCleanupGuard {
-    fn new(clients: Arc<RunnerRegistry>, job_id: String, access: Option<RunnerAccess>) -> Self {
+impl HiddenJobHandoff {
+    pub(super) fn new(
+        clients: Arc<RunnerRegistry>,
+        job_id: String,
+        access: Option<RunnerAccess>,
+    ) -> Self {
         Self {
             clients,
             job_id,
@@ -648,17 +734,97 @@ impl HiddenJobCleanupGuard {
         }
     }
 
-    fn disarm(&mut self) {
+    /// Observe the admitted execution once through waiting, promotion and recovery.
+    /// A terminal snapshot keeps cleanup armed until its caller finishes projection.
+    /// Public continuation ownership is transferred here; no path starts another Job.
+    pub(super) async fn wait(
+        &mut self,
+        sync_wait: Duration,
+        poll_interval: Duration,
+        terminal_tail_lines: Option<usize>,
+    ) -> Result<HiddenStructuredJobWait, StructuredJobHandoffFailure> {
+        let clients = &self.clients;
+        let job_id = &self.job_id;
+        let access = self.access.as_ref();
+        let attempt: Result<HiddenStructuredJobWait, String> = async {
+            let deadline = std::time::Instant::now() + sync_wait;
+            loop {
+                if let Ok(job) = clients.get_hidden_job_for_auth(access, job_id).await {
+                    if super::jobs::is_terminal_job_status(&job.status) {
+                        return hidden_terminal_snapshot(
+                            clients,
+                            access,
+                            job_id,
+                            terminal_tail_lines,
+                        )
+                        .await;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+
+            let promoted = clients.promote_hidden_job(access, job_id).await?;
+            if super::jobs::is_terminal_job_status(&promoted.status) {
+                return hidden_terminal_snapshot(clients, access, job_id, terminal_tail_lines)
+                    .await;
+            }
+            let observation = structured_job_observation(clients, access, job_id).await?;
+            if super::jobs::is_terminal_job_status(&observation.job.status) {
+                return hidden_terminal_snapshot(clients, access, job_id, terminal_tail_lines)
+                    .await;
+            }
+            if observation.job.observation_token.is_none() {
+                return Err("missing Job observation token".to_string());
+            }
+            let (execution_state, command_started) = continued_execution_state(
+                &observation.job.status,
+                observation.job.started_at.is_some(),
+            );
+            Ok(HiddenStructuredJobWait::Continued {
+                observation,
+                execution_state,
+                command_started,
+            })
+        }
+        .await;
+        let result = match attempt {
+            Ok(result) => Ok(result),
+            Err(_) => {
+                Box::pin(recover_hidden_structured_job(
+                    clients,
+                    access,
+                    job_id,
+                    terminal_tail_lines,
+                ))
+                .await
+            }
+        };
+        if matches!(&result, Ok(HiddenStructuredJobWait::Continued { .. }))
+            || result
+                .as_ref()
+                .is_err_and(|failure| failure.has_public_continuation())
+        {
+            self.disarm();
+        }
+        result
+    }
+
+    pub(super) fn disarm(&mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for HiddenJobCleanupGuard {
+impl Drop for HiddenJobHandoff {
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
         let clients = self.clients.clone();
+        // Register intent synchronously; the Registry retries cleanup even if
+        // this immediate processor is delayed or the Tokio runtime is closing.
         clients.record_hidden_cleanup_intent(self.job_id.clone(), self.access.clone());
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {

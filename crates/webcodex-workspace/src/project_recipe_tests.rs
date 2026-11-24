@@ -873,6 +873,53 @@ fn cargo_all_packages_manifest_aliases_share_the_canonical_content_budget() {
     );
 }
 
+#[test]
+fn cargo_all_packages_provenance_returns_exact_member_package_names() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[package]\nname='root-package'\nversion='0.1.0'\n\n[workspace]\nmembers=['member-a','member-b']\nresolver='2'\n\n[dependencies]\nimplicit={path='implicit'}\n",
+    );
+    for (path, name) in [("member-a", "alpha-package"), ("member-b", "beta-package")] {
+        write(
+            temp.path(),
+            &format!("{path}/Cargo.toml"),
+            &format!("[package]\nname='{name}'\nversion='0.1.0'\n"),
+        );
+    }
+    write(
+        temp.path(),
+        "implicit/Cargo.toml",
+        "[package]\nname='implicit-path-member'\nversion='0.1.0'\n",
+    );
+    let resolved =
+        resolve_project_recipe_root(temp.path(), None, Some(ProjectRecipeId::Rust)).unwrap();
+    let (_, members) = project_cargo_all_packages_provenance(&resolved).unwrap();
+    assert_eq!(
+        members,
+        [
+            "alpha-package",
+            "beta-package",
+            "implicit-path-member",
+            "root-package"
+        ]
+    );
+}
+
+#[test]
+fn legacy_cargo_all_packages_digest_does_not_require_member_name_extraction() {
+    let temp = tempfile::tempdir().unwrap();
+    write(temp.path(), "Cargo.toml", "");
+    let resolved =
+        resolve_project_recipe_root(temp.path(), None, Some(ProjectRecipeId::Rust)).unwrap();
+    assert!(digest_project_cargo_all_packages_provenance(&resolved).is_ok());
+    assert_eq!(
+        project_cargo_all_packages_provenance(&resolved).unwrap_err(),
+        ProjectRecipeResolutionError::SourceFileInvalid
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cargo_all_packages_recursive_glob_fails_closed_before_traversing_outside_project() {

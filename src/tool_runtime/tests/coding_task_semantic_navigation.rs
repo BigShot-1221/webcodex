@@ -119,6 +119,7 @@ fn status_result(
             available: status != LspAvailabilityStatus::Unavailable,
             running: status == LspAvailabilityStatus::Running,
             status,
+            index_readiness: Default::default(),
             source: Some(LspCommandSource::Path),
             position_encoding: position_encoding.map(str::to_string),
         }],
@@ -215,6 +216,7 @@ async fn coding_task_semantic_navigation_running_propagates_position_encoding() 
         let result = start_with_status(LspAvailabilityStatus::Running, Some(encoding)).await;
         let semantic = &result.output["semantic_navigation"];
         assert_eq!(semantic["status"], "running");
+        assert_eq!(semantic["index_readiness"], "unknown");
         assert_eq!(semantic["available"], true);
         assert_eq!(semantic["provider"], "rust-analyzer");
         assert_eq!(semantic["capability"], "lsp_read_only_navigation");
@@ -403,16 +405,14 @@ async fn coding_task_semantic_navigation_does_not_wait_after_mandatory_startup()
     let expired = runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "timeout-agent".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some("{}".to_string()),
-            stderr: None,
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "timeout-agent".to_string(),
+                "inst".to_string(),
+                request.request_id,
+            )
         })
         .await
         .expect_err("timed-out startup probe must remove pending waiter");
@@ -505,7 +505,8 @@ async fn coding_task_semantic_navigation_read_only_keeps_compact_shape() {
     .await;
     let result = finish_start_servicing_locally(&runtime, "compact-agent", task).await;
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic.as_object().unwrap().len(), 6);
+    assert_eq!(semantic.as_object().unwrap().len(), 7);
+    assert_eq!(semantic["index_readiness"], "unknown");
     assert_eq!(semantic["supported"], true);
     assert_eq!(semantic["status"], "available");
     assert_eq!(semantic["provider"], "rust-analyzer");

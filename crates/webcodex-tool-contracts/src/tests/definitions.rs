@@ -797,7 +797,7 @@ fn stop_job_preserves_one_canonical_effect() {
 }
 
 #[test]
-fn agent_continuation_setup_descriptions_are_self_guiding_without_direct_expansion() {
+fn agent_continuation_setup_descriptions_are_self_guiding_and_individually_reviewable() {
     let description = |name: &str| {
         lookup_tool_definition(name)
             .unwrap_or_else(|| panic!("missing ToolDefinition {name}"))
@@ -828,12 +828,11 @@ fn agent_continuation_setup_descriptions_are_self_guiding_without_direct_expansi
     assert!(present.contains("production_auto_resume_available"));
     assert!(present.contains("not production auto-resume readiness"));
 
-    assert_eq!(
+    assert!(
         lookup_tool_definition("create_agent_identity")
             .unwrap()
-            .adaptive_runtime_direct_rank(),
-        None,
-        "identity creation stays discoverable through the gateway rather than expanding Direct"
+            .requires_individual_host_review(),
+        "identity creation exposes its own schema and effects for Host review"
     );
     assert_eq!(
         lookup_tool_definition("present_agent_continuation")
@@ -841,12 +840,44 @@ fn agent_continuation_setup_descriptions_are_self_guiding_without_direct_expansi
             .adaptive_runtime_direct_reason(),
         Some(crate::tool_definition::ToolDirectReason::Continuation)
     );
-    assert_eq!(
-        lookup_tool_definition("rotate_agent_continuation_endpoint")
-            .unwrap()
-            .adaptive_runtime_direct_rank(),
-        None
-    );
+    assert!(lookup_tool_definition("rotate_agent_continuation_endpoint")
+        .unwrap()
+        .requires_individual_host_review());
+}
+
+#[test]
+fn individual_host_review_is_bounded_to_the_nine_goal_continuation_operations() {
+    let mut actual = crate::tool_definition::tool_definitions()
+        .filter(|definition| definition.requires_individual_host_review())
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    let mut expected = vec![
+        "create_agent_identity",
+        "rotate_agent_continuation_endpoint",
+        "list_agent_identities",
+        "prepare_goal_workflow",
+        "get_goal",
+        "checkpoint_goal",
+        "update_goal",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
+    ];
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    for name in expected {
+        let definition = lookup_tool_definition(name).unwrap();
+        assert!(definition.adaptive_runtime_direct_rank().is_some());
+        assert_eq!(
+            definition.adaptive_runtime_direct_reason(),
+            Some(crate::tool_definition::ToolDirectReason::HostReview)
+        );
+        assert_eq!(
+            definition.requires_permission(),
+            !definition.is_read_like(),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -858,7 +889,7 @@ fn retired_endpoint_name_is_absent_from_every_tool_surface() {
         .any(|spec| spec.name == "attach_agent_endpoint"));
     let canonical = lookup_tool_definition("rotate_agent_continuation_endpoint").unwrap();
     assert!(canonical.visibility.is_model_visible());
-    assert_eq!(canonical.adaptive_runtime_direct, None);
+    assert!(canonical.requires_individual_host_review());
 }
 
 #[test]
@@ -963,6 +994,7 @@ fn adaptive_direct_reason_is_independent_of_domain_and_authority() {
             ToolDirectReason::HostIntegration,
             ToolDirectReason::Presentation,
             ToolDirectReason::Continuation,
+            ToolDirectReason::HostReview,
         ] {
             let mut changed = *original;
             // Only change an existing policy; never admit a hidden/gateway tool.
@@ -1070,7 +1102,6 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
     for name in [
         "read_workspace_changes",
         "read_session_handoff",
-        "rotate_agent_continuation_endpoint",
         "run_skill_resource",
         "stop_job",
         "run_detached_process",
@@ -1136,20 +1167,18 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         .into_iter()
         .find(|spec| spec.name == "list_jobs")
         .expect("list_jobs ToolSpec");
-    assert!(observe_jobs
-        .description
-        .contains("do not call list_jobs first"));
+    assert!(observe_jobs.description.contains("no list_jobs needed"));
     assert!(observe_jobs.description.contains("after_observation_token"));
-    assert!(observe_jobs.description.contains("bounded wait_secs"));
+    assert!(observe_jobs.description.contains("wait_secs defaults to 0"));
     assert!(list_jobs
         .description
         .contains("Recovery and inventory primitive"));
     assert!(list_jobs
         .description
-        .contains("retain that continuation and continue independent work"));
+        .contains("retain its identity/continuation"));
     assert!(list_jobs
         .description
-        .contains("using observe_jobs only when logs/details/recovery are needed"));
+        .contains("use observe_jobs for logs/details/recovery"));
 
     let git_review = registered_tool_specs()
         .into_iter()
@@ -1170,21 +1199,19 @@ fn turn_economy_descriptors_stay_converged_and_bounded() {
     for name in ["run_process", "run_script", "run_shell"] {
         let spec = spec_named(&specs, name);
         for phrase in [
-            "continue independent work",
-            "observe_jobs only for",
-            "bounded wait_for_job_readiness",
+            "literal argv",
+            "shell grammar",
+            "Pending: retain returned Job/continuation",
+            "observe_jobs for Job recovery",
+            "Never redispatch pending or outcome_unknown",
+            "inspect existing execution",
+            "replacement cannot inherit",
         ] {
             assert!(spec.description.contains(phrase), "{name}: {phrase}");
         }
-        assert!(
-            !spec.description.contains("Use observe_jobs later"),
-            "{name}"
-        );
-
-        assert!(
-            spec.description.contains("sparse terminal Job attention"),
-            "{name}"
-        );
+        for strategy in ["independent work", "Promise.", "Host activation budget"] {
+            assert!(!spec.description.contains(strategy), "{name}: {strategy}");
+        }
     }
 
     for name in ["cargo_check", "cargo_test"] {
@@ -1213,9 +1240,10 @@ fn turn_economy_descriptors_stay_converged_and_bounded() {
 
     let observe = spec_named(&specs, "observe_jobs");
     for phrase in [
-        "logs/details/recovery",
-        "not the default follow-up to execution_state=pending",
-        "Never launches, retries",
+        "job_id or observation_ref",
+        "wait_secs defaults to 0",
+        "change/meaningful_change need after_observation_token",
+        "Never redispatch to observe",
     ] {
         assert!(
             observe.description.contains(phrase),
@@ -1240,10 +1268,10 @@ fn turn_economy_descriptors_stay_converged_and_bounded() {
         .contains("not the normal continuation step"));
     assert!(list
         .description
-        .contains("retain that continuation and continue independent work"));
+        .contains("retain its identity/continuation"));
     assert!(list
         .description
-        .contains("observe_jobs only when logs/details/recovery are needed"));
+        .contains("use observe_jobs for logs/details/recovery"));
 
     let edits = spec_named(&specs, "edit_project_files");
     for phrase in [
@@ -1524,14 +1552,14 @@ fn readiness_tool_is_sequential_outer_only() {
     let description = spec.description.as_str();
     for phrase in [
         "join barrier",
-        "currently-ready independent work",
-        "Use any when one terminal Job can unlock a useful dependent branch",
-        "use all only at a true join",
-        "do not mechanically repeat the same-set wait",
-        "largest safe remaining Host activation budget",
-        "no fixed 10/15/20s slice",
+        "exact authorized Jobs",
+        "1..45s",
+        "any returns when one is terminal",
+        "all requires every target",
+        "terminal-ready, not success",
+        "deadline may leave pending IDs",
+        "retry authority or automatic next turn",
         "Logs/details/recovery use observe_jobs",
-        "No automatic next turn",
     ] {
         assert!(description.contains(phrase), "{phrase}: {description}");
     }

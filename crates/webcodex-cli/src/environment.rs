@@ -7,7 +7,7 @@ mod cloudflare;
 mod commands;
 mod update;
 
-const USAGE: &str = "webcodex environment <COMMAND>\n\nconfigure [--create | --join URL] [--runner] [--runner-name NAME] [--project PATH | --no-project]\n          [--scope user|system]\n          [--code-stdin | --token-file PATH] [--new-pairing-code]\nresume    [--code-stdin] [--new-pairing-code] [--token-file PATH]\ninvite\nadd-project PATH [--code-stdin] [--new-pairing-code]\nremove-project PROJECT_ID\nstatus|doctor\npaths|backup-manifest (read-only metadata; no files or restore)\nstart|stop|restart <server|runner|tunnel> [--profile PROFILE]\nrepair-credential runner\nrepair-user-credential [--token-file PATH]\nuninstall-service <server|runner|tunnel> [--profile PROFILE]\nconfigure-tunnel [PROFILE] [--provider openai|cloudflare_named|cloudflare_quick]\n                 [--host embedded|standalone] [--name NAME] [--autostart true|false]\n                 [--expected-revision N] [--credentials-file PATH | --token-file PATH]\n                 [--public-origin HTTPS_ORIGIN --tunnel-id ID] [--ingress-port PORT]\ncloudflare-status|cloudflare-start|cloudflare-stop PROFILE\ncloudflare-oauth PROFILE --redirect-uri URL [--scopes JSON_ARRAY] [--replace]\ntunnel-status [PROFILE]\ntunnel-diagnose PROFILE --environment-dir PATH (read-only, including catalog-only configurations)\nrecover-tunnel PROFILE --environment-dir PATH [--apply --accept-uncertain-effects\n               --expected-environment-id ID --expected-revision N --expected-run-id ID]\ntunnel-host PROFILE --host embedded|standalone\nremove-tunnel [PROFILE] [--expected-revision N]\nupdate status|check|download|apply|resume|rollback (use update --help)\nupgrade-preflight|upgrade-prepare --candidate-dir PATH [--development-build]\nupgrade-finish|upgrade-rollback\ninstaller-authorize --upgrade-receipt PATH --candidate-dir PATH\ninstaller-apply --upgrade-receipt PATH --candidate-dir PATH --installer-file PATH --installer-target TARGET (OS authorization required)\ninstaller-verify --candidate-dir PATH [--installer-target TARGET]\ninstaller-verify-same --candidate-dir PATH --expected-runtime-dir PATH [--installer-target TARGET]\ninstaller-classify --expected-runtime-dir PATH (Windows)\npackage-upgrade-preflight|package-upgrade-prepare|package-upgrade-verify --candidate-dir PATH --expected-runtime-dir PATH (Windows)\npackage-upgrade-finish|package-upgrade-rollback --expected-runtime-dir PATH (Windows)\ninstaller-finish|installer-cancel\n\nPublic environment commands accept --json and --environment-dir PATH.\nInstaller finalization uses only the fixed owner authorization.\nAdvanced: --bin-dir PATH (configure only).\n--runner enables local work without requiring an initial project.\nNew environments default to user services; saved environments retain their manager.\nUser scope: Linux systemd user manager (linger-dependent), macOS login LaunchAgent, Windows signed-in user task.\nSystem scope: boot services with explicit OS authorization; no automatic fallback.\nSame-machine creation issues separate local credentials automatically, without pairing input.\nViewer-only uses a user credential; pairing codes are only for Runner machines.\nOpenAI credentials use hidden input or protected JSON with tunnel_id and api_key.\nNamed Cloudflare uses protected JSON with tunnel_id, public_origin and token, or --token-file plus identity/origin options. Quick Tunnel takes no credentials or saved origin.\nNew Cloudflare profiles default to embedded Server ownership; OpenAI retains its standalone default.\nExisting Cloudflare edits require --expected-revision. Separate Cloudflare services must be selected for startup before installation; stop and uninstall before deselecting them.\nCloudflare OAuth configuration returns a newly issued client secret once; repeat configuration retains the existing secret. Use --replace explicitly to recover a lost secret or change the callback; replacement revokes the previous client authorization.\nRuntime Join: configure --join URL --runner --no-project (hidden terminal pairing input, or --code-stdin).\nJoining starts only this machine’s Runner; it never creates or starts the central Server.\n";
+const USAGE: &str = "webcodex environment <COMMAND>\n\nconfigure [--create | --join URL] [--runner] [--runner-name NAME] [--project PATH | --no-project]\n          [--scope user|system]\n          [--code-stdin | --token-file PATH] [--new-pairing-code]\nresume    [--code-stdin] [--new-pairing-code] [--token-file PATH]\ninvite\nadd-project PATH [--code-stdin] [--new-pairing-code]\nremove-project PROJECT_ID\nstatus|doctor\npaths|backup-manifest (read-only metadata; no files or restore)\nstart|stop|restart <server|runner|tunnel> [--profile PROFILE]\nrepair-credential runner\nrepair-user-credential [--token-file PATH]\nuninstall-service <server|runner|tunnel> [--profile PROFILE]\nconfigure-tunnel [PROFILE] [--provider openai|cloudflare_named|cloudflare_quick]\n                 [--host embedded|standalone] [--name NAME] [--autostart true|false]\n                 [--expected-revision N] [--credentials-file PATH | --token-file PATH]\n                 [--public-origin HTTPS_ORIGIN --tunnel-id ID] [--ingress-port PORT] [--oauth-dcr true|false]\nprepare-cloudflared --json (prepare and verify the component for the current user)\ncloudflare-status|cloudflare-start|cloudflare-stop PROFILE\ncloudflare-oauth PROFILE --redirect-uri URL [--scopes JSON_ARRAY] [--replace]\ntunnel-status [PROFILE]\ntunnel-diagnose PROFILE --environment-dir PATH (read-only, including catalog-only configurations)\nrecover-tunnel PROFILE --environment-dir PATH [--apply --accept-uncertain-effects\n               --expected-environment-id ID --expected-revision N --expected-run-id ID]\ntunnel-host PROFILE --host embedded|standalone\nremove-tunnel [PROFILE] [--expected-revision N]\nupdate status|check|download|apply|resume|rollback (use update --help)\nupgrade-preflight|upgrade-prepare --candidate-dir PATH [--development-build]\nupgrade-finish|upgrade-rollback\ninstaller-authorize --upgrade-receipt PATH --candidate-dir PATH\ninstaller-apply --upgrade-receipt PATH --candidate-dir PATH --installer-file PATH --installer-target TARGET (OS authorization required)\ninstaller-verify --candidate-dir PATH [--installer-target TARGET]\ninstaller-verify-same --candidate-dir PATH --expected-runtime-dir PATH [--installer-target TARGET]\ninstaller-classify --expected-runtime-dir PATH (Windows)\npackage-upgrade-preflight|package-upgrade-prepare|package-upgrade-verify --candidate-dir PATH --expected-runtime-dir PATH (Windows)\npackage-upgrade-finish|package-upgrade-rollback --expected-runtime-dir PATH (Windows)\ninstaller-finish|installer-cancel\n\nPublic environment commands accept --json and --environment-dir PATH.\nInstaller finalization uses only the fixed owner authorization.\nAdvanced: --bin-dir PATH (configure only).\n--runner enables local work without requiring an initial project.\nNew environments default to user services; saved environments retain their manager.\nUser scope: Linux systemd user manager (linger-dependent), macOS login LaunchAgent, Windows signed-in user task.\nSystem scope: boot services with explicit OS authorization; no automatic fallback.\nSame-machine creation issues separate local credentials automatically, without pairing input.\nViewer-only uses a user credential; pairing codes are only for Runner machines.\nOpenAI credentials use hidden input or protected JSON with tunnel_id and api_key.\nNamed Cloudflare uses protected JSON with tunnel_id, public_origin and token, or --token-file plus identity/origin options. Quick Tunnel takes no credentials or saved origin.\nNew Cloudflare profiles default to embedded Server ownership; OpenAI retains its standalone default.\nExisting Cloudflare edits require --expected-revision. Separate Cloudflare services must be selected for startup before installation; stop and uninstall before deselecting them.\nCloudflare OAuth configuration returns a newly issued client secret once; repeat configuration retains the existing secret. Use --replace explicitly to recover a lost secret or change the callback; replacement revokes the previous client authorization.\nRuntime Join: configure --join URL --runner --no-project (hidden terminal pairing input, or --code-stdin).\nJoining starts only this machine’s Runner; it never creates or starts the central Server.\n";
 #[derive(Default)]
 struct Input {
     command: String,
@@ -27,6 +27,7 @@ struct Input {
     operand: Option<String>,
     candidate_dir: Option<PathBuf>,
     development_build: bool,
+    local_preview: bool,
     credentials_file: Option<PathBuf>,
     profile: Option<String>,
     tunnel_host: Option<TunnelHostMode>,
@@ -41,6 +42,7 @@ struct Input {
     expected_run_id: Option<String>,
     expected_environment_id: Option<String>,
     ingress_port: Option<u16>,
+    oauth_dynamic_registration_enabled: Option<bool>,
     redirect_uri: Option<String>,
     scopes: Option<Vec<String>>,
     replace: bool,
@@ -102,6 +104,13 @@ fn parse(args: &[String]) -> Result<Input, String> {
                         .map_err(|_| "--autostart must be true or false")?,
                 )
             }
+            "--oauth-dcr" => {
+                input.oauth_dynamic_registration_enabled = Some(
+                    value(&mut iter)?
+                        .parse()
+                        .map_err(|_| "--oauth-dcr must be true or false")?,
+                )
+            }
             "--expected-revision" => {
                 input.expected_revision = Some(
                     value(&mut iter)?
@@ -146,6 +155,7 @@ fn parse(args: &[String]) -> Result<Input, String> {
             "--new-pairing-code" => input.new_code = true,
             "--json" => input.json = true,
             "--development-build" => input.development_build = true,
+            "--local-preview" => input.local_preview = true,
             _ if !arg.starts_with('-') && input.operand.is_none() => {
                 input.operand = Some(arg.clone())
             }
@@ -187,6 +197,17 @@ fn parse(args: &[String]) -> Result<Input, String> {
         )
     {
         return Err("--development-build applies only to upgrade candidate verification".into());
+    }
+    if input.local_preview
+        && (!cfg!(all(windows, feature = "local-preview-installer"))
+            || !matches!(
+                input.command.as_str(),
+                "package-upgrade-preflight" | "package-upgrade-prepare" | "package-upgrade-verify"
+            )
+            || input.development_build
+            || input.upgrade_target_file.is_some())
+    {
+        return Err("--local-preview is restricted to the feature-built Windows package preflight/prepare/verify commands".into());
     }
     if input.installer_file.is_some() && input.command != "installer-apply" {
         return Err("--installer-file applies only to verified unified installer handoff".into());
@@ -299,6 +320,12 @@ pub(crate) async fn run(args: &[String]) -> Result<String, String> {
 }
 
 async fn run_inner(args: &[String]) -> Result<String, String> {
+    if args == ["prepare-cloudflared", "--json"] {
+        webcodex::prepare_user_cloudflare_component()
+            .await
+            .map_err(|code| serde_json::json!({"code":code}).to_string())?;
+        return Ok("true".into());
+    }
     if args.first().map(String::as_str) == Some("update") {
         return update::run(&args[1..]).await;
     }
@@ -585,22 +612,31 @@ async fn run_inner(args: &[String]) -> Result<String, String> {
                 )?;
                 match input.command.as_str() {
                     "package-upgrade-preflight" => {
-                        let result = windows_package::preflight(&store, &candidate, &runtime)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        let result = if input.local_preview {
+                            windows_package::preflight_local_preview(&store, &candidate, &runtime)
+                                .await
+                        } else {
+                            windows_package::preflight(&store, &candidate, &runtime).await
+                        }
+                        .map_err(|e| e.to_string())?;
                         if !result.ready {
                             return Err(serde_json::to_string(&result).unwrap_or_default());
                         }
                     }
-                    "package-upgrade-prepare" => {
-                        windows_package::prepare(&store, &candidate, &runtime)
-                            .await
-                            .map_err(|e| e.to_string())?
+                    "package-upgrade-prepare" => if input.local_preview {
+                        windows_package::prepare_local_preview(&store, &candidate, &runtime).await
+                    } else {
+                        windows_package::prepare(&store, &candidate, &runtime).await
                     }
+                    .map_err(|e| e.to_string())?,
                     _ => {
-                        windows_package::verify(&store, &candidate, &runtime)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        if input.local_preview {
+                            windows_package::verify_local_preview(&store, &candidate, &runtime)
+                                .await
+                        } else {
+                            windows_package::verify(&store, &candidate, &runtime).await
+                        }
+                        .map_err(|e| e.to_string())?;
                     }
                 }
             }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::webcodex_runner::ShellProfileConfig;
 use webcodex_core::project_validation::{
     ProjectValidationAction, ProjectValidationAdapter, ProjectValidationRequest,
 };
@@ -677,4 +678,468 @@ fn rust_clippy_activity_keeps_lint_step_identity() {
         Some(activity)
     );
     assert_eq!(step.name, "lint");
+}
+
+#[test]
+fn project_validation_rechecks_provenance_after_shell_profile_preparation() {
+    // A profile initializer runs *after* the worker's queue-time fence.
+    // Its filesystem effects must not authorize a stale native validation.
+    for (backend, marker, change_source) in [
+        ("rust", "Cargo.lock", true),
+        ("rust", "Cargo.lock", false),
+        ("go", "go.mod", true),
+        ("go", "go.mod", false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let registry = temp.path().join("registry");
+        let executable_temp = crate::tests::executable_tempdir();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&registry).unwrap();
+        let (adapter, manifest) = if backend == "rust" {
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .unwrap();
+            (ProjectValidationAdapter::Rust, "version = 3\n")
+        } else {
+            (
+                ProjectValidationAdapter::Go,
+                "module example.test/demo\ngo 1.22\n",
+            )
+        };
+        std::fs::write(root.join(marker), manifest).unwrap();
+        std::fs::write(
+            registry.join("demo.toml"),
+            format!(
+                "id='demo'\nname='Demo'\npath={}\nallow_patch=true\n",
+                serde_json::to_string(root.to_str().unwrap()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let policy = RunnerPolicy {
+            allowed_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let request = ProjectValidationRequest {
+            project_id: "demo".into(),
+            cwd: None,
+            action: ProjectValidationAction::Check,
+            adapter,
+            scope: None,
+            dependency_policy: None,
+            dependency_resolution_policy: None,
+            test: None,
+        };
+        let (plan, cwd) =
+            crate::webcodex_runner::validation::project::plan(&policy, &registry, &request)
+                .unwrap();
+        let metadata = ShellJobValidationMetadata {
+            project_validation: Some(plan.provenance),
+            source_fence: None,
+            tool: "project_validate".into(),
+            kind: "check".into(),
+            steps: vec![plan.step.clone()],
+            effective_timeout_secs: 30,
+            sync_wait_secs: 1,
+            adapter: plan.adapter,
+            validation_target_id: Some(plan.validation_target_id),
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
+        };
+        assert!(metadata.is_valid());
+        let context = ShellJobContext {
+            runtime_project_id: Some("agent:validation-agent:demo".into()),
+            validation: Some(metadata),
+            workflow_session_id: None,
+            ssh_resource: None,
+            project_cwd: Some(".".into()),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            purpose: Some("validation".into()),
+            shell: None,
+            command_preview: "project validation".into(),
+            validation_steps: vec!["check".into()],
+            structured_execution: None,
+        };
+        let job_id = format!("profile-fence-{backend}-{change_source}");
+        let operation = RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+            job_id: job_id.clone(),
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            steps: vec![plan.step],
+            timeout_secs: 30,
+            context,
+        });
+        let wire = RunnerRequest::from_operation(
+            RunnerInvocationMetadata {
+                request_id: format!("{job_id}-request"),
+                client_id: "validation-agent".into(),
+                requested_by: "test".into(),
+                created_at: chrono::Utc::now().timestamp(),
+            },
+            RunnerOperation::Job(operation),
+        )
+        .unwrap();
+
+        let helper = structured_process_helper();
+        let fake_tool = executable_temp.path().join(format!(
+            "{}{}",
+            if backend == "rust" { "cargo" } else { "go" },
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::copy(&helper.path, fake_tool).unwrap();
+        let capture = root.join("native-tool-invoked.txt");
+        let mut shell = ShellConfig::default();
+        shell
+            .path_prepend
+            .push(executable_temp.path().to_path_buf());
+        if backend == "go" {
+            shell.env.insert(
+                "WEBCODEX_TEST_CAPTURE_GO_MODULE_ENV".into(),
+                capture.to_string_lossy().into_owned(),
+            );
+        }
+        let init_script = if change_source {
+            if cfg!(windows) {
+                format!("Set-Content -LiteralPath '{marker}' -Value 'profile changed this input'")
+            } else {
+                format!("printf 'profile changed this input\\n' > '{marker}'")
+            }
+        } else if cfg!(windows) {
+            "$null = 1".to_string()
+        } else {
+            ":".to_string()
+        };
+        shell.default_profile = Some("source-test".into());
+        shell.profiles.insert(
+            "source-test".into(),
+            ShellProfileConfig {
+                init_script: Some(init_script),
+                ..Default::default()
+            },
+        );
+        let manager = JobManager::new(1);
+        let (sink, _rx) = structured_test_sink("validation-agent", "validation-instance");
+        manager.enqueue(
+            sink,
+            PendingJobStart::from_wire(1, policy, shell, SshConfig::default(), registry, wire),
+        );
+        assert!(manager.wait_for_workers(Instant::now() + Duration::from_secs(15)));
+        let snapshot = lock_unpoison(&manager.jobs)[&job_id].snapshot.clone();
+        manager.stop_all();
+        if change_source {
+            assert_eq!(snapshot.status, "failed", "{backend}: {snapshot:?}");
+            assert_eq!(
+                snapshot.command_execution_state,
+                Some(ShellCommandExecutionState::NotStarted),
+                "{backend}: {snapshot:?}"
+            );
+            assert!(
+                snapshot
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("validation_plan_stale")),
+                "{backend}: {snapshot:?}"
+            );
+            if backend == "go" {
+                let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+                assert!(
+                    !captured.contains("ARGV=vet"),
+                    "stale Go vet subprocess was launched: {captured}"
+                );
+            }
+        } else {
+            assert_eq!(snapshot.status, "completed", "{backend}: {snapshot:?}");
+            assert_eq!(snapshot.exit_code, Some(0), "{backend}: {snapshot:?}");
+            if backend == "go" {
+                assert!(
+                    std::fs::read_to_string(&capture)
+                        .unwrap()
+                        .contains("ARGV=vet"),
+                    "fresh Go validation must run"
+                );
+            } else {
+                assert!(snapshot.stdout.tail.contains("JOB_STDIN_EOF"));
+            }
+        }
+    }
+}
+
+#[test]
+fn project_validation_missing_clippy_keeps_prestart_progress() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let registry = temp.path().join("registry");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&registry).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='missing_clippy_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        registry.join("demo.toml"),
+        format!(
+            "id='demo'\nname='Demo'\npath={}\nallow_patch=true\n",
+            serde_json::to_string(root.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let policy = RunnerPolicy {
+        allowed_roots: vec![root.clone()],
+        ..Default::default()
+    };
+    let request = ProjectValidationRequest {
+        project_id: "demo".into(),
+        cwd: None,
+        action: ProjectValidationAction::Lint,
+        adapter: ProjectValidationAdapter::Rust,
+        scope: None,
+        dependency_policy: None,
+        dependency_resolution_policy: None,
+        test: None,
+    };
+    let (plan, cwd) =
+        crate::webcodex_runner::validation::project::plan(&policy, &registry, &request).unwrap();
+    let metadata = ShellJobValidationMetadata {
+        project_validation: Some(plan.provenance),
+        source_fence: None,
+        tool: "project_validate".into(),
+        kind: "lint".into(),
+        steps: vec![plan.step.clone()],
+        effective_timeout_secs: 30,
+        sync_wait_secs: 8,
+        adapter: plan.adapter,
+        validation_target_id: Some(plan.validation_target_id),
+        minimum_tests: None,
+        require_tests: None,
+        no_run: None,
+    };
+    let context = ShellJobContext {
+        runtime_project_id: Some("agent:validation-agent:demo".into()),
+        workflow_session_id: None,
+        ssh_resource: None,
+        project_cwd: Some(".".into()),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        purpose: Some("validation".into()),
+        shell: Some("configured".into()),
+        command_preview: "validation: lint".into(),
+        validation_steps: vec![plan.step.name.clone()],
+        validation: Some(metadata),
+        structured_execution: None,
+    };
+    let operation = RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+        job_id: "clippy-missing-job".into(),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        steps: vec![plan.step],
+        timeout_secs: 30,
+        context,
+    });
+    let wire = RunnerRequest::from_operation(
+        RunnerInvocationMetadata {
+            request_id: "clippy-missing-request".into(),
+            client_id: "validation-agent".into(),
+            requested_by: "test".into(),
+            created_at: chrono::Utc::now().timestamp(),
+        },
+        RunnerOperation::Job(operation),
+    )
+    .unwrap();
+    let mut shell = ShellConfig::default();
+    shell
+        .env
+        .insert("PATH".into(), bin.to_string_lossy().into_owned());
+    let manager = JobManager::new(1);
+    let (sink, _rx) = structured_test_sink("validation-agent", "validation-instance");
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(1, policy, shell, SshConfig::default(), registry, wire),
+    );
+    assert!(manager.wait_for_workers(Instant::now() + Duration::from_secs(12)));
+    let snapshot = lock_unpoison(&manager.jobs)["clippy-missing-job"]
+        .snapshot
+        .clone();
+    manager.stop_all();
+    assert_eq!(
+        snapshot.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert_eq!(snapshot.exit_code, None);
+    assert_eq!(
+        snapshot.error.as_deref(),
+        Some(VALIDATION_TOOL_UNAVAILABLE_CODE)
+    );
+    let progress = snapshot
+        .validation_progress
+        .expect("prestart tool failure must retain canonical validation progress");
+    assert_eq!(progress.completed, 0);
+    assert!(progress.current_step.is_none());
+    assert!(progress.failed_step.is_none());
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "requires installed Cargo Clippy; run explicitly with --ignored"]
+fn runner_real_process_job_manager_clippy_nested_project_default_and_offline() {
+    use webcodex_core::project_validation::ProjectDependencyResolutionPolicy;
+    let located = Command::new("rustup")
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .args(["which", "cargo-clippy"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("installed rustup and Clippy required");
+    assert!(located.status.success());
+    let clippy = PathBuf::from(String::from_utf8(located.stdout).unwrap().trim());
+    let toolchain = clippy.parent().unwrap();
+    let path = std::env::join_paths(std::iter::once(toolchain.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    for offline in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("registered-project");
+        let cwd = root.join("clippy-fixture/cached");
+        let registry = temp.path().join("registry");
+        let cargo_home = temp.path().join("cargo-home");
+        for dir in [&cwd.join("src"), &registry, &cargo_home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            cwd.join("Cargo.toml"),
+            "[package]\nname='clippy_job_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join("src/lib.rs"),
+            "pub fn value() -> u32 { return 1; }\n",
+        )
+        .unwrap();
+        let lock = Command::new(toolchain.join("cargo"))
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&cwd)
+            .env("PATH", &path)
+            .env("CARGO_HOME", &cargo_home)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(lock.status.success(), "{lock:?}");
+        std::fs::write(
+            registry.join("demo.toml"),
+            format!(
+                "id='demo'\nname='Demo'\npath={}\nallow_patch=true\n",
+                serde_json::to_string(root.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        let policy = RunnerPolicy {
+            allowed_roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let request = ProjectValidationRequest {
+            project_id: "demo".into(),
+            cwd: Some("clippy-fixture/cached".into()),
+            action: ProjectValidationAction::Lint,
+            adapter: ProjectValidationAdapter::Rust,
+            scope: None,
+            dependency_policy: None,
+            dependency_resolution_policy: offline
+                .then_some(ProjectDependencyResolutionPolicy::Offline),
+            test: None,
+        };
+        let (plan, resolved_cwd) =
+            crate::webcodex_runner::validation::project::plan(&policy, &registry, &request)
+                .unwrap();
+        let metadata = ShellJobValidationMetadata {
+            tool: "project_validate".into(),
+            kind: "lint".into(),
+            adapter: plan.adapter.clone(),
+            steps: vec![plan.step.clone()],
+            effective_timeout_secs: 30,
+            sync_wait_secs: 10,
+            validation_target_id: Some(plan.validation_target_id),
+            source_fence: Some(webcodex_core::validation_source::ValidationSourceFence {
+                epoch: "a".repeat(32),
+                generation: 0,
+                quiescent: true,
+            }),
+            project_validation: Some(plan.provenance),
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
+        };
+        assert!(metadata.is_valid());
+        let operation = RunnerJobOperation::StartValidation(RunnerJobValidationOperation {
+            job_id: "clippy-native-job".into(),
+            cwd: Some(resolved_cwd.to_string_lossy().into_owned()),
+            steps: vec![plan.step],
+            timeout_secs: 30,
+            context: ShellJobContext {
+                runtime_project_id: Some("agent:validation-agent:demo".into()),
+                workflow_session_id: None,
+                ssh_resource: None,
+                project_cwd: request.cwd.clone(),
+                cwd: Some(resolved_cwd.to_string_lossy().into_owned()),
+                purpose: Some("validation".into()),
+                shell: Some("configured".into()),
+                command_preview: "validation: lint".into(),
+                validation_steps: vec!["lint".into()],
+                validation: Some(metadata),
+                structured_execution: None,
+            },
+        });
+        let wire = RunnerRequest::from_operation(
+            RunnerInvocationMetadata {
+                request_id: "clippy-native-request".into(),
+                client_id: "validation-agent".into(),
+                requested_by: "test".into(),
+                created_at: chrono::Utc::now().timestamp(),
+            },
+            RunnerOperation::Job(operation),
+        )
+        .unwrap();
+        let wire: RunnerRequest =
+            serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        let decoded = wire.decode_operation();
+        assert!(
+            decoded.is_ok(),
+            "actual wire JSON must preserve typed validation: {decoded:?}"
+        );
+        let mut shell = ShellConfig::default();
+        shell
+            .env
+            .insert("PATH".into(), path.to_string_lossy().into_owned());
+        shell.env.insert(
+            "CARGO_HOME".into(),
+            cargo_home.to_string_lossy().into_owned(),
+        );
+        shell.env.insert(
+            "CARGO_TARGET_DIR".into(),
+            temp.path().join("target").to_string_lossy().into_owned(),
+        );
+        let manager = JobManager::new(1);
+        let (sink, _rx) = structured_test_sink("validation-agent", "validation-instance");
+        manager.enqueue(
+            sink,
+            PendingJobStart::from_wire(1, policy, shell, SshConfig::default(), registry, wire),
+        );
+        assert!(manager.wait_for_workers(Instant::now() + Duration::from_secs(40)));
+        let inventory = manager.inventory();
+        assert_eq!(inventory.jobs.len(), 1, "{inventory:?}");
+        let job = &inventory.jobs[0];
+        assert_eq!(job.status, "completed", "offline={offline}: {job:?}");
+        assert_eq!(job.exit_code, Some(0), "{job:?}");
+        assert!(
+            job.stderr.tail.contains("clippy::needless_return"),
+            "{job:?}"
+        );
+        assert_eq!(
+            job.context.validation.as_ref().unwrap().adapter,
+            "cargo_clippy"
+        );
+    }
 }

@@ -1,6 +1,5 @@
 use super::support::*;
 use crate::auth::scopes::{SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ};
-use crate::tool_runtime::project_resolution::ToolRuntime;
 use crate::tool_runtime::session_context::workflow_session_authority_fingerprint;
 use crate::tool_runtime::sessions::SessionCreateOptions;
 use crate::tool_runtime::{registered_tool_specs, ToolCall, ToolRuntime};

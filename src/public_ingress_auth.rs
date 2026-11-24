@@ -3,7 +3,7 @@ use salvo::prelude::*;
 use std::sync::Arc;
 use webcodex_store::{PublicIngressEntry, PublicIngressFence};
 
-fn oauth_client_ingress_allowed(
+pub(crate) fn oauth_client_ingress_allowed(
     db: &crate::Database,
     client_id: &str,
     fence: Option<PublicIngressFence>,
@@ -43,12 +43,20 @@ pub(crate) fn require_authority(
     };
     let origin = url::Url::parse(&entry.origin)
         .map_err(|_| (503, "ingress_unavailable", "public ingress unavailable"))?;
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| req.uri().authority().map(|authority| authority.as_str()))
-        .ok_or((400, "invalid_request_authority", "invalid Host header"))?;
+    if req.headers().get_all("host").iter().count() > 1
+        || req.headers().get_all("origin").iter().count() > 1
+    {
+        return Err((
+            400,
+            "invalid_request_authority",
+            "ambiguous Host or Origin header",
+        ));
+    }
+    let invalid_host = (400, "invalid_request_authority", "invalid Host header");
+    let host = match req.headers().get("host") {
+        Some(value) => value.to_str().map_err(|_| invalid_host)?,
+        None => req.uri().authority().ok_or(invalid_host)?.as_str(),
+    };
     let requested = url::Url::parse(&format!("https://{host}"))
         .map_err(|_| (400, "invalid_request_authority", "invalid Host header"))?;
     if requested.origin() != origin.origin()
@@ -188,28 +196,29 @@ impl Handler for ClientIngressGate {
 pub(crate) async fn authenticate_mcp(
     req: &Request,
     depot: &Depot,
-    config: Arc<crate::Config>,
-    db: Option<Arc<crate::Database>>,
+    config: &Arc<crate::Config>,
+    db: Option<&Arc<crate::Database>>,
 ) -> Option<crate::auth::AuthContext> {
     let entry = entry(depot)?;
     let token = crate::auth::bearer_token(req)?;
-    let fence = entry.fence();
-    let Some(db) = db else {
-        return None;
-    };
-    let join = tokio::task::spawn_blocking(move || {
+    // Same blocking-pool discipline as the shared verifier chain: the OAuth2
+    // ingress check is synchronous SQLite work on the shared writer
+    // connection. Failures (including a lost blocking task) reject.
+    let config = config.clone();
+    let db = db.cloned();
+    let entry = entry.clone();
+    tokio::task::spawn_blocking(move || {
         crate::auth::tokens::OAuth2Verifier::verify_for_ingress_sync(
             &config,
-            Some(&db),
+            db.as_ref(),
             &token,
-            Some(&fence),
+            Some(&entry),
         )
     })
-    .await;
-    match join {
-        Ok(Ok(Some(ctx))) => Some(ctx),
-        _ => None,
-    }
+    .await
+    .unwrap_or_else(|error| Err(format!("ingress verification task failed: {error}")))
+    .ok()
+    .flatten()
 }
 #[cfg(test)]
 mod tests;

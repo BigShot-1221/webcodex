@@ -12,6 +12,12 @@ use std::collections::BTreeMap;
 pub const CODING_AGENT_MAX_PROVIDERS: usize = 8;
 pub const CODING_AGENT_MAX_PROVIDER_ID_BYTES: usize = 64;
 pub const CODING_AGENT_MAX_PROVIDER_NAME_BYTES: usize = 128;
+/// Bound for one provider's declared `env_from_env` mappings; the Runner's
+/// ACP config validation shares this constant, so the Diagnose presence map
+/// and its output schema can never disagree with what was admitted.
+pub const CODING_AGENT_MAX_ENV_MAPPINGS: usize = 64;
+/// Maximum byte length of a declared ACP environment variable name.
+pub const CODING_AGENT_MAX_ENV_NAME_BYTES: usize = 256;
 pub const CODING_AGENT_MAX_RUN_ID_BYTES: usize = 96;
 pub const CODING_AGENT_MAX_INTENT_FINGERPRINT_BYTES: usize = 96;
 pub const CODING_AGENT_MAX_PROJECT_ID_BYTES: usize = 512;
@@ -333,6 +339,11 @@ pub struct CodingAgentStartRequest {
     #[serde(default)]
     pub config: BTreeMap<String, CodingAgentConfigValue>,
     pub timeout_secs: u64,
+    /// Immutable Run identities whose exact owning Runner is durably indexed
+    /// by the Server. None means no durable routing support; Some(empty)
+    /// advertises support but authorizes no archival.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_acknowledged_runs: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -653,6 +664,24 @@ pub fn validate_request(request: &CodingAgentRequest) -> Result<(), String> {
         CodingAgentRequest::Start(request) => {
             validate_intent_fingerprint(&request.intent_fingerprint)?;
             validate_authority_fingerprint(&request.authority_fingerprint)?;
+            let acknowledged = request
+                .archive_acknowledged_runs
+                .as_deref()
+                .unwrap_or_default();
+            if acknowledged.len() > CODING_AGENT_MAX_INVENTORY_RUNS {
+                return Err("too many ACP archive acknowledgements".to_string());
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for identity in acknowledged {
+                if identity.len() != 64
+                    || !identity
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || !seen.insert(identity)
+                {
+                    return Err("invalid ACP archive acknowledgement identity".to_string());
+                }
+            }
             if request.runtime_project_id.trim().is_empty()
                 || request.runtime_project_id.len() > CODING_AGENT_MAX_PROJECT_ID_BYTES
             {
@@ -994,9 +1023,7 @@ pub fn validate_permission_request_token(value: &str) -> Result<(), String> {
     )
 }
 
-pub fn validate_pending_permission(
-    pending: &CodingAgentPendingPermission,
-) -> Result<(), String> {
+pub fn validate_pending_permission(pending: &CodingAgentPendingPermission) -> Result<(), String> {
     validate_permission_request_token(&pending.request_token)?;
     if pending.generation == 0 {
         return Err("pending permission generation must be positive".to_string());
@@ -1046,17 +1073,13 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
     }
     if let Some(entries) = run.live_confirmed_effective_config.as_ref() {
         if entries.len() > CODING_AGENT_MAX_CONFIG_OPTIONS {
-            return Err(
-                "CodingAgentRun live_confirmed_effective_config is too large".to_string(),
-            );
+            return Err("CodingAgentRun live_confirmed_effective_config is too large".to_string());
         }
         for entry in entries {
             validate_live_confirmed_config_entry(entry)?;
         }
     }
-    if run.pending_permission.is_some()
-        && run.state != CodingAgentRunState::WaitingPermission
-    {
+    if run.pending_permission.is_some() && run.state != CodingAgentRunState::WaitingPermission {
         return Err(
             "pending permission is only valid while the Run is waiting_permission".to_string(),
         );
@@ -1212,6 +1235,28 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
         }
     }
     Ok(())
+}
+
+/// Stable fingerprint of the immutable Run identity, independent of observation
+/// revision, terminal truth and non-durable live configuration. A Server receipt
+/// for this identity cannot authorize archival of a different Run incarnation.
+pub fn archive_identity_fingerprint(run: &CodingAgentRunSnapshot) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"webcodex-coding-agent-archive-identity-v1\0");
+    for value in [
+        &run.run_id,
+        &run.intent_fingerprint,
+        &run.authority_fingerprint,
+        &run.runtime_project_id,
+        &run.provider_id,
+        &run.provider_instance_id,
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.update(run.created_at.to_be_bytes());
+    format!("{:x}", hash.finalize())
 }
 
 /// Classify one newer observation against the canonical snapshot already retained
@@ -1431,6 +1476,7 @@ mod tests {
             instruction: "inspect the repository".to_string(),
             config: BTreeMap::new(),
             timeout_secs: 60,
+            archive_acknowledged_runs: None,
         })
     }
 
@@ -1985,8 +2031,7 @@ mod tests {
             live_acp: None,
         });
         validate_response_for_request(&request, &response).unwrap();
-        if let Some(CodingAgentResponsePayload::Diagnose { config_policy, .. }) =
-            &response.payload
+        if let Some(CodingAgentResponsePayload::Diagnose { config_policy, .. }) = &response.payload
         {
             validate_config_policy_projection(config_policy).unwrap();
         } else {
@@ -2197,6 +2242,7 @@ mod tests {
             instruction: "inspect the repository".to_string(),
             config: BTreeMap::new(),
             timeout_secs: 60,
+            archive_acknowledged_runs: None,
         });
         validate_request(&request).unwrap();
         let json = serde_json::to_string(&request).unwrap();

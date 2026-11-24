@@ -107,7 +107,15 @@ test_support = []
 [packages.webcodex-computer]
 layer = "leaf"
 role = "Platform-native computer-use primitives."
-normal = ["webcodex-core"]
+normal = ["webcodex-computer-control", "webcodex-core"]
+dev = []
+build = []
+test_support = []
+
+[packages.webcodex-computer-control]
+layer = "leaf"
+role = "Local Computer control gate, activity lifecycle and bounded native management transport."
+normal = []
 dev = []
 build = []
 test_support = []
@@ -199,8 +207,8 @@ test_support = []
 
 [packages.webcodex-store]
 layer = "domain"
-role = "Durable SQLite-backed persistence ownership."
-normal = ["webcodex-core"]
+role = "Durable SQLite-backed persistence and exclusive offline restore/migration ownership."
+normal = ["webcodex-core", "webcodex-workflow-session"]
 dev = []
 build = []
 test_support = []

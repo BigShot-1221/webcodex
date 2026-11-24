@@ -33,8 +33,6 @@ impl RuntimeResponse {
         } = self;
         let work_result_thread_panel = surface.work_result_thread_context.is_some();
         let work_result_thread_context = surface.work_result_thread_context;
-        let runtime = context.runtime;
-        let auth = context.auth;
         let stateless_2026 = context.stateless_2026;
         let app_enabled = context.app_enabled;
         let server_mcp_apps_enabled = context.server_mcp_apps_enabled;
@@ -56,17 +54,18 @@ impl RuntimeResponse {
                 required_scope,
                 description,
             }) => {
-                if let Some(lc) = lifecycle.as_deref() {
-                    lc.dispatch_failed("forbidden");
-                    lc.dispatch_finished(false, Some(false), "forbidden");
-                }
                 if let (Some(slot), Some(completion)) = (
                     model_ergonomics_out.as_deref_mut(),
                     model_ergonomics_completion.as_ref(),
                 ) {
                     *slot = Some(completion.record_for_pre_result_failure("insufficient_scope"));
                 }
-                return scope_forbidden(auth, required_scope, description);
+                return tool_scope_denied(
+                    context,
+                    lifecycle.as_deref(),
+                    required_scope,
+                    description,
+                );
             }
             Some(ToolCallErrorStatus::InvalidArguments { message }) => {
                 if let Some(lc) = lifecycle.as_deref() {
@@ -87,16 +86,36 @@ impl RuntimeResponse {
         };
         debug_assert_eq!(outcome.success, result.success);
         if tool_name == "read_tool_manifest" {
-            project_mcp_model_manifest_defaults(&mut result);
+            project_mcp_model_manifest_defaults(
+                &mut result,
+                stateless_2026 && context.surface != crate::mcp::request_policy::McpSurface::Cli,
+            );
+            context
+                .exposure
+                .project_manifest(&mut result, context.surface, stateless_2026);
+            if context.surface == crate::mcp::request_policy::McpSurface::Cli {
+                crate::mcp::cli::project_manifest(&mut result, context.default_project.is_some());
+            }
         }
         project_job_terminal_resume_suggested_call(
             app_enabled
-                && surface.capabilities.agent_continuation_app
+                && context.exposure.job_continuation
                 && tool_name == "wait_for_job_terminal",
             &mut result,
         );
         project_tool_result_suggested_calls(tool_name, &mut result, &|target| {
-            mcp_suggested_tool_call_route(target, stateless_2026)
+            let route = context
+                .exposure
+                .route(context.surface, target, stateless_2026);
+            if context.surface == crate::mcp::request_policy::McpSurface::Cli {
+                crate::mcp::cli::default_project_route(
+                    target,
+                    route,
+                    context.default_project.is_some(),
+                )
+            } else {
+                route
+            }
         });
         // App display consumes the existing observation shape before the Host view
         // separates details. Keep only its bounded projection, not another log copy.
@@ -125,7 +144,7 @@ impl RuntimeResponse {
             artifact_presentation,
             result,
             resource_tool_call,
-            runtime.runtime_info.mcp_text_json_compat_enabled,
+            context.text_json_compat,
             result_presentation,
         ) {
             resources::McpResourceToolResultAdaptation::Framed(value) => value,
@@ -135,7 +154,7 @@ impl RuntimeResponse {
                 // continuation protocol data out of ordinary model tool results.
                 mcp_runtime_tool_result_fallback(
                     result,
-                    runtime.runtime_info.mcp_text_json_compat_enabled,
+                    context.text_json_compat,
                     result_presentation,
                 )
             }

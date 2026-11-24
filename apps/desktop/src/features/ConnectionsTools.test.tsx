@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { MantineProvider } from "@mantine/core";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LocaleProvider } from "../i18n/locale";
 import { CONNECTIONS_TOOLS_MESSAGES, connectionsToolsText } from "../i18n/connections-tools";
@@ -11,7 +11,7 @@ import { connectionFixture, connectionSnapshot } from "../test/connections-fixtu
 import { ConnectionPanel } from "./connection/ConnectionPanel";
 import { McpProvidersPanel } from "./extensions/McpProvidersPanel";
 
-const api = vi.hoisted(() => ({ getState: vi.fn(), saveTunnelProfile: vi.fn(), tunnelProfileAction: vi.fn(), cloudflareConnection: vi.fn(), environmentServiceAction: vi.fn(), saveMcpProvider: vi.fn(), removeMcpProvider: vi.fn(), runnerSettings: vi.fn(), restartOwnedRunner: vi.fn(), stopQuickShare: vi.fn() }));
+const api = vi.hoisted(() => ({ diagnostics: vi.fn(), copyRuntimeConsoleCredential: vi.fn(), openDiagnosticResource: vi.fn(), connectGemini: vi.fn(), getState: vi.fn(), inspectLocalMigration: vi.fn(), resetLocalMigration: vi.fn(), configureEnvironment: vi.fn(), saveTunnelProfile: vi.fn(), tunnelProfileAction: vi.fn(), cloudflareConnection: vi.fn(), environmentServiceAction: vi.fn(), saveMcpProvider: vi.fn(), removeMcpProvider: vi.fn(), runnerSettings: vi.fn(), restartOwnedRunner: vi.fn(), stopQuickShare: vi.fn() }));
 vi.mock("../lib/desktop-api", () => ({ desktopApi: api }));
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeText: vi.fn() }));
 const onSettings = vi.fn();
@@ -43,6 +43,240 @@ beforeEach(() => {
 });
 
 describe("Connections + Tools control surfaces", () => {
+
+  it("reports Stop immediately while the Tunnel control request is pending", async () => {
+    const initial = { ...state(), persistent_environment: "local" };
+    let finish!: (snapshot: DesktopState) => void;
+    api.tunnelProfileAction.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    render(<Harness mode="connections" initial={initial} />);
+    const stop = screen.getByRole("button", { name: "Stop ChatGPT Personal" });
+    fireEvent.click(stop);
+    expect(api.tunnelProfileAction).toHaveBeenCalledExactlyOnceWith("personal", "stop");
+    expect(screen.getByText(connectionsToolsText("en-US", "stopping"))).toBeInTheDocument();
+    expect(stop).toBeDisabled();
+    await act(async () => finish(initial));
+    expect(screen.queryByText(connectionsToolsText("en-US", "stopping"))).toBeNull();
+  });
+
+  it("acknowledges a Server restart before waiting for the native refresh", async () => {
+    const profile = connectionFixture({ id: "server-owned", host_mode: "embedded", autostart: true, server_restart_required: true });
+    const initial = { ...state(), persistent_environment: "local", connections: connectionSnapshot(profile) };
+    let finish!: (snapshot: DesktopState) => void;
+    api.environmentServiceAction.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    render(<Harness mode="connections" initial={initial} />);
+    const restart = screen.getByRole("button", { name: connectionsToolsText("en-US", "restartServer") });
+    fireEvent.click(restart);
+    expect(api.environmentServiceAction).toHaveBeenCalledExactlyOnceWith({ environmentId: "local", component: "server", action: "restart" });
+    expect(screen.getByText(connectionsToolsText("en-US", "restarting"))).toBeInTheDocument();
+    expect(restart).toBeDisabled();
+    await act(async () => finish(initial));
+    expect(screen.queryByText(connectionsToolsText("en-US", "restarting"))).toBeNull();
+  });
+  it("prepares one embedded Gemini Quick connection, starts the verified public ingress and hands off the current URL", async () => {
+    const initial = { ...state(), persistent_environment: "local", connections: connectionSnapshot() };
+    const quick = connectionFixture({ id: "q", configuration_id: "new", name: "Gemini", provider: {kind: "cloudflare_quick"},
+      host_mode: "embedded", revision: 1, oauth_dynamic_registration_enabled: true, server_restart_required: true });
+    const applied = { ...initial, connections: connectionSnapshot({ ...quick, server_restart_required: false }) };
+    let finish!: (next: DesktopState) => void;
+    api.connectGemini.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    api.environmentServiceAction.mockResolvedValue(applied);
+    api.cloudflareConnection.mockResolvedValue({ profile_id: "q", configuration_id:"new", server_instance_id: "server", process_generation: 1,
+      lifecycle: "running", public_origin: "https://current.trycloudflare.com", configured_revision: 1, applied_revision: 1,
+      registration_available: true, observed_authorization: false, observed_tool_call: false });
+    render(<Harness mode="connections" initial={initial} />);
+    const connect = screen.getByRole("button", { name: "Connect Gemini" });
+    fireEvent.click(connect);
+    fireEvent.click(connect);
+    expect(api.connectGemini).toHaveBeenCalledExactlyOnceWith({environment_id: "local", profile: null});
+    finish(applied);
+    expect(api.environmentServiceAction).not.toHaveBeenCalled();
+    expect(await screen.findByText("MCP endpoint ready")).toBeInTheDocument();
+    expect(screen.getByText("Waiting for an authorized request")).toBeInTheDocument();
+    expect(screen.queryByText("OAuth authorization observed")).toBeNull();
+    expect(screen.getByText("https://current.trycloudflare.com/mcp")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Gemini" }));
+    await waitFor(() => expect(api.openDiagnosticResource).toHaveBeenCalledExactlyOnceWith("gemini_apps"));
+    expect(api.cloudflareConnection.mock.calls.every(([request]) => request.action === "status")).toBe(true);
+    expect(api.diagnostics).not.toHaveBeenCalled();
+    api.diagnostics.mockResolvedValue({resources: ["runtime_console"], can_copy_console_credential: true, credential_copy_fence: "gemini-owner-fence"});
+    api.copyRuntimeConsoleCredential.mockResolvedValue(undefined);
+    fireEvent.click(screen.getByRole("button", {name: "Copy WebCodex sign-in credential"}));
+    const confirmCopy = await screen.findByRole("button", {name: "Copy sensitive credential"});
+    await waitFor(() => expect(confirmCopy).toBeEnabled());
+    expect(api.copyRuntimeConsoleCredential).not.toHaveBeenCalled();
+    fireEvent.click(confirmCopy);
+    await waitFor(() => expect(api.copyRuntimeConsoleCredential).toHaveBeenCalledExactlyOnceWith("gemini-owner-fence"));
+    expect(await screen.findByText(/Paste it on the WebCodex sign-in page/)).toBeVisible();
+  });
+
+  it("prefers the saved Named profile and enables only its policy after selection", async () => {
+    const quick = connectionFixture({ id: "quick", configuration_id: "old", provider: {kind: "cloudflare_quick"}, autostart: true });
+    const named = connectionFixture({ id: "long", configuration_id: "incarnation", name: "Studio", revision: 3, autostart: false,
+      provider: {kind: "cloudflare_named", public_origin: "https://studio.example", tunnel_id: "studio"}, tunnel_id: "studio" });
+    const initial = { ...state(), persistent_environment: "local", connections: connectionSnapshot(quick, named) };
+    api.connectGemini.mockResolvedValue(initial);
+    api.cloudflareConnection.mockImplementation(async ({profile_id}) => ({profile_id, configuration_id:profile_id === "long" ? "incarnation" : "old", lifecycle: "stopped", configured_revision: 3}));
+    render(<Harness mode="connections" initial={initial} />);
+    fireEvent.click(screen.getByText("Other Cloudflare connections"));
+    fireEvent.click(screen.getByRole("button", {name: "Use a fixed address"}));
+    expect(screen.getByRole("combobox", {name: "Saved connection"})).toHaveValue("long");
+    expect(api.saveTunnelProfile).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", {name: "Connect Gemini"}));
+    await waitFor(() => expect(api.connectGemini).toHaveBeenCalledExactlyOnceWith({
+      environment_id:"local", profile:{id:"long", configuration_id:"incarnation", revision:3},
+    }));
+    expect(screen.queryByLabelText("Tunnel token")).toBeNull();
+    expect(api.environmentServiceAction).not.toHaveBeenCalled();
+  });
+
+  it("does not publish a late save or start the Server after leaving Connections", async () => {
+    const initial = state();
+    initial.persistent_environment = "local";
+    initial.connections = connectionSnapshot();
+    initial.readiness.server = "stopped";
+    let finish!: (snapshot: DesktopState) => void;
+    api.connectGemini.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const publish = vi.fn();
+    const view = render(<MantineProvider><LocaleProvider><ConnectionPanel state={initial} onState={publish} onSettings={onSettings} /></LocaleProvider></MantineProvider>);
+    fireEvent.click(screen.getByRole("button", {name: "Connect Gemini"}));
+    view.unmount();
+    await act(async () => finish(initial));
+    expect(publish).not.toHaveBeenCalled();
+    expect(api.environmentServiceAction).not.toHaveBeenCalled();
+  });
+
+  it("opens the existing Named editor with app registration and Server ownership selected", () => {
+    render(<Harness mode="connections" initial={{ ...state(), persistent_environment:"local", connections:connectionSnapshot() }} />);
+    fireEvent.click(screen.getByRole("button", {name:"Use a fixed address"}));
+    expect(screen.getByLabelText("Fixed HTTPS origin")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", {name:"Allow automatic OAuth client registration"})).toBeChecked();
+    expect(screen.getByDisplayValue("embedded")).toBeChecked();
+    expect(api.saveTunnelProfile).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("confirms the inspected legacy target and returns to Gemini (resume=%s)", async resuming => {
+    api.inspectLocalMigration.mockResolvedValue({fingerprint: "original", resuming});
+    api.configureEnvironment.mockResolvedValue({...state(), persistent_environment: "saved"});
+    render(<Harness mode="connections" />);
+    fireEvent.click(screen.getByRole("button", { name: "Check existing setup" }));
+    const confirm = await screen.findByRole("button", {name: resuming ? "Resume saved migration" : "Save and switch services"});
+    expect(screen.getByText(resuming ? /during recovery/ : /Connections may drop briefly/)).toBeVisible();
+    expect(api.configureEnvironment).not.toHaveBeenCalled();
+    fireEvent.click(confirm);
+    expect(await screen.findByRole("button", {name: "Connect Gemini"})).toBeEnabled();
+    expect(api.configureEnvironment).toHaveBeenCalledExactlyOnceWith({
+      mode: "create", expectedLocalTarget: {kind: "legacy", fingerprint: "original"}, ...(resuming ? {} : {serviceScope: "user"}),
+    });
+    expect(screen.queryByRole("heading", {name: "Try reading a file in ChatGPT"})).toBeNull();
+    expect(api.saveTunnelProfile).not.toHaveBeenCalled();
+    expect(onSettings).not.toHaveBeenCalled();
+  });
+
+  it("offers a read-only recheck after a blocked migration", async () => {
+    api.inspectLocalMigration.mockRejectedValue({code: "migration_inventory_incomplete", message: "Incomplete", next_action: "Reconnect"});
+    render(<Harness mode="connections" />);
+    fireEvent.click(screen.getByRole("button", {name: "Check existing setup"}));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/full project list/);
+    expect(screen.getByRole("button", {name: "Retry"})).toBeEnabled();
+    expect(api.configureEnvironment).not.toHaveBeenCalled();
+    expect(api.tunnelProfileAction).not.toHaveBeenCalled();
+  });
+
+  it("shows localized recovery instead of raw English fallback and can clear a clean unfinished migration", async () => {
+    api.inspectLocalMigration
+      .mockRejectedValueOnce({
+        code: "legacy_project_registry",
+        message: "Registry path mismatch",
+        next_action: "Inspect both owners and resume the saved migration only after their state is known",
+      })
+      .mockRejectedValueOnce({
+        code: "migration_reset_available",
+        message: "An unrecognized legacy process generation is active",
+        next_action: "Clear the unfinished migration record and check your setup again.",
+      })
+      .mockResolvedValueOnce({ fingerprint: "fresh-after-reset", resuming: false });
+    api.resetLocalMigration.mockResolvedValue(state());
+    render(<Harness mode="connections" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check existing setup" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.querySelector("p")?.textContent).toMatch(/project folder still exists/i);
+    expect(alert.querySelector("p")?.textContent).not.toContain("Inspect both owners");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    const resetButton = await screen.findByRole("button", { name: "Clear unfinished record and recheck" });
+    fireEvent.click(resetButton);
+    expect(await screen.findByRole("button", { name: "Save and switch services" })).toBeEnabled();
+    expect(api.resetLocalMigration).toHaveBeenCalledExactlyOnceWith();
+    expect(api.inspectLocalMigration).toHaveBeenCalledTimes(3);
+  });
+
+  it("presents Connect ChatGPT alongside Connect Gemini with prefilled ChatGPT defaults", async () => {
+    const initial = { ...state(), persistent_environment: "local", connections: connectionSnapshot() };
+    const captured: TunnelProfileRequest[] = [];
+    api.saveTunnelProfile.mockImplementation(async request => {
+      captured.push(structuredClone(request));
+      return initial;
+    });
+    render(<Harness mode="connections" initial={initial} />);
+    expect(screen.getByRole("heading", {name:"Connect ChatGPT"})).toBeVisible();
+    expect(screen.getByRole("button", { name: "Connect Gemini" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Connect ChatGPT" }));
+    expect(screen.getByRole("dialog", { name: "Connect ChatGPT" })).toBeVisible();
+    expect(screen.queryByRole("combobox", { name: "Connection provider" })).toBeNull();
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(screen.getByLabelText("Name")).toHaveValue("ChatGPT");
+    expect(screen.getByLabelText("Name")).not.toBeVisible();
+    expect(screen.getByLabelText("Tunnel ID")).toHaveFocus();
+    expect(screen.getByText(/Create a Tunnel and an API key that can use it/)).toBeVisible();
+    fireEvent.change(screen.getByLabelText("Tunnel ID"), { target: { value: "tunnel_chatgpt_1" } });
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "chatgpt-write-only-secret" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(captured).toHaveLength(1));
+    expect(captured[0]).toMatchObject({
+      name: "ChatGPT",
+      tunnel_id: "tunnel_chatgpt_1",
+      host_mode: "embedded",
+      autostart: true,
+    });
+  });
+
+  it("keeps actionable save diagnostics without displaying arbitrary server text", async () => {
+    api.saveTunnelProfile.mockRejectedValue({ code: "cloudflare_authentication_failed",
+      message: "Bearer private-save-canary", next_action: "private-server-instruction",
+      diagnostic: {component: "auth", stage: "connection_save", reason_code: "http_forbidden",
+        recovery_kind: "user_action", safe_action: "repair_user_credential", retry_allowed: false, http_status: 403},
+    });
+    render(<Harness mode="connections" initial={{ ...state(), persistent_environment: "local", connections: connectionSnapshot() }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Connect ChatGPT" }));
+    fireEvent.change(screen.getByLabelText("Tunnel ID"), {target: {value: "chatgpt-test"}});
+    fireEvent.change(screen.getByLabelText("API key"), {target: {value: "write-only-key"}});
+    fireEvent.click(screen.getByRole("button", {name: "Save"}));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("HTTP 403");
+    expect(alert).toHaveTextContent("connection_save");
+    expect(alert).not.toHaveTextContent("private-save-canary");
+    expect(alert).not.toHaveTextContent("private-server-instruction");
+    expect(screen.getByLabelText("API key")).toHaveValue("");
+    expect(api.saveTunnelProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("can cancel local setup or finish with the sign-in defaults and no project", async () => {
+    api.configureEnvironment.mockResolvedValue({...state(), persistent_environment: "saved", connections: connectionSnapshot()});
+    render(<Harness mode="connections" initial={{...state(), topology: null, project: null, connections: connectionSnapshot()}} />);
+    fireEvent.click(screen.getByRole("button", {name: "Prepare this computer"}));
+    fireEvent.click(screen.getByRole("button", {name: "Back to Gemini"}));
+    expect(api.configureEnvironment).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", {name: "Prepare this computer"}));
+    fireEvent.click(screen.getByRole("button", {name: "Get started"}));
+    expect(await screen.findByRole("button", {name: "Connect Gemini"})).toBeEnabled();
+    expect(api.configureEnvironment).toHaveBeenCalledWith(expect.objectContaining({
+      mode: "create", expectedLocalTarget: {kind: "fresh"}, serviceScope: "user", projectPath: null, runner: true,
+    }));
+    expect(api.inspectLocalMigration).not.toHaveBeenCalled();
+    expect(api.saveTunnelProfile).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["http://127.0.0.1:18080", null],
     ["http://192.0.2.10:18080", null],
@@ -102,8 +336,8 @@ describe("Connections + Tools control surfaces", () => {
     expect(screen.getByText("Start the local Runtime to connect. Your settings remain saved.")).toBeInTheDocument();
     expect(screen.queryByText(/External connections to this Server are not observed here/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Restart ChatGPT Personal" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Runtime" }));
-    expect(onSettings).toHaveBeenCalledExactlyOnceWith("runtime");
+    expect(screen.getByRole("button", { name: "Start WebCodex" })).toBeEnabled();
+    expect(onSettings).not.toHaveBeenCalled();
     expect(api.tunnelProfileAction).not.toHaveBeenCalled();
     expect(api.restartOwnedRunner).not.toHaveBeenCalled();
   });
@@ -138,7 +372,7 @@ describe("Connections + Tools control surfaces", () => {
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "ChatGPT Work" } });
     fireEvent.change(screen.getByLabelText("Tunnel ID"), { target: { value: "tunnel_work" } });
     fireEvent.change(screen.getByLabelText("API key"), { target: { value: "write-only-server-key" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save and apply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(captured).toHaveLength(1));
     expect(captured[0]).toMatchObject({
@@ -173,7 +407,7 @@ describe("Connections + Tools control surfaces", () => {
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Independent" } });
     fireEvent.change(screen.getByLabelText("Tunnel ID"), { target: { value: "tunnel_independent" } });
     fireEvent.change(screen.getByLabelText("API key"), { target: { value: "write-only-separate-key" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save and apply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(captured).toHaveLength(1));
     expect(captured[0]).toMatchObject({ host_mode: "standalone", autostart: true });
@@ -330,8 +564,10 @@ describe("Connections + Tools control surfaces", () => {
     render(<Harness mode="connections" initial={initial} />);
 
     expect(screen.queryByRole("button", { name: "Start Server" })).not.toBeInTheDocument();
-    expect(screen.getByText("Runs with WebCodex Server", { selector: ".workspace-observation" })).toBeVisible();
+    const owner = screen.getByText("Runs with WebCodex Server");
+    expect(owner.closest("details")).not.toHaveAttribute("open");
     fireEvent.click(screen.getByText("Details"));
+    expect(owner).toBeVisible();
     expect(screen.getByText("Disabled")).toBeInTheDocument();
   });
 
@@ -360,7 +596,7 @@ describe("Connections + Tools control surfaces", () => {
     expect(document.body.textContent).not.toContain("embedded");
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Work renamed" } });
     fireEvent.change(screen.getByLabelText("API key"), { target: { value: "write-only-edit-key" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save and apply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(captured).toHaveLength(1));
     expect(captured[0]).toMatchObject({
@@ -466,7 +702,7 @@ describe("Connections + Tools control surfaces", () => {
   });
 
   it.each([
-    ["tunnel_restart_uncertain", "tunnel_recovery", "Restart is blocked", false],
+    ["tunnel_restart_uncertain", "tunnel_recovery", "Previous Tunnel work is unconfirmed", false],
     ["tunnel_control_plane_unreachable", "tunnel_control_plane", "Check internet", true],
   ] as const)("shows specific recovery for %s instead of blaming credentials", (reason_code, failure_stage, message, proxyHint) => {
     const initial = state();
@@ -572,6 +808,7 @@ describe("Connections + Tools control surfaces", () => {
     initial.connections = connectionSnapshot(connectionFixture({ id: "cf", name: "Quick", revision: 4, configuration_id: "displayed-configuration", provider: { kind: "cloudflare_quick" }, host_mode: "embedded" }));
     api.cloudflareConnection.mockResolvedValue({ profile_id: "cf", server_instance_id: "owner", process_generation: 7, lifecycle: "stopped", public_origin: null, oauth_configured: false, observed_authorization: false, configured_revision: 5, applied_revision: null, local_target: "http://127.0.0.1:8900", reason_code: null });
     render(<Harness mode="connections" initial={initial} />);
+    fireEvent.click(screen.getByText("Advanced connection settings"));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     const dialog = screen.getByRole("dialog", { name: "Delete Quick" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
@@ -586,7 +823,7 @@ describe("Connections + Tools control surfaces", () => {
     expect(screen.getByLabelText("API key")).toHaveValue("");
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Personal renamed" } });
     fireEvent.change(screen.getByLabelText("API key"), { target: { value: "write-only-fixture-secret" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save and apply" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(captured).toHaveLength(1));
     expect(captured[0]).toMatchObject({ id: "personal", expected_revision: 1, name: "Personal renamed", host_mode: "standalone", api_key: "write-only-fixture-secret" });
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());

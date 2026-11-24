@@ -187,3 +187,22 @@ async fn specialized_dispatch_preserves_recording_authority_denial_as_tool_resul
         }
     }
 }
+
+#[test]
+fn session_start_barrier_follows_effect_and_live_diagnostic() {
+    use crate::tool_runtime::{sessions::session_dispatch_requires_durable_start, ToolCall};
+    let diagnostic = |include_live_acp| ToolCall::CodingAgentDiagnose {
+        project: "project".into(),
+        provider_id: "cursor".into(),
+        include_live_acp,
+    };
+    assert!(!session_dispatch_requires_durable_start(&diagnostic(false)));
+    assert!(session_dispatch_requires_durable_start(&diagnostic(true)));
+    assert!(session_dispatch_requires_durable_start(
+        &ToolCall::CodingAgentRespondPermission {
+            run_id: "wc_agent_run_test".into(),
+            permission_request_token: "wc_acp_perm_test".into(),
+            option_id: "allow".into(),
+        }
+    ));
+}

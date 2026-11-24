@@ -1,14 +1,39 @@
 //! Caller-authorized Window queries shared by Console endpoints.
 use super::*;
 
-/// Compare the server-authored attribution already present in this observation.
-/// Live polling never locks the Store or infers identity from another request.
-fn same_managed_oauth_window_principal(
+/// Personal tokens operate their user's Windows; delegated OAuth credentials
+/// remain confined to their exact user/client. Neither selector grants Project
+/// access or changes the recipient's Operator/Peer storage namespace.
+pub(super) fn managed_oauth_window_visibility(
     auth: &AuthContext,
-    identity: Option<&(String, String)>,
-) -> bool {
-    auth.managed_oauth_window_identity().is_some_and(|caller| {
-        identity.is_some_and(|(user, client)| caller == (user.as_str(), client.as_str()))
+) -> Option<webcodex_store::WindowOAuthVisibility> {
+    // Only a canonical personal user key may cross OAuth client boundaries.
+    // The authentication fallback also classifies unknown non-agent key kinds
+    // as ApiToken, so that enum alone is not sufficient authorization.
+    if auth.kind == crate::auth::AuthKind::ApiToken
+        && auth.token_kind.as_deref() == Some(crate::models::TOKEN_KIND_USER)
+    {
+        return auth
+            .user_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .map(|user_id| webcodex_store::WindowOAuthVisibility::User {
+                user_id: user_id.clone(),
+            });
+    }
+    auth.managed_oauth_window_identity().map(|(user, client)| {
+        webcodex_store::WindowOAuthVisibility::Client {
+            user_id: user.into(),
+            client_id: client.into(),
+        }
+    })
+}
+
+/// Compare only server-authored attribution in this exact observation. Live
+/// polling never locks the Store or infers identity from another request.
+fn managed_oauth_window_visible(auth: &AuthContext, identity: Option<&(String, String)>) -> bool {
+    managed_oauth_window_visibility(auth).is_some_and(|visibility| {
+        identity.is_some_and(|(user, client)| visibility.matches(user, client))
     })
 }
 
@@ -87,10 +112,7 @@ pub(super) async fn console_window_event_visible_cached(
         return caller_principal.is_some_and(|(kind, id)| {
             event.principal_correlation_kind.as_deref() == Some(kind)
                 && event.principal_correlation_id.as_deref() == Some(id)
-        }) || same_managed_oauth_window_principal(
-            auth,
-            event.managed_oauth_identity.as_ref(),
-        );
+        }) || managed_oauth_window_visible(auth, event.managed_oauth_identity.as_ref());
     }
     window_event_visible_cached(runtime, auth, cache, event).await
 }
@@ -108,25 +130,12 @@ pub(super) async fn console_active_window_request_visible_cached(
             crate::tool_runtime::window_activity::active_window_request_matches_principal(
                 request, principal,
             )
-        }) && !same_managed_oauth_window_principal(auth, request.managed_oauth_identity.as_ref())
+        }) && !managed_oauth_window_visible(auth, request.managed_oauth_identity.as_ref())
         {
             return false;
         }
     }
     active_window_request_visible_cached(runtime, auth, cache, request).await
-}
-
-pub(super) async fn console_window_project_visible_cached(
-    runtime: &ToolRuntime,
-    auth: &AuthContext,
-    principal: Option<(&str, &str)>,
-    cache: &mut HashMap<String, bool>,
-    project: Option<&str>,
-) -> bool {
-    if principal.is_none() && !auth.is_admin_caller() && project.is_none() {
-        return false;
-    }
-    window_project_visible_cached(runtime, auth, cache, project).await
 }
 
 pub(super) async fn window_project_visible_cached(
@@ -153,212 +162,43 @@ pub(super) fn window_summary_internal_tool(tool: Option<&str>) -> bool {
     )
 }
 
-pub(super) async fn visible_window_summary_for_auth_bounded(
-    runtime: &ToolRuntime,
-    auth: &AuthContext,
-    principal: Option<(&str, &str)>,
-    window_key: &str,
-    visibility_cache: &mut HashMap<String, bool>,
-    project_filter: Option<&str>,
-    activity_scan_limit: usize,
-    include_relation_count: bool,
-) -> Result<Option<RuntimeConsoleWindowSummary>, RuntimeConsoleError> {
-    let db = runtime
-        .window_activity_db
-        .as_ref()
-        .ok_or(RuntimeConsoleError::Internal)?;
-    // Summary fields do not consume Code Mode composition or audit summary JSON.
-    // Keep full composition hydration on the selected Window detail path only.
-    let events =
-        super::store_read::events(db, window_key, principal, activity_scan_limit, false).await?;
-    let caller_principal = if principal.is_none() && !auth.is_admin_caller() {
-        crate::tool_runtime::runtime_observation_principal(Some(auth)).ok()
-    } else {
-        None
-    };
-    let caller_principal_ref = window_principal_ref(&caller_principal);
-    let mut source = None;
-    let mut last_seen_at_ms = None;
-    let mut first_seen_at_ms = None;
-    let mut last_tool_call_at_ms = None;
-    let mut last_meaningful_activity_at_ms = None;
-    let mut recorder_gap_count = 0usize;
-    let mut last_project = None;
-    let mut project_observed_at = i64::MIN;
-    let mut last_activity_name = None;
-    let mut last_activity_status = None;
-    let mut last_activity_meaningful = None;
-    let mut last_activity_observed_at = i64::MIN;
-    let mut latest_active_started_at = i64::MIN;
-    for event in events {
-        if !console_window_event_visible_cached(
-            runtime,
-            auth,
-            principal,
-            caller_principal_ref,
-            visibility_cache,
-            &event,
-        )
-        .await
-            || project_filter.is_some_and(|project| event.project.as_deref() != Some(project))
-        {
-            continue;
-        }
-        if window_summary_internal_tool(event.operation.as_deref()) {
-            continue;
-        }
-        source = Some(event.client_window_source.clone());
-        last_seen_at_ms = Some(last_seen_at_ms.unwrap_or(i64::MIN).max(event.ended_at_ms));
-        first_seen_at_ms = Some(first_seen_at_ms.unwrap_or(i64::MAX).min(event.ended_at_ms));
-        if event.action_name == "toolsCall" {
-            last_tool_call_at_ms = Some(
-                last_tool_call_at_ms
-                    .unwrap_or(i64::MIN)
-                    .max(event.ended_at_ms),
-            );
-        }
-        if event.project.is_some() && event.ended_at_ms > project_observed_at {
-            last_project = event.project.clone();
-            project_observed_at = event.ended_at_ms;
-        }
-        if event.ended_at_ms > last_activity_observed_at {
-            last_activity_name = event
-                .operation
-                .clone()
-                .or_else(|| Some(event.action_name.clone()));
-            last_activity_status = Some(event.status.clone());
-            last_activity_meaningful = Some(event.meaningful);
-            last_activity_observed_at = event.ended_at_ms;
-        }
-        if event.meaningful {
-            last_meaningful_activity_at_ms = Some(
-                last_meaningful_activity_at_ms
-                    .unwrap_or(i64::MIN)
-                    .max(event.ended_at_ms),
-            );
-        }
-        if event.recorder_gap_session_id.is_some() {
-            recorder_gap_count = recorder_gap_count.saturating_add(1);
-        }
-    }
-
-    // Session-link history has its own bounded relation query. Do not derive
-    // the cardinality only from the latest activity-page events: a busy Window
-    // may have >500 later calls while an older authoritative Session relation
-    // remains part of its many-to-many history.
-    let mut linked_session_count = 0usize;
-    if include_relation_count {
-        let relation_rows =
-            super::store_read::relations(db, window_key, principal, MAX_WINDOW_SESSION_LIMIT)
-                .await?;
-        for link in relation_rows {
-            if project_filter.is_some_and(|project| link.project.as_deref() != Some(project)) {
-                continue;
-            }
-            if console_window_project_visible_cached(
-                runtime,
-                auth,
-                principal,
-                visibility_cache,
-                link.project.as_deref(),
-            )
-            .await
-            {
-                linked_session_count = linked_session_count.saturating_add(1);
-            }
-        }
-    }
-
-    let mut active_count = 0usize;
-    for request in runtime
-        .window_activity
-        .list_for_window(window_key, principal)
-    {
-        if !console_active_window_request_visible_cached(
-            runtime,
-            auth,
-            principal,
-            caller_principal_ref,
-            visibility_cache,
-            &request,
-        )
-        .await
-            || project_filter.is_some_and(|project| request.project.as_deref() != Some(project))
-        {
-            continue;
-        }
-        if window_summary_internal_tool(request.tool_name.as_deref()) {
-            continue;
-        }
-        source = Some(request.client_window_source.clone());
-        last_seen_at_ms = Some(
-            last_seen_at_ms
-                .unwrap_or(i64::MIN)
-                .max(request.started_at_ms),
-        );
-        first_seen_at_ms = Some(
-            first_seen_at_ms
-                .unwrap_or(i64::MAX)
-                .min(request.started_at_ms),
-        );
-        if request.started_at_ms >= latest_active_started_at {
-            if request.project.is_some() {
-                last_project = request.project.clone();
-            }
-            last_activity_name = request
-                .tool_name
-                .clone()
-                .or_else(|| Some(request.method.clone()));
-            last_activity_status = Some("running".to_string());
-            last_activity_meaningful = Some(request.is_meaningful());
-            latest_active_started_at = request.started_at_ms;
-        }
-        active_count = active_count.saturating_add(1);
-    }
-
-    let Some(last_seen_at_ms) = last_seen_at_ms else {
-        return Ok(None);
-    };
-    Ok(Some(RuntimeConsoleWindowSummary {
-        client_window_key: window_key.to_string(),
-        last_project,
-        source: source.unwrap_or_default(),
-        last_seen_at_ms,
-        first_seen_at_ms: if include_relation_count {
-            first_seen_at_ms
-        } else {
-            None
-        },
-        last_tool_call_at_ms,
-        last_meaningful_activity_at_ms,
-        last_activity_name,
-        last_activity_status,
-        last_activity_meaningful,
-        active_count,
-        linked_session_count,
-        recorder_gap_count,
-    }))
-}
-
 pub(super) async fn visible_window_summary_for_auth(
     runtime: &ToolRuntime,
     auth: &AuthContext,
-    principal: Option<(&str, &str)>,
     window_key: &str,
     visibility_cache: &mut HashMap<String, bool>,
     project_filter: Option<&str>,
 ) -> Result<Option<RuntimeConsoleWindowSummary>, RuntimeConsoleError> {
-    visible_window_summary_for_auth_bounded(
+    let project_ids = project_filter.map(|project| vec![project.to_owned()]);
+    let (mut page, anchors) = super::window_inventory::inventory_for_auth_with_anchors(
         runtime,
         auth,
-        principal,
-        window_key,
-        visibility_cache,
-        project_filter,
-        MAX_WINDOW_ACTIVITY_LIMIT,
-        true,
+        Some(1),
+        0,
+        project_ids.as_deref(),
+        Some(window_key),
+        "",
     )
-    .await
+    .await?;
+    // Keep ALL authorized historical and live anchors for the final response
+    // recheck, including older Projects absent from last_project/activity page.
+    visibility_cache.extend(anchors.into_iter().map(|project| (project, true)));
+    Ok(page.windows.pop())
+}
+
+pub(super) async fn revalidate_window_projects(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    visibility_cache: &HashMap<String, bool>,
+) -> Result<(), RuntimeConsoleError> {
+    let project_ids = visibility_cache
+        .iter()
+        .filter_map(|(project, visible)| visible.then_some(project.clone()))
+        .collect::<Vec<_>>();
+    if !project_ids.is_empty() {
+        super::window_inventory::authorize_selection(runtime, auth, &project_ids).await?;
+    }
+    Ok(())
 }
 
 pub(super) fn primary_window_activity_scan_limit(activity_limit: usize) -> usize {
@@ -482,25 +322,30 @@ pub(super) async fn window_for_auth(
     auth: &AuthContext,
     input: WindowInput,
 ) -> Result<RuntimeConsoleWindowDetail, RuntimeConsoleError> {
+    let phase_name = if input.detail_level == WindowDetailLevel::Primary {
+        "console_window_primary"
+    } else {
+        "console_window_full"
+    };
+    let mut phase = super::store_read::Phase::start(phase_name);
+    let result = window_for_auth_inner(runtime, auth, input).await;
+    phase.finish(if result.is_ok() { "ok" } else { "error" });
+    result
+}
+
+pub(super) async fn window_for_auth_inner(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    input: WindowInput,
+) -> Result<RuntimeConsoleWindowDetail, RuntimeConsoleError> {
     require_runtime_read(auth)?;
     if input.client_window_key.chars().count() > MAX_WINDOW_KEY_CHARS
         || !valid_window_key(&input.client_window_key)
     {
         return Err(RuntimeConsoleError::Invalid);
     }
-    let db = runtime
-        .window_activity_db
-        .as_ref()
-        .ok_or(RuntimeConsoleError::Internal)?;
     let principal = window_principal_filter(auth)?;
     let principal_ref = window_principal_ref(&principal);
-    let durable_first_seen_at_ms = if auth.is_admin_caller() {
-        super::store_read::summary(db, &input.client_window_key, principal_ref)
-            .await?
-            .map(|summary| summary.first_seen_at_ms)
-    } else {
-        None
-    };
     let caller_principal = if principal.is_none() && !auth.is_admin_caller() {
         crate::tool_runtime::runtime_observation_principal(Some(auth)).ok()
     } else {
@@ -518,47 +363,64 @@ pub(super) async fn window_for_auth(
         .unwrap_or(DEFAULT_WINDOW_SESSION_LIMIT)
         .clamp(1, MAX_WINDOW_SESSION_LIMIT);
 
-    let mut visibility_cache = HashMap::new();
-    let summary = if primary_detail {
-        let primary_scan_limit = primary_window_activity_scan_limit(activity_limit);
-        let quick = visible_window_summary_for_auth_bounded(
+    let activity_scan_limit = if primary_detail {
+        primary_window_activity_scan_limit(activity_limit)
+    } else if auth.is_admin_caller() {
+        activity_limit
+            .saturating_add(1)
+            .min(MAX_WINDOW_ACTIVITY_LIMIT)
+    } else {
+        MAX_WINDOW_ACTIVITY_LIMIT
+    };
+    let session_scan_limit = if auth.is_admin_caller() {
+        session_limit
+            .saturating_add(1)
+            .min(MAX_WINDOW_SESSION_LIMIT)
+    } else {
+        MAX_WINDOW_SESSION_LIMIT
+    };
+    let window_key = input.client_window_key.clone();
+    let owned_principal = principal.clone();
+    let admin = auth.is_admin_caller();
+    let (mut summary_page, anchors, (durable_first_seen_at_ms, raw_activity, raw_sessions)) =
+        super::window_inventory::inventory_and_read_for_auth(
             runtime,
             auth,
-            principal_ref,
-            &input.client_window_key,
-            &mut visibility_cache,
+            Some(1),
+            0,
             None,
-            primary_scan_limit,
-            false,
+            Some(&input.client_window_key),
+            "",
+            move |db| {
+                let principal = window_principal_ref(&owned_principal);
+                let first_seen = if admin {
+                    db.get_window_activity_summary(&window_key, principal)?
+                        .map(|summary| summary.first_seen_at_ms)
+                } else {
+                    None
+                };
+                let activity = super::store_read::read_events(
+                    db,
+                    &window_key,
+                    principal,
+                    activity_scan_limit,
+                    cfg!(feature = "experimental-code-mode"),
+                )?;
+                let sessions = if primary_detail {
+                    Vec::new()
+                } else {
+                    db.list_window_workflow_sessions(&window_key, principal, session_scan_limit)?
+                };
+                Ok((first_seen, activity, sessions))
+            },
         )
         .await?;
-        if quick.is_some() {
-            quick
-        } else {
-            // A bounded primary scan can land entirely on currently-hidden Project
-            // history. Fall back to the canonical full authority scan rather than
-            // turning a performance optimization into a false 404/existence signal.
-            visible_window_summary_for_auth(
-                runtime,
-                auth,
-                principal_ref,
-                &input.client_window_key,
-                &mut visibility_cache,
-                None,
-            )
-            .await?
-        }
-    } else {
-        visible_window_summary_for_auth(
-            runtime,
-            auth,
-            principal_ref,
-            &input.client_window_key,
-            &mut visibility_cache,
-            None,
-        )
-        .await?
-    };
+    let summary = summary_page.windows.pop();
+    let mut visibility_cache = anchors
+        .into_iter()
+        .map(|project| (project, true))
+        .collect::<HashMap<_, _>>();
+    let mut active_authorization = super::store_read::Phase::start("console_window_authorization");
     let mut active_requests = Vec::new();
     let now_ms = chrono::Utc::now().timestamp_millis();
     for request in runtime
@@ -587,27 +449,13 @@ pub(super) async fn window_for_auth(
         });
     }
 
+    active_authorization.finish("ok");
+    drop(active_authorization);
     let active_count = active_requests.len();
     active_requests.truncate(crate::tool_runtime::MAX_ACTIVE_REQUESTS_PER_WINDOW);
 
-    let activity_scan_limit = if primary_detail {
-        primary_window_activity_scan_limit(activity_limit)
-    } else if auth.is_admin_caller() {
-        activity_limit
-            .saturating_add(1)
-            .min(MAX_WINDOW_ACTIVITY_LIMIT)
-    } else {
-        MAX_WINDOW_ACTIVITY_LIMIT
-    };
-    let raw_activity = super::store_read::events(
-        db,
-        &input.client_window_key,
-        principal_ref,
-        activity_scan_limit,
-        cfg!(feature = "experimental-code-mode"),
-    )
-    .await?;
     let raw_activity_at_cap = raw_activity.len() == activity_scan_limit;
+    let mut authorization = super::store_read::Phase::start("console_window_authorization");
     let mut activity_visible = Vec::with_capacity(raw_activity.len());
     for event in &raw_activity {
         activity_visible.push(
@@ -622,6 +470,9 @@ pub(super) async fn window_for_auth(
             .await,
         );
     }
+    authorization.finish("ok");
+    drop(authorization);
+    let mut assembly = super::store_read::Phase::start("console_window_assembly");
     let timing = project_window_loop_timings(&raw_activity, &activity_visible);
     let mut activity = Vec::new();
     for ((event, visible), timing) in raw_activity.into_iter().zip(activity_visible).zip(timing) {
@@ -636,6 +487,8 @@ pub(super) async fn window_for_auth(
     let activity_truncated = activity.len() > activity_limit || raw_activity_at_cap;
     activity.truncate(activity_limit);
 
+    assembly.finish("ok");
+    drop(assembly);
     let (jobs, jobs_truncated) = if primary_detail {
         (Vec::new(), false)
     } else {
@@ -648,35 +501,28 @@ pub(super) async fn window_for_auth(
         // canonical relation history are hydrated by the full follow-up request.
         (Vec::new(), false)
     } else {
-        let session_scan_limit = if auth.is_admin_caller() {
-            session_limit
-                .saturating_add(1)
-                .min(MAX_WINDOW_SESSION_LIMIT)
-        } else {
-            MAX_WINDOW_SESSION_LIMIT
-        };
-        let raw_sessions = super::store_read::relations(
-            db,
-            &input.client_window_key,
-            principal_ref,
-            session_scan_limit,
-        )
-        .await?;
         let raw_sessions_at_cap = raw_sessions.len() == session_scan_limit;
         let mut linked_sessions = Vec::new();
         for link in raw_sessions {
             let Some(project) = link.project.as_deref() else {
                 continue;
             };
-            if authorize_exact_project(runtime, auth, project)
-                .await
-                .is_err()
-            {
+            let Ok(registered) = exact_console_project_for_auth(runtime, auth, project).await
+            else {
                 continue;
-            }
-            let detail = runtime.workflow_session_console_detail(
+            };
+            if !runtime.sessions.console_session_matches_registration(
                 project,
                 &link.workflow_session_id,
+                registered.session_identity.as_ref(),
+            ) {
+                continue;
+            }
+            visibility_cache.insert(project.to_owned(), true);
+            let detail = runtime.workflow_session_console_detail_for_registration(
+                project,
+                &link.workflow_session_id,
+                registered.session_identity.as_ref(),
                 Some(1),
             );
             linked_sessions.push(RuntimeConsoleWindowSession {
@@ -695,6 +541,23 @@ pub(super) async fn window_for_auth(
         (linked_sessions, sessions_truncated)
     };
 
+    // Authorization may have changed during any awaited/offloaded activity or
+    // relation read. A stale summary must not leak an older Project timestamp.
+    revalidate_window_projects(runtime, auth, &visibility_cache).await?;
+    for link in &linked_sessions {
+        let project = link
+            .project
+            .as_deref()
+            .ok_or(RuntimeConsoleError::NotFound)?;
+        let registered = exact_console_project_for_auth(runtime, auth, project).await?;
+        if !runtime.sessions.console_session_matches_registration(
+            project,
+            &link.workflow_session_id,
+            registered.session_identity.as_ref(),
+        ) {
+            return Err(RuntimeConsoleError::NotFound);
+        }
+    }
     if summary.is_none()
         && active_requests.is_empty()
         && activity.is_empty()
@@ -702,6 +565,7 @@ pub(super) async fn window_for_auth(
     {
         return Err(RuntimeConsoleError::NotFound);
     }
+    let mut assembly = super::store_read::Phase::start("console_window_assembly");
     let active_last_seen = active_requests
         .iter()
         .map(|request| request.started_at_ms)
@@ -718,7 +582,8 @@ pub(super) async fn window_for_auth(
         .as_ref()
         .map(|summary| summary.source.clone())
         .unwrap_or_else(|| "openai-session".to_string());
-    Ok(RuntimeConsoleWindowDetail {
+    let result = RuntimeConsoleWindowDetail {
+        label: summary.as_ref().and_then(|row| row.label.clone()).flatten(),
         client_window_key: input.client_window_key,
         detail_level,
         source,
@@ -751,5 +616,7 @@ pub(super) async fn window_for_auth(
                 RuntimeConsoleWindowVisibilityScope::Principal
             },
         },
-    })
+    };
+    assembly.finish("ok");
+    Ok(result)
 }

@@ -71,32 +71,10 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
         "retired start_coding_task must stay out of MCP tools/list"
     );
     let description = tool("work_on_project")["description"].as_str().unwrap();
-    let normalized_description = description.to_ascii_lowercase();
-    for phrase in [
-        "canonical bootstrap",
-        "ordinary coding/review",
-        "mode=worktree",
-        "exact git base",
-        "fresh session",
-        "exact checkout resume",
-        "session_id alone",
-        "an explicit project must match",
-        "requires an explicit source",
-        "do not immediately reread",
-        "reuse workspace state",
-        "_wc.context",
-        "project.instructions",
-        "webcodex.workflow",
-        "skills",
-        "plugin",
-        "project authority",
-        "reauthorizes the bound project",
-    ] {
-        assert!(
-            normalized_description.contains(phrase),
-            "work_on_project description should mention {phrase}: {description}"
-        );
-    }
+    assert_eq!(
+        description,
+        crate::mcp::discovery::bootstrap_description(false)
+    );
 
     let work_schema = &tool("work_on_project")["inputSchema"];
     assert!(
@@ -449,7 +427,14 @@ async fn mcp_runtime_status_defaults_sparse_preserves_explicit_full_and_gateway_
             let output = &value["result"]["structuredContent"]["output"];
             assert_eq!(value["result"]["structuredContent"]["success"], true);
             assert_eq!(output.get("authority").is_none(), sparse);
-            assert_eq!(output.get("mcp_host").is_some(), sparse);
+            assert_eq!(
+                output["mcp_host"],
+                json!({
+                    "profile": runtime.mcp_host_policy.profile.as_str(),
+                    "deployment_profile": runtime.deployment_mcp_host_policy.profile.as_str(),
+                    "profile_source": "deployment",
+                }),
+            );
             if !sparse {
                 for field in [
                     "effective_config",

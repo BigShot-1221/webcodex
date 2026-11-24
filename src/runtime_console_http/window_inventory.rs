@@ -2,8 +2,8 @@
 //! retain evidence, never grant authority; all Project anchors are reauthorized
 //! with the canonical resolver on every HTTP request.
 use super::window_queries::{
-    console_active_window_request_visible_cached, window_principal_filter, window_principal_ref,
-    window_summary_internal_tool,
+    console_active_window_request_visible_cached, managed_oauth_window_visibility,
+    window_principal_filter, window_principal_ref, window_summary_internal_tool,
 };
 use super::{
     require_project_read, require_runtime_read, valid_project_id, valid_window_key, AuthContext,
@@ -19,20 +19,26 @@ pub(super) async fn authorize_selection(
     auth: &AuthContext,
     ids: &[String],
 ) -> Result<(), RuntimeConsoleError> {
-    if ids.iter().any(|id| !valid_project_id(id)) {
-        return Err(RuntimeConsoleError::Invalid);
+    let mut phase = super::store_read::Phase::start("console_window_authorization");
+    let result = async {
+        if ids.iter().any(|id| !valid_project_id(id)) {
+            return Err(RuntimeConsoleError::Invalid);
+        }
+        require_project_read(auth)?;
+        let access = crate::runner_http::runner_access_from_auth(Some(auth));
+        let visible = runtime
+            .runner_registry
+            .visible_project_ids_for_auth_snapshot(access.as_ref(), ids)
+            .await;
+        if ids.iter().all(|id| visible.contains(id)) {
+            Ok(())
+        } else {
+            Err(RuntimeConsoleError::NotFound)
+        }
     }
-    require_project_read(auth)?;
-    let access = crate::runner_http::runner_access_from_auth(Some(auth));
-    let visible = runtime
-        .runner_registry
-        .visible_project_ids_for_auth_snapshot(access.as_ref(), ids)
-        .await;
-    if ids.iter().all(|id| visible.contains(id)) {
-        Ok(())
-    } else {
-        Err(RuntimeConsoleError::NotFound)
-    }
+    .await;
+    phase.finish(if result.is_ok() { "ok" } else { "denied" });
+    result
 }
 
 pub(super) async fn query_for_auth(
@@ -118,7 +124,7 @@ pub(super) async fn query_for_auth(
                 .unwrap_or(MAX_WINDOW_LIMIT)
                 .clamp(1, MAX_WINDOW_LIMIT),
         )
-        .map(summary)
+        .map(|row| summary(row, WindowInventoryProjection::Liveness))
         .collect();
     let next = input.offset.saturating_add(rows.len());
     let principal = window_principal_filter(auth)?;
@@ -138,9 +144,14 @@ pub(super) async fn query_for_auth(
     })
 }
 
-pub(super) fn summary(row: WindowInventoryRow) -> RuntimeConsoleWindowSummary {
+pub(super) fn summary(
+    row: WindowInventoryRow,
+    projection: WindowInventoryProjection,
+) -> RuntimeConsoleWindowSummary {
     RuntimeConsoleWindowSummary {
         client_window_key: row.client_window_key,
+        label: (projection == WindowInventoryProjection::Inventory).then_some(row.label),
+        label_owner: row.label_owner,
         source: row.source,
         last_project: row.last_project,
         first_seen_at_ms: Some(row.first_seen_at_ms),
@@ -197,6 +208,8 @@ pub(super) async fn live_for_auth(
                 continue;
             }
             let entry = row.get_or_insert_with(|| WindowInventoryRow {
+                label: None,
+                label_owner: None,
                 client_window_key: window.client_window_key.clone(),
                 source: request.client_window_source.clone(),
                 last_project: None,
@@ -246,6 +259,42 @@ pub(super) async fn inventory_for_auth(
     key: Option<&str>,
     query: &str,
 ) -> Result<RuntimeConsoleWindows, RuntimeConsoleError> {
+    let mut phase = super::store_read::Phase::start("console_window_inventory");
+    let result =
+        inventory_for_auth_with_anchors(runtime, auth, limit, offset, projects, key, query).await;
+    phase.finish(if result.is_ok() { "ok" } else { "error" });
+    result.map(|(page, _)| page)
+}
+
+pub(super) async fn inventory_for_auth_with_anchors(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    limit: Option<usize>,
+    offset: usize,
+    projects: Option<&[String]>,
+    key: Option<&str>,
+    query: &str,
+) -> Result<(RuntimeConsoleWindows, Vec<String>), RuntimeConsoleError> {
+    let (page, anchors, ()) =
+        inventory_and_read_for_auth(runtime, auth, limit, offset, projects, key, query, |_| {
+            Ok(())
+        })
+        .await?;
+    Ok((page, anchors))
+}
+
+/// Authorization remains between the anchor read and the content read. Optional
+/// detail work shares the content worker's existing deadline and semaphore permit.
+pub(super) async fn inventory_and_read_for_auth<T: Send + 'static>(
+    runtime: &ToolRuntime,
+    auth: &AuthContext,
+    limit: Option<usize>,
+    offset: usize,
+    projects: Option<&[String]>,
+    key: Option<&str>,
+    query: &str,
+    read: impl FnOnce(&webcodex_store::Database) -> anyhow::Result<T> + Send + 'static,
+) -> Result<(RuntimeConsoleWindows, Vec<String>, T), RuntimeConsoleError> {
     require_runtime_read(auth)?;
     if let Some(projects) = projects {
         authorize_selection(runtime, auth, projects).await?;
@@ -260,12 +309,18 @@ pub(super) async fn inventory_for_auth(
         Some(projects) => projects.to_vec(),
         None => {
             let principal = principal.clone();
-            super::store_read::run(db, move |db| {
-                db.window_inventory_project_anchors(window_principal_ref(&principal))
+            let key = key.map(str::to_owned);
+            super::store_read::run(db, move |db| match key.as_deref() {
+                Some(key) => db.window_inventory_project_anchors_for_window(
+                    window_principal_ref(&principal),
+                    key,
+                ),
+                None => db.window_inventory_project_anchors(window_principal_ref(&principal)),
             })
             .await?
         }
     };
+    let mut authorization = super::store_read::Phase::start("console_window_authorization");
     let allowed: Vec<String> = if let Some(ids) = projects {
         ids.to_vec()
     } else if super::project_read_available(auth) {
@@ -280,6 +335,8 @@ pub(super) async fn inventory_for_auth(
         Vec::new()
     };
     let (live, live_projects) = live_for_auth(runtime, auth, projects, key).await?;
+    authorization.finish("ok");
+    drop(authorization);
     let mut recheck_projects = allowed.clone();
     recheck_projects.extend(live_projects);
     recheck_projects.sort();
@@ -290,14 +347,12 @@ pub(super) async fn inventory_for_auth(
     let query = query.to_string();
     let management = principal.is_none() && !auth.is_admin_caller();
     let query_allowed = allowed.clone();
-    let managed_oauth_identity = auth
-        .managed_oauth_window_identity()
-        .map(|(user, client)| (user.to_string(), client.to_string()));
-    let page = super::store_read::run(db, move |db| {
-        db.read_window_inventory(WindowInventoryQuery {
+    let managed_oauth_visibility = managed_oauth_window_visibility(auth);
+    let (page, extra) = super::store_read::run(db, move |db| {
+        let page = db.read_window_inventory(WindowInventoryQuery {
             principal: window_principal_ref(&owned_principal),
             caller: window_principal_ref(&caller),
-            managed_oauth_identity: window_principal_ref(&managed_oauth_identity),
+            managed_oauth_visibility: managed_oauth_visibility.as_ref(),
             management,
             visible_projects: &query_allowed,
             projects: owned_projects.as_deref(),
@@ -308,7 +363,8 @@ pub(super) async fn inventory_for_auth(
             limit: limit
                 .unwrap_or(DEFAULT_WINDOW_LIMIT)
                 .clamp(1, MAX_WINDOW_LIMIT),
-        })
+        })?;
+        Ok((page, read(db)?))
     })
     .await?;
     // A queued/offloaded read cannot publish a snapshot whose Project access
@@ -316,11 +372,16 @@ pub(super) async fn inventory_for_auth(
     if !recheck_projects.is_empty() {
         authorize_selection(runtime, auth, &recheck_projects).await?;
     }
+    let mut assembly = super::store_read::Phase::start("console_window_assembly");
     let returned = page.rows.len();
-    Ok(RuntimeConsoleWindows {
+    let result = RuntimeConsoleWindows {
         next_offset: (offset.saturating_add(returned) < page.total)
             .then_some(offset.saturating_add(returned)),
-        windows: page.rows.into_iter().map(summary).collect(),
+        windows: page
+            .rows
+            .into_iter()
+            .map(|row| summary(row, WindowInventoryProjection::Inventory))
+            .collect(),
         returned,
         total: page.total,
         truncated: offset.saturating_add(returned) < page.total,
@@ -331,5 +392,7 @@ pub(super) async fn inventory_for_auth(
                 RuntimeConsoleWindowVisibilityScope::Principal
             },
         },
-    })
+    };
+    assembly.finish("ok");
+    Ok((result, recheck_projects, extra))
 }

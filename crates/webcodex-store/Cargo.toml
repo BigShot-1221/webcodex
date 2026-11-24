@@ -9,10 +9,11 @@ root-test-support = []
 
 [dependencies]
 webcodex-core = { path = "../webcodex-core" }
+webcodex-workflow-session = { path = "../webcodex-workflow-session" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
-rusqlite = { version = "0.41.1", features = ["backup", "bundled", "hooks"] }
+rusqlite = { version = "0.41.1", features = ["backup", "bundled", "hooks", "trace"] }
 same-file = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }

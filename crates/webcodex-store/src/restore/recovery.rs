@@ -28,8 +28,8 @@
 
 use super::journal::{RestoreJournal, RestoreJournalPayload, RestorePhase};
 use super::{
-    run_sqlite_preflight, OriginalPreservation, OfflineRestoreOwner, RestoreWorkflowSessionRequirement,
-    SourceFileIdentity,
+    run_sqlite_preflight, OfflineRestoreOwner, OriginalPreservation,
+    RestoreWorkflowSessionRequirement, SourceFileIdentity,
 };
 use crate::connection_observation::StoreDomain;
 use crate::Database;
@@ -198,6 +198,11 @@ impl PendingRestoreStartup {
             let connection = database.lock_connection(StoreDomain::Schema);
             run_sqlite_preflight(&connection, workflow_session_requirement)
                 .context("restore startup SQLite pre-commit validation")?;
+            if webcodex_workflow_session::detect_workflow_session_schema(&connection)?
+                != webcodex_workflow_session::WorkflowSessionSchema::CurrentV1
+            {
+                bail!("restored database did not reach the current Workflow Session schema");
+            }
         }
 
         journal
@@ -329,9 +334,15 @@ fn diagnose_unjournaled_candidate_stages(owner: &OfflineRestoreOwner) -> anyhow:
         let entry = entry.context("read pre-journal candidate directory entry")?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(operation) = name.strip_prefix(".webcodex-restore-")
-            .and_then(|name| name.strip_suffix(".candidate")) else { continue };
-        let Ok(operation_id) = Uuid::parse_str(operation) else { continue };
+        let Some(operation) = name
+            .strip_prefix(".webcodex-restore-")
+            .and_then(|name| name.strip_suffix(".candidate"))
+        else {
+            continue;
+        };
+        let Ok(operation_id) = Uuid::parse_str(operation) else {
+            continue;
+        };
         if operation != operation_id.simple().to_string() {
             continue;
         }
@@ -361,10 +372,7 @@ fn diagnose_unjournaled_candidate_stages(owner: &OfflineRestoreOwner) -> anyhow:
 }
 
 fn journal_production_path(journal: &RestoreJournal) -> anyhow::Result<PathBuf> {
-    let name = journal
-        .payload()
-        .production_db_file_name
-        .as_str();
+    let name = journal.payload().production_db_file_name.as_str();
     validate_single_path_component(name, "production_db_file_name")?;
     Ok(journal.data_dir().join(name))
 }
@@ -431,16 +439,19 @@ fn verify_rollback_main_authority(
         return Ok(());
     }
     let size = file.metadata()?.len();
-    let original = preservation.preserved_files().iter()
+    let original = preservation
+        .preserved_files()
+        .iter()
         .find(|record| record.suffix().is_empty() && record.present());
     let original_hash = original
         .filter(|record| record.size_bytes() == Some(size))
         .and_then(|record| record.sha256_hex());
-    let legacy_candidate_hash = if payload.schema_version() == 1 && payload.candidate_size_bytes == size {
-        Some(payload.candidate_sha256_hex.as_str())
-    } else {
-        None
-    };
+    let legacy_candidate_hash =
+        if payload.schema_version() == 1 && payload.candidate_size_bytes == size {
+            Some(payload.candidate_sha256_hex.as_str())
+        } else {
+            None
+        };
     if original_hash.is_none() && legacy_candidate_hash.is_none() {
         bail!("unrelated production main blocks restore rollback; recovery evidence retained");
     }
@@ -598,10 +609,7 @@ fn validate_present_sqlite_sidecars_safe(
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error).with_context(|| {
-                    format!(
-                        "stat production SQLite sidecar {}",
-                        sidecar.display()
-                    )
+                    format!("stat production SQLite sidecar {}", sidecar.display())
                 });
             }
             Ok(meta) => {
@@ -710,9 +718,8 @@ fn remove_matching_candidate_stage(
         bail!("candidate stage path changed before removal; file retained");
     }
 
-    fs::remove_file(&stage_path).with_context(|| {
-        format!("remove matching candidate stage {}", stage_path.display())
-    })
+    fs::remove_file(&stage_path)
+        .with_context(|| format!("remove matching candidate stage {}", stage_path.display()))
 }
 
 fn ensure_direct_child_of_data_dir(
@@ -721,7 +728,10 @@ fn ensure_direct_child_of_data_dir(
     label: &str,
 ) -> anyhow::Result<()> {
     if child.parent() != Some(data_dir) {
-        bail!("{label} path must be a direct child of {}", data_dir.display());
+        bail!(
+            "{label} path must be a direct child of {}",
+            data_dir.display()
+        );
     }
     let Some(name) = child.file_name().and_then(OsStr::to_str) else {
         bail!("{label} file name is not UTF-8");
@@ -737,9 +747,13 @@ pub(crate) fn verify_hardened_regular_file_sha256(
     label: &str,
 ) -> anyhow::Result<SourceFileIdentity> {
     validate_sha256_hex(expected_sha256, &format!("{label} expected SHA-256"))?;
-    let meta = fs::symlink_metadata(path).with_context(|| format!("stat {label} {}", path.display()))?;
+    let meta =
+        fs::symlink_metadata(path).with_context(|| format!("stat {label} {}", path.display()))?;
     if meta.file_type().is_symlink() || super::is_reparse_point(&meta) {
-        bail!("{label} {} must not be a symlink or reparse point", path.display());
+        bail!(
+            "{label} {} must not be a symlink or reparse point",
+            path.display()
+        );
     }
     if !meta.is_file() {
         bail!("{label} {} is not a regular file", path.display());
@@ -760,7 +774,9 @@ pub(crate) fn verify_hardened_regular_file_sha256(
     let identity = SourceFileIdentity::from_open_file(&file)
         .with_context(|| format!("read {label} opening identity from handle"))?;
     let actual = hash_open_file_bounded(&mut file, expected_size)?;
-    if SourceFileIdentity::from_source_path(path)? != identity || file.metadata()?.len() != expected_size {
+    if SourceFileIdentity::from_source_path(path)? != identity
+        || file.metadata()?.len() != expected_size
+    {
         bail!("{label} path or size changed during SHA-256 verification");
     }
     if actual != expected_sha256 {
@@ -805,10 +821,7 @@ fn ensure_single_link_file(file: &File, path: &Path) -> anyhow::Result<()> {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            bail!(
-                "opened path {} must not be a reparse point",
-                path.display()
-            );
+            bail!("opened path {} must not be a reparse point", path.display());
         }
     }
 
@@ -860,7 +873,9 @@ fn hash_open_file_bounded(file: &mut File, expected_size: u64) -> anyhow::Result
     loop {
         let limit = (expected_size.saturating_sub(hashed).saturating_add(1))
             .min(buffer.len() as u64) as usize;
-        let read = file.read(&mut buffer[..limit]).context("read file for SHA-256")?;
+        let read = file
+            .read(&mut buffer[..limit])
+            .context("read file for SHA-256")?;
         if read == 0 {
             break;
         }

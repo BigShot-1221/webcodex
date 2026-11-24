@@ -132,6 +132,7 @@ pub(super) fn seed_client(
     let record = OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: crate::auth::generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: secret_hash,
         name: name.to_string(),
         owner_user_id: Some(user.id.clone()),
@@ -158,6 +159,7 @@ pub(super) fn seed_client_with_redirects_and_scopes(
     let record = OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: crate::auth::generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: secret_hash,
         name: "authorize-client".to_string(),
         owner_user_id: Some(user.id.clone()),
@@ -182,6 +184,7 @@ pub(super) fn seed_shared_key_bridge_client(
     let record = OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: crate::auth::generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: hash_token(&plaintext_secret),
         name: "Shared-key Bridge App".to_string(),
         owner_user_id: None,
@@ -206,6 +209,7 @@ pub(super) fn seed_project_share_client(
     let record = OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: crate::auth::generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: hash_token(&plaintext_secret),
         name: "project-share-client".to_string(),
         owner_user_id: None,
@@ -226,31 +230,6 @@ pub(super) fn seed_user_token(db: &crate::Database, user: &UserRecord) -> String
         user,
         "runtime:read project:read project:write job:run account:manage",
     )
-}
-
-pub(super) fn seed_user_token_with_scopes(
-    db: &crate::Database,
-    user: &UserRecord,
-    scopes: &str,
-) -> String {
-    let plaintext = generate_api_token();
-    let hash = hash_token(&plaintext);
-    let now = chrono::Utc::now().timestamp();
-    let record = ApiKeyRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        user_id: user.id.clone(),
-        name: "authorize-user-token".to_string(),
-        key_prefix: token_prefix(&plaintext),
-        created_at: now,
-        last_used_at: None,
-        revoked_at: None,
-        scopes: scopes.to_string(),
-        expires_at: None,
-        kind: TOKEN_KIND_USER.to_string(),
-        allowed_client_id: None,
-    };
-    db.insert_api_key(&record, &hash).unwrap();
-    plaintext
 }
 
 pub(super) fn seed_agent_token(db: &crate::Database, user: &UserRecord) -> String {
@@ -756,6 +735,7 @@ pub(super) fn build_router_with_session_and_registry(
         .hoop(salvo::prelude::affix_state::inject(db))
         .hoop(salvo::prelude::affix_state::inject(session_store))
         .hoop(salvo::prelude::affix_state::inject(registry))
+        .push(Router::with_path("oauth/register").post(oauth_register))
         .push(Router::with_path("oauth/token").post(oauth_token))
         .push(Router::with_path("oauth/revoke").post(oauth_revoke))
         .push(

@@ -182,6 +182,17 @@ pub fn sample_tool_args(name: &str) -> Value {
 }
 
 pub fn sample_tool_args_for_spec(spec: &ToolSpec) -> Value {
+    // The edit DTO has conditional required/excluded fields. A concrete semantic
+    // fixture is validated by the full schema; the bounded generic generator
+    // deliberately does not solve arbitrary JSON Schema conditionals.
+    if spec.name == "edit_project_files" {
+        let value = json!({"project":"agent:oe:private-drop", "changes":[{
+            "path":"src/lib.rs", "edits":[{"old_text":"old", "new_text":"new"}]
+        }]});
+        validate_schema_instance(&value, &spec.input_schema).expect("canonical exact-edit fixture");
+        return value;
+    }
+
     let mut value = generate(&spec.input_schema, 0, &mut 256, true)
         .unwrap_or_else(|error| panic!("{}: {error}", spec.name));
     let args = value.as_object_mut().expect("tool object sample");
@@ -292,7 +303,7 @@ fn validate_candidate(value: &Value, schema: &Value, fixtures: bool) -> Result<(
         *budget -= 1;
         let object = schema.as_object().ok_or("unsupported boolean schema")?;
         check_keywords(object, fixtures)?;
-        for key in ["oneOf", "anyOf"] {
+        for key in ["oneOf", "anyOf", "allOf"] {
             if let Some(variants) = schema.get(key).and_then(Value::as_array) {
                 for variant in variants {
                     visit(value, variant, fixtures, depth + 1, budget)?;
@@ -324,7 +335,7 @@ fn check_keywords(object: &Map<String, Value>, fixtures: bool) -> Result<(), Str
             "minimum" | "maximum" if value.is_number() => {}
             "minLength" | "maxLength" | "minItems" | "maxItems" if value.as_u64().is_some() => {}
             "additionalProperties" if value.is_boolean() => {}
-            "required" | "enum" | "anyOf" | "oneOf"
+            "required" | "enum" | "anyOf" | "oneOf" | "allOf"
                 if value.as_array().is_some_and(|a| a.len() <= 256) => {}
             // Opaque formats are allowed only in the explicit semantic-fixture path.
             "pattern" if fixtures => {}

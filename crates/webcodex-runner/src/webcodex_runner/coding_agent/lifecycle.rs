@@ -2,7 +2,7 @@
 
 use super::protocol::bounded_text;
 use super::store::{
-    DurableDispatchPhase, DurableRunRecord, STORE_RETENTION_SECS, durable_record_from_snapshot,
+    durable_record_from_snapshot, DurableDispatchPhase, DurableRunRecord, STORE_RETENTION_SECS,
 };
 use super::*;
 
@@ -64,6 +64,7 @@ fn oldest_evictable_durable_run_id<'a>(
     records: &'a [DurableRunRecord],
     protected_run_id: Option<&str>,
     skip_run_ids: &[&str],
+    archive_acknowledgements: &[String],
 ) -> Option<&'a DurableRunRecord> {
     records
         .iter()
@@ -73,10 +74,20 @@ fn oldest_evictable_durable_run_id<'a>(
                 .iter()
                 .any(|skipped| *skipped == record.run_id.as_str())
         })
-        .filter(|record| coding_agent_run_retention_evictable(&record.snapshot(0)))
+        .filter(|record| record.dispatch_phase == DurableDispatchPhase::Terminal)
+        .filter(|record| {
+            let snapshot = record.snapshot(0);
+            coding_agent_run_retention_evictable(&snapshot)
+                || archive_acknowledgements.contains(
+                    &webcodex_core::coding_agent::archive_identity_fingerprint(&snapshot),
+                )
+        })
         .min_by(|left, right| {
-            left.updated_at
-                .cmp(&right.updated_at)
+            // Prefer normal terminal eviction. Protected terminal records may
+            // leave the hot inventory only through the durable replay archive.
+            (!coding_agent_run_retention_evictable(&left.snapshot(0)))
+                .cmp(&(!coding_agent_run_retention_evictable(&right.snapshot(0))))
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
                 .then_with(|| left.run_id.cmp(&right.run_id))
         })
 }
@@ -268,8 +279,34 @@ impl CodingAgentManager {
     pub(super) fn enforce_durable_capacity_for_admission(
         &self,
         protected_run_id: Option<&str>,
+        archive_acknowledgements: &[String],
     ) -> Result<(), String> {
-        self.enforce_durable_capacity(protected_run_id, |count| {
+        // If a previous rename succeeded but directory synchronization failed,
+        // finish that same archival before admitting another live entry.
+        if self.store.archive_required()? {
+            let candidates = self
+                .runs
+                .lock()
+                .unwrap()
+                .values()
+                .map(|entry| entry.snapshot())
+                .filter(|run| run.state.terminal() && !coding_agent_run_retention_evictable(run))
+                .collect::<Vec<_>>();
+            for run in candidates {
+                if let Some(record) = self.store.read_archived(&run.run_id)? {
+                    if !archive_acknowledgements.contains(
+                        &webcodex_core::coding_agent::archive_identity_fingerprint(&run),
+                    ) || !self.try_evict_retained_durable_run(&run.run_id, &record)?
+                    {
+                        return Err(
+                            "ACP archived Run requires durable reconciliation before admission"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+        self.enforce_durable_capacity(protected_run_id, archive_acknowledgements, |count| {
             count >= CODING_AGENT_MAX_INVENTORY_RUNS
         })
     }
@@ -279,16 +316,17 @@ impl CodingAgentManager {
         &self,
         protected_run_id: Option<&str>,
     ) -> Result<(), String> {
-        self.enforce_durable_capacity_for_admission(protected_run_id)
+        self.enforce_durable_capacity_for_admission(protected_run_id, &[])
     }
 
     fn enforce_durable_capacity_before_scan(&self) -> Result<(), String> {
-        self.enforce_durable_capacity(None, |count| count > CODING_AGENT_MAX_INVENTORY_RUNS)
+        self.enforce_durable_capacity(None, &[], |count| count > CODING_AGENT_MAX_INVENTORY_RUNS)
     }
 
     fn enforce_durable_capacity(
         &self,
         protected_run_id: Option<&str>,
+        archive_acknowledgements: &[String],
         mut should_evict: impl FnMut(usize) -> bool,
     ) -> Result<(), String> {
         let mut skip_eviction = Vec::new();
@@ -298,11 +336,14 @@ impl CodingAgentManager {
                 return Ok(());
             }
             let skip_refs = skip_eviction.iter().map(String::as_str).collect::<Vec<_>>();
-            let Some(record) =
-                oldest_evictable_durable_run_id(&listing.records, protected_run_id, &skip_refs)
-            else {
+            let Some(record) = oldest_evictable_durable_run_id(
+                &listing.records,
+                protected_run_id,
+                &skip_refs,
+                archive_acknowledgements,
+            ) else {
                 return Err(
-                    "ACP Run durable retention cannot reclaim space without evicting active or uncertain Runs"
+                    "ACP Run hot inventory cannot reclaim space: active, uncommitted, invalid or protected Runs without durable Server archive acknowledgement"
                         .to_string(),
                 );
             };
@@ -326,23 +367,28 @@ impl CodingAgentManager {
             map.get(run_id).cloned()
         };
         let Some(entry) = entry else {
-            let snapshot = record.snapshot(0);
-            if !coding_agent_run_retention_evictable(&snapshot) {
+            if record.dispatch_phase != DurableDispatchPhase::Terminal {
                 return Ok(false);
             }
-            self.store.remove_checked(run_id)?;
+            self.retire_durable_terminal(record)?;
             return Ok(true);
         };
         let _terminal_transition = entry.terminal_transition.lock().unwrap();
         let snapshot = entry.snapshot();
-        if !coding_agent_run_retention_evictable(&snapshot)
-            || !durable_live_retention_aligned(record, &snapshot)
-        {
+        if !snapshot.state.terminal() || !durable_live_retention_aligned(record, &snapshot) {
             return Ok(false);
         }
-        self.store.remove_checked(run_id)?;
+        self.retire_durable_terminal(record)?;
         self.runs.lock().unwrap().remove(run_id);
         Ok(true)
+    }
+
+    fn retire_durable_terminal(&self, record: &DurableRunRecord) -> Result<(), String> {
+        if coding_agent_run_retention_evictable(&record.snapshot(0)) {
+            self.store.remove_checked(&record.run_id)
+        } else {
+            self.store.archive_terminal(record)
+        }
     }
 
     pub(super) fn setup_failure(

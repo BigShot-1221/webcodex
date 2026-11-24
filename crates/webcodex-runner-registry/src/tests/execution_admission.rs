@@ -19,30 +19,18 @@ fn script_payload() -> ShellScriptPayload {
 async fn rejected_job_start(
     registry: &RunnerRegistry,
     client_id: &str,
-    execution: Option<StructuredJobExecution>,
+    execution: Option<JobStartExecution>,
     access: Option<&RunnerAccess>,
 ) -> ExecutionAdmissionError {
+    let execution =
+        execution.unwrap_or_else(|| JobStartRequest::shell(client_id, "echo test").execution);
     registry
-        .start_job_with_metadata_for_access_typed(
-            ShellJobOpRequest {
-                op: "start".into(),
-                client_id: Some(client_id.into()),
-                cwd: None,
-                command: Some(if execution.is_some() { "" } else { "echo test" }.into()),
-                login: false,
-                timeout_secs: Some(30),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
+        .start_job(
+            JobStartRequest {
+                timeout_secs: 30,
+                ..JobStartRequest::new(client_id, execution)
             },
             "test".into(),
-            ShellJobStartMetadata {
-                structured_execution: execution,
-                ..Default::default()
-            },
             access,
             None,
         )
@@ -109,8 +97,16 @@ async fn unknown_runner_execution_admission_is_identifier_independent() {
         ];
         for execution in [
             None,
-            Some(StructuredJobExecution::Process(process_payload())),
-            Some(StructuredJobExecution::Script(script_payload())),
+            Some(JobStartExecution::Process {
+                process: process_payload(),
+                stdin: None,
+                correlation: JobValidationCorrelation::default(),
+            }),
+            Some(JobStartExecution::Script {
+                script: script_payload(),
+                stdin: None,
+                correlation: JobValidationCorrelation::default(),
+            }),
         ] {
             errors.push(rejected_job_start(&registry, client_id, execution, None).await);
         }
@@ -228,4 +224,317 @@ fn detached_recovery_identity_is_carried_as_data_not_extracted_from_text() {
     assert_eq!(lookalike.recovery_job_id(), None);
     assert_eq!(lookalike.failure_kind(), "runtime_error");
     assert!(!lookalike.is_idempotency_conflict());
+}
+
+#[tokio::test]
+async fn job_start_plan_preserves_validation_error_precedence() {
+    let registry = RunnerRegistry::default();
+    let valid_step = ShellJobValidationStep {
+        name: "check".into(),
+        program: "cargo".into(),
+        args: vec!["check".into()],
+        env: Vec::new(),
+    };
+    let mut invalid_step = valid_step.clone();
+    invalid_step.program = "arbitrary-program".into();
+    // Invalid step content still precedes invalid adapter metadata, and both
+    // precede scope validation. Conflicting execution shapes are unrepresentable.
+    for (steps, expected) in [
+        (vec![invalid_step], "invalid structured validation plan"),
+        (vec![valid_step], "invalid structured validation metadata"),
+        (Vec::new(), "invalid structured validation metadata"),
+    ] {
+        let metadata = ShellJobValidationMetadata {
+            tool: "invalid".into(),
+            kind: "check".into(),
+            steps,
+            effective_timeout_secs: 30,
+            sync_wait_secs: 0,
+            adapter: "invalid".into(),
+            validation_target_id: None,
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
+            project_validation: None,
+            source_fence: None,
+        };
+        let error = registry
+            .start_job(
+                JobStartRequest {
+                    cwd: Some("invalid\0cwd".into()),
+                    timeout_secs: 0,
+                    ..JobStartRequest::new(
+                        "missing",
+                        JobStartExecution::Validation {
+                            plan: JobValidationPlan::Metadata(metadata),
+                            ssh_resource: None,
+                        },
+                    )
+                },
+                "test".into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.failure_kind(), "invalid_arguments");
+        assert_eq!(error.to_string(), expected);
+    }
+    let inner = registry.inner.read().await;
+    assert!(inner.pending_by_id.is_empty());
+    assert!(inner.jobs_by_id.is_empty());
+}
+
+#[tokio::test]
+async fn job_start_plan_keeps_ssh_validation_and_step_capability_admission() {
+    let registry = RunnerRegistry::default();
+    let mut registration = runner_registration("plan-ssh", "instance", Vec::new());
+    for feature in [
+        RunnerFeature::AsyncJobs,
+        RunnerFeature::StructuredValidationArgv,
+        RunnerFeature::SshShell,
+    ] {
+        registration.capabilities.set(feature, true);
+    }
+    registration.capabilities.project_validation_python_ruff_v1 = false;
+    registry.register(registration.clone()).await.unwrap();
+    let step = ShellJobValidationStep::python_ruff("check").unwrap();
+    let request = JobStartRequest {
+        timeout_secs: 30,
+        context: JobStartContext {
+            session_id: Some("wc_sess_plan_test".into()),
+            ..Default::default()
+        },
+        ..JobStartRequest::new(
+            "plan-ssh",
+            JobStartExecution::Validation {
+                plan: JobValidationPlan::Steps(vec![step.clone()]),
+                ssh_resource: Some("build-host".into()),
+            },
+        )
+    };
+    let error = registry
+        .start_job(request.clone(), "test".into(), None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.failure_kind(), "capability_unavailable");
+    assert!(
+        error
+            .to_string()
+            .contains("project_validation_python_ruff_v1"),
+        "{error}"
+    );
+    assert!(registry.inner.read().await.jobs_by_id.is_empty());
+
+    registration.capabilities.project_validation_python_ruff_v1 = true;
+    registry.register(registration).await.unwrap();
+    let job = registry
+        .start_job(request, "test".into(), None, None)
+        .await
+        .unwrap();
+    let request = registry
+        .poll(RunnerPollRequest {
+            client_id: "plan-ssh".into(),
+            runner_instance_id: "instance".into(),
+        })
+        .await
+        .unwrap()
+        .expect("SSH validation must be queued");
+    assert_eq!(request.kind, "start_validation_job");
+    assert_eq!(
+        serde_json::from_str::<Vec<ShellJobValidationStep>>(&request.command).unwrap(),
+        vec![step]
+    );
+    assert_eq!(request.job_id.as_deref(), Some(job.job_id.as_str()));
+    let context = request.job_context.unwrap();
+    assert_eq!(context.ssh_resource.as_deref(), Some("build-host"));
+    assert!(context.structured_execution.is_none());
+}
+
+#[tokio::test]
+async fn job_start_plan_preserves_shape_specific_stdin_and_correlation() {
+    let mut registration = runner_registration("plan-fields", "instance", Vec::new());
+    for feature in [
+        RunnerFeature::AsyncJobs,
+        RunnerFeature::StructuredExecutionJobs,
+        RunnerFeature::DetachedProcessJobs,
+        RunnerFeature::JobProcessInput,
+    ] {
+        registration.capabilities.set(feature, true);
+    }
+    let initiator = DetachedInitiatorIdentity::internal();
+    for (execution, expected_source, expected_assertion, expected_stdin, correlated) in [
+        (
+            JobStartRequest::shell("plan-fields", "echo test").execution,
+            None,
+            None,
+            false,
+            false,
+        ),
+        (
+            JobStartExecution::Process {
+                process: process_payload(),
+                stdin: Some("input".into()),
+                correlation: JobValidationCorrelation {
+                    validation_identity: Some("validation-id".into()),
+                    validation_tool: Some("tool".into()),
+                    assertion_name: Some("assertion".into()),
+                },
+            },
+            Some("run_process"),
+            Some("assertion"),
+            true,
+            true,
+        ),
+        (
+            JobStartExecution::DetachedProcess {
+                process: process_payload(),
+                stdin: Some("input".into()),
+                idempotency_key: "plan-detached-key".into(),
+                validation_identity: Some("validation-id".into()),
+                validation_tool: Some("tool".into()),
+            },
+            Some("run_detached_process"),
+            None,
+            true,
+            true,
+        ),
+        (
+            JobStartExecution::InteractiveProcess(process_payload()),
+            Some("run_process_interactive"),
+            None,
+            false,
+            false,
+        ),
+    ] {
+        // Each shape owns its fixture lifecycle; active Jobs from a previous
+        // case must not consume this case's default Runner concurrency slots.
+        let registry = RunnerRegistry::default();
+        registry.register(registration.clone()).await.unwrap();
+        crate::test_support::apply_project_inventory_snapshot(
+            &registry,
+            "plan-fields",
+            "instance",
+            vec![project_summary("demo", "/tmp/demo")],
+        )
+        .await;
+        let job = registry
+            .start_job(
+                JobStartRequest {
+                    timeout_secs: 30,
+                    context: JobStartContext {
+                        project_id: Some("agent:plan-fields:demo".into()),
+                        ..Default::default()
+                    },
+                    ..JobStartRequest::new("plan-fields", execution)
+                },
+                "test".into(),
+                None,
+                Some(&initiator),
+            )
+            .await
+            .unwrap();
+        let request = registry
+            .poll(RunnerPollRequest {
+                client_id: "plan-fields".into(),
+                runner_instance_id: "instance".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected queued start for {expected_source:?}, kind={}",
+                    job.kind
+                )
+            });
+        assert_eq!(request.job_id.as_deref(), Some(job.job_id.as_str()));
+        assert_eq!(request.stdin.is_some(), expected_stdin);
+        let context = request.job_context.unwrap();
+        match (expected_source, context.structured_execution) {
+            (None, None) => {}
+            (Some(source), Some(metadata)) => {
+                assert_eq!(metadata.execution_source, source);
+                assert_eq!(metadata.stdin_present, expected_stdin);
+                assert_eq!(metadata.arg_count, 1);
+                assert_eq!(
+                    metadata.validation_identity.as_deref(),
+                    correlated.then_some("validation-id")
+                );
+                assert_eq!(
+                    metadata.validation_tool.as_deref(),
+                    correlated.then_some("tool")
+                );
+                assert_eq!(metadata.assertion_name.as_deref(), expected_assertion);
+            }
+            other => panic!("incorrect execution metadata: {other:?}"),
+        }
+        assert_eq!(registry.inner.read().await.jobs_by_id.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn job_start_plan_checks_current_capabilities_before_detached_replay() {
+    let registry = RunnerRegistry::default();
+    let mut registration = runner_registration("plan-replay", "instance", Vec::new());
+    for feature in [
+        RunnerFeature::AsyncJobs,
+        RunnerFeature::StructuredExecutionJobs,
+        RunnerFeature::DetachedProcessJobs,
+    ] {
+        registration.capabilities.set(feature, true);
+    }
+    registry.register(registration.clone()).await.unwrap();
+    let request = JobStartRequest {
+        timeout_secs: 30,
+        ..JobStartRequest::new(
+            "plan-replay",
+            JobStartExecution::DetachedProcess {
+                process: process_payload(),
+                stdin: None,
+                idempotency_key: "same-intent".into(),
+                validation_identity: None,
+                validation_tool: None,
+            },
+        )
+    };
+    let initiator = DetachedInitiatorIdentity::internal();
+    registry
+        .start_job(request.clone(), "test".into(), None, Some(&initiator))
+        .await
+        .unwrap();
+    registration
+        .capabilities
+        .set(RunnerFeature::DetachedProcessJobs, false);
+    registry.register(registration).await.unwrap();
+    let error = registry
+        .start_job(request, "test".into(), None, Some(&initiator))
+        .await
+        .unwrap_err();
+    assert_eq!(error.failure_kind(), "capability_unavailable");
+    assert!(
+        error.to_string().contains("detached_process_jobs"),
+        "{error}"
+    );
+    assert_eq!(registry.inner.read().await.jobs_by_id.len(), 1);
+}
+
+#[test]
+fn format_admission_details_are_independent_of_display_text() {
+    let unavailable = ExecutionAdmissionError::format_execution_unavailable();
+    assert_eq!(
+        unavailable.reason_code(),
+        Some("format_execution_unavailable")
+    );
+    assert_eq!(unavailable.failure_kind(), "runtime_error");
+    let replaced = ExecutionAdmissionError::format_runner_replaced();
+    assert_eq!(replaced.reason_code(), Some("format_runner_replaced"));
+    let lookalike = ExecutionAdmissionError::unavailable("format_runner_replaced");
+    assert_eq!(lookalike.reason_code(), None);
+    let missing_async = ExecutionAdmissionError::async_jobs_unavailable("format-runner");
+    assert!(missing_async.is_async_jobs_unavailable());
+    assert_eq!(missing_async.failure_kind(), "capability_unavailable");
+    assert!(
+        !ExecutionAdmissionError::capability_unavailable(missing_async.to_string())
+            .is_async_jobs_unavailable()
+    );
 }

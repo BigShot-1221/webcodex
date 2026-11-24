@@ -4,9 +4,15 @@ use super::*;
 
 pub(super) const STORE_SCHEMA_VERSION: u32 = 1;
 const STORE_FILE: &str = "state.json";
+const STORE_ARCHIVE_MARKER: &str = "archive-required-v1";
+const STORE_ARCHIVE_MARKER_BYTES: &[u8] = b"webcodex-acp-archive-v1\n";
 const STORE_MAX_BYTES: usize = 64 * 1024;
 /// One recoverable overflow directory above the normal inventory bound.
 const STORE_MAX_RUN_DIR_SCAN: usize = CODING_AGENT_MAX_INVENTORY_RUNS + 1;
+// A separate, sharded replay ledger. The hot inventory limit is not a limit
+// on historical uncertain identities. Each record is size-bounded; lookup
+// never scans the archive. Storage failures, not an arbitrary count of
+// uncertain identities, are the admission boundary.
 /// Must match `SERVER_TERMINAL_RETENTION_SECS` in `src/tool_runtime/coding_agent.rs`.
 pub(super) const STORE_RETENTION_SECS: i64 = 24 * 60 * 60;
 
@@ -164,12 +170,82 @@ impl DurableRunStore {
         self.run_dir(run_id).join(STORE_FILE)
     }
 
+    fn archive_dir(&self, run_id: &str) -> PathBuf {
+        let key = format!("{:x}", Sha256::digest(run_id.as_bytes()));
+        self.root
+            .with_extension("archive-v1")
+            .join(&key[..2])
+            .join(key)
+    }
+
     pub(super) fn read(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
-        let path = self.state_path(run_id);
-        let mut file = match File::open(&path) {
+        self.archive_required()?;
+        let hot = if real_directory_or_absent(&self.root)? {
+            self.read_run_dir(run_id, &self.run_dir(run_id))?
+        } else {
+            None
+        };
+        let archived = self.read_archived(run_id)?;
+        match (hot, archived) {
+            (Some(_), Some(_)) => Err(
+                "ACP Run exists in both hot and archive storage; reconcile before retrying".into(),
+            ),
+            (Some(record), None) | (None, Some(record)) => Ok(Some(record)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Used when no live RunEntry exists. A durable active claim in that
+    /// situation is not a controllable process and must remain uncertain.
+    pub(super) fn read_retained_terminal(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<DurableRunRecord>, String> {
+        let record = self.read(run_id)?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.dispatch_phase != DurableDispatchPhase::Terminal)
+        {
+            return Err(
+                "ACP Run has a durable active claim but no live owner; reconcile before retrying"
+                    .to_string(),
+            );
+        }
+        Ok(record)
+    }
+
+    pub(super) fn read_archived(&self, run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+        let dir = self.archive_dir(run_id);
+        let shard = dir.parent().expect("archive record has shard");
+        if !real_directory_or_absent(shard.parent().expect("archive shard has root"))?
+            || !real_directory_or_absent(shard)?
+        {
+            return Ok(None);
+        }
+        let record = self.read_run_dir(run_id, &dir)?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.dispatch_phase != DurableDispatchPhase::Terminal)
+        {
+            return Err("ACP archived Run is not terminal; replay is unsafe".to_string());
+        }
+        Ok(record)
+    }
+
+    fn read_run_dir(&self, run_id: &str, dir: &Path) -> Result<Option<DurableRunRecord>, String> {
+        let path = dir.join(STORE_FILE);
+        if !real_directory_or_absent(dir)? {
+            return Ok(None);
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect ACP Run state: {error}"))?;
+        if !metadata.is_file() || is_state_link(&metadata) {
+            return Err("ACP Run state must be a real regular file".into());
+        }
+        let file = match File::open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return match fs::symlink_metadata(self.run_dir(run_id)) {
+                return match fs::symlink_metadata(dir) {
                     Ok(_) => Err(
                         "ACP Run state is missing from an existing Run state directory".to_string(),
                     ),
@@ -189,17 +265,113 @@ impl DurableRunStore {
             return Err("ACP Run state has invalid bounded size".to_string());
         }
         let mut bytes = Vec::with_capacity(len);
-        file.read_to_end(&mut bytes)
+        file.take(STORE_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
             .map_err(|error| format!("failed to read ACP Run state: {error}"))?;
+        if bytes.len() > STORE_MAX_BYTES {
+            return Err("ACP Run state exceeds durable bound".into());
+        }
         let record: DurableRunRecord =
             serde_json::from_slice(&bytes).map_err(|_| "ACP Run state is malformed".to_string())?;
         validate_durable_record(&record)?;
-        if record.run_id != run_id
-            || self.run_dir(&record.run_id) != path.parent().unwrap_or(Path::new(""))
-        {
+        if record.run_id != run_id {
             return Err("ACP Run state identity mismatch".to_string());
         }
         Ok(Some(record))
+    }
+
+    // Older Runners reject this non-directory entry instead of silently
+    // forgetting archived replay fences after a downgrade.
+    pub(super) fn archive_required(&self) -> Result<bool, String> {
+        if !real_directory_or_absent(&self.root)? {
+            return Ok(false);
+        }
+        let path = self.root.join(STORE_ARCHIVE_MARKER);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("ACP archive marker unavailable: {error}")),
+        };
+        if !metadata.is_file()
+            || is_state_link(&metadata)
+            || metadata.len() != STORE_ARCHIVE_MARKER_BYTES.len() as u64
+            || fs::read(&path).map_err(|error| format!("ACP archive marker unreadable: {error}"))?
+                != STORE_ARCHIVE_MARKER_BYTES
+        {
+            return Err("ACP archive marker is invalid".into());
+        }
+        if !real_directory_or_absent(&self.root.with_extension("archive-v1"))? {
+            return Err("ACP archive marker exists but its archive root is missing; restore the paired state before admission".into());
+        }
+        Ok(true)
+    }
+
+    fn ensure_archive_marker(&self, shard: &Path) -> Result<(), String> {
+        if !self.archive_required()? {
+            let temp = shard.join(format!("marker.{}.tmp", Uuid::new_v4().simple()));
+            let result = (|| {
+                let mut file = File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp)
+                    .map_err(|error| format!("ACP archive marker creation failed: {error}"))?;
+                file.write_all(STORE_ARCHIVE_MARKER_BYTES)
+                    .and_then(|_| file.sync_all())
+                    .map_err(|error| format!("ACP archive marker write failed: {error}"))?;
+                drop(file);
+                publish_state_file(&temp, &self.root.join(STORE_ARCHIVE_MARKER))
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+            result?;
+        }
+        sync_parent(&self.root)
+    }
+
+    /// Move a validated, immutable terminal claim out of the hot inventory.
+    /// No deletion/re-creation gap: the directory rename is on the same volume.
+    /// The archived record remains a fail-closed idempotency fence forever
+    /// unless an explicit future reconciliation/migration protocol retires it.
+    pub(super) fn archive_terminal(&self, record: &DurableRunRecord) -> Result<(), String> {
+        validate_durable_record(record)?;
+        if record.dispatch_phase != DurableDispatchPhase::Terminal {
+            return Err("cannot archive a non-terminal ACP Run".to_string());
+        }
+        let source = self.run_dir(&record.run_id);
+        let destination = self.archive_dir(&record.run_id);
+        let shard = destination.parent().expect("archive record has shard");
+        if let Some(existing) = self.read_archived(&record.run_id)? {
+            if self.read_run_dir(&record.run_id, &source)?.is_none()
+                && existing.snapshot(0) == record.snapshot(0)
+            {
+                self.ensure_archive_marker(shard)?;
+                sync_parent(shard)?;
+                return sync_parent(&self.root);
+            }
+            return Err("ACP archive already contains this Run identity".to_string());
+        }
+        let current = self
+            .read_run_dir(&record.run_id, &source)?
+            .ok_or_else(|| "ACP Run disappeared before archival".to_string())?;
+        if current.snapshot(0) != record.snapshot(0) {
+            return Err("ACP Run changed before archival".to_string());
+        }
+        let archive_root = shard.parent().expect("archive shard has root");
+        real_directory_or_absent(archive_root)?;
+        real_directory_or_absent(shard)?;
+        fs::create_dir_all(shard)
+            .map_err(|error| format!("failed to create ACP replay archive: {error}"))?;
+        if !real_directory_or_absent(archive_root)? || !real_directory_or_absent(shard)? {
+            return Err("ACP replay archive directory disappeared".into());
+        }
+        sync_parent(shard.parent().expect("archive shard has parent"))?;
+        sync_parent(self.root.parent().expect("Run store has parent"))?;
+        self.ensure_archive_marker(shard)?;
+        move_to_archive(&source, &destination)?;
+        sync_parent(shard)?;
+        sync_parent(&self.root)?;
+        Ok(())
     }
 
     pub(super) fn write(&self, record: &DurableRunRecord) -> Result<(), String> {
@@ -265,6 +437,7 @@ impl DurableRunStore {
     }
 
     pub(super) fn list_records_for_retention(&self) -> Result<DurableRetentionListing, String> {
+        real_directory_or_absent(&self.root)?;
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -280,10 +453,13 @@ impl DurableRunStore {
         for entry in entries {
             let entry =
                 entry.map_err(|error| format!("failed to inspect ACP Run state: {error}"))?;
-            let ty = entry
-                .file_type()
+            if entry.file_name() == std::ffi::OsStr::new(STORE_ARCHIVE_MARKER) {
+                self.archive_required()?;
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| format!("failed to inspect ACP Run state: {error}"))?;
-            if !ty.is_dir() || ty.is_symlink() {
+            if !metadata.is_dir() || is_state_link(&metadata) {
                 return Err("ACP Run state root contains an unexpected entry".to_string());
             }
             entry_count = entry_count
@@ -294,7 +470,13 @@ impl DurableRunStore {
             }
             let path = entry.path().join(STORE_FILE);
             let len = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata.len() as usize,
+                Ok(metadata) if metadata.is_file() && !is_state_link(&metadata) => {
+                    metadata.len() as usize
+                }
+                Ok(_) => {
+                    tracing::error!(state_path = %path.display(), "ACP Run durable state is not a real regular file; preserving tombstone");
+                    continue;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     tracing::error!(state_path = %path.display(), "ACP Run durable state is missing from an existing Run state directory; preserving tombstone");
                     continue;
@@ -308,7 +490,7 @@ impl DurableRunStore {
                 tracing::error!(state_path = %path.display(), "ACP Run durable state has invalid bounded size; preserving tombstone");
                 continue;
             }
-            let mut file = match File::open(&path) {
+            let file = match File::open(&path) {
                 Ok(file) => file,
                 Err(error) => {
                     tracing::error!(state_path = %path.display(), error = %error, "ACP Run durable state unavailable during recovery; preserving tombstone");
@@ -316,8 +498,15 @@ impl DurableRunStore {
                 }
             };
             let mut bytes = Vec::with_capacity(len);
-            if let Err(error) = file.read_to_end(&mut bytes) {
+            if let Err(error) = file
+                .take(STORE_MAX_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+            {
                 tracing::error!(state_path = %path.display(), error = %error, "ACP Run durable state unavailable during recovery; preserving tombstone");
+                continue;
+            }
+            if bytes.len() > STORE_MAX_BYTES {
+                tracing::error!(state_path = %path.display(), "ACP Run durable state exceeds size bound; preserving tombstone");
                 continue;
             }
             let record: DurableRunRecord = match serde_json::from_slice(&bytes) {
@@ -387,6 +576,40 @@ impl DurableRunStore {
     }
 }
 
+#[cfg(windows)]
+fn move_to_archive(source: &Path, destination: &Path) -> Result<(), String> {
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "failed to archive ACP Run state: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn move_to_archive(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::rename(source, destination)
+        .map_err(|error| format!("failed to archive ACP Run state: {error}"))
+}
+
 #[cfg(unix)]
 fn publish_state_file(temp: &Path, state_path: &Path) -> Result<(), String> {
     fs::rename(temp, state_path)
@@ -439,6 +662,25 @@ fn sync_parent(_dir: &Path) -> Result<(), String> {
             .map_err(|error| format!("failed to sync ACP Run state dir: {error}"))?;
     }
     Ok(())
+}
+
+fn is_state_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    metadata.file_type().is_symlink()
+}
+
+fn real_directory_or_absent(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !is_state_link(&metadata) => Ok(true),
+        Ok(_) => Err("ACP durable state path must be a real directory".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("ACP durable state directory unavailable: {error}")),
+    }
 }
 
 fn validate_durable_record(record: &DurableRunRecord) -> Result<(), String> {

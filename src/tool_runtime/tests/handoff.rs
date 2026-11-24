@@ -9,8 +9,10 @@ use super::support::record_session_tool_event as record_handoff_tool_event;
 use super::support::*;
 use crate::auth::AuthContext;
 use crate::runner_protocol::RunnerCapabilities;
-use crate::tool_runtime::closeout_facts::{Observation, WorkspaceFacts};
-use crate::tool_runtime::closeout_projection::{closeout_facts, install_closeout_decision};
+use crate::tool_runtime::closeout_facts::{
+    CloseoutFacts, Observation, ValidationFacts, ValidationStatus, WorkspaceFacts,
+};
+use crate::tool_runtime::closeout_projection::install_closeout_decision;
 use crate::tool_runtime::handoff::VALIDATION_IDENTITY_REUSE_ACTION;
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use crate::tool_runtime::sessions::SessionTransport;
@@ -44,18 +46,19 @@ fn closeout_projection_classifies_workspace_conflicts_as_hard_blockers() {
         "suggested_next_actions": []
     });
 
-    let facts = closeout_facts(
-        Observation::Observed(WorkspaceFacts {
+    let facts = CloseoutFacts {
+        workspace: Observation::Observed(WorkspaceFacts {
             clean: Some(false),
             conflicts: Some(1),
             non_git: false,
         }),
-        None,
-        &output["jobs"],
-        &output["validation"],
-        &output["tool_failures"],
-        &output["review_evidence"],
-    );
+        validation: ValidationFacts {
+            status: Some(ValidationStatus::NotRun),
+            ..Default::default()
+        },
+        review_evidence_total: 1,
+        ..Default::default()
+    };
     install_closeout_decision(&mut output, &facts, &[]);
 
     assert!(output["hard_blockers"]
@@ -646,13 +649,8 @@ async fn expectation_mismatch_and_unexpected_success_are_visible() {
     .await;
     let project = "agent:expect-mismatch:demo".to_string();
 
-    let mismatch_session = start_registered_project_session(
-        &runtime,
-        &project,
-        &auth,
-        Some("mismatch"),
-    )
-    .await;
+    let mismatch_session =
+        start_registered_project_session(&runtime, &project, &auth, Some("mismatch")).await;
     let mismatch_sid = mismatch_session.session_id.clone();
     let mismatch = call_recorded_tool(
         &runtime,
@@ -1791,20 +1789,10 @@ async fn generic_call_runtime_tool_recording_session_preserves_failure_expectati
     let project =
         register_runner_project_at_path(&runtime, "generic-recording", "demo", tmp.path()).await;
     let auth = bootstrap_auth_context();
-    let business_session = start_registered_project_session(
-        &runtime,
-        &project,
-        &auth,
-        Some("business session"),
-    )
-    .await;
-    let tracking_session = start_registered_project_session(
-        &runtime,
-        &project,
-        &auth,
-        Some("tracking session"),
-    )
-    .await;
+    let business_session =
+        start_registered_project_session(&runtime, &project, &auth, Some("business session")).await;
+    let tracking_session =
+        start_registered_project_session(&runtime, &project, &auth, Some("tracking session")).await;
     let business_sid = business_session.session_id.clone();
     let tracking_sid = tracking_session.session_id.clone();
 
@@ -3187,34 +3175,6 @@ async fn session_handoff_diagnostic_verdict_fails_for_unresolved_mixed_validatio
     );
 }
 
-#[test]
-fn compact_review_evidence_tools_are_bounded_and_source_only() {
-    let source_tools: Vec<Value> = (0..25)
-        .map(|idx| Value::String(format!("review_tool_{idx}")))
-        .collect();
-    let review_evidence = json!({
-        "available": true,
-        "total": 25,
-        "read_only_inspection_count": 25,
-        "search_count": 0,
-        "diff_review_count": 0,
-        "workspace_review_count": 0,
-        "hygiene_review_count": 0,
-        "tools": source_tools,
-        "command": "ignored command text"
-    });
-
-    let compact = crate::tool_runtime::handoff::compact_review_evidence(&review_evidence);
-
-    let tools = compact["tools"]
-        .as_array()
-        .expect("compact review evidence tools array");
-    assert_eq!(tools.len(), 20);
-    assert_eq!(tools[0], "review_tool_0");
-    assert_eq!(tools[19], "review_tool_19");
-    assert!(compact.get("command").is_none());
-}
-
 // =========================================================================
 // 8. Non-git project does not fail the whole tool
 // =========================================================================
@@ -3630,14 +3590,17 @@ async fn call_typed_tool_with_metadata(
     arguments: Value,
     auth: Option<&AuthContext>,
 ) -> ToolResult {
+    use crate::tool_runtime::dispatch::DispatchContext;
+
     let (call, metadata) =
         crate::tool_runtime::parse_tool_call_with_recorder_metadata(tool_name, arguments).unwrap();
     runtime
-        .dispatch_with_auth_transport_options_and_metadata(
+        .dispatch_with_context(
             call,
-            auth,
-            SessionTransport::Mcp,
-            metadata,
+            DispatchContext {
+                recorder: metadata,
+                ..DispatchContext::internal(auth, SessionTransport::Mcp, None)
+            },
         )
         .await
 }
@@ -4674,4 +4637,48 @@ async fn session_handoff_workspace_continuity_is_unproven_when_changed_path_evid
         result.output["workspace_continuity"]["overlap_count"], 1,
         "path overlap remains observable but cannot certify incomplete Session evidence"
     );
+}
+
+#[tokio::test]
+async fn closeout_collection_pairs_fresh_session_evidence_with_its_revision() {
+    let runtime = test_runtime();
+    let session = runtime
+        .sessions
+        .start_session(None, Some("closeout evidence revision".to_string()));
+    let sid = &session.session_id;
+    let stale_summary = runtime.sessions.summary(sid, Some(200)).unwrap();
+    let stale_revision = runtime.sessions.handoff_revision(sid);
+
+    // This models a new result arriving while finish waits for Job inventory.
+    // It is ledger evidence only; the test never starts a process or a Runner.
+    record_handoff_tool_event(
+        &runtime,
+        sid,
+        "run_process",
+        json!({"executable": "fixture", "purpose": "operation"}),
+        false,
+        json!({"execution_state": "completed", "command_started": true, "exit_code": 1}),
+    );
+    let expected_revision = runtime.sessions.handoff_revision(sid);
+    assert_ne!(expected_revision, stale_revision);
+
+    let evidence = runtime
+        .collect_closeout_session_evidence(&stale_summary, false, 20, None)
+        .await;
+    assert_eq!(evidence.revision, expected_revision);
+    assert!(evidence.summary.events.len() > stale_summary.events.len());
+    assert!(evidence.summary.events.iter().any(|event| {
+        event.tool_name == "run_process"
+            && event.kind == "tool_call_finished"
+            && event.status.as_deref() == Some("failed")
+    }));
+    assert_eq!(evidence.failures.facts().unexpected_count, 1);
+    assert_eq!(evidence.failures.facts().actionable_unexpected_count, 1);
+    assert_eq!(evidence.validation_value(10)["skipped"], true);
+
+    // A later message changes the existing fence without altering the captured
+    // policy facts. The caller must now treat the observation as historical.
+    post_session_message(&runtime, sid, "guidance", "inspect the failed operation");
+    assert_ne!(evidence.revision, runtime.sessions.handoff_revision(sid));
+    assert_eq!(evidence.failures.facts().actionable_unexpected_count, 1);
 }

@@ -55,6 +55,15 @@ pub fn validate_service_env_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Apply the existing current-account ACL policy to newly created private
+/// runtime state. Callers must own the path and reject reparse points first.
+#[cfg(windows)]
+pub fn protect_windows_runtime_state_path(path: &Path) -> Result<(), String> {
+    crate::storage::secure_windows_path(path)
+        .map_err(|_| "private runtime state ACL could not be applied".to_string())?;
+    validate_windows_env_acl(path)
+}
+
 #[cfg(windows)]
 pub fn validate_windows_env_acl(path: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;

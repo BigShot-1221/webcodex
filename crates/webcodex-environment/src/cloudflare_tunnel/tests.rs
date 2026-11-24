@@ -15,6 +15,7 @@ fn fixture() -> (tempfile::TempDir, EnvironmentStore) {
 
 fn record(id: &str, provider: TunnelProvider, autostart: bool) -> TunnelRecord {
     TunnelRecord {
+        oauth_dynamic_registration_enabled: false,
         configuration_id: None,
         profile_id: id.into(),
         provider,
@@ -67,6 +68,30 @@ fn bind(store: &EnvironmentStore, record: &TunnelRecord, token: Option<&str>) ->
     )
     .unwrap();
     token_path
+}
+
+#[test]
+fn fresh_user_ingress_persists_one_private_port_without_a_public_profile() {
+    let (_temp, store) = fixture();
+    prepare_user_ingress(&store).unwrap();
+    let first = cloudflare_ingress_port(&store).unwrap().unwrap();
+    assert_ne!(first, 62645);
+    assert_ne!(first, 0);
+    prepare_user_ingress(&store).unwrap();
+    assert_eq!(
+        load_cloudflare_server_ingress_port(&store.root().join("server")).unwrap(),
+        Some(first)
+    );
+    assert!(tunnel_profiles(&store).unwrap().is_empty());
+    assert!(!store.root().join("server/tunnels").exists());
+    let saved = read_secret(&store.root().join("server/webcodex.env")).unwrap();
+    assert_eq!(
+        saved
+            .expose()
+            .matches("WEBCODEX_TUNNEL_ENVIRONMENT=")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -255,7 +280,8 @@ fn runtime_materialization_binds_owner_actual_local_targets_revision_and_protect
             &IngressConfiguration { port: 45678 },
         )
         .unwrap();
-    let named = record("named", named("https://mcp.example.com", "id-one"), true);
+    let mut named = record("named", named("https://mcp.example.com", "id-one"), true);
+    named.oauth_dynamic_registration_enabled = true;
     let mut quick = record("quick", TunnelProvider::CloudflareQuick, false);
     quick.host_mode = TunnelHostMode::Standalone;
     let token_path = bind(&store, &named, Some("private-named-token")).unwrap();
@@ -273,6 +299,8 @@ fn runtime_materialization_binds_owner_actual_local_targets_revision_and_protect
     assert_eq!(paths.len(), 2);
     let selected = load_cloudflare_server_materializations(&store.root().join("server")).unwrap();
     assert_eq!(selected.len(), 2);
+    assert!(selected[0].oauth_dynamic_registration_enabled);
+    assert!(!selected[1].oauth_dynamic_registration_enabled);
     assert_eq!(selected[0].runner_client_id.as_deref(), Some("client-one"));
     assert_eq!(selected[1].host_mode, TunnelHostMode::Standalone);
     assert_eq!(
@@ -320,6 +348,8 @@ fn runtime_binding_rejects_arbitrary_management_targets_and_identity_mismatch() 
 fn name_edits_preserve_applied_runtime_revision_and_origin_or_token_edits_advance_it() {
     let saved = record("named", named("https://old.example.com", "id-one"), true);
     let mut request = CloudflareTunnelProfileRequest {
+        expected_target: None,
+        oauth_dynamic_registration_enabled: None,
         profile_id: "named",
         name: None,
         host_mode: TunnelHostMode::Embedded,
@@ -334,6 +364,15 @@ fn name_edits_preserve_applied_runtime_revision_and_origin_or_token_edits_advanc
     assert_eq!(renamed.revision, 4);
     assert_eq!(renamed.runtime_revision, 2);
     assert!(!runtime_changed);
+    request.oauth_dynamic_registration_enabled = Some(true);
+    let (enabled, changed) =
+        updated_record(Some(&saved), &request, saved.name.clone(), false).unwrap();
+    assert!(changed && enabled.oauth_dynamic_registration_enabled);
+    assert_eq!((enabled.revision, enabled.runtime_revision), (4, 3));
+    request.oauth_dynamic_registration_enabled = None;
+    let (retained, changed) =
+        updated_record(Some(&enabled), &request, enabled.name.clone(), false).unwrap();
+    assert!(!changed && retained.oauth_dynamic_registration_enabled);
     request.provider = named("https://new.example.com", "id-one");
     let (changed, runtime_changed) =
         updated_record(Some(&saved), &request, saved.name.clone(), false).unwrap();
@@ -362,6 +401,8 @@ async fn stale_cloudflare_writer_cannot_rotate_credentials_or_change_saved_profi
     store.write_json("tunnel.json", &[saved.clone()]).unwrap();
     let token = Secret::new("replacement-token".into());
     let request = CloudflareTunnelProfileRequest {
+        expected_target: None,
+        oauth_dynamic_registration_enabled: None,
         profile_id: "named",
         name: Some("New"),
         host_mode: TunnelHostMode::Embedded,
@@ -377,6 +418,34 @@ async fn stale_cloudflare_writer_cannot_rotate_credentials_or_change_saved_profi
         .await
         .unwrap_err();
     assert_eq!(error.code, "tunnel_revision_stale");
+    // Even the correct revision cannot retarget a displayed Desktop edit.
+    let mut request = request;
+    request.expected_revision = Some(saved.revision.max(1));
+    for target in [
+        CloudflareProfileTarget {
+            environment_id: "replacement".into(),
+            configuration_id: saved.effective_configuration_id(),
+        },
+        CloudflareProfileTarget {
+            environment_id: store.load_environment().unwrap().unwrap().environment_id,
+            configuration_id: Some("replacement".into()),
+        },
+    ] {
+        let edit = CloudflareTunnelProfileRequest {
+            expected_target: Some(&target),
+            provider: request.provider.clone(),
+            ..request
+        };
+        assert_eq!(
+            NativeEnvironment::new()
+                .unwrap()
+                .configure_cloudflare_tunnel_profile(&store, &edit)
+                .await
+                .unwrap_err()
+                .code,
+            "tunnel_revision_stale"
+        );
+    }
     assert_eq!(read_secret(&path).unwrap().expose(), "saved-token");
     assert_eq!(tunnel_profiles(&store).unwrap()[0].provider, saved.provider);
 }
@@ -429,6 +498,8 @@ fn unchanged_materialization_preserves_installer_file_identity() {
 #[test]
 fn recreated_cloudflare_profile_gets_a_fresh_incarnation_and_edits_retain_it() {
     let request = CloudflareTunnelProfileRequest {
+        expected_target: None,
+        oauth_dynamic_registration_enabled: None,
         profile_id: "quick",
         name: None,
         host_mode: TunnelHostMode::Embedded,
@@ -496,6 +567,8 @@ fn retired_profile_revision_prevents_an_old_editor_from_targeting_recreation() {
     // The absent-service boundary has already admitted catalog withdrawal; no
     // native service or network fixture is needed for this durability fence.
     let request = CloudflareTunnelProfileRequest {
+        expected_target: None,
+        oauth_dynamic_registration_enabled: None,
         profile_id: "quick",
         name: None,
         host_mode: TunnelHostMode::Embedded,
@@ -723,6 +796,8 @@ async fn retirement_intent_fences_live_catalog_before_withdrawal_and_rejects_rep
         "tunnel_profile_recovery_required"
     );
     let request = CloudflareTunnelProfileRequest {
+        expected_target: None,
+        oauth_dynamic_registration_enabled: None,
         profile_id: &saved.profile_id,
         name: Some("Changed while deletion is pending"),
         host_mode: saved.host_mode,
@@ -860,6 +935,8 @@ async fn withdrawn_profile_cleanup_retains_exact_recovery_and_resumes_after_loca
     }
     let replacement_token = Secret::new("replacement-token".into());
     let request = CloudflareTunnelProfileRequest {
+        expected_target: None,
+        oauth_dynamic_registration_enabled: None,
         profile_id: &saved.profile_id,
         name: None,
         host_mode: saved.host_mode,

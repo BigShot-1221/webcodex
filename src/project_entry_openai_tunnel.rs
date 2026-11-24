@@ -121,13 +121,7 @@ impl OpenAiTunnel {
             }
             OpenAiTunnelRecovery::Durable => client
                 .with_restart_recovery(root, current_owner_started(), owner_absent)
-                .map_err(|code| {
-                    tunnel_error(if code == "tunnel_archive_capacity" {
-                        Error::Capacity
-                    } else {
-                        Error::Uncertain
-                    })
-                }),
+                .map_err(tunnel_recovery_error),
         }
     }
 
@@ -209,10 +203,16 @@ impl Drop for OpenAiTunnel {
 }
 
 pub(super) async fn prepare_openai_tunnel() -> Result<OpenAiTunnelPrerequisites, ProductError> {
+    let proxy = match std::env::var("WEBCODEX_TUNNEL_PROXY") {
+        Ok(value) if !value.trim().is_empty() => {
+            ControlPlaneProxy::Explicit(value.trim().to_owned())
+        }
+        _ => ControlPlaneProxy::System,
+    };
     OpenAiTunnelPrerequisites::bound(
         std::env::var("CONTROL_PLANE_TUNNEL_ID").map_err(|_| missing_configuration())?,
         std::env::var("CONTROL_PLANE_API_KEY").map_err(|_| missing_configuration())?,
-        ControlPlaneProxy::System,
+        proxy,
     )
 }
 
@@ -439,6 +439,20 @@ fn missing_configuration() -> ProductError {
         Some("Select a Tunnel and supply its Restricted runtime key with Tunnels Read + Use."),
     )
 }
+fn tunnel_recovery_error(code: &'static str) -> ProductError {
+    match code {
+        "tunnel_protected_history_binding_changed"
+        | "tunnel_receipts_binding_changed"
+        | "tunnel_archive_binding_changed" => ProductError::new(
+            code,
+            "This Tunnel's saved history does not match the local address or credential",
+            Some("Use the original local environment, or create a new Tunnel for this environment. Preserve the existing history; restarting does not authorize a different local binding."),
+        ),
+        "tunnel_archive_capacity" => tunnel_error(Error::Capacity),
+        _ => tunnel_error(Error::Uncertain),
+    }
+}
+
 fn tunnel_error(error: Error) -> ProductError {
     let code = match error {
         Error::Authentication => "tunnel_auth_rejected",

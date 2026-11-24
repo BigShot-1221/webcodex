@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use webcodex_tool_contracts::tool_call::WebcodexResourceKind;
 
 pub(crate) const RESOURCE_PREFIX: &str = "webcodex-resource://";
-const SOURCE_LIMIT: usize = 2000;
 
 #[derive(Debug, PartialEq, Eq)]
 enum ResourceIdentity {
@@ -321,17 +320,17 @@ impl ToolRuntime {
                     return error("resource_access_denied");
                 }
                 let result = self
-                    .list_projects_with_options_cap(
+                    .list_projects_with_options(
                         auth,
                         super::projects::ListProjectsOptions {
                             client_id,
                             project,
                             query: query.filter(|q| !q.trim().is_empty()),
-                            limit: Some(SOURCE_LIMIT),
+                            limit: Some(limit),
+                            offset,
                             summary_only: true,
                             include_git_summary: true,
                         },
-                        SOURCE_LIMIT,
                     )
                     .await;
                 if !result.success {
@@ -341,9 +340,11 @@ impl ToolRuntime {
                     .as_array()
                     .cloned()
                     .unwrap_or_default();
-                let mut incomplete = result.output["truncated"].as_bool().unwrap_or(false);
+                // Ordinary pagination is complete source coverage; per-row
+                // authorization/root changes below still mark this page incomplete.
+                let mut incomplete = false;
                 let mut items = Vec::new();
-                for row in rows.iter().skip(offset).take(limit) {
+                for row in &rows {
                     let Some(id) = row["id"].as_str() else {
                         incomplete = true;
                         continue;
@@ -480,18 +481,18 @@ impl ToolRuntime {
                             json!("no_valid_output_manifest_in_retained_session_history");
                         return result;
                     };
-                    let rows = outputs["items"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|row| {
-                            query
-                                .as_ref()
-                                .is_none_or(|q| row["path"].as_str().is_some_and(|p| p.contains(q)))
-                        })
+                    let rows = outputs
+                        .items
+                        .iter()
+                        .filter(|row| query.as_ref().is_none_or(|q| row.path.contains(q)))
                         .collect::<Vec<_>>();
-                    let items=rows.iter().skip(offset).take(limit).filter_map(|row| {let path=row["path"].as_str()?;Some(link(file_uri(&resolved.resolved_id,root,path),path,"Recorded task output; read resolves current file",json!({"kind":"artifact","project":resolved.resolved_id,"project_ref":selector,"path":path,"provenance":{"session_id":session,"observed_at":outputs["observed_at"],"observation":row}})))}).collect();
+                    let items = rows.iter().skip(offset).take(limit).map(|row| {
+                        link(file_uri(&resolved.resolved_id, root, &row.path), &row.path,
+                            "Recorded task output; read resolves current file",
+                            json!({"kind":"artifact","project":resolved.resolved_id,"project_ref":selector,
+                                "path":row.path,"provenance":{"session_id":session,
+                                    "observed_at":outputs.observed_at,"observation":row}}))
+                    }).collect();
                     page(items, rows.len(), offset, limit, false)
                 }
             }

@@ -119,9 +119,9 @@ pub enum ToolCall {
         /// and its Session. A source Session is never retargeted to the new Project. The legacy client_id +
         /// path worktree form may re-observe an already registered managed Project on exact resume. Failure
         /// never guesses or creates a replacement Session. Supplying session_id does not prove this
-        /// model context still retains project instructions, workflow guidance, or extension metadata. On
-        /// MCP, a fresh model context should request missing static guidance through `_wc.context`. This
-        /// business input is distinct from recorder provenance supplied through `_wc.record`.
+        /// model context still retains project instructions, workflow guidance, or extension metadata.
+        /// Obtain missing context through this surface's advertised route. This business input is
+        /// distinct from invocation recorder provenance and does not select a recorder.
         #[schemars(regex(
             pattern = "^(wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})|~s[1-9][0-9]{0,18})$"
         ))]
@@ -274,6 +274,9 @@ pub enum ToolCall {
         delivery_key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<SessionMessageKind>,
+        /// Optional conversational priority; defaults to normal and never gates execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<SessionMessagePriority>,
     },
 
     /// Work Result App-only lazy read from one opaque frozen final-changes snapshot.
@@ -951,18 +954,26 @@ pub enum ToolCall {
         #[schemars(length(min = 1, max = 128))]
         option_id: String,
     },
-    #[serde(rename = "inspect_coding_agent_config")]
-    CodingAgentInspectConfig {
-        /// Exact registered Project id; resolves the Runner and authorized Project root fence.
+    #[serde(rename = "diagnose_coding_agent")]
+    CodingAgentDiagnose {
+        /// Exact registered Project id. It selects the authorized Project whose configured Runner
+        /// performs the diagnostic; the Runner re-verifies that this exact Project identity and
+        /// root are still admitted before answering.
         #[schemars(length(min = 1))]
         project: String,
-        /// Logical Runner-advertised ACP provider id from get_runtime_status or list_runners.
+        /// Logical Runner-advertised ACP provider id, for example codex. Executable, argv,
+        /// environment, credentials, and provider instance ids are Runner-owned and cannot be
+        /// supplied here. Choose providers only from the exact Runner inventory.
         #[schemars(length(min = 1, max = 64))]
         provider_id: String,
-        /// When true, authorizes one bounded ephemeral ACP child (`initialize` then `session/new`
-        /// only) to project live configOptions. This can spawn a provider process and trigger
-        /// provider-side effects such as an external login prompt; it never sends
-        /// session/set_config_option or session/prompt.
+        /// Authorize one bounded ephemeral live ACP probe: the Runner launches the configured
+        /// provider exactly like a Coding Run start, performs only `initialize` then
+        /// `session/new`, and always terminates the whole process tree. It never sends
+        /// `session/prompt`, runs provider tools, or writes configuration. This launch authority
+        /// is never implied by the presence-only observation authority of this tool: it requires
+        /// the same authority as start_coding_agent, and provider-side initialization effects
+        /// (for example an external login prompt) are possible. The result reports the bounded
+        /// phase where the probe stopped.
         #[serde(default)]
         include_live_acp: bool,
     },
@@ -1045,10 +1056,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Legacy caller override for same-execution durable Job handoff grace. Hidden from model discovery;
-        /// Server transport policy and timeout_secs bound the effective wait. It controls return only, not
-        /// when the command is killed; named SSH remains unsupported.
-        #[schemars(skip)]
+        /// Seconds to wait before returning the same background Job. Omit for the connection default
+        /// (CLI: up to 50s). Smaller values return earlier; Server limits and timeout_secs still apply.
+        /// This never changes command lifetime or re-executes it; Session SSH does not support handoff.
+        #[schemars(range(min = 1))]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
         /// Working directory contract: without a Session SSH resource, omit, empty string, or '.' selects
@@ -1565,6 +1576,16 @@ pub enum ToolCall {
     /// Run one portable project build. The Runner resolves the nearest supported
     /// Rust/Go/Python recipe, plans canonical argv, and admits one typed build Job.
     ProjectBuild {
+        /// Rust-only Cargo profile (dev, release or a project-defined name), not arbitrary flags.
+        #[serde(default)]
+        #[schemars(length(min = 1, max = 64))]
+        profile: Option<String>,
+        /// Rust-only library and/or at most eight named binaries. Omission keeps native defaults.
+        #[serde(default)]
+        targets: Option<webcodex_core::project_build::ProjectBuildTargets>,
+        /// Rust-only opt-in bounded output observation, not correctness or source-freshness proof.
+        #[serde(default)]
+        artifact_policy: Option<webcodex_core::project_build::ProjectBuildArtifactPolicy>,
         /// Exact registered Runner Project.
         project: String,
         #[serde(default)]
@@ -1605,7 +1626,7 @@ pub enum ToolCall {
         cwd: Option<String>,
         /// check uses Runner priority (check/typecheck/lint); lint selects only the
         /// Node lint script with check identity, or Rust Clippy with distinct lint evidence.
-        /// Rust lint fixes --all-targets -- -D clippy::correctness; offline policy is unsupported.
+        /// Rust lint fixes --all-targets -- -D clippy::correctness; offline adds Cargo --offline.
         action: webcodex_core::project_validation::ProjectValidationAction,
         /// Omission means auto. Rust and Go are supported; Python supports test through pytest and
         /// check/format_check through project-local Ruff with explicit target-version.
@@ -1823,6 +1844,10 @@ pub enum ToolCall {
         #[schemars(regex(pattern = "^wc_skillpkg_[A-Za-z0-9_-]{43}$"))]
         #[serde(default)]
         expected_package_revision: Option<String>,
+        /// Optional full resource SHA-256 guard for safe cross-page continuation.
+        #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+        #[serde(default)]
+        expected_resource_sha256: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
     },
@@ -2794,7 +2819,13 @@ pub enum ToolCall {
         /// unlinked to Workflow Session state.
         #[serde(default)]
         session_id: Option<String>,
-        /// Maximum runtime in seconds.
+        /// Total Runner-owned shell Job execution lifetime in seconds (minimum 1, default 3600).
+        /// Values above 86400 (24 hours) are accepted and clamped to 86400. Runner policy can impose
+        /// a lower ceiling; the receipt reports the requested and admission budgets, source and policy basis.
+        /// Without reported Runner policy the effective budget is unknown; only the dispatch budget is known.
+        /// Queued acceptance does not prove command start or guarantee survival until the deadline.
+        #[schemars(extend("default" = 3600))]
+        #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<i64>,
         /// Working directory contract: without a Session SSH resource, omit, empty string, or '.' selects
@@ -2838,7 +2869,7 @@ pub enum ToolCall {
         close: bool,
     },
 
-    /// Stop a bounded runtime job after explicit confirmation.
+    /// Stop a bounded runtime Job. Calling this tool expresses cancellation intent.
     StopJob {
         /// Configured project id that must match the job project.
         project: String,
@@ -2850,6 +2881,7 @@ pub enum ToolCall {
         #[serde(default)]
         session_id: Option<String>,
         /// Must be true to stop or no-op an already-finished job; false returns confirmation_required.
+        /// The execution-only CLI adapter treats an explicit stop_job call as this intent.
         #[serde(default)]
         confirm: bool,
     },
@@ -2870,13 +2902,14 @@ pub enum ToolCall {
         )]
         #[schemars(extend("default" = 40))]
         /// Global per-stream bound. Values above 200 are accepted and clamped to 200. First observations
-        /// return a current tail; cursor-aware follow-ups return at most this many new or reset-recovery
-        /// lines.
+        /// return a current tail; token follow-ups return the latest incremental tail. Explicit page=true
+        /// reads forward from the token for log recovery; use 200 lines per page.
         #[schemars(range(min = 1))]
         tail_lines: usize,
         /// Optional one shared bounded wait (a maximum), never a minimum sleep or multiplied by item count.
-        /// Omission or any item without a token returns an immediate observation/baseline. Values above 100
-        /// seconds are clamped to 100. With tokens, wake_on selects early wake behavior; updates never
+        /// Omitted wait_secs returns an immediate observation. Terminal waits need no token; change
+        /// waits without a token return an immediate baseline. Values above 100 seconds are clamped to 100.
+        /// wake_on selects early wake behavior; updates never
         /// extend the deadline. Runtime accepts explicit waits up to 100 seconds; MCP transport may clamp
         /// that wait further using the effective Server-side Host timing profile. Use terminal waits
         /// when further useful progress depends on terminal outcome; otherwise defer observation while
@@ -2884,15 +2917,15 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default, deserialize_with = "deserialize_observe_jobs_wait_secs")]
         wait_secs: Option<u64>,
-        #[schemars(extend("default" = "change"))]
-        /// Bounded-wait wake policy. change (default) returns on any observable change.
+        #[schemars(extend("default" = "terminal"))]
+        /// Bounded-wait wake policy. terminal (default) waits for any selected Job to finish. change returns on any observable change.
         /// meaningful_change suppresses sequence-only heartbeat revisions but still wakes for log,
         /// lifecycle, progress, activity and recovery changes. terminal waits for any Job to be terminal;
         /// use it for one Job or when any terminal result unblocks progress. all_terminal waits for every
         /// Job in a predetermined set needed before progress. Terminal policies coalesce non-terminal
         /// updates and all policies return immediately on any item error or at the shared deadline.
         /// Deadline returns timeout even when changed=true; deltas remain relative to the caller's
-        /// original tokens. No token means immediate baseline; no wait_secs means immediate observation.
+        /// original tokens. No token is required for terminal/all_terminal; change policies need a baseline. No wait_secs means immediate observation.
         #[serde(default)]
         wake_on: ObserveJobsWakeOn,
         /// Opt-in projection for proven successful structured validation Jobs. Removes routine
@@ -3119,8 +3152,9 @@ pub enum ToolCall {
         /// is returned by the read phase.
         #[serde(default)]
         query: Option<SearchProjectTextsQuery>,
-        /// Batch of 1..8 predetermined independent queries. Exactly one of `query`
-        /// or `queries` is required; all queries share the global `max_reads` budget.
+        /// Batch of 1..8 predetermined independent queries sharing the global
+        /// `max_reads` budget. Match mode and zero search context are fixed;
+        /// use read_before/read_after to control the returned source context.
         #[schemars(length(max = 8))]
         #[serde(default)]
         queries: Option<Vec<SearchProjectTextsQuery>>,
@@ -3845,10 +3879,13 @@ pub enum ToolCall {
         #[schemars(length(min = 1, max = 200))]
         #[serde(default)]
         query: Option<String>,
-        /// Maximum results, clamped to 100. Filtered queries default to 100; unfiltered omission returns all visible Projects.
+        /// Page size, default 30, clamped to 100 after authorization and filters.
         #[schemars(range(min = 1))]
         #[serde(default)]
         limit: Option<usize>,
+        /// Live offset, default 0, in stable Runtime Project ID order. Registry or authorization changes may repeat/omit rows; restart at zero and deduplicate IDs.
+        #[serde(default)]
+        offset: usize,
         /// Include cached Runner-inventory Git branch/HEAD/dirty, not a fresh filesystem read.
         #[serde(default)]
         include_git_summary: bool,
@@ -3953,10 +3990,14 @@ pub enum ToolCall {
         #[schemars(extend("uniqueItems" = true))]
         #[serde(default)]
         client_ids: Option<Vec<String>>,
-        /// When false, omit Project bodies while retaining each Runner project count. Defaults to true for
-        /// compatibility.
+        /// Explicitly include up to 100 enabled Projects per Runner, independently of summary_only.
+        /// Omitted/false keeps counts only. Use projects_offset and each projects_next_offset to continue.
         #[serde(default)]
         include_projects: Option<bool>,
+        /// Zero-based Project-id offset for include_projects=true, default 0. Prefer an exact client_id
+        /// when paging one Runner's Projects. Each page reauthorizes fresh inventory.
+        #[serde(default)]
+        projects_offset: usize,
         /// Literal case-insensitive substring over Runner id, display name and hostname.
         #[serde(default)]
         #[schemars(length(max = 200))]
@@ -3964,11 +4005,16 @@ pub enum ToolCall {
         /// Online=connected; offline=not connected (includes stale); stale=heartbeat-expired inventory.
         #[serde(default)]
         status: Option<RunnerStatusFilter>,
-        /// Matching Runner limit, clamped to 1..100; omission preserves full operator inventory.
+        /// Matching Runner page size, default 30, clamped to 1..100 after authorization and filtering.
         #[serde(default)]
         limit: Option<usize>,
-        /// Return compact Runner identity, health, build, project-count, and shared Job-concurrency facts.
+        /// Zero-based offset in client_id order. Each call reauthorizes a fresh inventory; registration
+        /// or visibility changes can repeat/skip entries. Restart at zero to reconcile.
         #[serde(default)]
+        offset: usize,
+        /// Default true: compact identity, health, Project/Job counts and provider choices.
+        /// Set false for capabilities, build, synchronization status and diagnostic metadata.
+        #[serde(default = "default_true")]
         summary_only: bool,
     },
 

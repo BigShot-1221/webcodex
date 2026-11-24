@@ -3,6 +3,7 @@
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerPollRequest, RunnerResultRequest};
+use crate::tool_runtime::dispatch::DispatchContext;
 use serde_json::Value;
 
 fn scoped_text_edit(
@@ -120,31 +121,12 @@ async fn bulk_exact_old_runner_is_rejected_without_queueing() {
 fn apply_text_edits_occurrence_and_recovery_schemas_are_model_visible() {
     let specs = registered_tool_specs();
     let spec = spec_named(&specs, "edit_project_files");
-    let change_variants = spec.input_schema["properties"]["changes"]["items"]["oneOf"]
-        .as_array()
-        .expect("apply_text_edits change wire union");
-    let canonical = change_variants
-        .iter()
-        .find(|variant| variant["properties"].get("kind").is_some())
-        .expect("canonical apply-file-change wire variant");
-    let edit = &canonical["properties"]["edits"]["items"];
-    let edit_variants = edit["oneOf"].as_array().expect("text edit wire union");
-    assert_eq!(edit_variants.len(), 5);
-    assert!(edit_variants
-        .iter()
-        .all(|variant| variant["additionalProperties"] == false));
-    let replace_exact = edit_variants
-        .iter()
-        .find(|variant| {
-            variant["properties"]["kind"]["enum"] == serde_json::json!(["replace_exact"])
-        })
-        .expect("replace_exact variant");
-    let replace_range = edit_variants
-        .iter()
-        .find(|variant| {
-            variant["properties"]["kind"]["enum"] == serde_json::json!(["replace_range"])
-        })
-        .expect("replace_range variant");
+    let change = &spec.input_schema["properties"]["changes"]["items"];
+    assert_eq!(change["additionalProperties"], false);
+    let edit = &change["properties"]["edits"]["items"];
+    assert_eq!(edit["additionalProperties"], false);
+    let replace_exact = edit;
+    let replace_range = edit;
     assert_eq!(replace_exact["properties"]["occurrence"]["type"], "integer");
     assert_eq!(replace_exact["properties"]["occurrence"]["minimum"], 1);
     assert_eq!(
@@ -164,16 +146,9 @@ fn apply_text_edits_occurrence_and_recovery_schemas_are_model_visible() {
     );
     assert_eq!(line_scope["properties"]["start_line"]["minimum"], 1);
     assert_eq!(line_scope["properties"]["end_line"]["minimum"], 1);
-    assert!(!replace_exact["required"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!("occurrence")));
     assert_eq!(replace_range["properties"]["start_line"]["minimum"], 1);
     assert_eq!(replace_range["properties"]["end_line"]["minimum"], 1);
-    assert_eq!(
-        replace_range["required"],
-        serde_json::json!(["kind", "start_line", "end_line", "new_text"])
-    );
+    assert!(edit["allOf"].is_array());
     let output_properties = &spec.output_schema["properties"]["output"]["properties"];
     for removed in [
         "conflict_recovery",
@@ -277,85 +252,6 @@ fn apply_text_edits_occurrence_and_recovery_schemas_are_model_visible() {
     );
 }
 
-#[test]
-fn replace_range_handles_lf_crlf_utf8_eof_and_empty_replacement() {
-    let (updated, out) = files::apply_text_edits_to_string(
-        "α\nβ\nγ\n",
-        "src/x.rs",
-        &[range_text_edit(2, 2, "BETA\n")],
-        None,
-        false,
-    )
-    .unwrap();
-    assert_eq!(updated, "α\nBETA\nγ\n");
-    assert_eq!(out["edits"][0]["kind"], "replace_range");
-
-    let (crlf, _) = files::apply_text_edits_to_string(
-        "a\r\nb\r\nc",
-        "src/x.rs",
-        &[range_text_edit(2, 2, "B\nC\n")],
-        None,
-        false,
-    )
-    .unwrap();
-    assert_eq!(crlf, "a\r\nB\r\nC\r\nc");
-
-    let (eof, _) = files::apply_text_edits_to_string(
-        "a\nβ",
-        "src/x.rs",
-        &[range_text_edit(2, 2, "Ω")],
-        None,
-        false,
-    )
-    .unwrap();
-    assert_eq!(eof, "a\nΩ");
-
-    let (deleted, _) = files::apply_text_edits_to_string(
-        "a\nb\nc\n",
-        "src/x.rs",
-        &[range_text_edit(2, 2, "")],
-        None,
-        false,
-    )
-    .unwrap();
-    assert_eq!(deleted, "a\nc\n");
-}
-
-#[test]
-fn replace_range_resolves_multiple_ranges_against_one_original_snapshot_and_rejects_overlap() {
-    let edits = vec![range_text_edit(2, 2, "B\n"), range_text_edit(4, 4, "D\n")];
-    let (updated, out) =
-        files::apply_text_edits_to_string("a\nb\nc\nd\ne\n", "src/x.rs", &edits, None, false)
-            .unwrap();
-    assert_eq!(updated, "a\nB\nc\nD\ne\n");
-    assert_eq!(out["edits"].as_array().unwrap().len(), 2);
-
-    let overlapping = vec![range_text_edit(2, 3, "X\n"), range_text_edit(3, 4, "Y\n")];
-    let error =
-        files::apply_text_edits_to_string("a\nb\nc\nd\ne\n", "src/x.rs", &overlapping, None, false)
-            .unwrap_err();
-    assert!(error.contains("overlap"));
-    assert!(error.contains("No files were modified"));
-}
-
-#[test]
-fn replace_range_rejects_invalid_or_out_of_bounds_lines() {
-    for edit in [
-        range_text_edit(0, 1, "x"),
-        range_text_edit(3, 2, "x"),
-        range_text_edit(2, 4, "x"),
-    ] {
-        let error =
-            files::apply_text_edits_to_string("a\nb\nc\n", "src/x.rs", &[edit], None, false)
-                .unwrap_err();
-        assert!(
-            error.contains("No files were modified")
-                || error.contains("line_scope")
-                || error.contains("exceeds")
-        );
-    }
-}
-
 #[tokio::test]
 async fn replace_range_requires_fresh_revision_and_explicit_runner_capability() {
     let client_id = "ate-range-old-runner";
@@ -402,430 +298,6 @@ async fn replace_range_requires_fresh_revision_and_explicit_runner_capability() 
         .await
         .unwrap()
         .is_none());
-}
-
-#[test]
-fn apply_text_edits_replace_exact_large_block() {
-    let original = "mod foo {\n    fn old_a() {\n        todo!()\n    }\n    fn old_b() {\n        todo!()\n    }\n}\n";
-    let old_block =
-        "    fn old_a() {\n        todo!()\n    }\n    fn old_b() {\n        todo!()\n    }";
-    let new_block =
-        "    fn new_a() -> u32 {\n        1\n    }\n    fn new_b() -> u32 {\n        2\n    }";
-    let edits = vec![text_edit(
-        ApplyTextEditKind::ReplaceExact,
-        Some(old_block),
-        Some(new_block),
-        None,
-    )];
-    let (updated, out) =
-        files::apply_text_edits_to_string(original, "src/foo.rs", &edits, None, false).unwrap();
-    assert!(updated.contains("fn new_a() -> u32 {"));
-    assert!(updated.contains("fn new_b() -> u32 {"));
-    assert!(!updated.contains("old_a"));
-    assert!(!updated.contains("old_b"));
-    assert_eq!(out["path"], "src/foo.rs");
-    assert_eq!(out["applied_count"], 1);
-    assert_eq!(out["changed"], true);
-    assert_eq!(out["would_change"], true);
-    assert_eq!(out["edits"][0]["kind"], "replace_exact");
-    assert_eq!(out["changed_paths"][0], "src/foo.rs");
-}
-
-#[test]
-fn apply_text_edits_multiple_edits_atomic() {
-    let original = "alpha\nbeta\ngamma\ndelta\n";
-    let edits = vec![
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("beta"),
-            Some("BETA"),
-            None,
-        ),
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("delta"),
-            Some("DELTA"),
-            None,
-        ),
-    ];
-    let (updated, out) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap();
-    assert_eq!(updated, "alpha\nBETA\ngamma\nDELTA\n");
-    assert_eq!(out["applied_count"], 2);
-    assert_eq!(out["edits"].as_array().unwrap().len(), 2);
-}
-
-#[test]
-fn apply_text_edits_ignores_empty_insert_noop_without_blocking_other_edits() {
-    let original = "alpha\nbeta\n";
-    let edits = vec![
-        text_edit(
-            ApplyTextEditKind::InsertBefore,
-            None,
-            Some(""),
-            Some("anchor-that-does-not-exist"),
-        ),
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("beta"),
-            Some("BETA"),
-            None,
-        ),
-    ];
-    let (updated, out) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap();
-    assert_eq!(updated, "alpha\nBETA\n");
-    assert_eq!(out["applied_count"], 2);
-    assert_eq!(out["ignored_noop_count"], 1);
-    assert_eq!(out["edits"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn apply_text_edits_rejects_missing_match() {
-    let original = "alpha\nbeta\n";
-    let edits = vec![text_edit(
-        ApplyTextEditKind::ReplaceExact,
-        Some("nonexistent"),
-        Some("x"),
-        None,
-    )];
-    let err =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap_err();
-    assert!(err.contains("not found"));
-    assert!(err.contains("No files were modified"));
-    // Original is untouched (pure function never mutates input).
-    assert_eq!(original, "alpha\nbeta\n");
-}
-
-#[test]
-fn apply_text_edits_rejects_ambiguous_match() {
-    let original = "dup\ndup\n";
-    let edits = vec![text_edit(
-        ApplyTextEditKind::ReplaceExact,
-        Some("dup"),
-        Some("x"),
-        None,
-    )];
-    let err =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap_err();
-    assert!(err.contains("matched 2 times"));
-    assert!(err.contains("ambiguous"));
-}
-
-#[test]
-fn apply_text_edits_line_scope_fences_all_exact_edit_kinds() {
-    let original = "head\ndup\nmid\ndup\ntail\n";
-    let cases = [
-        (
-            scoped_text_edit(
-                text_edit(
-                    ApplyTextEditKind::ReplaceExact,
-                    Some("dup"),
-                    Some("SECOND"),
-                    None,
-                ),
-                4,
-                4,
-            ),
-            "head\ndup\nmid\nSECOND\ntail\n",
-        ),
-        (
-            scoped_text_edit(
-                text_edit(ApplyTextEditKind::DeleteExact, Some("dup\n"), None, None),
-                4,
-                4,
-            ),
-            "head\ndup\nmid\ntail\n",
-        ),
-        (
-            scoped_text_edit(
-                text_edit(
-                    ApplyTextEditKind::InsertBefore,
-                    None,
-                    Some("BEFORE\n"),
-                    Some("dup\n"),
-                ),
-                4,
-                4,
-            ),
-            "head\ndup\nmid\nBEFORE\ndup\ntail\n",
-        ),
-        (
-            scoped_text_edit(
-                text_edit(
-                    ApplyTextEditKind::InsertAfter,
-                    None,
-                    Some("AFTER\n"),
-                    Some("dup\n"),
-                ),
-                4,
-                4,
-            ),
-            "head\ndup\nmid\ndup\nAFTER\ntail\n",
-        ),
-    ];
-    for (edit, expected) in cases {
-        let (updated, _) =
-            files::apply_text_edits_to_string(original, "src/x.rs", &[edit], None, false).unwrap();
-        assert_eq!(updated, expected);
-    }
-}
-
-#[test]
-fn apply_text_edits_line_scope_never_renumbers_occurrence_and_rejects_invalid_range() {
-    let original = "head\ndup\nmid\ndup\ntail\n";
-    let mut mismatch = scoped_text_edit(
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("dup"),
-            Some("x"),
-            None,
-        ),
-        4,
-        4,
-    );
-    mismatch.occurrence = Some(1);
-    let err = files::apply_text_edits_to_string(original, "src/x.rs", &[mismatch], None, false)
-        .unwrap_err();
-    assert!(err.contains("occurrence 1 is outside line_scope"));
-
-    let reversed = scoped_text_edit(
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("dup"),
-            Some("x"),
-            None,
-        ),
-        4,
-        3,
-    );
-    let err = files::apply_text_edits_to_string(original, "src/x.rs", &[reversed], None, false)
-        .unwrap_err();
-    assert!(err.contains("end_line must be greater than or equal to start_line"));
-}
-
-#[test]
-fn apply_text_edits_expected_file_sha256_guard() {
-    let original = "alpha\nbeta\n";
-    let edits = vec![text_edit(
-        ApplyTextEditKind::ReplaceExact,
-        Some("beta"),
-        Some("BETA"),
-        None,
-    )];
-    // Wrong sha → rejected before any edit is applied.
-    let err = files::apply_text_edits_to_string(
-        original,
-        "src/x.rs",
-        &edits,
-        Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
-        false,
-    )
-    .unwrap_err();
-    assert!(err.contains("expected_file_sha256 mismatch"));
-    // Correct sha → succeeds.
-    let real_sha = files::sha256_hex_bytes(original.as_bytes());
-    let (updated, _) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, Some(&real_sha), false)
-            .unwrap();
-    assert_eq!(updated, "alpha\nBETA\n");
-}
-
-#[test]
-fn apply_text_edits_insert_before_after_unique_anchor() {
-    let original = "header\nbody\nfooter\n";
-    // insert_before unique anchor.
-    let edits = vec![text_edit(
-        ApplyTextEditKind::InsertBefore,
-        None,
-        Some("// before body\n"),
-        Some("body"),
-    )];
-    let (updated, out) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap();
-    assert_eq!(updated, "header\n// before body\nbody\nfooter\n");
-    assert_eq!(out["edits"][0]["kind"], "insert_before");
-
-    // insert_after unique anchor.
-    let edits = vec![text_edit(
-        ApplyTextEditKind::InsertAfter,
-        None,
-        Some("// after body\n"),
-        Some("body\n"),
-    )];
-    let (updated, _) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap();
-    assert_eq!(updated, "header\nbody\n// after body\nfooter\n");
-
-    // Ambiguous anchor → rejected.
-    let dup = "tag\ntag\n";
-    let edits = vec![text_edit(
-        ApplyTextEditKind::InsertBefore,
-        None,
-        Some("x"),
-        Some("tag"),
-    )];
-    let err = files::apply_text_edits_to_string(dup, "src/x.rs", &edits, None, false).unwrap_err();
-    assert!(err.contains("matched 2 times"));
-}
-
-#[test]
-fn apply_text_edits_delete_exact_removes_block() {
-    let original = "keep1\ndelete_me\nkeep2\n";
-    let edits = vec![text_edit(
-        ApplyTextEditKind::DeleteExact,
-        Some("delete_me\n"),
-        None,
-        None,
-    )];
-    let (updated, out) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap();
-    assert_eq!(updated, "keep1\nkeep2\n");
-    assert_eq!(out["edits"][0]["kind"], "delete_exact");
-}
-
-#[test]
-fn apply_text_edits_rejects_overlapping_edits() {
-    let original = "abcdefghij\n";
-    // Two replace_exact ops whose ranges overlap.
-    let edits = vec![
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("cde"),
-            Some("X"),
-            None,
-        ),
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("def"),
-            Some("Y"),
-            None,
-        ),
-    ];
-    let err =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap_err();
-    assert!(err.contains("overlap"));
-}
-
-#[test]
-fn apply_text_edits_crlf_accepts_lf_edits_and_preserves_crlf() {
-    let original = "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n";
-    let edits = vec![
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("one\n"),
-            Some("ONE\n"),
-            None,
-        ),
-        text_edit(
-            ApplyTextEditKind::InsertAfter,
-            None,
-            Some("AFTER-TWO\n"),
-            Some("two\n"),
-        ),
-        text_edit(ApplyTextEditKind::DeleteExact, Some("three\n"), None, None),
-        text_edit(
-            ApplyTextEditKind::InsertBefore,
-            None,
-            Some("BEFORE-FOUR\n"),
-            Some("four\n"),
-        ),
-    ];
-    let real_sha = files::sha256_hex_bytes(original.as_bytes());
-    let (updated, out) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, Some(&real_sha), false)
-            .unwrap();
-
-    assert_eq!(
-        updated,
-        "ONE\r\ntwo\r\nAFTER-TWO\r\nBEFORE-FOUR\r\nfour\r\nfive\r\n"
-    );
-    assert!(!updated.replace("\r\n", "").contains('\n'));
-    assert_eq!(out["changed"], true);
-}
-
-#[test]
-fn apply_text_edits_lf_accepts_crlf_edits_and_preserves_lf() {
-    let original = "one\ntwo\nthree\nfour\nfive\n";
-    let edits = vec![
-        text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("one\r\n"),
-            Some("ONE\r\n"),
-            None,
-        ),
-        text_edit(
-            ApplyTextEditKind::InsertAfter,
-            None,
-            Some("AFTER-TWO\r\n"),
-            Some("two\r\n"),
-        ),
-        text_edit(
-            ApplyTextEditKind::DeleteExact,
-            Some("three\r\n"),
-            None,
-            None,
-        ),
-        text_edit(
-            ApplyTextEditKind::InsertBefore,
-            None,
-            Some("BEFORE-FOUR\r\n"),
-            Some("four\r\n"),
-        ),
-    ];
-    let (updated, _) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap();
-
-    assert_eq!(updated, "ONE\ntwo\nAFTER-TWO\nBEFORE-FOUR\nfour\nfive\n");
-    assert!(!updated.contains('\r'));
-}
-
-#[test]
-fn apply_text_edits_rejects_mixed_or_bare_cr_line_endings() {
-    for original in ["one\r\ntwo\n", "one\rtwo\r"] {
-        let edits = vec![text_edit(
-            ApplyTextEditKind::ReplaceExact,
-            Some("one\n"),
-            Some("ONE\n"),
-            None,
-        )];
-        let err = files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false)
-            .unwrap_err();
-        assert!(err.contains("line endings"), "{err}");
-        assert!(err.contains("No files were modified"), "{err}");
-    }
-}
-
-#[test]
-fn apply_text_edits_rejects_bare_cr_edit_text_without_file_line_endings() {
-    let original = "one";
-    let edits = vec![text_edit(
-        ApplyTextEditKind::ReplaceExact,
-        Some("one"),
-        Some("ONE\r"),
-        None,
-    )];
-    let err =
-        files::apply_text_edits_to_string(original, "src/x.rs", &edits, None, false).unwrap_err();
-    assert!(err.contains("bare CR"), "{err}");
-    assert!(err.contains("No files were modified"), "{err}");
-}
-
-#[test]
-fn apply_text_edits_occurrence_selects_exact_second_match_in_test_mirror() {
-    let original = "dup\nkeep\ndup\n";
-    let mut edit = text_edit(
-        ApplyTextEditKind::ReplaceExact,
-        Some("dup"),
-        Some("SECOND"),
-        None,
-    );
-    edit.occurrence = Some(2);
-    let sha = files::sha256_hex_bytes(original.as_bytes());
-    let (updated, _) =
-        files::apply_text_edits_to_string(original, "src/x.rs", &[edit], Some(&sha), false)
-            .unwrap();
-    assert_eq!(updated, "dup\nkeep\nSECOND\n");
 }
 
 #[test]
@@ -960,9 +432,6 @@ async fn apply_text_edits_translates_strong_read_revisions_to_existing_wire_sha_
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "ate-revision-translation".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -992,10 +461,8 @@ async fn apply_text_edits_translates_strong_read_revisions_to_existing_wire_sha_
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request("ate-revision-translation".to_string(), "inst".to_string(), request.request_id)
         })
         .await
         .unwrap();
@@ -1089,9 +556,6 @@ async fn apply_text_edits_success_mints_final_revisions_and_continues_without_re
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1111,10 +575,8 @@ async fn apply_text_edits_success_mints_final_revisions_and_continues_without_re
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(client_id.to_string(), "inst".to_string(), request.request_id)
         })
         .await
         .unwrap();
@@ -1185,9 +647,6 @@ async fn apply_text_edits_success_mints_final_revisions_and_continues_without_re
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: continuation_request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1198,10 +657,8 @@ async fn apply_text_edits_success_mints_final_revisions_and_continues_without_re
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(client_id.to_string(), "inst".to_string(), continuation_request.request_id)
         })
         .await
         .unwrap();
@@ -1259,9 +716,6 @@ async fn apply_text_edits_success_mints_final_revisions_and_continues_without_re
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: destination_request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1272,10 +726,8 @@ async fn apply_text_edits_success_mints_final_revisions_and_continues_without_re
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(client_id.to_string(), "inst".to_string(), destination_request.request_id)
         })
         .await
         .unwrap();
@@ -1462,9 +914,6 @@ async fn edit_project_files_ambiguous_guarded_exact_retries_as_range_without_rer
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: first_request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1492,10 +941,8 @@ async fn edit_project_files_ambiguous_guarded_exact_retries_as_range_without_rer
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(client_id.to_string(), "inst".to_string(), first_request.request_id)
         })
         .await
         .unwrap();
@@ -1544,9 +991,6 @@ async fn edit_project_files_ambiguous_guarded_exact_retries_as_range_without_rer
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: retry_request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1575,10 +1019,12 @@ async fn edit_project_files_ambiguous_guarded_exact_retries_as_range_without_rer
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                client_id.to_string(),
+                "inst".to_string(),
+                retry_request.request_id,
+            )
         })
         .await
         .unwrap();
@@ -1627,9 +1073,6 @@ async fn apply_text_edits_without_occurrence_unique_match_queues_and_succeeds() 
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "ate-no-occurrence-unique".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1645,10 +1088,12 @@ async fn apply_text_edits_without_occurrence_unique_match_queues_and_succeeds() 
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "ate-no-occurrence-unique".to_string(),
+                "inst".to_string(),
+                request.request_id,
+            )
         })
         .await
         .unwrap();
@@ -1690,9 +1135,6 @@ async fn apply_text_edits_without_occurrence_ambiguous_match_fails_closed() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "ate-no-occurrence-ambiguous".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1704,10 +1146,8 @@ async fn apply_text_edits_without_occurrence_ambiguous_match_fails_closed() {
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request("ate-no-occurrence-ambiguous".to_string(), "inst".to_string(), request.request_id)
         })
         .await
         .unwrap();
@@ -1762,9 +1202,6 @@ async fn apply_text_edits_overlap_projects_bounded_resolved_ranges_without_bodie
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -1794,10 +1231,8 @@ async fn apply_text_edits_overlap_projects_bounded_resolved_ranges_without_bodie
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(client_id.to_string(), "inst".to_string(), request.request_id)
         })
         .await
         .unwrap();
@@ -1953,9 +1388,6 @@ async fn apply_text_edits_duplicate_anchor_advisory_survives_runner_projection()
         runtime
             .runner_registry
             .complete(RunnerResultRequest {
-                client_id: "ate-advisory".to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id: req.request_id,
                 exit_code: Some(0),
                 stdout: Some(
                     serde_json::json!({
@@ -1974,10 +1406,12 @@ async fn apply_text_edits_duplicate_anchor_advisory_survives_runner_projection()
                     .to_string(),
                 ),
                 stderr: Some(String::new()),
-                stdout_truncated: false,
-                stderr_truncated: false,
                 duration_ms: Some(1),
-                error: None,
+                ..runner_result_request(
+                    "ate-advisory".to_string(),
+                    "inst".to_string(),
+                    req.request_id,
+                )
             })
             .await
             .unwrap();
@@ -2041,9 +1475,6 @@ async fn apply_text_edits_dry_run_does_not_write() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "ate-dry".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -2061,10 +1492,8 @@ async fn apply_text_edits_dry_run_does_not_write() {
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request("ate-dry".to_string(), "inst".to_string(), req.request_id)
         })
         .await
         .unwrap();
@@ -2225,22 +1654,14 @@ async fn apply_text_edits_session_event_summary() {
     session_change.expected_read_revision = Some(revision);
     let task = tokio::spawn(async move {
         runtime_for_task
-            .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
+            .dispatch_canonical(
                 ToolCall::ApplyTextEdits {
                     project: project_for_task,
                     changes: vec![session_change],
                     dry_run: None,
                     session_id: Some(session_id),
                 },
-                Some(&bootstrap),
-                sessions::SessionTransport::Api,
-                Default::default(),
-                None,
-                true,
-                Vec::new(),
-                Default::default(),
-                Default::default(),
-                super::super::return_timing::ToolReturnTimingPolicy::unconstrained(),
+                DispatchContext::internal(Some(&bootstrap), sessions::SessionTransport::Api, None),
             )
             .await
     });
@@ -2250,9 +1671,6 @@ async fn apply_text_edits_session_event_summary() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "ate-sess".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(
                 serde_json::json!({
@@ -2276,10 +1694,8 @@ async fn apply_text_edits_session_event_summary() {
                 .to_string(),
             ),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request("ate-sess".to_string(), "inst".to_string(), req.request_id)
         })
         .await
         .unwrap();
@@ -2715,4 +2131,37 @@ fn edit_project_files_projection_preserves_identity_and_nonhappy_results() {
         result_projection::ModelFacingProjectionPlan::capture(&call).project(&mut result);
         assert_eq!(result.output, before);
     }
+}
+
+#[tokio::test]
+async fn whole_file_write_rejects_an_older_runner_before_queueing() {
+    let client = "write-old-runner";
+    let runtime = runtime_with_agent_project(client);
+    register_agent(
+        &runtime,
+        client,
+        None,
+        RunnerCapabilities {
+            file_write: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client);
+    let revision = seed_read_revision(&runtime, &project, "sample.txt", &"a".repeat(64)).await;
+    let changes = parsed_edit_project_files_changes(serde_json::json!({
+        "project": project, "changes":[{"kind":"write", "path":"sample.txt", "content":"replacement", "expected_read_revision":revision}]
+    }));
+    let result = runtime.apply_text_edits(project, changes, None).await;
+    assert!(!result.success);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("apply_file_write"),
+        "{result:?}"
+    );
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_no_apply_text_edits_runner_request(&runtime, client).await;
 }

@@ -95,11 +95,53 @@ pub(in crate::tool_runtime::tests) fn assert_sparse_pending_job_handoff(output: 
         .expect("pending handoff output object")
         .keys()
         .map(String::as_str)
+        .filter(|key| {
+            !matches!(
+                *key,
+                "stdout_tail" | "stderr_tail" | "stdout_truncated" | "stderr_truncated"
+            )
+        })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         keys,
         ["continuation", "execution_state"].into_iter().collect(),
         "normal model-facing pending handoff must stay sparse"
+    );
+    observe_job_continuation_job_id(output)
+}
+
+/// Legacy Runner fixtures without policy metadata must keep the uncertainty visible.
+pub(in crate::tool_runtime::tests) fn assert_sparse_pending_job_handoff_with_unreported_policy(
+    output: &Value,
+    timeout_secs: u64,
+) -> &str {
+    assert_eq!(output["execution_state"], "pending");
+    assert_observe_job_continuation(output);
+    let keys = output
+        .as_object()
+        .expect("pending handoff output object")
+        .keys()
+        .map(String::as_str)
+        .filter(|key| {
+            !matches!(
+                *key,
+                "stdout_tail" | "stderr_tail" | "stdout_truncated" | "stderr_truncated"
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        ["continuation", "execution_state", "timeout"]
+            .into_iter()
+            .collect(),
+        "unreported Runner policy must add only its explicit timeout evidence"
+    );
+    assert_eq!(
+        output["timeout"],
+        format!(
+            "{timeout_secs}s dispatch budget (requested {timeout_secs}); Runner policy unavailable and may further limit execution"
+        ),
+        "unreported Runner policy must not imply a known execution ceiling"
     );
     observe_job_continuation_job_id(output)
 }

@@ -53,7 +53,7 @@ function RunnerCapacitySettings({ state, onState, active }: Props) {
       // Only an explicit, successful reload discards the draft and its old
       // compare-and-save fence. Background reads must not overwrite an edit.
       if (reloadDraft) { editBase.current = undefined; setError(null); }
-      setDraft(current => editBase.current === undefined ? String(next.max_concurrent_jobs ?? 4) : current);
+      setDraft(current => editBase.current === undefined ? String(next.max_concurrent_jobs ?? 32) : current);
     }
     const runner = live.status === "fulfilled" && selected && live.value?.client_id === selected.client_id ? live.value : null;
     setObservation(runner ? { runner, at: Date.now() } : null);
@@ -80,12 +80,13 @@ function RunnerCapacitySettings({ state, onState, active }: Props) {
   const stale = !active || !serverReady || operationBusy || observation?.at == null || Math.max(now, Date.now()) - observation.at > 30000;
   const capacity = runnerCapacity(observation?.runner, stale);
   const saved = settings?.max_concurrent_jobs;
-  const savedLimit = saved === undefined ? null : saved ?? 4;
+  const savedLimit = saved === undefined ? null : saved ?? 32;
   const savedDisplay = saved == null ? "—" : saved;
   const limit = parseJobConcurrency(draft ?? "");
   const canEdit = state.topology?.runner?.kind === "local" && Boolean(settings?.can_restart) && saved !== undefined;
   const disabled = busy || operationBusy || !canEdit;
   const changed = limit !== null && limit !== savedLimit;
+  const canApply = changed || (saved != null && limit === saved && capacity.state === "available" && capacity.limit !== saved);
   const run = async (work: () => Promise<void>) => {
     if (action.current || disabled) return;
     action.current = true; setBusy(true); setError(null);
@@ -99,7 +100,7 @@ function RunnerCapacitySettings({ state, onState, active }: Props) {
     }
   };
   const save = () => run(async () => {
-    if (!settings || saved === undefined || limit === null || !changed) return;
+    if (!settings || saved === undefined || limit === null || !canApply) return;
     const next = await desktopApi.saveRunnerJobConcurrency(settings.target, editBase.current === undefined ? saved : editBase.current, limit);
     editBase.current = undefined;
     if (alive.current) onState(next);
@@ -137,18 +138,18 @@ function RunnerCapacitySettings({ state, onState, active }: Props) {
       {observation.runner.jobs_truncated && <p className="field-help">{s("Inventory incomplete; some jobs are not shown.")}</p>}
     </section>}
     {loading ? <p role="status">{s("Loading…")}</p> : <>
-      <p>{s("Saved limit: {saved} · Default: {default}").replace("{saved}", String(savedDisplay)).replace("{default}", "4")}</p>
-      {saved != null && savedLimit !== null && <p role="status">{s(capacity.state !== "available" ? "Saved for the next Runner start; the effective limit is unknown." : capacity.limit !== savedLimit ? "Restart required to apply the saved limit." : "Saved limit is in effect.")}</p>}
+      <p>{s("Saved limit: {saved} · Default: {default}").replace("{saved}", String(savedDisplay)).replace("{default}", "32")}</p>
+      {saved != null && savedLimit !== null && <p role="status">{s(capacity.state !== "available" ? "The effective limit is unknown. Reconnect and refresh before applying." : capacity.limit !== savedLimit ? "Saved limit is not yet reported as active." : "Saved limit is in effect.")}</p>}
       {saved !== undefined && <div className="field-group"><label htmlFor="runner-job-concurrency">{s("Maximum concurrent jobs")}</label>
         <input id="runner-job-concurrency" type="number" min={1} max={64} step={1} value={draft ?? ""} onChange={event => {
           editBase.current = event.target.value === String(savedLimit) ? undefined : editBase.current === undefined ? saved : editBase.current;
           setDraft(event.target.value);
         }} disabled={disabled} aria-describedby="runner-job-concurrency-help" />
-        <p id="runner-job-concurrency-help" className="field-help">{s("Choose a whole number from 1 to 64. Saving does not restart the Runner.")}</p>
+        <p id="runner-job-concurrency-help" className="field-help">{s("Choose a whole number from 1 to 64. Apply without restarting; running jobs continue.")}</p>
       </div>}
-      {!canEdit && !settingsUnavailable && <p className="field-help">{s("Read-only. Change and restart this Runner through its actual process owner.")}</p>}
+      {!canEdit && !settingsUnavailable && <p className="field-help">{s("Read-only. Change this Runner through its actual process owner.")}</p>}
       <div className="connection-actions">
-        {saved !== undefined && <button type="button" className="secondary-button" disabled={disabled || !changed} onClick={() => void save()}>{s("Save for next restart")}</button>}
+        {saved !== undefined && <button type="button" className="secondary-button" disabled={disabled || !canApply} onClick={() => void save()}>{s("Save and apply")}</button>}
         {canEdit && <button type="button" className="secondary-button" disabled={disabled || changed || limit === null} onClick={() => setConfirm(settings)}>{s("Restart Runner…")}</button>}
         <button type="button" className="text-button" disabled={busy || operationBusy} onClick={() => void refresh(true, true)}>{s("Refresh")}</button>
       </div>

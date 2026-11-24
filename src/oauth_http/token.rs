@@ -81,17 +81,37 @@ pub(crate) async fn oauth_token(
         ));
     }
     let (db, client) = authenticate_token_client(
+        req,
         depot,
+        &config,
         form.client_id.as_deref(),
         form.client_secret.as_deref(),
     )
     .await?;
     let now = chrono::Utc::now().timestamp();
-    let body = if grant_type == "authorization_code" {
-        handle_authorization_code_grant(&config, &db, &client, &form, now)?
-    } else {
-        handle_refresh_token_grant(&config, &db, &client, &form, now)?
-    };
+    let ingress = crate::public_ingress_auth::entry(depot).map(|entry| entry.fence());
+    let authorization_code = grant_type == "authorization_code";
+    if !authorization_code
+        && client
+            .dynamic_registration
+            .as_ref()
+            .is_some_and(|d| !d.refresh)
+    {
+        return Err(OAuthTokenError::new(
+            StatusCode::BAD_REQUEST,
+            "unauthorized_client",
+            "refresh grant not registered",
+        ));
+    }
+    let body = tokio::task::spawn_blocking(move || {
+        if authorization_code {
+            handle_authorization_code_grant(&config, &db, &client, &form, now, ingress.as_ref())
+        } else {
+            handle_refresh_token_grant(&config, &db, &client, &form, now, ingress.as_ref())
+        }
+    })
+    .await
+    .map_err(|_| OAuthTokenError::server_error("internal error"))??;
     apply_oauth_no_store_headers(res);
     res.render(Json(body));
     Ok(())
@@ -103,6 +123,7 @@ fn handle_authorization_code_grant(
     client: &crate::models::OAuthClientRecord,
     form: &TokenRequest,
     now: i64,
+    ingress: Option<&webcodex_store::PublicIngressFence>,
 ) -> Result<serde_json::Value, OAuthTokenError> {
     let plaintext_code = required_token_parameter(form.code.as_deref(), "code")?;
 
@@ -129,7 +150,7 @@ fn handle_authorization_code_grant(
     )
     .is_err()
     {
-        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
         return Err(OAuthTokenError::invalid_grant(
             "authorization grant is no longer active",
         ));
@@ -142,7 +163,7 @@ fn handle_authorization_code_grant(
                     && client.owner_project_grant_id.as_deref() == Some(grant_id)
             });
         if !owner_matches {
-            let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+            let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
             return Err(OAuthTokenError::invalid_grant(
                 "authorization grant does not belong to this client",
             ));
@@ -150,26 +171,26 @@ fn handle_authorization_code_grant(
     }
 
     if code_record.client_id != client.client_id {
-        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
         return Err(OAuthTokenError::invalid_grant(
             "authorization code was not issued to this client",
         ));
     }
 
     if code_record.redirect_uri != redirect_uri {
-        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
         return Err(OAuthTokenError::invalid_grant(
             "redirect_uri does not match",
         ));
     }
 
     // --- PKCE S256 (before code consumption) ---
-    let require_pkce = config.oauth2.require_pkce;
+    let require_pkce = config.oauth2.require_pkce || client.dynamic_registration.is_some();
     if let Some(ref challenge) = code_record.code_challenge {
         let verifier = match form.code_verifier.as_deref() {
             Some(v) if !v.is_empty() => v,
             _ => {
-                let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+                let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
                 return Err(OAuthTokenError::invalid_grant(
                     "missing code_verifier for PKCE",
                 ));
@@ -179,19 +200,25 @@ fn handle_authorization_code_grant(
         match code_record.code_challenge_method.as_deref() {
             Some("S256") => {}
             _ => {
-                let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+                let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
                 return Err(OAuthTokenError::invalid_grant(
                     "unsupported code_challenge_method; only S256 is supported",
                 ));
             }
         }
 
-        if !verify_pkce_s256(verifier, challenge) {
-            let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+        let valid_verifier = (43..=128).contains(&verifier.len())
+            && verifier
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b));
+        if (client.dynamic_registration.is_some() && !valid_verifier)
+            || !verify_pkce_s256(verifier, challenge)
+        {
+            let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
             return Err(OAuthTokenError::invalid_grant("PKCE verification failed"));
         }
     } else if require_pkce {
-        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+        let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
         return Err(OAuthTokenError::invalid_grant(
             "PKCE is required but no code_challenge was provided during authorization",
         ));
@@ -204,7 +231,7 @@ fn handle_authorization_code_grant(
     ) {
         Ok(resource) => resource,
         Err(()) => {
-            let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now);
+            let _ = db.consume_oauth_authorization_code_by_hash(&code_hash, now, ingress);
             return Err(OAuthTokenError::invalid_target(
                 "resource does not match authorization grant",
             ));
@@ -213,9 +240,12 @@ fn handle_authorization_code_grant(
 
     // --- All validations passed — transactional exchange ---
     let access_token = generate_oauth_access_token();
-    let refresh_token = generate_oauth_refresh_token();
+    let refresh_token = client
+        .dynamic_registration
+        .as_ref()
+        .is_none_or(|d| d.refresh)
+        .then(generate_oauth_refresh_token);
     let at_hash = hash_token(&access_token);
-    let rt_hash = hash_token(&refresh_token);
     let at_expires_at = now + config.oauth2.access_token_ttl_secs;
     let rt_expires_at = now + config.oauth2.refresh_token_ttl_secs;
 
@@ -236,26 +266,34 @@ fn handle_authorization_code_grant(
         last_used_at: None,
     };
 
-    let rt_record = OAuthRefreshTokenRecord {
-        admin_authority: code_record.admin_authority,
-        id: uuid::Uuid::new_v4().to_string(),
-        token_hash: rt_hash,
-        client_id: client.client_id.clone(),
-        subject_kind: code_record.subject_kind.clone(),
-        subject_id: code_record.subject_id.clone(),
-        user_id: code_record.user_id.clone(),
-        scopes: code_record.scopes.clone(),
-        resource: token_resource,
-        shared_key_hash: code_record.shared_key_hash.clone(),
-        created_at: now,
-        expires_at: rt_expires_at,
-        revoked_at: None,
-        last_used_at: None,
-        rotated_from_id: None,
-    };
+    let rt_record = refresh_token
+        .as_ref()
+        .map(|secret| OAuthRefreshTokenRecord {
+            admin_authority: code_record.admin_authority,
+            id: uuid::Uuid::new_v4().to_string(),
+            token_hash: hash_token(secret),
+            client_id: client.client_id.clone(),
+            subject_kind: code_record.subject_kind.clone(),
+            subject_id: code_record.subject_id.clone(),
+            user_id: code_record.user_id.clone(),
+            scopes: code_record.scopes.clone(),
+            resource: token_resource,
+            shared_key_hash: code_record.shared_key_hash.clone(),
+            created_at: now,
+            expires_at: rt_expires_at,
+            revoked_at: None,
+            last_used_at: None,
+            rotated_from_id: None,
+        });
 
     let code_record = db
-        .exchange_oauth_authorization_code_for_tokens(&code_hash, now, &at_record, &rt_record)
+        .exchange_oauth_authorization_code_for_tokens(
+            ingress,
+            &code_hash,
+            now,
+            &at_record,
+            rt_record.as_ref(),
+        )
         .map_err(|_| OAuthTokenError::server_error("internal error"))?
         .ok_or_else(|| {
             OAuthTokenError::invalid_grant(
@@ -277,6 +315,7 @@ fn handle_refresh_token_grant(
     client: &crate::models::OAuthClientRecord,
     form: &TokenRequest,
     now: i64,
+    ingress: Option<&webcodex_store::PublicIngressFence>,
 ) -> Result<serde_json::Value, OAuthTokenError> {
     let plaintext_rt = required_token_parameter(form.refresh_token.as_deref(), "refresh_token")?;
 
@@ -385,6 +424,7 @@ fn handle_refresh_token_grant(
     };
 
     match db.rotate_oauth_refresh_token(
+        ingress,
         &rt_hash,
         &client.client_id,
         now,
@@ -394,7 +434,7 @@ fn handle_refresh_token_grant(
         Ok(crate::RotateResult::Rotated(old_rt)) => Ok(token_response(
             config,
             new_access_token,
-            new_refresh_token,
+            Some(new_refresh_token),
             &old_rt.scopes,
         )),
         Ok(crate::RotateResult::NotFound) => {
@@ -422,15 +462,17 @@ fn handle_refresh_token_grant(
 fn token_response(
     config: &crate::Config,
     access_token: String,
-    refresh_token: String,
+    refresh_token: Option<String>,
     scopes: &str,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": config.oauth2.access_token_ttl_secs,
-        "refresh_token": refresh_token,
     });
+    if let Some(refresh_token) = refresh_token {
+        body["refresh_token"] = refresh_token.into();
+    }
     if !scopes.is_empty() {
         body["scope"] = serde_json::Value::String(scopes.to_string());
     }

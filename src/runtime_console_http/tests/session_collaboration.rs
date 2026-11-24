@@ -59,7 +59,7 @@ async fn collaboration_message_projection_reuses_authority_fence_and_hides_compl
     let auth_b = crate::auth::shared_key_context("runtime-console-group-b");
     let project_id = "agent:client-a:proj-a";
     register_project(&runtime, "client-a", "proj-a", "/private/a", Some(&auth_a)).await;
-    let session = start_authorized_session(&runtime, project_id, &auth_a);
+    let session = start_authorized_session(&runtime, project_id, &auth_a).await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -150,7 +150,7 @@ async fn human_join_reuses_formal_session_authority_and_ack_validation() {
     let auth_b = crate::auth::shared_key_context("runtime-console-human-b");
     let project_id = "agent:client-a:proj-a";
     register_project(&runtime, "client-a", "proj-a", "/private/a", Some(&auth_a)).await;
-    let session = start_authorized_session(&runtime, project_id, &auth_a);
+    let session = start_authorized_session(&runtime, project_id, &auth_a).await;
 
     let posted = session_post_message_for_auth(
         &runtime,
@@ -271,7 +271,7 @@ async fn browser_message_mutation_routes_succeed_and_retain_history() {
     let auth = test_bootstrap_auth();
     let project_id = "agent:client-a:proj-a";
     register_project(&runtime, "client-a", "proj-a", "/private/a", Some(&auth)).await;
-    let session = start_authorized_session(&runtime, project_id, &auth);
+    let session = start_authorized_session(&runtime, project_id, &auth).await;
     let withdraw_target = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -373,7 +373,7 @@ async fn browser_message_mutations_fail_closed_on_authority_and_state_conflicts(
     let runtime_read_only = scoped_oauth(&[SCOPE_RUNTIME_READ, SCOPE_PROJECT_READ]);
     let project_id = "agent:client-a:proj-a";
     register_project(&runtime, "client-a", "proj-a", "/private/a", Some(&auth_a)).await;
-    let session = start_authorized_session(&runtime, project_id, &auth_a);
+    let session = start_authorized_session(&runtime, project_id, &auth_a).await;
     let note = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -568,6 +568,7 @@ async fn browser_message_mutation_json_and_uncertain_errors_are_distinct() {
     let (_tmp, service) = hosted_service(test_runtime());
     let unknown_field =
         TestClient::post("http://localhost/api/runtime-console/workflow-session-withdraw-message")
+            .bearer_auth("console-bootstrap-test")
             .json(&serde_json::json!({
                 "project": "agent:missing:project",
                 "session_id": "wc_sess_missing000000000",
@@ -638,7 +639,7 @@ async fn browser_message_mutation_persistence_uncertain_is_503_and_retains_live_
     let auth = test_bootstrap_auth();
     let project_id = "agent:client-a:proj-a";
     register_project(&runtime, "client-a", "proj-a", "/private/a", Some(&auth)).await;
-    let session = start_authorized_session(&runtime, project_id, &auth);
+    let session = start_authorized_session(&runtime, project_id, &auth).await;
     let message = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -651,8 +652,7 @@ async fn browser_message_mutation_persistence_uncertain_is_503_and_retains_live_
         })
         .unwrap();
     runtime.sessions.flush_persistence();
-    std::fs::remove_dir_all(&ledger_dir).unwrap();
-    std::fs::write(&ledger_dir, b"block durable ledger recreation").unwrap();
+    runtime.sessions.set_persistence_failure_for_test(true);
     let (_tmp, service) = hosted_service_with_shared_key(runtime.clone(), token);
 
     let mut response =
@@ -697,7 +697,7 @@ async fn collaboration_observation_route_preserves_baseline_update_timeout_and_p
     let auth = crate::auth::shared_key_context("runtime-console-observe");
     let project_id = "agent:client-a:proj-a";
     register_project(&runtime, "client-a", "proj-a", "/private/a", Some(&auth)).await;
-    let session = start_authorized_session(&runtime, project_id, &auth);
+    let session = start_authorized_session(&runtime, project_id, &auth).await;
 
     let baseline = session_observe_for_auth(
         &runtime,
@@ -807,12 +807,12 @@ async fn collaboration_observation_route_preserves_baseline_update_timeout_and_p
 }
 
 #[tokio::test]
-async fn collaboration_observation_route_surfaces_history_loss_from_authoritative_retention() {
+async fn collaboration_observation_route_keeps_history_after_message_churn() {
     let runtime = test_runtime();
     let auth = crate::auth::shared_key_context("runtime-console-history-loss");
     let project_id = "agent:client-a:proj-a";
     register_project(&runtime, "client-a", "proj-a", "/private/a", Some(&auth)).await;
-    let session = start_authorized_session(&runtime, project_id, &auth);
+    let session = start_authorized_session(&runtime, project_id, &auth).await;
     let baseline = session_observe_for_auth(
         &runtime,
         &auth,
@@ -827,7 +827,7 @@ async fn collaboration_observation_route_surfaces_history_loss_from_authoritativ
     .await
     .unwrap();
 
-    let retention_limit = runtime.sessions.status().max_messages_per_session;
+    let retention_limit = 500;
     for index in 0..=retention_limit {
         runtime
             .sessions
@@ -856,7 +856,7 @@ async fn collaboration_observation_route_surfaces_history_loss_from_authoritativ
     .await
     .unwrap();
     assert!(observed.changed);
-    assert!(observed.history_lost);
+    assert!(!observed.history_lost);
     assert!(observed.has_more);
     assert_eq!(observed.messages.len(), 100);
 }

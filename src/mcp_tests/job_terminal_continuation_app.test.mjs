@@ -165,6 +165,27 @@ test("Host ui/message rejection records delivery_unknown and never retries dispa
   assert.equal(view.timers.size, 0);
 });
 
+for (const [label, hostResult] of [
+  ["isError true", { isError: true }],
+  ["isError string", { isError: "false" }],
+  ["null", null],
+  ["array", []],
+]) {
+  test(`Host ui/message resolved with ${label} records delivery_unknown without retry`, async () => {
+    const view = await initializedView();
+    await view.reply(calls(view, "bind_job_terminal_continuation")[0], bindResult(pending));
+    await view.reply(calls(view, "get_job_terminal_continuation_state")[0], stateResult(pending));
+    await view.reply(calls(view, "prepare_job_terminal_continuation")[0], prepareResult());
+    assert.equal(hostMessages(view).length, 1);
+    await view.reply(hostMessages(view)[0], hostResult);
+    const finish = calls(view, "finish_job_terminal_continuation").at(-1);
+    assert.equal(finish.params.arguments.outcome, "delivery_unknown");
+    await view.reply(finish, finishResult("delivery_unknown"));
+    assert.equal(hostMessages(view).length, 1);
+    assert.equal(view.timers.size, 0);
+  });
+}
+
 test("finish response loss retries only the exact finish fence, never ui/message", async () => {
   const view = await initializedView();
   await view.reply(calls(view, "bind_job_terminal_continuation")[0], bindResult(pending));

@@ -925,7 +925,7 @@ fn coding_intent_has_independent_ordered_canonical_selection_surface() {
         "project_validate",
         "review_changes",
         "check_workspace_hygiene",
-        "inspect_coding_agent_config",
+        "diagnose_coding_agent",
         "start_coding_agent",
         "observe_coding_agent",
         "respond_coding_agent_permission",
@@ -989,7 +989,7 @@ fn delegated_acp_coding_flow_exposes_lifecycle_tools_and_safe_continuation() {
     assert_eq!(
         flow.tools,
         &[
-            "inspect_coding_agent_config",
+            "diagnose_coding_agent",
             "start_coding_agent",
             "observe_coding_agent",
             "respond_coding_agent_permission",
@@ -1016,7 +1016,7 @@ fn delegated_acp_coding_flow_exposes_lifecycle_tools_and_safe_continuation() {
         "observe_coding_agent",
         "uncertain start",
         "omit config overrides",
-        "inspect_coding_agent_config",
+        "diagnose_coding_agent",
         "side effect",
         "respond_coding_agent_permission",
         "permission_request_token",
@@ -1036,7 +1036,7 @@ fn delegated_acp_coding_flow_exposes_lifecycle_tools_and_safe_continuation() {
         .find(|intent| intent.name == "coding")
         .expect("coding intent");
     for acp_tool in [
-        "inspect_coding_agent_config",
+        "diagnose_coding_agent",
         "start_coding_agent",
         "observe_coding_agent",
         "respond_coding_agent_permission",

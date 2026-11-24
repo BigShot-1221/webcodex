@@ -332,7 +332,15 @@ impl PreparedInvocation {
             *trusted_recording_session_id = context.session_id.map(str::to_string);
         }
         if let Some(session_id) = context.session_id {
-            if session_event.is_none() {
+            let evidence_confirmed = if session_event.is_none() {
+                false
+            } else if crate::tool_runtime::sessions::session_dispatch_requires_durable_start(&call)
+            {
+                runtime.sessions.await_persistence_barrier().await.is_ok()
+            } else {
+                runtime.sessions.prepare_request().await.is_ok()
+            };
+            if !evidence_confirmed {
                 let mut result =
                     session_context::session_persistence_unavailable_result(Some(session_id));
                 result.output["dispatch_certainty"] = Value::String("not_started".to_string());
@@ -340,6 +348,13 @@ impl PreparedInvocation {
                     &request.tool_name,
                     &mut result,
                     "persistence_unavailable",
+                );
+                runtime.sessions.record_tool_call_finished(
+                    session_event,
+                    false,
+                    &result.output,
+                    result.error.as_deref(),
+                    Some("session_persistence_unavailable"),
                 );
                 return Err(ToolCallOutcome::rejected_result(result));
             }

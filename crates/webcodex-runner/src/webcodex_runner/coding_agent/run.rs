@@ -1,9 +1,9 @@
 //! One ACP turn, prompt-dispatch fencing, and owned process I/O cleanup.
 
 use super::protocol::{
-    AcpFailure, AcpOutboundWriter, OutboundWriteOutcome, ReaderEvent, error_frame,
-    normalize_update, notification_frame, permission_event, remaining_run_budget, request_frame,
-    result_frame, wait_outbound_write,
+    error_frame, normalize_update, notification_frame, permission_event, remaining_run_budget,
+    request_frame, result_frame, wait_outbound_write, AcpFailure, AcpOutboundWriter,
+    OutboundWriteOutcome, ReaderEvent,
 };
 use super::store::DurableDispatchPhase;
 use super::*;
@@ -116,7 +116,7 @@ impl CodingAgentManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = match ManagedChild::spawn(&mut command) {
+        let mut child = match ManagedChild::spawn_background(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 let failure = AcpFailure::SpawnIo(error.kind()).diagnose(
@@ -459,18 +459,6 @@ impl CodingAgentManager {
                             return;
                         };
                         let params = message.get("params").cloned().unwrap_or(Value::Null);
-                        if serde_json::from_value::<RequestPermissionRequest>(params.clone())
-                            .is_err()
-                        {
-                            self.terminate_run_io(&mut child, &mut outbound);
-                            self.mark_lost(
-                                &request.run_id,
-                                &entry,
-                                "coding_agent_permission_invalid",
-                            );
-                            return;
-                        }
-                        entry.push_event(permission_event(&params));
                         let permission_deadline =
                             (Instant::now() + self.permission_timeout).min(run_deadline);
                         let pending = match entry.permission.open_from_acp(
@@ -480,7 +468,10 @@ impl CodingAgentManager {
                             permission_deadline,
                         ) {
                             Ok(pending) => pending,
-                            Err(_) => {
+                            Err(reason) => {
+                                // The parser returns only fixed diagnostic messages,
+                                // never raw tool input or other ACP payload data.
+                                tracing::warn!(run_id = %request.run_id, %reason, "ACP permission request rejected");
                                 self.terminate_run_io(&mut child, &mut outbound);
                                 self.mark_lost(
                                     &request.run_id,
@@ -490,6 +481,7 @@ impl CodingAgentManager {
                                 return;
                             }
                         };
+                        entry.push_event(permission_event(&pending));
                         entry.update_snapshot(|snapshot| {
                             snapshot.state = CodingAgentRunState::WaitingPermission;
                             snapshot.pending_permission = Some(pending.clone());

@@ -9,6 +9,7 @@ async fn discovery_materializes_only_the_requested_contract_shape() {
     let exact = runtime
         .tool_manifest(
             None,
+            None,
             Some("run_process".into()),
             None,
             None,
@@ -33,6 +34,7 @@ async fn discovery_materializes_only_the_requested_contract_shape() {
         .tool_manifest(
             None,
             None,
+            None,
             Some("execution".into()),
             None,
             false,
@@ -54,6 +56,7 @@ async fn discovery_materializes_only_the_requested_contract_shape() {
     );
     let hidden = runtime
         .tool_manifest(
+            None,
             None,
             Some("read_memory".into()),
             None,
@@ -2487,6 +2490,14 @@ async fn tool_manifest_projects_canonical_semantic_contracts() {
             "desired_state",
             false,
         ),
+        (
+            "diagnose_coding_agent",
+            "observe",
+            "read_only",
+            "none",
+            "pure_read",
+            true,
+        ),
     ] {
         let result = runtime
             .dispatch(ToolCall::ToolManifest {
@@ -2605,6 +2616,7 @@ async fn tool_manifest_operator_extensions_require_explicit_family_capabilities(
     };
     let manifest = |tool_name: &'static str, capabilities: ToolProtocolCapabilities| {
         runtime.tool_manifest(
+            None,
             Some(&admin),
             Some(tool_name.to_string()),
             None,
@@ -2792,6 +2804,7 @@ async fn keyword_discovery_is_bounded_schema_free_and_new_maintenance_tools_stay
             None,
             None,
             None,
+            None,
             false,
             false,
             Some("batch unregister".into()),
@@ -2814,6 +2827,7 @@ async fn keyword_discovery_is_bounded_schema_free_and_new_maintenance_tools_stay
         let exact = runtime
             .tool_manifest(
                 None,
+                None,
                 Some(name.into()),
                 None,
                 None,
@@ -2829,6 +2843,7 @@ async fn keyword_discovery_is_bounded_schema_free_and_new_maintenance_tools_stay
     }
     let list = runtime
         .tool_manifest(
+            None,
             None,
             None,
             None,
@@ -2852,6 +2867,7 @@ async fn keyword_discovery_is_bounded_schema_free_and_new_maintenance_tools_stay
             None,
             None,
             None,
+            None,
             false,
             false,
             Some("read_memory".into()),
@@ -2861,6 +2877,29 @@ async fn keyword_discovery_is_bounded_schema_free_and_new_maintenance_tools_stay
         .await;
     assert!(hidden.success);
     assert_eq!(hidden.output["count"], 0);
+}
+
+#[tokio::test]
+async fn natural_language_discovery_finds_computer_tools_for_desktop_gui_request() {
+    let runtime = test_runtime();
+    let result = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "read_tool_manifest",
+                json!({"query":"operate my Mac desktop GUI safely","limit":5}),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(result.success, "{result:?}");
+    let tools = result.output["tools"].as_array().expect("tools array");
+    let names = tools
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"observe_computer"), "{names:?}");
+    assert!(names.contains(&"control_computer"), "{names:?}");
+    assert!(result.output["contract"].is_null());
 }
 
 #[tokio::test]
@@ -2940,6 +2979,7 @@ async fn natural_language_discovery_preserves_filters_bounds_and_exact_contracts
         take_counts();
         let result = runtime
             .tool_manifest(
+                None,
                 None,
                 None,
                 Some(category.into()),
@@ -3027,6 +3067,7 @@ async fn natural_language_discovery_preserves_filters_bounds_and_exact_contracts
                 None,
                 None,
                 None,
+                None,
                 false,
                 false,
                 Some(query),
@@ -3097,6 +3138,7 @@ async fn natural_language_discovery_exact_names_rank_first_across_admitted_catal
     let runtime = test_runtime();
     let catalog = runtime
         .tool_manifest(
+            None,
             None,
             None,
             None,

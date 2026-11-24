@@ -1,0 +1,9 @@
+isError: true
+ERROR: Rejected before write: the read revision is unknown, expired, evicted, or belongs to a prior Server runtime. No files were modified.
+error_kind: unknown_read_revision
+recovery_kind: fix_input
+change_index: 0
+path: src/sample.txt
+state_changed: false
+execution_state: not_started
+next: read_files items=[{"path":"src/sample.txt"}] project="agent:cli-runtime-reads:demo"

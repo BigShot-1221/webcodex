@@ -2,35 +2,48 @@ import { useEffect, useRef, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { desktopApi } from "../../lib/desktop-api";
 import type { DesktopError, DesktopState } from "../../models/topology";
-import { desktopErrorPresentation, normalizeDesktopError } from "../../i18n/presentation";
+import { isErrorStaleForState } from "../../lib/desktop-errors";
+import { normalizeDesktopError } from "../../i18n/presentation";
+import { DesktopErrorAlert } from "../../components/DesktopErrorAlert";
 import { useLocale } from "../../i18n/locale";
-import { useShellText } from "../../i18n/runtime-shell";
 import { EMPTY_CONNECTIONS, type TunnelConnection, type TunnelProfileAction } from "../../models/connections-tools";
 import { useProduct } from "../../i18n/product";
 import { useConnectionsTools } from "../../i18n/connections-tools";
-import { desktopStatusPresentation } from "../workspace/WorkspaceStatus";
+import { ChatgptObservation, desktopStatusPresentation } from "../workspace/WorkspaceStatus";
 import { WorkspaceDialog } from "../workspace/WorkspaceDialog";
+import { desktopIdentity, type ChatgptActivityQueryStatus } from "../../lib/desktop-observation";
+import { FirstRun } from "../onboarding/FirstRun";
+import { LocalMigrationSetup } from "../onboarding/LocalMigrationSetup";
 import { FirstReadGuide } from "../onboarding/FirstRunCompletion";
 import { ConnectionEditor } from "./ConnectionEditor";
-import { CloudflareConnectionCard } from "./CloudflareConnectionCard";
+import { GeminiConnections } from "./GeminiConnections";
 import { ConnectionCard } from "./ConnectionCard";
 
-export function ConnectionPanel({ state, operationPending = false, onState, onSettings }: {
+export function ConnectionPanel({ state, operationPending = false, onState, onSettings, initialClient, chatgptActivityQueryStatus }: {
+  initialClient?: "chatgpt" | "gemini";
+  chatgptActivityQueryStatus?: ChatgptActivityQueryStatus;
   state: DesktopState;
   operationPending?: boolean;
   onState: (state: DesktopState) => void;
   onSettings: (section: "network" | "runtime" | "diagnostics") => void;
 }) {
+  useEffect(() => { if (initialClient) document.getElementById(initialClient + "-heading")?.focus(); }, [initialClient]);
   const p = useProduct();
   const c = useConnectionsTools();
   const { t } = useLocale();
-  const s = useShellText();
   const profiles = state.connections ?? EMPTY_CONNECTIONS;
-  const [editor, setEditor] = useState<{ profile: TunnelConnection | null } | null>(null);
+  const [editor, setEditor] = useState<{ profile: TunnelConnection | null; geminiNamed?: boolean; chatgptPreset?: boolean } | null>(null);
   const [deleting, setDeleting] = useState<TunnelConnection | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [tunnelAction, setTunnelAction] = useState<TunnelProfileAction | null>(null);
+  const [serverAction, setServerAction] = useState<"start" | "restart" | null>(null);
   const [failed, setFailed] = useState<DesktopError | null>(null);
+  useEffect(() => {
+    setFailed(previous => previous && isErrorStaleForState(previous, state) ? null : previous);
+  }, [state]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [showReadGuide, setShowReadGuide] = useState(false);
+  const [localSetup, setLocalSetup] = useState(false);
   const [saved, setSaved] = useState(false);
   const submitting = useRef(false);
   const disabled = operationPending || busyId !== null || Boolean(state.current_operation);
@@ -38,8 +51,9 @@ export function ConnectionPanel({ state, operationPending = false, onState, onSe
   const environmentId = state.persistent_environment?.trim() || null;
   const persistentLocal = Boolean(environmentId && local);
   const canManageConnections = !environmentId || local;
-  const serverOwnedProfiles = profiles.profiles.filter(profile => profile.host_mode === "embedded" && profile.autostart);
-  const serverRestartRequired = persistentLocal && profiles.server_restart_required;
+  const serverOwnedProfiles = profiles.profiles.filter(profile => (!profile.provider || profile.provider.kind === "openai") && profile.host_mode === "embedded" && profile.autostart);
+  const serverRestartRequired = persistentLocal && profiles.profiles.some(profile =>
+    (!profile.provider || profile.provider.kind === "openai") && profile.server_restart_required);
   const serverStartRequired = persistentLocal
     && !serverRestartRequired
     && serverOwnedProfiles.length > 0
@@ -55,16 +69,53 @@ export function ConnectionPanel({ state, operationPending = false, onState, onSe
         : state.tunnel_proxy.effective_source === "invalid_custom"
           ? `${t("settings.tunnelProxyCustom")} · ${p("unavailable")}`
           : t("settings.tunnelProxyDirectValue");
-  const failure = failed ? desktopErrorPresentation(failed, t) : null;
   useEffect(() => {
     if (!copiedId) return;
     const timer = window.setTimeout(() => setCopiedId(null), 2500);
     return () => window.clearTimeout(timer);
   }, [copiedId]);
+  const cloudflareProfiles = profiles.profiles.filter(profile => profile.provider && profile.provider.kind !== "openai");
+  const openaiProfiles = profiles.profiles.filter(profile => !profile.provider || profile.provider.kind === "openai");
+  const latest = useRef(state);
+  latest.current = state;
+  const mounted = useRef(false);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const prepareGemini = async (profile: TunnelConnection | null) => {
+    if (!environmentId || !persistentLocal || !state.connections || profiles.config_error || submitting.current || state.current_operation) return;
+    submitting.current = true;
+    setBusyId("__gemini__");
+    setFailed(null);
+    setSaved(false);
+    const currentEnvironment = () => mounted.current && latest.current.persistent_environment === environmentId;
+    try {
+      if (profile && !profile.configuration_id) throw {code: "cloudflare_revision_stale"};
+      const next = await desktopApi.connectGemini({
+        environment_id: environmentId, profile: profile ? {
+          id: profile.id, configuration_id: profile.configuration_id!, revision: profile.revision,
+        } : null,
+      });
+      if (currentEnvironment() && next.persistent_environment === environmentId &&
+          (next.state_generation ?? 0) >= (latest.current.state_generation ?? 0)) onState(next);
+    } catch (value) {
+      if (currentEnvironment()) {
+        setFailed(normalizeDesktopError(value));
+        // A save or start may have taken effect before its reply was lost.
+        try {
+          const observed = await desktopApi.getState();
+          if (currentEnvironment() && observed.persistent_environment === environmentId &&
+              (observed.state_generation ?? 0) >= (latest.current.state_generation ?? 0)) onState(observed);
+        } catch { /* Keep the original diagnostic. */ }
+      }
+    } finally {
+      submitting.current = false;
+      if (mounted.current) setBusyId(null);
+    }
+  };
   const run = async (id: string, action: TunnelProfileAction, expectedRevision?: number, expectedConfigurationId?: string | null) => {
     if (submitting.current || state.current_operation) return;
     submitting.current = true;
     setBusyId(id);
+    setTunnelAction(action);
     setFailed(null);
     setSaved(false);
     try {
@@ -75,12 +126,14 @@ export function ConnectionPanel({ state, operationPending = false, onState, onSe
     } finally {
       submitting.current = false;
       setBusyId(null);
+      setTunnelAction(null);
     }
   };
   const runServer = async (action: "start" | "restart") => {
     if (!environmentId || submitting.current || state.current_operation) return;
     submitting.current = true;
     setBusyId("__server__");
+    setServerAction(action);
     setFailed(null);
     setSaved(false);
     try {
@@ -100,30 +153,91 @@ export function ConnectionPanel({ state, operationPending = false, onState, onSe
     } finally {
       submitting.current = false;
       setBusyId(null);
+      setServerAction(null);
     }
   };
+  const diagnostics = () => onSettings("diagnostics");
+  const remote = state.topology?.server.kind === "remote" || state.environment_setup?.mode === "join";
+  let preparation;
+  if (state.configuration_issue || profiles.config_error || (!local && environmentId && !remote)) {
+    preparation = <div><p>{t("migration.recovery")}</p><button className="secondary-button" onClick={diagnostics}>{p("troubleshooting")}</button></div>;
+  } else if (state.quick_share || state.topology?.experience === "quick_share") {
+    preparation = <p>{t("setup.stopSharing")}</p>;
+  } else if (remote) {
+    preparation = <p>{t("setup.geminiRemote")}</p>;
+  } else if (persistentLocal && state.topology?.runner.kind === "none" && state.environment_setup?.configured !== false) {
+    preparation = <div><p>{t("setup.geminiRunner")}</p><button className="secondary-button" onClick={() => onSettings("runtime")}>{c("openRuntimeSetup")}</button></div>;
+  } else if (!persistentLocal && local && !state.environment_setup) {
+    preparation = <LocalMigrationSetup key={desktopIdentity(state)} state={state} onComplete={onState} onReset={onState} onDiagnostics={diagnostics} />;
+  } else if (!persistentLocal || state.environment_setup?.configured === false) {
+    preparation = localSetup
+      ? <FirstRun state={state} onState={onState} onComplete={() => setLocalSetup(false)} onCancelLocal={() => setLocalSetup(false)} />
+      : <div><p>{t("setup.geminiPrepare")}</p><button className="primary-button" disabled={disabled} onClick={() => setLocalSetup(true)}>{t(state.environment_setup?.configured === false ? "setup.resumeLocal" : "setup.prepareComputer")}</button></div>;
+  }
   return <section className="page-section workspace-page" aria-labelledby="connection-title" data-webcodex-page="connection">
-    <header className="page-heading-row"><h1 id="connection-title">{c("connections")}</h1><button type="button" className="primary-button" disabled={disabled || profiles.config_error || !canManageConnections} onClick={() => { setSaved(false); setEditor({ profile: null }); }}>{c("addConnection")}</button></header>
-    <div className="connection-context"><span>{presentation.connectionText}</span><div className="connection-route"><span>{c("networkRoute")}</span><strong>{route}</strong></div><button type="button" className="text-button" onClick={() => onSettings("network")}>{c("proxySettings")}</button></div>
+    <header className="page-heading-row"><h1 id="connection-title">{c("connections")}</h1></header>
+    {serverAction && <p role="status" className="workspace-notice">{serverAction === "restart" ? c("restarting") : p("starting")}</p>}
+    {local && state.topology?.runner.kind === "local" && <p className="lede">{c("sharedRuntimeHelp")}</p>}
     {state.topology?.server.kind === "remote" && <p className="workspace-notice"><code>{state.topology.server.url}</code></p>}
     {presentation.externalConnectionUnobserved && <p className="workspace-notice">{c("externalConnectionUnobserved")}</p>}
-    {local && !state.readiness.runtime_ready && <div className="workspace-notice"><p>{c("localRuntimeNeeded")}</p><button type="button" className="secondary-button" onClick={() => onSettings("runtime")}>{s("Runtime")}</button></div>}
     {serverRestartRequired && <div className="server-owned-apply shell-notice warning" role="status"><div><strong>{c("serverRestartRequired")}</strong><p>{c("serverRestartHelp")}</p></div><button type="button" className="primary-button" disabled={disabled} onClick={() => void runServer("restart")}>{c("restartServer")}</button></div>}
     {serverStartRequired && <div className="server-owned-apply shell-notice" role="status"><div><strong>{c("serverStartRequired")}</strong><p>{c("serverStartHelp")}</p></div><button type="button" className="primary-button" disabled={disabled} onClick={() => void runServer("start")}>{c("startServer")}</button></div>}
     {profiles.config_error && <p role="alert" className="workspace-notice">{c("configError")}</p>}
-    {failure && !deleting && <div role="alert" className="workspace-notice"><strong>{failure.title}</strong><p>{failure.action}</p><p>{c("operationFailed")}</p>{autoProxyRecovery && <p>{c("currentProxyHint")}</p>}</div>}
+    {failed && !deleting && <div className="connection-error">
+      <DesktopErrorAlert
+        error={failed}
+        disabled={disabled}
+        actions={{
+          onOpenDiagnostics: diagnostics,
+          onRestartServer: environmentId ? () => void runServer("restart") : undefined,
+          onOpenRuntime: () => onSettings("runtime"),
+          onOpenNetwork: () => onSettings("network"),
+          onRefresh: () => void desktopApi.refresh().then(onState).catch(value => setFailed(normalizeDesktopError(value))),
+          onCheckConnection: () => void desktopApi.refresh().then(onState).catch(value => setFailed(normalizeDesktopError(value))),
+        }}
+        extraActions={autoProxyRecovery ? <p className="field-help">{c("currentProxyHint")}</p> : undefined}
+      />
+      {failed.code === "tunnel_revision_stale" && <p className="field-help">{c("staleConnection")}</p>}
+      {failed.code === "cloudflare_selection_conflict" && <p className="field-help">{c("otherCloudflareActive")}</p>}
+    </div>}
     {saved && <p role="status" className="workspace-notice">{c("saved")}</p>}
-    <div className="connection-list">{profiles.profiles.map(profile => profile.provider && profile.provider.kind !== "openai" ? <CloudflareConnectionCard key={profile.id} profile={profile} canStart={local && state.readiness.server === "ready"} busy={disabled || !canManageConnections} onRepair={() => onSettings("runtime")} onRestartServer={persistentLocal ? () => void runServer("restart") : undefined} onEdit={() => setEditor({ profile })} onDelete={() => { setFailed(null); setDeleting(profile); }} /> : <ConnectionCard key={profile.id} profile={profile} canStart={local && state.readiness.runtime_ready} busy={disabled || !canManageConnections} copied={copiedId === profile.id}
-      onAction={action => void run(profile.id, action)} onSettings={onSettings}
-      onEdit={() => { setSaved(false); setEditor({ profile }); }} onDelete={() => { setFailed(null); setDeleting(profile); }}
-      onCopy={() => { if (profile.tunnel_id) void writeText(profile.tunnel_id).then(() => setCopiedId(profile.id)).catch(value => setFailed(normalizeDesktopError(value))); }} />)}</div>
-    {state.connections && !profiles.profiles.length && !profiles.config_error && state.topology?.experience !== "quick_share" && <p className="workspace-empty">{presentation.connectionText}</p>}
+    <GeminiConnections key={environmentId} state={state} profiles={cloudflareProfiles} preparation={preparation} preparing={busyId === "__gemini__"}
+      busy={disabled || !state.connections || profiles.config_error} canStart={persistentLocal && state.readiness.server === "ready" && busyId !== "__server__" && state.current_operation?.kind !== "environment_service"}
+      onPrepare={profile => void prepareGemini(profile)} onNamed={() => setEditor({profile: null, geminiNamed: true})}
+      onRepair={() => onSettings("runtime")} onRestartServer={persistentLocal && !serverRestartRequired ? () => void runServer("restart") : undefined}
+      onEdit={profile => setEditor({profile})} onDelete={profile => { setFailed(null); setDeleting(profile); }} />
+    {state.topology?.experience !== "quick_share" && <section className="chatgpt-connection" aria-labelledby="chatgpt-heading">
+      <header className="workspace-section-heading">
+        <div>
+          <h2 id="chatgpt-heading" tabIndex={-1}>{c("connectChatgpt")}</h2>
+          <p className="field-help">{c("chatgptSectionHelp")}</p>
+        </div>
+        {canManageConnections && !profiles.config_error && <button type="button" className={openaiProfiles.length ? "secondary-button" : "primary-button"} disabled={disabled} onClick={() => { setSaved(false); setEditor({ profile: null, chatgptPreset: true }); }}>{c("connectChatgpt")}</button>}
+      </header>
+      {local && !state.readiness.runtime_ready && !serverStartRequired && !serverRestartRequired && openaiProfiles.length > 0 &&
+        <div className="shell-actions"><p>{c("localRuntimeNeeded")}</p>
+          <button type="button" className="secondary-button" disabled={disabled} onClick={() => void desktopApi.resumeSavedRuntime().then(onState).catch(value => setFailed(normalizeDesktopError(value)))}>{p("start")} WebCodex</button></div>}
+      {openaiProfiles.some(profile => profile.ready) && <p className="field-help">{c("chatgptNextStep")}</p>}
+      {(openaiProfiles.length > 0 || state.chatgpt_activity?.observed) && <ChatgptObservation state={state} queryStatus={chatgptActivityQueryStatus} />}
+      <div className="connection-list">{openaiProfiles.map(profile => <ConnectionCard key={profile.id} profile={profile} canStart={local && state.readiness.runtime_ready} busy={disabled || !canManageConnections} pendingAction={busyId === profile.id ? tunnelAction : null} copied={copiedId === profile.id}
+        onAction={action => void run(profile.id, action)} onSettings={onSettings}
+        onEdit={() => { setSaved(false); setEditor({ profile }); }} onDelete={() => { setFailed(null); setDeleting(profile); }}
+        onCopy={() => { if (profile.tunnel_id) void writeText(profile.tunnel_id).then(() => setCopiedId(profile.id)).catch(value => setFailed(normalizeDesktopError(value))); }} />)}</div>
+      {state.connections && !profiles.profiles.length && !profiles.config_error && <p className="workspace-empty">{presentation.connectionText}</p>}
+    </section>}
     {state.topology?.experience === "quick_share" && state.quick_share && <button className="secondary-button" disabled={disabled} onClick={() => { void desktopApi.stopQuickShare().then(onState).catch(value => setFailed(normalizeDesktopError(value))); }}>{p("stop")} Quick Share</button>}
-    <FirstReadGuide state={state} />
-    {editor && <ConnectionEditor profile={editor.profile} persistentLocal={persistentLocal} onSetup={() => onSettings("runtime")} onState={next => { onState(next); setSaved(true); }} onClose={() => setEditor(null)} />}
+    <details className="connection-details" onToggle={event => setShowReadGuide(event.currentTarget.open)}>
+      <summary>{t("completion.chatgptGuide")}</summary>
+      {showReadGuide && <FirstReadGuide state={state} />}
+    </details>
+    <details className="connection-details"><summary>{t("first.advanced")}</summary>
+    <div className="connection-context"><span>{presentation.connectionText}</span><div className="connection-route"><span>{c("networkRoute")}</span><strong>{route}</strong></div><button type="button" className="text-button" onClick={() => onSettings("network")}>{c("proxySettings")}</button></div>
+      <button type="button" className="secondary-button" disabled={disabled || profiles.config_error || !canManageConnections} onClick={() => { setSaved(false); setEditor({ profile: null }); }}>{c("addConnection")}</button>
+    </details>
+    {editor && (!editor.profile || profiles.profiles.some(item => item.id === editor.profile?.id && item.revision === editor.profile.revision && item.configuration_id === editor.profile.configuration_id)) && <ConnectionEditor environmentId={environmentId} profile={editor.profile} geminiNamed={editor.geminiNamed} chatgptPreset={editor.chatgptPreset} initialAutostart={!editor.geminiNamed || !cloudflareProfiles.some(item => item.autostart)} persistentLocal={persistentLocal} onSetup={() => requestAnimationFrame(() => document.getElementById("gemini-heading")?.focus())} onState={next => { onState(next); setSaved(true); }} onClose={() => setEditor(null)} />}
     {deleting && <WorkspaceDialog title={c("delete") + " " + deleting.name} onClose={() => setDeleting(null)} busy={busyId !== null}>
       <p>{deleting.host_mode === "embedded" ? c("deleteServerOwnedHelp") : c("deleteConnectionHelp")}</p>
-      {failed && <p role="alert" className="workspace-notice">{c("operationFailed")}</p>}
+      {failed && <DesktopErrorAlert error={failed} disabled={disabled} actions={{ onOpenDiagnostics: diagnostics }} />}
       <div className="connection-actions"><button type="button" className="danger-button" disabled={disabled} onClick={() => void run(deleting.id, "delete", deleting.provider && deleting.provider.kind !== "openai" ? deleting.revision : undefined, deleting.configuration_id)}>{c("delete")}</button><button type="button" className="secondary-button" disabled={disabled} onClick={() => setDeleting(null)}>{p("cancel")}</button></div>
     </WorkspaceDialog>}
   </section>;

@@ -40,6 +40,7 @@ mod cloudflare_ingress;
 mod oauth_http;
 mod public_ingress_auth;
 pub use cloudflare_host::run_cloudflare_tunnel_with_stop;
+pub use project_entry::cloudflare_transport::prepare_user_cloudflare_component;
 
 mod pairing_http;
 mod plugin_gateway;
@@ -89,11 +90,7 @@ pub use config::Config;
 pub use config::OAuth2Config;
 pub use db::{Database, RotateResult};
 
-pub(crate) use runner_http::{
-    runner_job_update, runner_offline, runner_persistent_shell_result, runner_poll,
-    runner_register, runner_result, shell_file_op, shell_job, shell_job_log, shell_job_status,
-    shell_job_stop, shell_jobs_list, shell_run, RunnerRegistry,
-};
+pub(crate) use runner_http::RunnerRegistry;
 pub use startup::{
     is_project_command, run_project_command, run_regular_server_tunnel, CliCommandOutput,
     RegularServerTunnelOptions,
@@ -128,6 +125,13 @@ async fn healthz(res: &mut Response) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerBinaryAction {
+    MigrateWorkflowSessions {
+        database: std::path::PathBuf,
+    },
+    RestoreForkWorkflowBackup {
+        database: std::path::PathBuf,
+        backup: std::path::PathBuf,
+    },
     Run {
         stop_on_stdin_eof: bool,
         env_file: Option<std::path::PathBuf>,
@@ -167,9 +171,14 @@ where
             stop_on_stdin_eof: true,
             env_file: Some(path.into()),
         },
+        [flag, database] if flag == "--migrate-workflow-sessions" && !database.is_empty() && !database.starts_with('-') =>
+            ServerBinaryAction::MigrateWorkflowSessions { database: database.into() },
+        [flag, database, backup] if flag == "--restore-fork-workflow-backup"
+            && !database.is_empty() && !backup.is_empty() && !database.starts_with('-') && !backup.starts_with('-') =>
+            ServerBinaryAction::RestoreForkWorkflowBackup { database: database.into(), backup: backup.into() },
         [arg] if matches!(arg.as_str(), "--help" | "-h") => ServerBinaryAction::Exit {
             code: 0,
-            stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n      --env-file PATH     Load the selected private Server environment\n      --stop-on-stdin-eof  Stop when the invoking parent closes stdin\n  -h, --help               Print help and exit\n  -V, --version            Print version and exit\n".to_string(),
+            stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n      --env-file PATH     Load the selected private Server environment\n      --stop-on-stdin-eof  Stop when the invoking parent closes stdin\n      --migrate-workflow-sessions DB_PATH  Explicit offline Fork schema migration with verified backup\n      --restore-fork-workflow-backup DB_PATH BACKUP_PATH  Explicit offline restore via converted private stage\n  -h, --help               Print help and exit\n  -V, --version            Print version and exit\n".to_string(),
             stderr: String::new(),
         },
         [arg] if arg == "--build-info-json" => ServerBinaryAction::Exit {
@@ -195,6 +204,16 @@ where
 /// MCP dispatch hard bound (150s) plus response-write margin so the inner,
 /// better-reported timeouts always fire first.
 const REQUEST_HARD_TIMEOUT_SECS: u64 = 300;
+
+/// Low-frequency cadence for the runtime stale-auth sweep. `Database::open`
+/// purges expired/revoked/used auth material once at startup; this sweep keeps
+/// a long-running Server from accumulating dead rows between restarts. Each
+/// sweep deletes at most [`AUTH_PURGE_SWEEP_BATCH_PER_TABLE`] rows per table,
+/// so a backlog shrinks over consecutive sweeps with bounded writer-lock time.
+const AUTH_PURGE_SWEEP_INTERVAL_SECS: u64 = 6 * 60 * 60;
+/// Per-table delete bound for one stale-auth sweep (see
+/// `Database::purge_stale_auth_rows_batch`).
+const AUTH_PURGE_SWEEP_BATCH_PER_TABLE: i64 = 200;
 
 /// A finite request may legitimately consume the full HTTP hard timeout. Give
 /// its response and connection teardown an additional bounded window before
@@ -281,7 +300,9 @@ pub async fn run_server_with_shutdown(
             load.loaded_count,
         );
     }
-    let config = Config::from_env();
+    let config = Config::from_env().map_err(std::io::Error::other)?;
+    let mcp_tool_exposure =
+        mcp::tool_exposure::ToolExposureConfig::from_env().map_err(std::io::Error::other)?;
     let mcp_host_timing =
         mcp_host::McpHostTimingOverrides::from_env().map_err(std::io::Error::other)?;
     let mcp_host_policy = mcp_host::McpHostConfig::from_env()
@@ -296,14 +317,6 @@ pub async fn run_server_with_shutdown(
     let console_asset_source = Arc::new(
         console_web::ConsoleAssetSource::from_env(&config.addr).map_err(std::io::Error::other)?,
     );
-    if !config.is_auth_enabled() {
-        tracing::warn!(
-            "WEBCODEX_TOKEN is not set! Running in development mode without authentication. \
-Use `webcodex server init` to generate a bootstrap/admin key, or set WEBCODEX_ALLOW_ANONYMOUS=true \
-only for local/trusted-network demos."
-        );
-        tracing::warn!("Anonymous API access is rejected by default in production mode.");
-    }
     if auth::shared_key_enabled() && auth::shared_key_requires_remote_opt_in(&config) {
         if auth::shared_key_remote_enabled() {
             tracing::warn!(
@@ -345,10 +358,9 @@ explicitly allow remote shared-key auth."
     // downstream local (`db`, registries, backup maintenance, `ToolRuntime` / session writer). Locals
     // drop in reverse declaration order; uncommitted `PendingRestoreStartup` must drop only after
     // those handles close so RAII rollback does not race open SQLite handles. Do not `drop` early.
-    let mut pending_restore = webcodex_store::OfflineRestoreOwner::from_shared_guard(
-        server_instance_owner.clone(),
-    )?
-    .recover_startup_before_database_open()?;
+    let mut pending_restore =
+        webcodex_store::OfflineRestoreOwner::from_shared_guard(server_instance_owner.clone())?
+            .recover_startup_before_database_open()?;
     let db = Database::open(&server_instance_owner.database_path().to_path_buf())?;
     if !server_instance_owner.owns_database(&db) {
         return Err(anyhow::anyhow!(
@@ -406,6 +418,7 @@ explicitly allow remote shared-key auth."
     let mut runtime_info =
         tool_runtime::RuntimeInfo::from_config_with_quic_config(&config, &quic_cfg);
     runtime_info.tunnels = tunnels.status();
+    runtime_info.mcp_tool_exposure = mcp_tool_exposure;
     let runtime_info = Arc::new(runtime_info);
     let runtime_state_dir = config.runtime_state_dir();
     let mut tool_runtime_builder =
@@ -418,11 +431,10 @@ explicitly allow remote shared-key auth."
             .with_communication_database(db.clone())
             .with_job_terminal_attention(db.clone(), job_terminal_continuations)
             .with_backup_maintenance(backup_maintenance.clone());
-    tool_runtime_builder = tool_runtime_builder
-        .with_session_database(
-            server_instance_owner.database_path().to_path_buf(),
-            config.session_ledger_path(),
-        )?;
+    tool_runtime_builder = tool_runtime_builder.with_session_database(
+        server_instance_owner.database_path().to_path_buf(),
+        config.session_ledger_path(),
+    )?;
     tool_runtime_builder = tool_runtime_builder
         .with_persistent_coding_agent_observation_state(&runtime_state_dir)
         .map_err(std::io::Error::other)?;
@@ -653,46 +665,7 @@ explicitly allow remote shared-key auth."
             Router::with_path(route_metadata::api_path(RouteId::AgentTokensRevoke))
                 .post(runner_tokens_http::runner_tokens_revoke),
         )
-        .push(Router::with_path(route_metadata::api_path(RouteId::ShellRun)).post(shell_run))
-        .push(Router::with_path(route_metadata::api_path(RouteId::ShellFile)).post(shell_file_op))
-        .push(Router::with_path(route_metadata::api_path(RouteId::ShellJob)).post(shell_job))
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellJobsStatus))
-                .post(shell_job_status),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellJobsLog)).post(shell_job_log),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellJobsStop))
-                .post(shell_job_stop),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::ShellJobsList))
-                .post(shell_jobs_list),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerRegister))
-                .post(runner_register),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerOffline))
-                .post(runner_offline),
-        )
-        .push(Router::with_path(route_metadata::api_path(RouteId::RunnerPoll)).post(runner_poll))
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerResult)).post(runner_result),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(
-                RouteId::RunnerPersistentShellResult,
-            ))
-            .post(runner_persistent_shell_result),
-        )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::RunnerJobUpdate))
-                .post(runner_job_update),
-        )
+        .push(runner_http::routes())
         // WebSocket Runner transport (preferred long-lived connection).
         // Polling endpoints above remain as fallback. Bearer auth is
         // enforced by the shared AuthMiddleware hoop.
@@ -789,17 +762,17 @@ explicitly allow remote shared-key auth."
         .push(health_router)
         .push(runtime_console_router)
         .push(admin_router)
-        // OAuth2 token, revocation, and discovery endpoints — public, no
-        // AuthMiddleware. Token/revoke clients authenticate via
-        // client_id + client_secret in the form body.
+        // Public OAuth endpoints enforce their own registration and client authentication policies.
+        .push(
+            Router::with_path(route_metadata::root_path(RouteId::OAuthRegister))
+                .post(oauth_http::oauth_register),
+        )
         .push(
             Router::with_path(route_metadata::root_path(RouteId::OAuthToken))
-                .hoop(public_ingress_auth::ClientIngressGate::ClientId)
                 .post(oauth_http::oauth_token),
         )
         .push(
             Router::with_path(route_metadata::root_path(RouteId::OAuthRevoke))
-                .hoop(public_ingress_auth::ClientIngressGate::ClientId)
                 .post(oauth_http::oauth_revoke),
         )
         // /oauth/authorize is NOT behind AuthMiddleware: the handler accepts
@@ -919,6 +892,39 @@ explicitly allow remote shared-key auth."
             runner_http::recovery_timeout_sweep(&sweep_registry).await;
         }
     });
+    // Low-frequency bounded cleanup of expired/revoked/used authentication
+    // material (same predicates as the startup purge in `Database::open`).
+    // Long-running Servers accumulate dead rows between restarts; each sweep
+    // deletes at most a small batch per table so the writer connection is
+    // never held for an unbounded bulk delete. The task dies with the process
+    // like the recovery sweep above; no shutdown coordination is needed.
+    let purge_db = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            AUTH_PURGE_SWEEP_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the first (immediate) tick: startup already purged.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let purge_db = purge_db.clone();
+            // Bounded synchronous SQLite work stays off the async worker.
+            let purged = tokio::task::spawn_blocking(move || {
+                purge_db.purge_stale_auth_rows_batch(
+                    chrono::Utc::now().timestamp(),
+                    AUTH_PURGE_SWEEP_BATCH_PER_TABLE,
+                )
+            })
+            .await;
+            match purged.unwrap_or_else(|error| Err(anyhow::anyhow!("purge task failed: {error}")))
+            {
+                Ok(0) => {}
+                Ok(count) => tracing::debug!("stale-auth sweep deleted {count} rows"),
+                Err(error) => tracing::warn!("stale-auth sweep failed: {error}"),
+            }
+        }
+    });
     #[cfg(target_os = "macos")]
     if let Some(log) = service_log.as_ref() {
         log.ready().map_err(std::io::Error::other)?;
@@ -946,7 +952,10 @@ explicitly allow remote shared-key auth."
             }
         };
         if backup_services_stop.borrow().is_some() {
-            request_owner_shutdown(backup_maintenance_for_stop.as_ref(), "initial background stop");
+            request_owner_shutdown(
+                backup_maintenance_for_stop.as_ref(),
+                "initial background stop",
+            );
             return;
         }
         loop {
@@ -974,12 +983,7 @@ explicitly allow remote shared-key auth."
     )
     .await;
     if let Some(mut listener) = quic_listener.take() {
-        match tokio::time::timeout(
-            runner_quic::QUIC_LISTENER_JOIN_TIMEOUT,
-            &mut listener,
-        )
-        .await
-        {
+        match tokio::time::timeout(runner_quic::QUIC_LISTENER_JOIN_TIMEOUT, &mut listener).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 if error.is_panic() {
@@ -1123,6 +1127,46 @@ mod tests {
     }
 
     #[test]
+    fn server_binary_requires_explicit_offline_migration_or_restore_action() {
+        let database = r"C:\WebCodex\data\state.db";
+        let backup = r"C:\WebCodex\data\backups\old.db";
+        assert_eq!(
+            server_binary_action(["--migrate-workflow-sessions", database]),
+            ServerBinaryAction::MigrateWorkflowSessions {
+                database: database.into()
+            }
+        );
+        assert_eq!(
+            server_binary_action(["--restore-fork-workflow-backup", database, backup]),
+            ServerBinaryAction::RestoreForkWorkflowBackup {
+                database: database.into(),
+                backup: backup.into()
+            }
+        );
+        for args in [
+            vec!["--migrate-workflow-sessions"],
+            vec![
+                "--migrate-workflow-sessions",
+                database,
+                "--stop-on-stdin-eof",
+            ],
+            vec!["--restore-fork-workflow-backup", database],
+            vec![
+                "--restore-fork-workflow-backup",
+                database,
+                backup,
+                "--env-file",
+                database,
+            ],
+        ] {
+            assert!(matches!(
+                server_binary_action(args),
+                ServerBinaryAction::Exit { code: 2, .. }
+            ));
+        }
+    }
+
+    #[test]
     fn test_parse_env_file_line_basic() {
         let parsed = parse_env_file_line("WEBCODEX_ADDR=127.0.0.1:8080")
             .unwrap()
@@ -1173,13 +1217,12 @@ mod tests {
         // Clear env vars to test defaults; Drop restores the process environment.
         env.remove("WEBCODEX_ADDR");
         env.remove("WEBCODEX_DATA");
-        env.remove("WEBCODEX_TOKEN");
+        env.set("WEBCODEX_TOKEN", "test-bootstrap");
 
-        let config = Config::from_env();
-        assert_eq!(config.addr, "0.0.0.0:8080");
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.addr, "127.0.0.1:8080");
         assert_eq!(config.data_dir, PathBuf::from("./data"));
-        assert_eq!(config.token, None);
-        assert!(!config.is_auth_enabled());
+        assert!(config.is_auth_enabled());
         assert_eq!(config.max_text_size, 2 * 1024 * 1024);
     }
 

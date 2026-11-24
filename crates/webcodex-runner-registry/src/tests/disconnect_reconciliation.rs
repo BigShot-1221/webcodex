@@ -4,43 +4,20 @@ use super::*;
 async fn reconcile_disconnect_marks_running_jobs_lost() {
     let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "oe".to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
-            owner: None,
-            hostname: None,
-            host_context: None,
-            capabilities: async_job_capabilities(),
-            policy: None,
-        }))
+        .register(current_runner_registration(runner_registration_request(
+            "oe".to_string(),
+            "inst".to_string(),
+            crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            async_job_capabilities(),
+        )))
         .await
         .unwrap();
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                login: false,
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "test".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -64,26 +41,12 @@ async fn reconcile_disconnect_fails_pending_sync_requests_fast() {
     // wait timeout.
     let registry = RunnerRegistry::default();
     registry
-        .register(current_runner_registration(RunnerRegisterRequest {
-            computer_session_availability: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "oe".to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
-            owner: None,
-            hostname: None,
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(
-                RunnerCapabilities::default(),
-            ),
-            policy: None,
-        }))
+        .register(current_runner_registration(runner_registration_request(
+            "oe".to_string(),
+            "inst".to_string(),
+            crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            crate::test_support::current_runner_capabilities(RunnerCapabilities::default()),
+        )))
         .await
         .unwrap();
     let (_request_id, rx) = registry

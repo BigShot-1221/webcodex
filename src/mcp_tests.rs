@@ -176,6 +176,17 @@ fn test_runtime() -> ToolRuntime {
     ToolRuntime::new_for_tests()
 }
 
+/// Workflow/App fixtures explicitly opt into the surface they exercise.
+fn with_workflow_tools(mut runtime: ToolRuntime) -> ToolRuntime {
+    std::sync::Arc::make_mut(&mut runtime.runtime_info).mcp_tool_exposure =
+        crate::mcp::tool_exposure::ToolExposureConfig::all_enabled();
+    runtime
+}
+
+fn workflow_runtime() -> ToolRuntime {
+    with_workflow_tools(test_runtime())
+}
+
 /// Build a runtime with an explicit MCP startup snapshot, so tests assert the
 /// frozen values instead of holding process-global env guards across requests.
 fn test_runtime_with_mcp_snapshot(
@@ -296,20 +307,30 @@ fn mcp_export_api_auth(api_key_id: &str, username: &str) -> crate::auth::AuthCon
 mod agent_continuation_app;
 #[path = "mcp_tests/artifact_export.rs"]
 mod artifact_export;
+#[path = "mcp_tests/cli.rs"]
+mod cli;
 #[path = "mcp_tests/computer_app.rs"]
 mod computer_app;
 #[path = "mcp_tests/computer_contracts.rs"]
 mod computer_contracts;
+#[path = "mcp_tests/computer_post_observation.rs"]
+mod computer_post_observation;
 #[path = "mcp_tests/conformance.rs"]
 mod conformance;
 #[path = "mcp_tests/execution_control.rs"]
 mod execution_control;
 #[path = "mcp_tests/execution_feedback.rs"]
 mod execution_feedback;
+#[path = "mcp_tests/experience_baseline.rs"]
+mod experience_baseline;
 #[path = "mcp_tests/file_import.rs"]
 mod file_import;
+#[path = "mcp_tests/fixed_scope.rs"]
+mod fixed_scope;
 #[path = "mcp_tests/goal_plan_app.rs"]
 mod goal_plan_app;
+#[path = "mcp_tests/host_review.rs"]
+mod host_review;
 #[path = "mcp_tests/http_transport.rs"]
 mod http_transport;
 #[path = "mcp_tests/invocation_envelope.rs"]
@@ -328,6 +349,8 @@ mod pdf_document_app;
 mod plugin_check;
 #[path = "mcp_tests/plugin_tools.rs"]
 mod plugin_tools;
+#[path = "mcp_tests/project_discovery.rs"]
+mod project_discovery;
 #[path = "mcp_tests/protocol.rs"]
 mod protocol;
 #[path = "mcp_tests/request_policy.rs"]
@@ -338,12 +361,16 @@ mod resource_references;
 mod response_tests;
 #[path = "mcp_tests/result_app.rs"]
 mod result_app;
+#[path = "mcp_tests/runner_discovery.rs"]
+mod runner_discovery;
 #[path = "mcp_tests/runtime_tools.rs"]
 mod runtime_tools;
 #[path = "mcp_tests/ssh_resource.rs"]
 mod ssh_resource;
 #[path = "mcp_tests/structured_failure.rs"]
 mod structured_failure;
+#[path = "mcp_tests/tool_exposure.rs"]
+mod tool_exposure;
 #[path = "mcp_tests/tools.rs"]
 mod tools;
 #[path = "mcp_tests/work_result_app.rs"]

@@ -8,7 +8,7 @@ import {
   Server,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   LANGUAGE_STORAGE_KEY,
   loadLanguagePreference,
@@ -36,6 +36,7 @@ import { useFlowingSelection } from "../ui/useFlowingSelection.js";
 import { locateSession } from "./api/sessions.js";
 import { useProjects } from "./state/useProjects.js";
 import { projectFamilyId } from "../ui/projectPresentation.js";
+import { projectInventoryKey } from "./model/projectInventory.js";
 import { RuntimeV2Client } from "./api/client.js";
 import { SessionWindowNavigation } from "./components/SessionWindowNavigation.js";
 import { AuthGate } from "./components/AuthGate.js";
@@ -82,6 +83,7 @@ export function App() {
   const [token, setToken] = useState(initialToken);
   const [view, setViewState] = useState<PrimaryView>(initialView);
   const [selected, setSelected] = useState<SessionLocation | null>(null);
+  const [mobileWindowDetail, setMobileWindowDetail] = useState(false);
   const [workSurface, setWorkSurface] = useState<WorkSurface>("windows");
   const [workWindowTarget, setWorkWindowTarget] = useState<{ windowKey: string; sessionId: string } | null>(null);
   const [sessionNavigation, setSessionNavigation] = useState<SessionLocation | null>(null);
@@ -95,6 +97,20 @@ export function App() {
   const [mobileSettingsOpen, setMobileSettingsOpen] = useState(false);
   const sessionLocator = useRef<AbortController | null>(null);
   const navigationRef = useRef<HTMLElement | null>(null);
+  const contentRef = useRef<HTMLElement | null>(null);
+  const windowListScroll = useRef(0);
+  const mobileDetailActive = useRef(false);
+  const showMobileWindowDetail = useCallback((open: boolean) => {
+    if (mobileDetailActive.current === open) return;
+    mobileDetailActive.current = open;
+    if (open && contentRef.current) windowListScroll.current = contentRef.current.scrollTop;
+    setMobileWindowDetail(open);
+  }, []);
+  useLayoutEffect(() => {
+    // Restore after the shell navigation has returned, avoiding scroll anchoring
+    // against the shorter detail layout during the same React commit.
+    if (contentRef.current) contentRef.current.scrollTop = mobileWindowDetail ? 0 : windowListScroll.current;
+  }, [mobileWindowDetail]);
   const mobileNavigationRef = useRef<HTMLElement | null>(null);
   const navigationSelection = { variant: "filled", itemSelector: "button", selectedSelector: "button[aria-current]" } as const;
   useFlowingSelection(navigationRef, view, navigationSelection);
@@ -136,10 +152,11 @@ export function App() {
   const overviewState = useRuntimeOverview(client, Boolean(token), handleUnauthorized,
     view === "runtime" || (view === "work" && workSurface === "session"));
   const overview = overviewState.data;
+  const inventoryKey = projectInventoryKey(overview);
   // Work needs labels/lineage, not a new Project projection on every nav tick.
   // Projects owns its own inventory; Runtime/Session hydrate through full overview.
   const workCatalog = useProjects(client, Boolean(token) && view === "work" && workSurface !== "session" && overview?.projects_included === false,
-    handleUnauthorized, { initialLimit: 2_000, refreshMs: 60_000 });
+    handleUnauthorized, { initialLimit: 2_000, refreshMs: 60_000, inventoryKey });
   const workProjects = overview?.projects_included === false ? workCatalog.projects : overview?.projects || [];
   const visibleProjectFamilyCount = useMemo(
     () => overview?.visible_project_families ?? new Set((overview?.projects || []).map(projectFamilyId)).size,
@@ -234,12 +251,13 @@ export function App() {
   const locateExactSession = useCallback(async (sessionId: string): Promise<boolean> => {
     sessionLocator.current?.abort();
     const controller = new AbortController();
+    const authorityRevision = client.authorityRevision ?? 0;
     sessionLocator.current = controller;
     const response = await locateSession(client, sessionId, controller.signal);
-    if (sessionLocator.current !== controller || controller.signal.aborted || !response) return false;
+    if (sessionLocator.current !== controller || controller.signal.aborted || !response || (client.authorityRevision ?? 0) !== authorityRevision) return false;
     sessionLocator.current = null;
     if (response.status === 401) {
-      lock(translate("Your access key is no longer valid. Connect again.", language));
+      if ((client.authorityRevision ?? 0) === authorityRevision) lock(translate("Your access key is no longer valid. Connect again.", language));
       return false;
     }
     if (!response.ok || !response.data) {
@@ -282,7 +300,7 @@ export function App() {
   }
 
   return (
-    <div className={"app-shell ui-canvas" + (sidebarCollapsed ? " sidebar-collapsed" : "")}>
+    <div data-window-detail={mobileWindowDetail || undefined} className={"app-shell ui-canvas" + (sidebarCollapsed ? " sidebar-collapsed" : "")}>
       <aside className="app-nav ui-glass">
         <div className="nav-brand-row">
           <div className="brand">
@@ -336,7 +354,7 @@ export function App() {
       </div>
       {mobileSettingsOpen && <div id="mobile-preferences" className="mobile-preferences ui-glass" role="group" aria-label={translate("Preferences", language)}>{preferenceControls()}<div className="mobile-lock-action">{lockControl()}</div></div>}
 
-      <section className="app-content">
+      <section ref={contentRef} className="app-content">
         {notice && <div className="global-notice" role="status">{notice}<IconButton label={translate("Close", language)} onClick={() => setNotice("")}><X size={16} /></IconButton></div>}
         {view === "work" && (
           <WorkView
@@ -353,10 +371,11 @@ export function App() {
             onOpenWindow={openWindow}
             onOpenSession={openSession}
             onLocateSession={locateExactSession}
-            onOpenSessionRecord={openSessionRecord}
+            onBackToWindows={openWork}
             requestedWindowKey={workWindowTarget?.windowKey}
             requestedSessionId={workWindowTarget?.sessionId}
             onRequestedWindowConsumed={() => setWorkWindowTarget(null)}
+            onMobileDetailChange={showMobileWindowDetail}
             onUnauthorized={handleUnauthorized}
           />
         )}
@@ -365,6 +384,7 @@ export function App() {
             client={client}
             language={language}
             runners={overview?.runners || []}
+            inventoryKey={inventoryKey}
             onOpenSession={openSession}
             onOpenWindow={openWindow}
             onUnauthorized={handleUnauthorized}
@@ -379,6 +399,7 @@ export function App() {
             onRefresh={overviewState.refresh}
             updatedAt={overviewState.updatedAt}
             refreshing={overviewState.refreshing}
+            onOpenWindow={openWindow}
             onOpenWork={() => { setWorkSurface("windows"); setView("work"); }}
             onUnauthorized={handleUnauthorized}
             target={runtimeTarget}

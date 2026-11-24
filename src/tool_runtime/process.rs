@@ -1,25 +1,25 @@
 use serde_json::json;
 
 use super::helpers::{
-    bounded_tail, command_failed_message, command_outcome_unknown_message,
-    command_rejected_message, command_timeout_message, project_relative_runner_cwd,
-    resolve_runner_cwd, COMMAND_STDIO_TAIL_CHARS,
+    command_failed_message, command_outcome_unknown_message, command_rejected_message,
+    command_timeout_message, project_relative_runner_cwd, resolve_runner_cwd,
+    COMMAND_STDIO_TAIL_CHARS,
 };
 use super::shell::command_execution_state_name;
 use super::structured_execution::{
-    await_structured_job_result, await_structured_request_result, StructuredExecutionBudget,
-    StructuredRequestKind,
+    add_timeout_cap_notice, apply_runner_timeout_cap, await_structured_job_result,
+    await_structured_request_result, StructuredExecutionBudget, StructuredRequestKind,
 };
 use super::tool_audit::{assertion_validation_identity, run_process_validation_identity};
 use super::{ExecutionPurpose, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{
-    process_preview, RunnerFeature, ShellJobStartMetadata, ShellJobVisibility,
-    StructuredJobExecution,
+    process_preview, JobStartContext, JobStartExecution, JobStartRequest, JobValidationCorrelation,
+    RunnerFeature, ShellJobVisibility,
 };
 use crate::runner_protocol::{
-    validate_process_argv, ShellCommandExecutionState, ShellJobInfo, ShellJobOpRequest,
-    ShellProcessArgv, PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
+    validate_process_argv, ShellCommandExecutionState, ShellJobInfo, ShellProcessArgv,
+    PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
     STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS,
 };
 use webcodex_core::runner_skill::RunnerSkillExecutionRequest;
@@ -60,8 +60,10 @@ pub(crate) fn success_output(
     stderr: String,
     duration_ms: Option<u64>,
 ) -> serde_json::Value {
-    let (stdout_tail, stdout_truncated) = bounded_tail(&stdout, COMMAND_STDIO_TAIL_CHARS);
-    let (stderr_tail, stderr_truncated) = bounded_tail(&stderr, COMMAND_STDIO_TAIL_CHARS);
+    let (stdout_tail, stdout_truncated) =
+        super::helpers::bounded_head_tail(&stdout, COMMAND_STDIO_TAIL_CHARS);
+    let (stderr_tail, stderr_truncated) =
+        super::helpers::bounded_head_tail(&stderr, COMMAND_STDIO_TAIL_CHARS);
     json!({
         "exit_code": exit_code,
         "stdout_tail": stdout_tail,
@@ -88,8 +90,10 @@ pub(crate) fn command_failure_result(
     timeout_secs: u64,
     state: ShellCommandExecutionState,
 ) -> ToolResult {
-    let (stdout_tail, stdout_truncated) = bounded_tail(&stdout, COMMAND_STDIO_TAIL_CHARS);
-    let (stderr_tail, stderr_truncated) = bounded_tail(&stderr, COMMAND_STDIO_TAIL_CHARS);
+    let (stdout_tail, stdout_truncated) =
+        super::helpers::bounded_head_tail(&stdout, COMMAND_STDIO_TAIL_CHARS);
+    let (stderr_tail, stderr_truncated) =
+        super::helpers::bounded_head_tail(&stderr, COMMAND_STDIO_TAIL_CHARS);
     let timed_out = state == ShellCommandExecutionState::TimedOut;
     let output = json!({
         "exit_code": exit_code,
@@ -635,20 +639,14 @@ impl ToolRuntime {
             );
         }
         let access = crate::runner_http::runner_access_from_auth(auth);
-        // Runner policy is the final execution authority and may clamp a process
-        // timeout below the protocol/tool maximum. Surface the most recently
-        // registered policy at admission so callers do not mistake the requested
-        // lifetime for the effective one. The Runner still re-applies its live
-        // policy when it prepares the detached launch.
-        let runner_policy_max_timeout_secs = self
-            .runner_registry
-            .get_runner_view_for_auth(&client_id, access.as_ref())
-            .await
-            .and_then(|view| view.policy.map(|policy| policy.max_timeout_secs));
-        let admission_effective_timeout_secs = runner_policy_max_timeout_secs
-            .map(|max_timeout_secs| timeout.min(max_timeout_secs.max(1)))
-            .unwrap_or(timeout);
-        let timeout_clamped = admission_effective_timeout_secs != requested_timeout_secs;
+        let (_, timeout_notice) = apply_runner_timeout_cap(
+            &self.runner_registry,
+            &client_id,
+            auth,
+            Some(requested_timeout_secs),
+            budget,
+        )
+        .await;
         let detached_initiator = match crate::runner_http::detached_initiator_identity_from_auth(auth)
         {
             Ok(identity) => identity,
@@ -665,34 +663,29 @@ impl ToolRuntime {
         };
         match self
             .runner_registry
-            .start_job_with_metadata_for_access_typed(
-                ShellJobOpRequest {
-                    login: false,
-                    op: "start".to_string(),
-                    client_id: Some(client_id),
+            .start_job(
+                JobStartRequest {
+                    client_id: client_id,
                     cwd: Some(effective_cwd),
-                    command: Some(String::new()),
-                    timeout_secs: Some(timeout),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
+                    timeout_secs: timeout,
+                    execution: JobStartExecution::DetachedProcess {
+                        process,
+                        stdin,
+                        idempotency_key,
+                        validation_identity: None,
+                        validation_tool: None,
+                    },
+                    context: JobStartContext {
+                        project_id: Some(project.clone()),
+                        session_id: session_id,
+                        project_cwd: Some(resolved_cwd.clone()),
+                        purpose: Some(declared_purpose.as_str().to_string()),
+                        shell: Some("direct_argv".to_string()),
+                        visibility: ShellJobVisibility::Public,
+                    },
                     codex: None,
                 },
                 "tool_runtime".to_string(),
-                ShellJobStartMetadata {
-                    project_id: Some(project.clone()),
-                    session_id,
-                    project_cwd: Some(resolved_cwd.clone()),
-                    purpose: Some(declared_purpose.as_str().to_string()),
-                    shell: Some("direct_argv".to_string()),
-                    visibility: ShellJobVisibility::Public,
-                    structured_execution: Some(StructuredJobExecution::DetachedProcess(process)),
-                    stdin,
-                    detached_idempotency_key: Some(idempotency_key),
-                    ..Default::default()
-                },
                 access.as_ref(),
                 Some(&detached_initiator),
             )
@@ -718,7 +711,7 @@ impl ToolRuntime {
                 } else {
                     ("pending", false, false)
                 };
-                ToolResult::ok(json!({
+                let mut result = ToolResult::ok(json!({
                     "job_id": job.job_id,
                     "kind": job.kind,
                     "status": job.status,
@@ -733,16 +726,14 @@ impl ToolRuntime {
                     "command_started": started,
                     "command_completed": completed,
                     "terminal": terminal,
-                    "requested_timeout_secs": requested_timeout_secs,
-                    "effective_timeout_secs": admission_effective_timeout_secs,
-                    "runner_policy_max_timeout_secs": runner_policy_max_timeout_secs,
-                    "timeout_clamped": timeout_clamped,
                     "created_at": job.created_at,
                     "observation_token": job.observation_token,
                     "continuation_semantics": crate::tool_runtime::jobs::job_observation_continuation_semantics(),
                     "last_update_seq": job.last_update_seq,
                     "continuation": continuation,
-                }))
+                }));
+                add_timeout_cap_notice(&mut result, timeout_notice);
+                result
             }
             Err(error) => {
                 if let Some(job_id) = error.recovery_job_id() {
@@ -838,7 +829,6 @@ impl ToolRuntime {
                 )
             }
         };
-        let timeout = budget.effective_timeout_secs;
         let process = ShellProcessArgv { executable, args };
         let skill_execution = skill_resource.as_ref();
         let validation_error = match skill_execution {
@@ -935,6 +925,15 @@ impl ToolRuntime {
             }
         };
         let client_id = proj.client_id.clone();
+        let (budget, timeout_notice) = apply_runner_timeout_cap(
+            &self.runner_registry,
+            &client_id,
+            auth,
+            timeout_secs,
+            budget,
+        )
+        .await;
+        let timeout = budget.effective_timeout_secs;
         let effective_cwd = match resolve_runner_cwd(&proj, cwd.as_deref()) {
                 Ok(cwd) => cwd,
                 Err(error) => {
@@ -981,50 +980,47 @@ impl ToolRuntime {
         if async_handoff_available && timeout > budget.sync_wait_secs {
             let job = self
                 .runner_registry
-                .start_job_with_metadata_for_access_typed(
-                    ShellJobOpRequest {
-                        login: false,
-                        op: "start".to_string(),
-                        client_id: Some(client_id),
+                .start_job(
+                    JobStartRequest {
+                        client_id: client_id,
                         cwd: Some(effective_cwd),
-                        command: Some(String::new()),
-                        timeout_secs: Some(timeout),
-                        job_id: None,
-                        since_stdout_line: None,
-                        since_stderr_line: None,
-                        tail_lines: None,
-                        limit: None,
+                        timeout_secs: timeout,
+                        execution: {
+                            let correlation = JobValidationCorrelation {
+                                validation_identity: validation_identity
+                                    .as_ref()
+                                    .map(|identity| identity.identity.clone()),
+                                validation_tool: validation_identity.as_ref().and_then(
+                                    |identity| identity.validation_tool.map(str::to_string),
+                                ),
+                                assertion_name: validation_identity
+                                    .as_ref()
+                                    .filter(|identity| identity.identity.starts_with("assertion:"))
+                                    .and_then(|_| validation_assertion_name.map(str::to_string)),
+                            };
+                            match skill_execution {
+                                Some(request) => JobStartExecution::SkillResource {
+                                    request: request.clone(),
+                                    correlation,
+                                },
+                                None => JobStartExecution::Process {
+                                    process: process.clone(),
+                                    stdin: stdin.clone(),
+                                    correlation,
+                                },
+                            }
+                        },
+                        context: JobStartContext {
+                            project_id: Some(project.clone()),
+                            session_id: session_id,
+                            project_cwd: Some(resolved_cwd.clone()),
+                            purpose: Some(declared_purpose.as_str().to_string()),
+                            shell: Some("direct_argv".to_string()),
+                            visibility: ShellJobVisibility::HiddenUntilHandoff,
+                        },
                         codex: None,
                     },
                     "tool_runtime".to_string(),
-                    ShellJobStartMetadata {
-                        project_id: Some(project.clone()),
-                        session_id,
-                        project_cwd: Some(resolved_cwd.clone()),
-                        purpose: Some(declared_purpose.as_str().to_string()),
-                        shell: Some("direct_argv".to_string()),
-                        visibility: ShellJobVisibility::HiddenUntilHandoff,
-                        structured_execution: Some(match skill_execution {
-                            Some(request) => StructuredJobExecution::SkillResource(request.clone()),
-                            None => StructuredJobExecution::Process(process.clone()),
-                        }),
-                        validation_identity: validation_identity
-                            .as_ref()
-                            .map(|identity| identity.identity.clone()),
-                        validation_tool: validation_identity
-                            .as_ref()
-                            .and_then(|identity| identity.validation_tool.map(str::to_string)),
-                        assertion_name: validation_identity
-                            .as_ref()
-                            .filter(|identity| identity.identity.starts_with("assertion:"))
-                            .and_then(|_| validation_assertion_name.map(str::to_string)),
-                        stdin: if skill_execution.is_some() {
-                            None
-                        } else {
-                            stdin.clone()
-                        },
-                        ..Default::default()
-                    },
                     crate::runner_http::runner_access_from_auth(auth).as_ref(),
                     None,
                 )
@@ -1067,6 +1063,7 @@ impl ToolRuntime {
                 Ok(result) => result,
                 Err(failure) => return failure.into_tool_result(&project, budget),
             };
+            add_timeout_cap_notice(&mut result, timeout_notice);
             decorate(
                 &mut result.output,
                 declared_purpose,

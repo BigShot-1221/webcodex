@@ -6,7 +6,8 @@ import { desktopApi } from "../../lib/desktop-api";
 import { desktopIdentity, readDesktopObservation } from "../../lib/desktop-observation";
 import type { DesktopError, DesktopState, TunnelProxyMode } from "../../models/topology";
 import { LANGUAGES, useLocale } from "../../i18n/locale";
-import { desktopErrorPresentation, normalizeDesktopError } from "../../i18n/presentation";
+import { normalizeDesktopError } from "../../i18n/presentation";
+import { DesktopErrorAlert } from "../../components/DesktopErrorAlert";
 import { useProduct } from "../../i18n/product";
 import type { RunnerSettings } from "../../models/topology";
 import { ComputerPermissions } from "./ComputerPermissions";
@@ -15,6 +16,8 @@ import { PowerShellInstallGuidance } from "./PowerShellInstallGuidance";
 import { APPEARANCES, useAppearance } from "../../hooks/useAppearance";
 import { AccentPicker } from "../../components/AccentPicker";
 import { RunnerCapacityPanel } from "./RunnerCapacityPanel";
+import { BrowserRuntimeStatus } from "../dashboard/BrowserRuntimeStatus";
+import { WorkspaceStatus } from "../workspace/WorkspaceStatus";
 import { RuntimePanel } from "./RuntimePanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { AboutPanel } from "./AboutPanel";
@@ -220,6 +223,7 @@ function SettingsView({
       {visited.includes("access") && <ComputerPermissions />}
       </div>
       <div id="desktop-settings-diagnostics" hidden={section !== "diagnostics"}>
+        {section === "diagnostics" && <><WorkspaceStatus state={state} /><BrowserRuntimeStatus state={state} /></>}
         {visited.includes("diagnostics") && <DiagnosticsPanel state={state} onState={onState} onActivity={onActivity} onRuntime={() => selectSection("runtime")} onConnection={onConnection} />}
       </div>
       <div id="desktop-settings-network" hidden={section !== "network"} className="settings-network">
@@ -240,9 +244,10 @@ function SettingsView({
         <section className="settings-section">
         <h2>{p("serviceControls")}</h2><p className="field-help">{p("serviceControlsHelp")}</p>
         {visited.includes("runtime") && <LocalServicesPanel state={state} onState={onState} />}
+        {onChangeSetup && !state.topology && <button type="button" className="secondary-button" data-webcodex-action="advanced-runtime-setup" disabled={operationBusy} onClick={onChangeSetup}>{t("setup.prepareComputer")}</button>}
         <details className="workspace-technical"><summary>{p("advanced")}</summary>
         <div className="connection-actions">
-          {onChangeSetup && <button type="button" className="secondary-button" disabled={operationBusy} onClick={onChangeSetup}>{p("changeServer")}</button>}
+          {onChangeSetup && state.topology && <button type="button" className="secondary-button" disabled={operationBusy} onClick={onChangeSetup}>{p("changeServer")}</button>}
           {!state.persistent_environment && onStopRuntime && state.topology?.server.kind === "local" && state.readiness.runtime_ready && <button type="button" className="secondary-button" disabled={operationBusy} onClick={onStopRuntime}>{p("stop")} WebCodex</button>}
         </div>
         {!state.persistent_environment && runnerSettings && <><p className="field-help">{p("restartRunnerHelp")}</p><button type="button" className="secondary-button" disabled={operationBusy || restartingRunner || loadingRunnerSettings || Boolean(runnerSettingsError) || !runnerSettings.can_restart} data-webcodex-action="restart-owned-runner" onClick={() => void restartRunner()}>{p("restartRunner")}</button></>}
@@ -267,19 +272,12 @@ function SettingsView({
 }
 
 function SettingsError({ error, onRetry }: { error: DesktopError; onRetry?: () => void }) {
-  const { t } = useLocale();
   const p = useProduct();
-  const presentation = desktopErrorPresentation(error, t);
   return (
-    <div className="error-card" role="alert">
-      <strong>{presentation.title}</strong>
-      <span>{presentation.action}</span>
-      <details>
-        <summary>{t("common.details")}</summary>
-        <code>{error.code}</code>
-        <p>{error.message}</p>
-      </details>
-      {onRetry && <button type="button" className="secondary-button" onClick={onRetry}>{p("refresh")}</button>}
-    </div>
+    <DesktopErrorAlert
+      error={error}
+      showSafeMessage
+      extraActions={onRetry ? <button type="button" className="secondary-button" onClick={onRetry}>{p("refresh")}</button> : undefined}
+    />
   );
 }

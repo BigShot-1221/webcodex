@@ -1,8 +1,7 @@
 //! JSON session ledger load/save, sanitize-on-restore, and atomic writes.
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -15,14 +14,12 @@ use super::events::{
     sanitize_tool_execution_state, session_input_summary_for_tool,
 };
 use super::model::{
-    ColdSessionRecord, PersistedRetentionTombstoneRow, PersistedSessionLedger,
-    PersistedSessionRecord, SessionEvent, SessionGuards, SessionMessage, SessionMessageKind,
-    SessionMessageStatus, SessionRecord, SessionRetentionTombstone, StoredSession,
-    DEFAULT_MAX_MESSAGES_PER_SESSION, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS,
+    ColdSessionRecord, PersistedRetentionTombstoneRow, PersistedSessionRecord, SessionEvent,
+    SessionGuards, SessionMessage, SessionProjectIdentity, SessionRecord,
+    SessionRetentionTombstone, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS,
     MAX_INPUT_ARRAY_ITEMS, MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_CHARS,
     MAX_MESSAGE_RESOLUTION_CHARS, SESSION_LEDGER_VERSION,
 };
-use self::database::SessionDatabase;
 use super::query::{is_valid_completion_id, validate_message_tags};
 use super::util::{
     bound_chars, bound_event_error_summary, bound_summary_string, redact_and_bound_instruction,
@@ -30,8 +27,10 @@ use super::util::{
 use webcodex_core::project_instructions::ProjectInstructionsSummarySnapshot;
 use webcodex_core::workflow_session_contract::is_safe_job_id;
 
+#[cfg(test)]
+use crate::model::StoredSession;
+
 pub(crate) mod database;
-mod legacy_import;
 mod resident;
 mod stream;
 
@@ -59,14 +58,33 @@ fn v2_record_has_canonical_logical_invocation_shape(value: &Value) -> bool {
 }
 
 impl PersistedSessionRecord {
-    pub fn from_record(record: &SessionRecord, max_events_per_session: usize) -> Self {
-        let event_skip = record.events.len().saturating_sub(max_events_per_session);
-        let message_skip = record
-            .messages
-            .len()
-            .saturating_sub(DEFAULT_MAX_MESSAGES_PER_SESSION);
+    pub fn from_record(record: &SessionRecord, recent_event_limit: usize) -> Self {
+        Self::snapshot(record, recent_event_limit, None)
+    }
+
+    pub(crate) fn database_delta(record: &SessionRecord, after: u64) -> Self {
+        Self::snapshot(record, 0, Some(after))
+    }
+
+    fn snapshot(record: &SessionRecord, recent_event_limit: usize, after: Option<u64>) -> Self {
+        let changed = |id: &String| {
+            after.is_none_or(|after| {
+                record
+                    .message_observation_revisions
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0)
+                    > after
+            })
+        };
+        let event_skip = record.events.len().saturating_sub(recent_event_limit);
         let events: Vec<_> = record.events.iter().skip(event_skip).cloned().collect();
-        let messages: Vec<_> = record.messages.iter().skip(message_skip).cloned().collect();
+        let messages: Vec<_> = record
+            .messages
+            .iter()
+            .filter(|message| changed(&message.message_id))
+            .cloned()
+            .collect();
         debug_assert!(record
             .events
             .iter()
@@ -76,7 +94,7 @@ impl PersistedSessionRecord {
         debug_assert!(record
             .messages
             .iter()
-            .skip(message_skip)
+            .filter(|message| changed(&message.message_id))
             .zip(&messages)
             .all(|(record, snapshot)| Arc::ptr_eq(record, snapshot)));
         Self {
@@ -91,9 +109,22 @@ impl PersistedSessionRecord {
             lifecycle: record.lifecycle,
             created_at: record.created_at,
             updated_at: record.updated_at,
+            current_instruction: record.current_instruction.clone(),
+            event_history_start: if record.history_is_durable {
+                record.event_history_start
+            } else {
+                record
+                    .events_observed
+                    .saturating_sub(record.events.len() as u64)
+            },
             events,
             messages,
-            message_delivery_replays: record.message_delivery_replays.clone(),
+            message_delivery_replays: record
+                .message_delivery_replays
+                .iter()
+                .filter(|(_, replay)| changed(&replay.message_id))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             events_observed: record.events_observed,
             legacy_context_revision: None,
             git_baseline_tree: record.git_baseline_tree.clone(),
@@ -105,12 +136,23 @@ impl PersistedSessionRecord {
                 .collect(),
             message_observation_revision: record.message_observation_revision,
             message_observation_floor: record.message_observation_floor,
-            message_observation_revisions: record.message_observation_revisions.clone(),
-            assignment_history_floors: record.assignment_history_floors.clone(),
+            message_observation_revisions: record
+                .message_observation_revisions
+                .iter()
+                .filter(|(id, _)| changed(id))
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            assignment_history_floors: record
+                .assignment_history_floors
+                .iter()
+                .filter(|(id, _)| changed(id))
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
             assignment_history_tracking_complete: record.assignment_history_tracking_complete,
             completion_assignment_fence_fingerprints: record
                 .completion_assignment_fence_fingerprints
                 .iter()
+                .filter(|(id, _)| changed(id))
                 .filter_map(|(todo_id, fingerprint)| {
                     fingerprint
                         .as_ref()
@@ -134,6 +176,8 @@ impl PersistedSessionRecord {
             && self.lifecycle == record.lifecycle
             && self.created_at == record.created_at
             && self.updated_at == record.updated_at
+            && self.current_instruction.as_ref().map(|e| &e.event_id)
+                == record.current_instruction.as_ref().map(|e| &e.event_id)
             && self.events_observed == record.events_observed
             && self.git_baseline_tree == record.git_baseline_tree
             && self.repository_edit_observed == record.repository_edit_observed
@@ -176,7 +220,7 @@ impl PersistedSessionRecord {
                 .all(|(snapshot, live)| Arc::ptr_eq(snapshot, live))
     }
 
-    fn into_record(self, max_events_per_session: usize) -> Option<SessionRecord> {
+    fn into_record(self, recent_event_limit: usize) -> Option<SessionRecord> {
         let session_id = self.session_id.trim().to_string();
         if !is_valid_session_id(&session_id) {
             return None;
@@ -185,6 +229,12 @@ impl PersistedSessionRecord {
         // can enter the in-memory Session store.
         let owner_authority_fingerprint =
             sanitize_owner_authority_fingerprint(self.owner_authority_fingerprint)?;
+        if !valid_persisted_project_identity(
+            self.project.as_deref(),
+            self.project_identity.as_ref(),
+        ) {
+            return None;
+        }
         let lifecycle = self.lifecycle;
         let events: VecDeque<Arc<SessionEvent>> = self
             .events
@@ -193,7 +243,7 @@ impl PersistedSessionRecord {
             .filter_map(|event| sanitize_persisted_event(event, &session_id))
             .map(Arc::new)
             .rev()
-            .take(max_events_per_session)
+            .take(recent_event_limit)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -206,7 +256,6 @@ impl PersistedSessionRecord {
             .filter_map(|message| sanitize_persisted_message(message, &session_id))
             .map(Arc::new)
             .rev()
-            .take(DEFAULT_MAX_MESSAGES_PER_SESSION)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -383,9 +432,25 @@ impl PersistedSessionRecord {
             Default::default()
         };
         Some(SessionRecord {
+            current_instruction: self
+                .current_instruction
+                .and_then(|event| sanitize_persisted_event((*event).clone(), &session_id))
+                .filter(|event| event.kind == "task_instruction")
+                .map(Arc::new)
+                .or_else(|| {
+                    events
+                        .iter()
+                        .rev()
+                        .find(|event| event.kind == "task_instruction")
+                        .cloned()
+                }),
+            history_is_durable: false,
+            event_history_start: self.event_history_start,
+            pending_events: VecDeque::new(),
+            durable: None,
             session_id,
             project,
-            project_identity: self.project_identity.clone(),
+            project_identity: self.project_identity,
             owner_authority_fingerprint,
             title: self.title.map(|value| bound_summary_string(value.trim())),
             mode: self.mode,
@@ -443,13 +508,13 @@ fn sanitize_owner_authority_fingerprint(value: String) -> Option<String> {
 
 pub fn cold_session_from_record(
     record: &SessionRecord,
-    max_events_per_session: usize,
+    recent_event_limit: usize,
 ) -> Result<ColdSessionRecord, serde_json::Error> {
     let project_instructions = record
         .project_instructions
         .as_ref()
         .map(|snapshot| snapshot.to_summary());
-    let persisted = PersistedSessionRecord::from_record(record, max_events_per_session);
+    let persisted = PersistedSessionRecord::from_record(record, recent_event_limit);
     let mut cold = cold_session_from_persisted(&persisted, project_instructions)?;
     if record.lifecycle.allows_mutation() {
         cold.resident_instructions = record
@@ -478,10 +543,21 @@ pub fn cold_session_from_persisted(
                     "persisted Session has invalid canonical authority",
                 ))
             })?;
+    if !valid_persisted_project_identity(
+        persisted.project.as_deref(),
+        persisted.project_identity.as_ref(),
+    ) {
+        return Err(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted Session has invalid Project identity",
+        )));
+    }
     let lifecycle = persisted.lifecycle;
     let raw = Arc::from(serde_json::value::to_raw_value(persisted)?);
     let revision_raw = Arc::downgrade(&raw);
     Ok(ColdSessionRecord {
+        database: None,
+        database_revision: 0,
         session_id: persisted.session_id.clone(),
         project: persisted.project.clone(),
         project_identity: persisted.project_identity.clone(),
@@ -490,6 +566,7 @@ pub fn cold_session_from_persisted(
         guards: persisted.guards,
         lifecycle,
         updated_at: persisted.updated_at,
+        created_at: persisted.created_at,
         project_instructions,
         raw,
         console_list_cache: Arc::new(std::sync::Mutex::new(None)),
@@ -501,11 +578,31 @@ pub fn cold_session_from_persisted(
     })
 }
 
+/// Pending events include updates to existing rows. Retain the first observed
+/// order and the newest payload of each ID, not the last update's queue order.
+pub(crate) fn deduplicated_pending_events(record: &SessionRecord) -> Vec<Arc<SessionEvent>> {
+    let mut positions = std::collections::HashMap::<String, usize>::new();
+    let mut events = Vec::<Arc<SessionEvent>>::new();
+    for event in &record.pending_events {
+        if let Some(&index) = positions.get(&event.event_id) {
+            events[index] = Arc::clone(event);
+        } else {
+            positions.insert(event.event_id.clone(), events.len());
+            events.push(Arc::clone(event));
+        }
+    }
+    events
+}
+
 pub fn materialize_cold_session(
     record: &ColdSessionRecord,
-    _max_events_per_session: usize,
+    recent_event_limit: usize,
 ) -> Option<SessionRecord> {
-    let persisted = serde_json::from_str::<PersistedSessionRecord>(record.raw.get()).ok()?;
+    let persisted = if let Some(database) = &record.database {
+        database.load(record, recent_event_limit).ok()?
+    } else {
+        serde_json::from_str::<PersistedSessionRecord>(record.raw.get()).ok()?
+    };
     if persisted.session_id != record.session_id
         || persisted.project != record.project
         || persisted.project_identity != record.project_identity
@@ -517,37 +614,10 @@ pub fn materialize_cold_session(
     {
         return None;
     }
-    // A Cold record is only admitted from our own canonical serializer or
-    // after the stream loader has already sanitized the full persisted row.
-    // Re-sanitizing Closed Sessions at every read would deep-clone and traverse
-    // up to 2,000 retained events, despite these bytes being immutable in RAM.
-    // Keep the exact identity/authority checks above and the single sanitize
-    // boundary in the stream loader; both lifecycles can materialize directly.
+    // SQLite validates persisted input on load. Memory-only Cold bytes were
+    // produced by our own canonical serializer. Both restore process-local
+    // instruction/fence metadata separately without changing identity.
     Some(resident::materialize(persisted, record))
-}
-
-pub struct RestoredSessionLedger {
-    pub sessions: HashMap<String, StoredSession>,
-    pub lru: VecDeque<String>,
-    pub tombstones: BTreeMap<u64, SessionRetentionTombstone>,
-    pub tombstone_ids: HashMap<String, u64>,
-    pub next_expiry_ordinal: u64,
-    pub expiry_ordinal_exhausted: bool,
-    pub last_persist_error: Option<String>,
-}
-
-impl RestoredSessionLedger {
-    fn empty(last_persist_error: Option<String>) -> Self {
-        Self {
-            sessions: HashMap::new(),
-            lru: VecDeque::new(),
-            tombstones: BTreeMap::new(),
-            tombstone_ids: HashMap::new(),
-            next_expiry_ordinal: 1,
-            expiry_ordinal_exhausted: false,
-            last_persist_error,
-        }
-    }
 }
 
 fn parse_retention_tombstone_row(value: &Value) -> Option<SessionRetentionTombstone> {
@@ -562,249 +632,13 @@ fn parse_retention_tombstone_row(value: &Value) -> Option<SessionRetentionTombst
     Some(tombstone)
 }
 
-/// Accept valid tombstones in file order.
-///
-/// Duplicate ordinals keep the first row. Duplicate canonical ids keep the
-/// greater ordinal, and an equal ordinal keeps the first row. A live Session
-/// id drops its tombstone. `next_expiry_ordinal` is strictly above every valid
-/// restored ordinal, including ordinals discarded by those rules. `u64::MAX`
-/// marks allocation exhausted here without renumbering, so restore does not
-/// rewrite the ledger. The next allocation compacts retained ordinals instead
-/// of wrapping.
-fn accept_restored_tombstones(
-    rows: Vec<SessionRetentionTombstone>,
-    live_ids: &HashSet<String>,
-) -> (
-    BTreeMap<u64, SessionRetentionTombstone>,
-    HashMap<String, u64>,
-    u64,
-    bool,
-) {
-    let mut greatest: Option<u64> = None;
-    let mut tombstones = BTreeMap::new();
-    let mut tombstone_ids = HashMap::new();
-    for tombstone in rows {
-        greatest = Some(greatest.map_or(tombstone.expiry_ordinal, |current| {
-            current.max(tombstone.expiry_ordinal)
-        }));
-        if live_ids.contains(&tombstone.session_id) {
-            continue;
-        }
-        if tombstones.contains_key(&tombstone.expiry_ordinal) {
-            continue;
-        }
-        if let Some(existing) = tombstone_ids.get(&tombstone.session_id).copied() {
-            if tombstone.expiry_ordinal <= existing {
-                continue;
-            }
-            tombstones.remove(&existing);
-        }
-        tombstone_ids.insert(tombstone.session_id.clone(), tombstone.expiry_ordinal);
-        tombstones.insert(tombstone.expiry_ordinal, tombstone);
-    }
-    let (next_expiry_ordinal, expiry_ordinal_exhausted) = match greatest {
-        None => (1, false),
-        Some(max) => match max.checked_add(1) {
-            Some(next) => (next, false),
-            None => (u64::MAX, true),
-        },
-    };
-    (
-        tombstones,
-        tombstone_ids,
-        next_expiry_ordinal,
-        expiry_ordinal_exhausted,
-    )
-}
-
-pub fn load_persisted_ledger(
-    path: &PathBuf,
-    max_events_per_session: usize,
-) -> RestoredSessionLedger {
-    let started = std::time::Instant::now();
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return RestoredSessionLedger::empty(None)
-        }
-        Err(err) => {
-            return RestoredSessionLedger::empty(Some(bound_summary_string(&format!(
-                "restore_failed: {}: {err}",
-                path.display()
-            ))))
-        }
-    };
-    let bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-    let stream::Rows {
-        mut records,
-        tombstones: tombstone_rows,
-    } = match stream::load(io::BufReader::new(file), max_events_per_session) {
-        Ok(rows) => rows,
-        Err(err) => {
-            let error =
-                bound_summary_string(&format!("restore_failed: invalid v2 session ledger: {err}"));
-            tracing::warn!("session ledger restore failed: {}", error);
-            return RestoredSessionLedger::empty(Some(error));
-        }
-    };
-    let live_ids = records
-        .iter()
-        .map(|record| record.session_id().to_string())
-        .collect::<HashSet<_>>();
-    let (tombstones, tombstone_ids, next_expiry_ordinal, expiry_ordinal_exhausted) =
-        accept_restored_tombstones(tombstone_rows, &live_ids);
-    records.sort_by(|left, right| {
-        left.updated_at()
-            .cmp(&right.updated_at())
-            .then_with(|| left.session_id().cmp(right.session_id()))
-    });
-    let mut sessions = HashMap::new();
-    let mut lru = VecDeque::new();
-    let (mut hot, mut cold, mut cold_bytes) = (0usize, 0usize, 0usize);
-    for record in records {
-        match &record {
-            StoredSession::Hot(_) => hot += 1,
-            StoredSession::Cold(record) => {
-                cold += 1;
-                cold_bytes += record.raw.get().len();
-            }
-        }
-        let session_id = record.session_id().to_string();
-        lru.push_back(session_id.clone());
-        sessions.insert(session_id, record);
-    }
-    tracing::debug!(target: "webcodex::session_cost", phase="restore", ledger_bytes=bytes,
-        hot_sessions=hot, cold_sessions=cold, cold_raw_bytes=cold_bytes,
-        elapsed_ms=started.elapsed().as_secs_f64()*1000.0, "session ledger streamed restore");
-    RestoredSessionLedger {
-        sessions,
-        lru,
-        tombstones,
-        tombstone_ids,
-        next_expiry_ordinal,
-        expiry_ordinal_exhausted,
-        last_persist_error: None,
-    }
-}
-
-/// SQLite startup restore bundle for Stage E production: rehydrates the Store from durable
-/// session rows and seeds Writer/global revision allocation on process start.
-pub(crate) struct RestoredSessionDatabase {
-    pub database: Arc<SessionDatabase>,
-    pub ledger: RestoredSessionLedger,
-    /// Last durable `workflow_session_state.revision` per live Session id.
-    pub committed_revisions: HashMap<String, u64>,
-    /// Committed message-observation watermark per live Session (`previous_message_revision` at restore).
-    pub committed_message_revisions: HashMap<String, u64>,
-    /// `max(committed_revisions)` after restore. Zero only when inventory is empty.
-    /// Seeds global next dirty-revision allocation (production restore must not restart from zero).
-    pub durable_revision_high_water: u64,
-}
-
-fn cold_from_sanitized_persisted(
-    persisted: &PersistedSessionRecord,
-) -> Result<ColdSessionRecord, serde_json::Error> {
-    let mut cold = cold_session_from_persisted(persisted, None)?;
-    if persisted.lifecycle.allows_mutation() {
-        cold.unfenced_completion_ids = unfenced_completion_ids_from_persisted(persisted);
-    }
-    Ok(cold)
-}
-
-fn unfenced_completion_ids_from_persisted(persisted: &PersistedSessionRecord) -> Vec<String> {
-    let fenced: HashSet<_> = persisted
-        .completion_assignment_fence_fingerprints
-        .keys()
-        .cloned()
-        .collect();
-    persisted
-        .messages
-        .iter()
-        .filter(|message| {
-            message.kind == SessionMessageKind::Todo
-                && message.status == SessionMessageStatus::Resolved
-                && message.completion_id.is_some()
-                && message.resolved_by_message_id.is_some()
-                && !fenced.contains(&message.message_id)
-        })
-        .map(|message| message.message_id.clone())
-        .collect()
-}
-
-/// Fail-closed SQLite restore: open shared DB, optional one-time legacy import, bounded
-/// load + single sanitize boundary per Session, Cold RAM payloads, tombstone parity.
-///
-/// Does not mutate the JSON ledger. Returns `Err` on any open/import/inventory/load/
-/// conversion/tombstone error without publishing a partial ledger.
-pub(crate) fn restore_session_database(
-    db_path: &Path,
-    legacy_ledger_path: &Path,
-    max_events_per_session: usize,
-) -> io::Result<RestoredSessionDatabase> {
-    let started = std::time::Instant::now();
-    let database = Arc::new(SessionDatabase::open(db_path)?);
-    database.import_legacy(legacy_ledger_path)?;
-    let locators = database.inventory()?;
-    let tombstone_rows = database.tombstones()?;
-    let mut sessions = HashMap::new();
-    let mut lru = VecDeque::new();
-    let mut committed_revisions = HashMap::new();
-    let mut committed_message_revisions = HashMap::new();
-    let mut durable_revision_high_water = 0_u64;
-    let (mut cold_count, mut cold_bytes) = (0usize, 0usize);
-    for locator in &locators {
-        let persisted = database.load(locator, max_events_per_session)?;
-        let cold_record = cold_from_sanitized_persisted(&persisted).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "SQLite restore failed to admit Cold Session {}: {err}",
-                    persisted.session_id
-                ),
-            )
-        })?;
-        committed_revisions.insert(persisted.session_id.clone(), locator.revision);
-        committed_message_revisions.insert(
-            persisted.session_id.clone(),
-            locator.previous_message_revision,
-        );
-        durable_revision_high_water = durable_revision_high_water.max(locator.revision);
-        cold_bytes += cold_record.raw.get().len();
-        cold_count += 1;
-        let session_id = persisted.session_id.clone();
-        lru.push_back(session_id.clone());
-        sessions.insert(session_id, StoredSession::Cold(cold_record));
-    }
-    let live_ids = sessions.keys().cloned().collect::<HashSet<_>>();
-    let (tombstones, tombstone_ids, next_expiry_ordinal, expiry_ordinal_exhausted) =
-        accept_restored_tombstones(tombstone_rows, &live_ids);
-    tracing::debug!(
-        target: "webcodex::session_cost",
-        phase = "restore",
-        source = "sqlite",
-        session_count = sessions.len(),
-        hot_sessions = 0,
-        cold_sessions = cold_count,
-        cold_raw_bytes = cold_bytes,
-        durable_revision_high_water,
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        "session database restore"
-    );
-    Ok(RestoredSessionDatabase {
-        database,
-        ledger: RestoredSessionLedger {
-            sessions,
-            lru,
-            tombstones,
-            tombstone_ids,
-            next_expiry_ordinal,
-            expiry_ordinal_exhausted,
-            last_persist_error: None,
-        },
-        committed_revisions,
-        committed_message_revisions,
-        durable_revision_high_water,
-    })
+/// A legacy or missing witness can be represented for historical access.
+/// Only a strong identity can authorize live work; restore never upgrades it.
+fn valid_persisted_project_identity(
+    project: Option<&str>,
+    identity: Option<&SessionProjectIdentity>,
+) -> bool {
+    identity.is_none_or(|identity| project.is_some() && identity.is_well_formed())
 }
 
 pub(super) fn is_lower_hex_sha256(value: &str) -> bool {
@@ -813,47 +647,6 @@ pub(super) fn is_lower_hex_sha256(value: &str) -> bool {
             .as_bytes()
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-}
-
-pub fn write_ledger_atomic(path: &PathBuf, ledger: &PersistedSessionLedger) -> io::Result<()> {
-    write_ledger_atomic_measured(path, ledger).map(|_| ())
-}
-
-pub(super) fn write_ledger_atomic_measured(
-    path: &PathBuf,
-    ledger: &PersistedSessionLedger,
-) -> io::Result<u64> {
-    let started = std::time::Instant::now();
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("sessions.json");
-    let tmp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, ledger).map_err(io::Error::other)?;
-        writer.flush()?;
-        let bytes = writer.get_ref().metadata()?.len();
-        drop(writer);
-        fs::rename(&tmp_path, path)?;
-        Ok(bytes)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
-    }
-    tracing::debug!(target: "webcodex::session_cost", phase="persist", bytes=result.as_ref().copied().unwrap_or(0),
-        success=result.is_ok(), elapsed_ms=started.elapsed().as_secs_f64()*1000.0, "session ledger atomic write");
-    result
 }
 
 pub fn sanitize_persisted_event(mut event: SessionEvent, session_id: &str) -> Option<SessionEvent> {

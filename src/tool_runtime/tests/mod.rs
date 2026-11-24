@@ -14,16 +14,22 @@ mod browser_user_handoff;
 mod builtin_coding_workflow;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
+#[cfg(unix)]
+mod cli_runtime_projection;
 #[cfg(feature = "experimental-code-mode")]
 mod code_mode;
 #[cfg(feature = "experimental-code-mode")]
 mod code_mode_e2b;
 mod coding_agent_context;
+mod coding_agent_diagnose;
 mod coding_agent_discovery;
 mod coding_task;
 mod coding_task_semantic_navigation;
 mod collaboration;
 mod computer_budgets;
+mod computer_lifecycle;
+mod computer_post_observation;
+mod computer_selection;
 mod context_projection;
 mod continuation_feedback;
 mod control_sidecars;
@@ -32,7 +38,7 @@ mod diagnostics;
 mod dispatch;
 mod edit_tool_telemetry;
 mod execution_context;
-mod files;
+pub(super) mod files;
 mod files_helpers;
 mod git;
 mod goals;
@@ -61,6 +67,7 @@ mod project_references;
 mod read_files;
 mod reconnect;
 mod resource_references;
+mod runner_discovery;
 mod runner_fixtures;
 mod safe_recovery;
 mod schema;
@@ -76,6 +83,7 @@ mod sessions_git;
 mod sessions_guards;
 mod sessions_instructions;
 mod sessions_resolver;
+mod sessions_retired_projects;
 mod skills;
 mod specialized_dispatch;
 mod startup_brief;
@@ -97,3 +105,5 @@ mod write_project_file;
 mod external_observations;
 
 mod docx_document;
+
+mod computer_scroll;

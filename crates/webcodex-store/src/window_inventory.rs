@@ -9,15 +9,34 @@
 use crate::Database;
 use rusqlite::{named_params, params, Connection};
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+use std::time::Instant;
 
 const SCHEMA: &str = include_str!("window_inventory/schema.sql");
 const CELLS: &str = include_str!("window_inventory/cells.sql");
 const LINKS: &str = include_str!("window_inventory/links.sql");
 const INVENTORY: &str = include_str!("window_inventory/read.sql");
+// Eliminate the nullable OR for exact Window reads so SQLite uses the existing
+// (window_key, scope_key) primary key rather than scanning every summary cell.
+static EXACT_INVENTORY: LazyLock<String> =
+    LazyLock::new(|| INVENTORY.replace("(:key IS NULL OR window_key=:key)", "window_key=:key"));
+const ANCHORS: &str = "WITH cells AS (SELECT project, anchors FROM window_inventory_cells WHERE (?3 IS NULL OR window_key=?3) AND (?1 IS NULL OR (principal_kind=?1 AND principal_id=?2)))
+    SELECT project FROM cells WHERE project IS NOT NULL
+    UNION SELECT j.value FROM cells c, json_each(c.anchors) j WHERE j.value IS NOT NULL
+    UNION SELECT project FROM window_inventory_links WHERE project IS NOT NULL AND (?3 IS NULL OR window_key=?3) AND (?1 IS NULL OR (principal_kind=?1 AND principal_id=?2))";
+static EXACT_ANCHORS: LazyLock<String> =
+    LazyLock::new(|| ANCHORS.replace("(?3 IS NULL OR window_key=?3)", "window_key=?3"));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowInventoryRow {
     pub client_window_key: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Principal of the newest visible historical cell: the owner whose label
+    /// this row projects and the only principal a Console rename may target.
+    /// Server-internal; never serialized into live rows or API responses.
+    #[serde(skip)]
+    pub label_owner: Option<(String, String)>,
     pub source: String,
     pub last_project: Option<String>,
     pub first_seen_at_ms: i64,
@@ -32,12 +51,40 @@ pub struct WindowInventoryRow {
     pub recorder_gap_count: usize,
 }
 
+/// Caller-authorized selector for unanchored managed OAuth observations only.
+/// The Console derives User for a personal token and Client for an OAuth token;
+/// this selector never overrides Project anchors or the exact principal filter.
+#[derive(Clone)]
+pub enum WindowOAuthVisibility {
+    User { user_id: String },
+    Client { user_id: String, client_id: String },
+}
+
+impl WindowOAuthVisibility {
+    fn identity(&self) -> Option<(&str, Option<&str>)> {
+        let (user, client) = match self {
+            Self::User { user_id } => (user_id.as_str(), None),
+            Self::Client { user_id, client_id } => (user_id.as_str(), Some(client_id.as_str())),
+        };
+        (!user.trim().is_empty() && client.is_none_or(|id| !id.trim().is_empty()))
+            .then_some((user, client))
+    }
+
+    pub fn matches(&self, user: &str, client: &str) -> bool {
+        !client.trim().is_empty()
+            && self.identity().is_some_and(|(owner, selected_client)| {
+                owner == user && selected_client.is_none_or(|selected| selected == client)
+            })
+    }
+}
+
 pub struct WindowInventoryQuery<'a> {
     pub principal: Option<(&'a str, &'a str)>,
     pub caller: Option<(&'a str, &'a str)>,
-    pub managed_oauth_identity: Option<(&'a str, &'a str)>,
-    /// Ordinary management credentials restrict projectless unanchored events
-    /// to their caller principal. Admin/scoped-principal reads use native links.
+    pub managed_oauth_visibility: Option<&'a WindowOAuthVisibility>,
+    /// Ordinary management credentials restrict unanchored events to their
+    /// caller principal or explicit managed OAuth visibility selector.
+    /// Admin/scoped-principal reads use native links.
     pub management: bool,
     pub visible_projects: &'a [String],
     pub projects: Option<&'a [String]>,
@@ -80,7 +127,7 @@ pub(crate) fn ensure_schema(conn: &mut Connection) -> anyhow::Result<()> {
 
 /// Caller owns the write/read transaction. No nested lock or independent commit.
 pub(crate) fn repair_dirty(conn: &Connection) -> anyhow::Result<()> {
-    repair_selected(conn, None)
+    repair_selected(conn, None).map(|_| ())
 }
 
 pub(crate) fn repair_dirty_for_event(
@@ -94,25 +141,50 @@ pub(crate) fn repair_dirty_for_event(
     Ok(())
 }
 
-fn repair_selected(conn: &Connection, window: Option<&str>) -> anyhow::Result<()> {
-    let dirty: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM window_inventory_dirty WHERE ?1 IS NULL OR window_key=?1)",
-        [window],
-        |r| r.get(0),
-    )?;
-    if !dirty {
-        return Ok(());
+fn has_dirty(conn: &Connection, window: Option<&str>) -> anyhow::Result<bool> {
+    Ok(match window {
+        Some(window) => conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM window_inventory_dirty WHERE window_key=?1)",
+            [window],
+            |r| r.get(0),
+        )?,
+        None => conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM window_inventory_dirty)",
+            [],
+            |r| r.get(0),
+        )?,
+    })
+}
+
+fn repair_selected(conn: &Connection, window: Option<&str>) -> anyhow::Result<usize> {
+    if !has_dirty(conn, window)? {
+        return Ok(0);
     }
-    conn.execute("DELETE FROM window_inventory_cells WHERE window_key IN (SELECT window_key FROM window_inventory_dirty WHERE ?1 IS NULL OR window_key=?1)", [window])?;
-    conn.execute("DELETE FROM window_inventory_links WHERE window_key IN (SELECT window_key FROM window_inventory_dirty WHERE ?1 IS NULL OR window_key=?1)", [window])?;
-    let predicate = "e.client_window_key IN (SELECT window_key FROM window_inventory_dirty WHERE ?1 IS NULL OR window_key=?1)";
-    conn.execute(&CELLS.replace("__SELECTION__", predicate), [window])?;
-    conn.execute(&LINKS.replace("__SELECTION__", predicate), [window])?;
+    let selection = if window.is_some() {
+        "window_key=?1"
+    } else {
+        "?1 IS NULL"
+    };
+    let dirty = format!("SELECT window_key FROM window_inventory_dirty WHERE {selection}");
     conn.execute(
-        "DELETE FROM window_inventory_dirty WHERE ?1 IS NULL OR window_key=?1",
+        &format!("DELETE FROM window_inventory_cells WHERE window_key IN ({dirty})"),
         [window],
     )?;
-    Ok(())
+    conn.execute(
+        &format!("DELETE FROM window_inventory_links WHERE window_key IN ({dirty})"),
+        [window],
+    )?;
+    let predicate = format!("e.client_window_key IN ({dirty})");
+    conn.execute(&CELLS.replace("__SELECTION__", &predicate), [window])?;
+    conn.execute(&LINKS.replace("__SELECTION__", &predicate), [window])?;
+    // Repair only affected Windows, retaining annotations of other principals.
+    conn.execute(&format!("DELETE FROM window_labels WHERE window_key IN ({dirty})
+        AND NOT EXISTS (SELECT 1 FROM window_inventory_cells c WHERE c.window_key=window_labels.window_key
+            AND c.principal_kind=window_labels.principal_kind AND c.principal_id=window_labels.principal_id)"), [window])?;
+    Ok(conn.execute(
+        &format!("DELETE FROM window_inventory_dirty WHERE {selection}"),
+        [window],
+    )?)
 }
 /// transaction. The caller repairs any earlier dirty history BEFORE inserting.
 pub(crate) fn index_appended_event(conn: &Connection, event_id: &str) -> anyhow::Result<()> {
@@ -135,6 +207,7 @@ impl Database {
     /// fails unavailable rather than returning stale evidence.
     fn with_window_inventory_read<T>(
         &self,
+        window: Option<&str>,
         mut read: impl FnMut(&Connection) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         for _ in 0..3 {
@@ -142,11 +215,7 @@ impl Database {
                 let mut reader =
                     self.lock_history_connection(crate::StoreDomain::WindowActivity)?;
                 let snapshot = reader.transaction()?;
-                let dirty: bool = snapshot.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM window_inventory_dirty)",
-                    [],
-                    |r| r.get(0),
-                )?;
+                let dirty = has_dirty(&snapshot, window)?;
                 if !dirty {
                     let result = read(&snapshot)?;
                     snapshot.commit()?;
@@ -155,9 +224,22 @@ impl Database {
             }
             let mut writer =
                 self.lock_history_repair_connection(crate::StoreDomain::WindowActivity)?;
-            let transaction = writer.transaction()?;
-            repair_dirty(&transaction)?;
-            transaction.commit()?;
+            let started = Instant::now();
+            let result = (|| -> anyhow::Result<usize> {
+                let transaction = writer.transaction()?;
+                let windows = repair_selected(&transaction, window)?;
+                transaction.commit()?;
+                Ok(windows)
+            })();
+            let elapsed = started.elapsed();
+            // Only committed repairs contribute to the repaired-Window count.
+            let windows = result.as_ref().copied().unwrap_or(0);
+            crate::history_budget::record_dirty_repair(self, elapsed, windows);
+            tracing::debug!(target: "webcodex_store::connection", phase="history_dirty_repair",
+                selection=if window.is_some() { "exact" } else { "global" },
+                outcome=if result.is_ok() { "ok" } else { "error" }, windows,
+                elapsed_ms=elapsed.as_secs_f64()*1000.0, "derived Window repair");
+            result?;
         }
         anyhow::bail!("window inventory changed during bounded repair")
     }
@@ -168,22 +250,39 @@ impl Database {
         &self,
         principal: Option<(&str, &str)>,
     ) -> anyhow::Result<Vec<String>> {
+        self.window_inventory_anchors_selected(principal, None)
+    }
+
+    /// Exact detail reads repair and inspect only this Window. This remains an
+    /// evidence query; the Console must authorize every returned Project.
+    pub fn window_inventory_project_anchors_for_window(
+        &self,
+        principal: Option<(&str, &str)>,
+        window: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        self.window_inventory_anchors_selected(principal, Some(window))
+    }
+
+    fn window_inventory_anchors_selected(
+        &self,
+        principal: Option<(&str, &str)>,
+        window: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
         #[cfg(any(test, feature = "root-test-support"))]
         self.window_inventory_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.with_window_inventory_read(|tx| {
-        let (kind, id) = principal.map_or((None, None), |(k, i)| (Some(k), Some(i)));
-        let rows = {
-            let mut stmt = tx.prepare_cached("WITH cells AS (SELECT project, anchors FROM window_inventory_cells WHERE ?1 IS NULL OR (principal_kind=?1 AND principal_id=?2))
-                SELECT project FROM cells WHERE project IS NOT NULL
-                UNION SELECT j.value FROM cells c, json_each(c.anchors) j WHERE j.value IS NOT NULL
-                UNION SELECT project FROM window_inventory_links WHERE project IS NOT NULL AND (?1 IS NULL OR (principal_kind=?1 AND principal_id=?2))")?;
+        self.with_window_inventory_read(window, |tx| {
+            let (kind, id) = principal.map_or((None, None), |(k, i)| (Some(k), Some(i)));
+            let sql = if window.is_some() {
+                EXACT_ANCHORS.as_str()
+            } else {
+                ANCHORS
+            };
+            let mut stmt = tx.prepare_cached(sql)?;
             let rows = stmt
-                .query_map(params![kind, id], |r| r.get(0))?
+                .query_map(params![kind, id, window], |r| r.get(0))?
                 .collect::<Result<Vec<String>, _>>()?;
-            rows
-        };
-        Ok(rows)
+            Ok(rows)
         })
     }
 
@@ -198,7 +297,8 @@ impl Database {
         #[cfg(any(test, feature = "root-test-support"))]
         self.window_inventory_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.with_window_inventory_read(|tx| {
+        self.with_window_inventory_read(query.window_key, |tx| {
+        let sql = if query.window_key.is_some() { EXACT_INVENTORY.as_str() } else { INVENTORY };
         let allowed = serde_json::to_string(query.visible_projects)?;
         let projects = query.projects.map(serde_json::to_string).transpose()?;
         let live = serde_json::to_string(query.live)?;
@@ -208,9 +308,9 @@ impl Database {
         let (ck, ci) = query
             .caller
             .map_or((None, None), |(k, i)| (Some(k), Some(i)));
-        let (oauth_user, oauth_client) = query.managed_oauth_identity
-            .filter(|(user, client)| !user.trim().is_empty() && !client.trim().is_empty())
-            .map_or((None, None), |(user, client)| (Some(user), Some(client)));
+        let (oauth_user, oauth_client) = query.managed_oauth_visibility
+            .and_then(WindowOAuthVisibility::identity)
+            .map_or((None, None), |(user, client)| (Some(user), client));
         let limit = query.limit.clamp(1, 2000) as i64;
         let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
         let params = named_params! {":allowed": allowed, ":projects": projects, ":pk": pk, ":pi": pi,
@@ -221,12 +321,16 @@ impl Database {
             total: 0,
         };
         {
-            let mut stmt = tx.prepare_cached(INVENTORY)?;
+            let mut stmt = tx.prepare_cached(sql)?;
             let mut rows = stmt.query(params)?;
             while let Some(r) = rows.next()? {
-                page.total = usize::try_from(r.get::<_, i64>(13)?).unwrap_or(usize::MAX);
+                page.total = usize::try_from(r.get::<_, i64>(16)?).unwrap_or(usize::MAX);
+                let owner_kind: Option<String> = r.get(14)?;
+                let owner_id: Option<String> = r.get(15)?;
                 page.rows.push(WindowInventoryRow {
                     client_window_key: r.get(0)?,
+                    label: r.get(13)?,
+                    label_owner: owner_kind.zip(owner_id),
                     source: r.get(1)?,
                     last_project: r.get(2)?,
                     first_seen_at_ms: r.get(3)?,
@@ -245,12 +349,58 @@ impl Database {
         // Empty pages still report the authorized total, not zero or a hidden
         // source count. This rare fallback repeats the same compact projection.
         if page.rows.is_empty() && query.offset > 0 {
-            let count_sql = INVENTORY.replace("SELECT *, COUNT(*) OVER() AS total FROM filtered ORDER BY last_seen_at_ms DESC, client_window_key ASC LIMIT :limit OFFSET :offset", "SELECT COUNT(*) FROM filtered WHERE :limit >= 0 AND :offset >= 0");
+            let count_sql = sql.replace("SELECT *, COUNT(*) OVER() AS total FROM filtered ORDER BY last_seen_at_ms DESC, client_window_key ASC LIMIT :limit OFFSET :offset", "SELECT COUNT(*) FROM filtered WHERE :limit >= 0 AND :offset >= 0");
             page.total = tx
                 .query_row(&count_sql, params, |r| r.get::<_, i64>(0))?
                 .max(0) as usize;
         }
         Ok(page)
         })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exact_inventory_and_anchor_queries_use_window_primary_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("exact-plan.db")).unwrap();
+        let conn = db.conn_for_tests();
+        let anchor_plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", EXACT_ANCHORS.as_str()))
+            .unwrap()
+            .query_map(
+                params![Option::<&str>::None, Option::<&str>::None, "target"],
+                |r| r.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            anchor_plan.contains("SEARCH window_inventory_cells USING PRIMARY KEY (window_key=?)"),
+            "{anchor_plan}"
+        );
+        assert!(
+            anchor_plan.contains("SEARCH window_inventory_links USING PRIMARY KEY (window_key=?)"),
+            "{anchor_plan}"
+        );
+        let plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {}", EXACT_INVENTORY.as_str())).unwrap()
+            .query_map(named_params! {":allowed":"[]",":projects":Option::<&str>::None,
+                ":pk":Option::<&str>::None,":pi":Option::<&str>::None,
+                ":ck":Option::<&str>::None,":ci":Option::<&str>::None,
+                ":oauth_user":Option::<&str>::None,":oauth_client":Option::<&str>::None,
+                ":management":false,":live":"[]",":key":"target",":query":"",":limit":1,":offset":0},
+                |r| r.get::<_, String>(3)).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap().join("\n");
+        assert!(
+            plan.contains("SEARCH c USING PRIMARY KEY (window_key=?)"),
+            "{plan}"
+        );
+        assert!(plan.contains("SEARCH labels USING PRIMARY KEY (principal_kind=? AND principal_id=? AND window_key=?)"), "{plan}");
+        assert!(
+            !plan.contains("action_events") && !plan.contains("action_event_workflow_links"),
+            "{plan}"
+        );
     }
 }

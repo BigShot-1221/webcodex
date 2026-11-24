@@ -6,6 +6,8 @@ Desktop 负责启动和维护本机 WebCodex Runtime；用户只需要在 ChatGP
 
 贡献者如果要做 frontend/Tauri 开发、从源码加载 runtime、构建 NSIS/DMG 或运行原生安装 smoke，请看 [Desktop 开发与打包](DESKTOP_DEVELOPMENT.zh-CN.md)。
 
+全新安装后点击**开始使用**。Desktop 在当前用户下准备本机服务，观察到两个服务就绪后打开连接页。稍后可在**项目**中添加文件夹。其他角色、自定义程序和服务控制位于**设置 → Runtime 与服务**。 [Windows 实机验收清单](desktop-windows-acceptance.zh-CN.md)
+
 ## Runtime 项目清单
 
 **项目**页显示当前 Runner 已观察到的 Runtime Project，包括 Git 分支、活跃 Session 和最近活动。**添加本机文件夹**是显式授权并注册本机其他目录的可选入口，不是模型开始工作的前置步骤。Runtime Project identity 仍然承担授权、路由、持久化、审计和 Session 边界，但它不是用户需要在 Desktop 中维护的前置资源。
@@ -24,9 +26,9 @@ Runner 文件系统 policy 仍然是权限边界。全新 Desktop 的本机 Runn
 
 **项目 → 设备** 显示每个 Runner 上报的持久任务运行数、排队数和当前生效的并发上限。计数来自 Server 的容量聚合；已请求停止的任务在真正终止前仍计入运行数，因为它们仍占用执行槽位。离线、过期、不可用或未上报的状态不会显示为零使用量；普通请求调度队列单独计算。
 
-打开 **设置 → Runtime 与服务 → Runner 任务容量**，可为 Desktop 管理的本地 Runner 保存 **1–64** 的整数并发上限。默认值仍为 **4**，已保存的配置与实际生效值分别显示。**保存，下次重启时生效** 只修改身份匹配的本地 Runner 配置，保留其他内容并拒绝冲突修改，不会热重载或自动重启。
+打开 **设置 → Runtime 与服务 → Runner 任务容量**，可为 Desktop 管理的本地 Runner 保存 **1–64** 的整数并发上限。未配置时默认值为 **32**，已有显式配置值保持不变，已保存的配置与实际生效值分别显示。**保存并热应用** 暂存身份匹配的本地 Runner 配置，保留其他内容，随后使用 Check → Reload 与 Generation Fence 验证生效。明确拒绝时只回滚未被外部修改的候选；结果不确定时要求核对，不盲目重试或回滚。运行中的 Job 继续执行。
 
-准备好后选择 **重启 Runner…**，确认中断警告。重启会应用已保存的 Runner 配置，可能中断任务、浏览器会话和用户接管。Desktop 复用现有进程所有权或持久服务重启机制。远程及独立管理的 Runner 保持只读，需由实际管理者修改配置并重启。只有刷新后的 Runner 状态上报新上限，界面才会确认它已生效。
+**重启 Runner…** 保留为独立操作，仍需确认中断警告。重启会应用已保存的 Runner 配置，可能中断任务、浏览器会话和用户接管。Desktop 复用现有进程所有权或持久服务重启机制。远程及独立管理的 Runner 保持只读，需由实际管理者修改并应用配置。只有刷新后的 Runner 状态上报新上限，界面才会确认它已生效。
 
 ## Windows 启动与升级
 
@@ -38,21 +40,21 @@ Runner 文件系统 policy 仍然是权限边界。全新 Desktop 的本机 Runn
 
 ## 第一次使用
 
-1. 启动 WebCodex Desktop，选择**创建主节点**或**加入主节点**。普通创建同时启用独立的 Server 与本机 Runner；普通加入把本机 Runner 接入已有 Server。初始项目可跳过，Runner 仍保持启用。确认配置后才会安装持久服务、请求系统授权；仅打开窗口不会抢先把新机器绑定到本地 Server。
-2. 直接在 ChatGPT 中描述工作。请求给出工作目录后，Runtime 会在 Runner 允许的范围内自动解析或注册对应 Project。后续打开 Desktop 只观察已保存的持久服务，不会自动重启被主动停止的组件。
+1. 在新电脑上打开 Desktop，点击**开始使用**，即可在当前登录用户下准备一套本机 Server 与 Runner，无需选择初始项目。其他部署角色和服务控制仍可在设置中查看。
+2. 配置完成后可以选择**连接 AI 应用**、**项目**或**打开概览**。连接应用后，就可以在其中描述工作。请求给出工作目录后，Runtime 会在 Runner 允许的范围内自动解析或注册对应 Project。后续打开 Desktop 只观察已保存的持久服务，不会自动重启被主动停止的组件。
 3. **项目**页显示已经出现的 Runtime Project。需要手动添加本机目录时，点击**添加本机文件夹**，选择目录后确认**授权并添加文件夹**。这会显式允许现有本机 Runner 访问该目录及其子目录，并复用原有 Server 与 Tunnel 凭据；不需要新的 Tunnel ID 或 API Key。仅查看的 viewer 连接不提供本机目录添加入口。
 4. 只有需要让 ChatGPT 从外部访问本机时，才配置 **OpenAI Secure Tunnel**。Tunnel 负责连接，不定义 Project 权限。
 5. 观察到真实项目调用只能证明此前发生过客户端使用，不能证明宿主此刻在线。
 
-选择**加入主节点**时，填写从本机可访问的中心 Server 直接地址，并通过受保护输入提供一次性配对码。ChatGPT 使用另一条 OpenAI Tunnel 连接；Tunnel 地址和主节点的环回地址不能作为追加 Runner 的接入口。无需主节点的 Tunnel Key 或 bootstrap 凭据。已有连接复用原身份。**高级**保留明确的 Server-only、viewer-only 设置；重新打开设置不会改变既有环境的角色或服务所有权。
+选择**连接其他电脑**时，填写从本机可访问的中心 Server 直接地址，并通过受保护输入提供一次性配对码。ChatGPT 使用另一条 OpenAI Tunnel 连接；Tunnel 地址和主节点的环回地址不能作为追加 Runner 的接入口。无需主节点的 Tunnel Key 或 bootstrap 凭据。已有连接复用原身份。**高级**保留明确的 Server-only、viewer-only 设置；重新打开设置不会改变既有环境的角色或服务所有权。
 
-如果只想临时共享一个项目，展开**高级**，选择 **用 Quick Share 共享项目** 和连接提供方。Quick Share 仍保留显式项目选择和独立的临时生命周期。
+如果只想临时共享一个项目，打开**返回全部配置方式 → 高级**，选择 **用 Quick Share 共享项目** 和连接提供方。Quick Share 仍保留显式项目选择和独立的临时生命周期。
 
 ## 添加其他设备
 
 在已保存的本地 Server 环境中，打开**项目 → 添加设备**；没有设备清单时也可使用。打开窗口不会签发配对码。填写其他机器可访问的 Server 地址，再明确点击**创建邀请**。邀请权限由现有 Core 和 Server 检查决定；填写的地址仅用于接入说明，不选择签发目标。窗口不会修改监听地址、防火墙或服务设置。
 
-配对码默认掩码显示，有效期十分钟，仅可使用一次。**查看配对码**和每项复制操作都需要明确点击。在追加机器安装 WebCodex，选择**加入主节点**并输入地址与配对码，初始项目可以跳过。关闭窗口、切换环境或本地展示期结束后清除所展示的配对码；关闭不会撤销 Server 上的邀请。失败或结果未确认时不会自动生成新码。
+配对码默认掩码显示，有效期十分钟，仅可使用一次。**查看配对码**和每项复制操作都需要明确点击。在追加机器安装 WebCodex，选择**连接其他电脑**并输入地址与配对码，初始项目可以跳过。关闭窗口、切换环境或本地展示期结束后清除所展示的配对码；关闭不会撤销 Server 上的邀请。失败或结果未确认时不会自动生成新码。
 
 点击**查看设备和项目**刷新现有授权清单。邀请已创建、Runner 在线、ChatGPT 真实读取项目是不同的观察结果。项目文件保留在各自机器上；同名、同路径项目仍按 Runner 与项目身份区分。
 
@@ -74,6 +76,33 @@ Runner 文件系统 policy 仍然是权限边界。全新 Desktop 的本机 Runn
 首页与侧栏显示**本机 Runner** 的状态，Tunnel 计数显示本地就绪数量，不确认 ChatGPT 当前已接入。项目表的会话数量表示未结束的会话。非 macOS 平台的桌面访问设置会解释权限检查不可用，并提示检查桌面登录与项目页的会话状态；不会把缺少权限观测当作桌面工具不可用。
 
 ChatGPT 在不同工作目录之间切换时，不需要先停止 Runtime 或 OpenAI Secure Tunnel。Runtime 会根据当前 Runner policy 解析兼容路径，并按需注册 Project。
+## 连接 ChatGPT
+
+打开**连接 → 连接 ChatGPT**，填写 OpenAI Tunnel ID 和 API key 后点击**保存**。专用表单已选定连接提供方与本机 Server 归属；可选名称及自动启动放在**高级**中。高级**添加连接**编辑器仍保留自定义设置。若保存后提示**重启 Server**，明确点击该操作应用配置，再等待连接就绪。保存凭据不代表 Tunnel 或 ChatGPT 已连通。
+
+在 ChatGPT 中使用同一个 Tunnel ID 添加或连接 WebCodex，认证方式选择无。API key 保留在桌面版中。具体网页创建步骤见[安装指南](desktop-install.zh-CN.md)。**使用 ChatGPT**会为确切的本机 Runner 提供只读 Runtime 状态检查提示，即使尚无项目也能验证；已有确切项目时提供文件读取提示。用户手动确认与实际观测到的工具调用分别显示。
+
+## 连接 Gemini 网页版
+
+打开**连接 → 连接 Gemini**。ChatGPT（OpenAI Secure Tunnel）与 Gemini（Cloudflare + OAuth）可以同时连接到同一个本机 WebCodex Server，互不冲突。如果检测到本机已有 WebCodex，点击**检查并继续**。Desktop 会先核对进程归属、项目清单、原有配置和运行中的作业，再记录迁移。阅读服务切换的影响后，再点击**确认保存并切换服务**。中断的迁移沿用原恢复记录；若上次失败的迁移未留下已安装的后台服务，可选择**清理未完成记录并重新检查**。新电脑选择**准备这台电脑 → 开始使用**。两种流程完成后都会回到 Gemini。如果本机连接的是远程 Server，请在运行该 Server 的电脑上配置 Gemini，或向管理员索取 MCP 地址。
+
+1. 点击**连接 Gemini**。Desktop 复用选定的 Cloudflare 连接，或创建 Quick 连接，启用应用注册并启动。首次交互式启动可下载固定版本的组件并校验 SHA-256。等待卡片显示已验证的地址。旧版 Server 首次加载专用入口时可能需要明确确认一次重启。
+2. 只有卡片显示 **Gemini MCP 地址（复制完整网址）** 后，才点击 **复制 MCP 地址** 和 **打开 Gemini**。Quick 地址形如 `https://实际随机域名.trycloudflare.com/mcp`，Named 地址形如 `https://你的固定域名/mcp`。**不要填写高级设置中的 `http://127.0.0.1:端口` 本机转发目标，也不能直接填写另一台 Server 的首页地址。**在 Gemini 网页的 **Settings → Connected Apps → Custom apps** 中添加地址并点击 **Next**。部分界面将 Connected Apps 放在 Personal Intelligence 下。浏览器跳转到 WebCodex 后，核对地址，在 Desktop 点击**复制 WebCodex 登录凭据**并确认剪贴板操作，仅把凭据粘贴到该 WebCodex 登录页。这是连接所有者的用户凭据；查看请求的权限后再授权。Gemini 的表单只需 MCP 地址。
+3. 在 Gemini 对话中输入 `@` 并选择刚添加的应用，试着说“查看 WebCodex Runtime 状态”。Desktop 会分别显示已观察到的 OAuth 使用和本次连接中成功的 MCP 工具调用。之后直接在对话中使用工具；Gemini 可能要求确认写入操作。[Google 的自定义应用指南](https://support.google.com/gemini/answer/17209137)
+
+**长期连接**可选择**其他 Cloudflare 连接 → 使用固定地址**。选择已有 Named 连接即可复用其凭据。首次配置时填写 Cloudflare Tunnel ID、固定 HTTPS 地址和 Tunnel 令牌，选择随 Server 运行或独立服务及自动启动。在 Cloudflare 中把固定主机名转发到**高级连接设置**中显示的本机转发目标。一个 Server 只允许一个活动的 Cloudflare 连接。切换时先停止正在使用的连接，并在编辑配置时明确选择哪个随服务启动。
+
+| 遇到的情况 | 如何继续 |
+| --- | --- |
+| 所有者或 Runner 不可用 | 打开 Runtime 设置，检查本机 Server 和同一用户的 Runner。若提示缺少 `cloudflared`，点击**连接 Gemini**可自动下载校验版本，离线环境也可手动安装 2025.4.0 或更高版本后再启动连接。 |
+| 暂时无法读取 Gemini 登录所需的信息 | 保持连接运行，WebCodex 会自动重新检查公网登录元数据。 |
+| 地址尚未出现或固定地址无法连接 | 等待启动及公网验证完成。Named 请核对 Cloudflare 主机名路由和本机转发目标，修正后重新连接。复制失败时，可手动选中卡片中的地址复制。 |
+| 看不到 Custom apps | Google 目前要求用户位于美国、年满 18 岁、使用个人账号、选择英语并开启 Gemini 历史记录。工作或学校账号暂不支持此入口。可用性以当前账号和 Google 帮助为准。 |
+| 首次登录被取消，或尚未观察到授权 | 在 Gemini 重新打开应用完成授权，再查询一次 Runtime 状态。调试时可使用 Developer Mode 的 Event Log。[Google 调试指南](https://developers.google.com/connected-apps/mcp/dev-mode/usage) |
+| 关闭窗口或重新启动 | 持久化服务独立运行。重新打开 Desktop 会读取当前连接状态。Quick 停止重建后请复制新地址，在 Gemini 重新添加并授权。Named 保持同一配置、所有者及固定地址时会保留有效授权。 |
+
+需要暂停访问时，在 Desktop 点击 **停止**。要取消 Google 端的关联，在 Gemini 的 Connected Apps 打开该应用的详情，点击 **Disconnect**。要撤销此连接上所有自动注册客户端的授权，请在 Desktop 编辑连接，关闭 **允许自动注册 OAuth 客户端**，点击**保存**。[Google 的断开连接说明](https://support.google.com/gemini/answer/17209137)
+
 ## 连接与故障恢复
 
 连接卡片直接显示观察到的隧道与本地 MCP 可达状态。故障会显示具体原因，并提供代理设置、Runtime 或故障诊断入口。页面显示当前网络路径；故障建议使用失败时的代理证据，不会自动更改网络路径。
@@ -119,7 +148,7 @@ Desktop 的授权结果不等于独立 Runner 已获授权。持久 Runner 的 G
 
 **设置** 按通用、文件访问与权限、网络、Runtime、故障排查、关于与更新分区。选中分区后直接显示配置，无需展开折叠项；在分区之间切换会保留网络和追踪设置草稿，不会自动保存或重启服务。通用包含语言、外观和登录时启动；文件访问与权限包含 Runner 允许目录和 macOS Computer Use 权限。语言也可以在左下角直接切换。支持简体中文、繁體中文、English、日本語、한국어、Deutsch、Français；选择会保存，重开后恢复，活动时间按所选语言格式显示。系统托盘菜单跟随所选语言，后台启动时也会恢复上次选择；原始后端诊断仍使用英文，系统文件选择器的语言由操作系统决定。
 
-关闭窗口只会把 Desktop 隐藏到菜单栏或系统托盘。持久的 Server、Runner 和 Tunnel 服务独立于窗口运行，退出 Desktop 后也会继续运行。托盘中的 **退出 WebCodex** 会结束 Desktop 及其直接管理的进程，例如临时 Quick Share、旧版由 Desktop 管理的 Runtime 或普通 Tunnel。Core 管理的本机服务需要使用诊断页的明确控制；仅此电脑拥有的组件才显示对应控制。viewer 没有本机 Runner 控制，只有 Server 的电脑也没有 Runner 控制。Desktop 可以通过 Server 连接观察自定义旧服务，但不会接管其生命周期。首页用于旧版 Desktop Runtime 的停止操作还会更新已保存的启动偏好，不会停止独立服务。
+关闭窗口只会把 Desktop 隐藏到菜单栏或系统托盘。在 macOS 上，可在菜单栏菜单中开启 **关闭窗口后隐藏 Dock 图标**，窗口关闭期间 Dock 中不再显示图标。持久的 Server、Runner 和 Tunnel 服务独立于窗口运行，退出 Desktop 后也会继续运行。托盘中的 **退出 WebCodex** 会结束 Desktop 及其直接管理的进程，例如临时 Quick Share、旧版由 Desktop 管理的 Runtime 或普通 Tunnel。Core 管理的本机服务需要使用诊断页的明确控制；仅此电脑拥有的组件才显示对应控制。viewer 没有本机 Runner 控制，只有 Server 的电脑也没有 Runner 控制。Desktop 可以通过 Server 连接观察自定义旧服务，但不会接管其生命周期。首页用于旧版 Desktop Runtime 的停止操作还会更新已保存的启动偏好，不会停止独立服务。
 
 macOS 使用 **⌘ + 1–6**，Windows 使用 **Ctrl + 1–6**，依次切换首页、项目、活动、连接、扩展和设置；**⌘ / Ctrl + 7** 打开 Runtime Console，**⌘ / Ctrl + ,** 打开设置。按住 ⌘ 或 Ctrl 片刻，侧边栏会显示各页面对应的数字。这些导航快捷键在输入框和语言选择框内同样生效，普通输入及复制、粘贴等文本编辑快捷键不受影响。安装版中按 F5 或 ⌘ / Ctrl + R 不会重新加载窗口，避免丢失未保存的草稿；页面右键菜单仅在选中文字或输入框中出现。可用 Tab 聚焦按钮，用 Enter 激活；设置分区支持上下方向键及 Home / End 切换。
 
@@ -131,3 +160,9 @@ Full Runtime 由 Server、Runner 和 Runner 已观察到的 Project 清单组成
 Desktop 重启会恢复已保存的 Server/Runner 身份和 Connections，不会预先注册 Project。只有模型驱动的工作解析了具体目录时，才会出现对应 Runtime Project。在线且完整的 Runner inventory 是这些注册状态的权威来源；Desktop 可以清理过期的展示历史，但正常 Desktop UI 不负责修改 Project 注册状态。
 
 项目目录、Git 文件和 Runner policy 是彼此独立的边界：按需注册 Project 只是为已经获得授权的路径创建或复用 runtime identity，不会扩大 `allowed_roots`。
+
+## 本机 Computer 活动与暂停
+
+Windows 原生托盘显示 Computer 观察和控制活动，并为保存的本机 Runner 提供
+**暂停 Computer Control**。暂停控制后仍可观察。恢复、可选边缘提示、快捷键和执行边界
+见[本机 Computer Control](agent/computer-local-control.zh-CN.md)。

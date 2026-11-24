@@ -36,6 +36,8 @@ use webcodex_core::runner_protocol::{
     RunnerRegisterRequest, RunnerView, RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN,
 };
 
+use webcodex_core::runner_operation::valid_computer_control_epoch;
+
 fn validate_coding_agent_registration(
     client_id: &str,
     capability: bool,
@@ -233,6 +235,16 @@ impl RunnerRegistry {
         auth: Option<&crate::RunnerAccess>,
         streaming: Option<StreamingSessionRegistration>,
     ) -> Result<RunnerView, String> {
+        if body
+            .computer_control_epoch
+            .as_deref()
+            .is_some_and(|epoch| !valid_computer_control_epoch(epoch))
+        {
+            return Err("invalid Computer control epoch".into());
+        }
+        if body.computer_control_epoch.is_some() && !body.capabilities.computer_local_control {
+            return Err("Computer control epoch requires computer_local_control support".into());
+        }
         validate_id(&body.client_id, "client_id")?;
         validate_runner_instance_id(&body.runner_instance_id)?;
         validate_optional_field(&body.display_name, "display_name")?;
@@ -298,6 +310,11 @@ impl RunnerRegistry {
         // exclusively through the bounded paged inventory protocol.
         let projects = Vec::new();
         let project_inventory = pending_inventory_state(0);
+        let job_capacity_generation = policy
+            .as_ref()
+            .and_then(|p| p.tool_providers.as_ref())
+            .map(|p| p.config_reload.generation)
+            .unwrap_or(0);
         let record = RunnerRecord {
             client_id: client_id.clone(),
             runner_instance_id: runner_instance_id.clone(),
@@ -308,6 +325,7 @@ impl RunnerRegistry {
             host_context,
             runner_features: runner_features.clone(),
             computer_session_availability: body.computer_session_availability,
+            computer_control_epoch: body.computer_control_epoch.clone(),
             projects,
             project_inventory,
             last_seen: now,
@@ -327,6 +345,7 @@ impl RunnerRegistry {
             process_started_at: body.process_started_at,
             build: body.build,
             job_concurrency_limit: body.job_concurrency_limit,
+            job_capacity_generation,
             coding_agent_providers: coding_agent_providers.clone(),
             coding_agent_inventory,
             projected_structured_terminal_suppressions: VecDeque::new(),
@@ -408,6 +427,15 @@ impl RunnerRegistry {
                 client_id
             ));
         }
+        if let Some(existing) = inner.runners.get(&client_id) {
+            if existing.runner_instance_id == runner_instance_id
+                && (record.job_capacity_generation < existing.job_capacity_generation
+                    || (record.job_capacity_generation == existing.job_capacity_generation
+                        && record.job_concurrency_limit != existing.job_concurrency_limit))
+            {
+                return Err("stale or conflicting Runner capacity generation".into());
+            }
+        }
         reject_same_instance_feature_downgrade(
             inner.runners.get(&client_id),
             &runner_instance_id,
@@ -419,6 +447,12 @@ impl RunnerRegistry {
             &runner_instance_id,
             &runner_features,
             RunnerFeature::CodingAgentRuns,
+        )?;
+        reject_same_instance_feature_downgrade(
+            inner.runners.get(&client_id),
+            &runner_instance_id,
+            &runner_features,
+            RunnerFeature::CodingAgentArchiveLookup,
         )?;
         reject_same_instance_feature_downgrade(
             inner.runners.get(&client_id),
@@ -798,6 +832,47 @@ impl RunnerRegistry {
         Ok(())
     }
 
+    /// Capacity is observational metadata, accepted only for the active instance
+    /// and stream lease. A delayed same-instance poll cannot regress generation.
+    pub async fn update_job_capacity(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: Option<&str>,
+        capacity: Option<webcodex_core::runner_protocol::RunnerJobCapacity>,
+    ) -> Result<(), String> {
+        let Some(capacity) = capacity else {
+            return Ok(());
+        };
+        if capacity.generation == 0
+            || !(RUNNER_JOB_CONCURRENCY_MIN..=RUNNER_JOB_CONCURRENCY_MAX).contains(&capacity.limit)
+        {
+            return Err("invalid Runner capacity".into());
+        }
+        let mut inner = self.inner.lock().await;
+        let runner = inner.runners.get_mut(client_id).ok_or("unknown Runner")?;
+        if runner.runner_instance_id != runner_instance_id
+            || runner.disconnected_at.is_some()
+            || match connection_id {
+                Some(id) => runner.connection_id.as_deref() != Some(id),
+                None => runner.transport != RunnerTransport::Polling,
+            }
+        {
+            return Err("stale Runner capacity lease".into());
+        }
+        if capacity.generation < runner.job_capacity_generation
+            || (capacity.generation == runner.job_capacity_generation
+                && runner
+                    .job_concurrency_limit
+                    .is_some_and(|limit| limit != capacity.limit))
+        {
+            return Err("stale or conflicting Runner capacity generation".into());
+        }
+        runner.job_concurrency_limit = Some(capacity.limit);
+        runner.job_capacity_generation = capacity.generation;
+        Ok(())
+    }
+
     /// Update only brokered Computer availability for the exact active lease.
     /// A missing field leaves legacy/transient behavior unchanged.
     pub async fn update_computer_session_availability(
@@ -826,6 +901,33 @@ impl RunnerRegistry {
         }
         runner.computer_session_availability = Some(availability);
         runner.last_seen = now_ts();
+        Ok(())
+    }
+
+    pub async fn update_computer_control_epoch(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: Option<&str>,
+        epoch: Option<String>,
+    ) -> Result<(), String> {
+        let Some(epoch) = epoch else {
+            return Ok(());
+        };
+        if !valid_computer_control_epoch(&epoch) {
+            return Err("invalid Computer control epoch".into());
+        }
+        let mut inner = self.inner.lock().await;
+        let runner = inner.runners.get_mut(client_id).ok_or("unknown Runner")?;
+        if runner.runner_instance_id != runner_instance_id
+            || runner.connection_id.as_deref() != connection_id
+            || !runner
+                .runner_features
+                .supports(RunnerFeature::ComputerLocalControl)
+        {
+            return Err("Computer control epoch requires the active opted-in Runner lease".into());
+        }
+        runner.computer_control_epoch = Some(epoch);
         Ok(())
     }
 
@@ -1401,6 +1503,28 @@ impl RunnerRegistry {
         Self::runner_view_locked(&inner, client_id)
     }
 
+    /// A single locked observation for historical Session authorization.
+    /// Admin visibility alone is not a grant to a formerly registered Project.
+    pub async fn get_runner_view_for_owned_history(
+        &self,
+        client_id: &str,
+        auth: Option<&crate::RunnerAccess>,
+    ) -> Option<RunnerView> {
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner.runners.get(client_id)?;
+        if let Some(access) = auth {
+            // Keep bootstrap's explicit owner bypass, but ordinary admin
+            // inventory visibility must not bypass the owner's group fence.
+            let mut scoped = access.clone();
+            if !scoped.owner_bypass {
+                scoped.global_visibility = false;
+            }
+            assert_runner_access(Some(&scoped), runner).ok()?;
+        }
+        Self::runner_view_locked(&inner, client_id)
+    }
+
     pub async fn get_runner_view_for_auth(
         &self,
         client_id: &str,
@@ -1482,6 +1606,19 @@ impl RunnerRegistry {
         auth: Option<&crate::RunnerAccess>,
         run_id: &str,
     ) -> Option<(RunnerView, CodingAgentRunSnapshot)> {
+        self.coding_agent_run_for_auth_checked(auth, run_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Unlike the compatibility projection, this distinguishes absence from
+    /// conflicting identities. Admission must never interpret a conflict as a miss.
+    pub async fn coding_agent_run_for_auth_checked(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        run_id: &str,
+    ) -> Result<Option<(RunnerView, CodingAgentRunSnapshot)>, String> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
         self.prune_expired_shared_key_runners_locked(&mut inner, now);
@@ -1508,12 +1645,39 @@ impl RunnerRegistry {
                 // A Server restart has no process-local binding to disambiguate
                 // duplicate run ids. Fail closed instead of choosing a Runner by
                 // registry iteration order and silently retargeting provenance.
-                return None;
+                return Err("ACP Run identity is present on multiple Runners".to_string());
             }
-            let view = Self::runner_view_locked(&inner, &client_id)?;
+            let view = Self::runner_view_locked(&inner, &client_id)
+                .ok_or_else(|| "ACP Run owner could not be observed".to_string())?;
             matched = Some((view, run));
         }
-        matched
+        Ok(matched)
+    }
+
+    /// Internal bounded inventory of one exact Runner registration. The caller
+    /// persists only protected terminal routing identities, never exposes this
+    /// inventory as a model-facing cross-Project listing.
+    pub async fn coding_agent_archive_inventory_for_runner(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        client_id: &str,
+        expected_instance_id: &str,
+    ) -> Result<Vec<CodingAgentRunSnapshot>, String> {
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner
+            .runners
+            .get(client_id)
+            .ok_or_else(|| "exact ACP Runner is unavailable".to_string())?;
+        assert_runner_access(auth, runner)?;
+        if runner.runner_instance_id != expected_instance_id
+            || !runner
+                .runner_features
+                .supports(RunnerFeature::CodingAgentArchiveLookup)
+        {
+            return Err("ACP archive inventory registration changed".to_string());
+        }
+        Ok(runner.coding_agent_inventory.runs.clone())
     }
 
     pub async fn assert_runner_access(

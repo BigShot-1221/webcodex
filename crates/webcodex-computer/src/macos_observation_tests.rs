@@ -109,6 +109,84 @@ fn ax_observation_scoped_seed_checks_secure_ancestry_without_protected_flag() {
 }
 
 #[test]
+fn ax_unverified_subrole_redacts_text_blocks_input_and_cannot_attest_identity() {
+    let unverified = ElementFingerprint {
+        role: "AXTextField".into(),
+        subrole: None,
+        identifier: None,
+        title: None,
+        description: None,
+        placeholder: None,
+        protected: true,
+        #[cfg(windows)]
+        native_runtime_id: vec![1, 2],
+    };
+    let observed = finish_ax_fingerprint(unverified, |_| {
+        panic!("unknown secure subrole must prevent every text attribute read")
+    })
+    .unwrap();
+    assert_redacted(&observed);
+    assert!(!observed.has_positive_evidence());
+
+    let element = ElementRecord {
+        surface_id: "surface_unverified".into(),
+        path: vec![0],
+        lineage: vec![fingerprint("AXWindow", None, false), observed],
+    };
+    assert!(element.contains_protected_content());
+    assert!(validate_element_state_target(&element).is_err());
+    assert!(validate_text_input_target(&element).is_err());
+
+    let descendant = finish_ax_fingerprint(
+        fingerprint("AXGroup", None, element.contains_protected_content()),
+        |_| panic!("descendant of uncertain subrole must not read text"),
+    )
+    .unwrap();
+    assert_redacted(&descendant);
+
+    // A separate sibling with verified metadata remains readable.
+    let sibling = finish_ax_fingerprint(fingerprint("AXButton", None, false), |attribute| {
+        Ok((attribute == "AXTitle").then_some("7".into()))
+    })
+    .unwrap();
+    assert_eq!(sibling.title.as_deref(), Some("7"));
+    assert!(!sibling.protected);
+}
+
+// Optional metadata must not weaken protected fields or other errors.
+#[test]
+fn ax_description_regression_preserves_protected_fields_and_errors() {
+    for (role, subrole, inherited_protected) in [
+        ("AXSecureTextField", None, false),
+        ("AXTextField", Some("AXSecureTextField"), false),
+        ("AXTextArea", None, true),
+        ("AXRadioButton", None, true),
+    ] {
+        let observed =
+            finish_ax_fingerprint(fingerprint(role, subrole, inherited_protected), |_| {
+                panic!("protected text must never be read")
+            })
+            .unwrap();
+        assert_redacted(&observed);
+    }
+
+    for failed_attribute in ["AXTitle", "AXDescription", "AXPlaceholderValue"] {
+        let error = finish_ax_fingerprint(fingerprint("AXTextArea", None, false), |attribute| {
+            if attribute == failed_attribute {
+                Err("permission_denied: macOS Accessibility permission is not granted".into())
+            } else {
+                Ok(None)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "permission_denied: macOS Accessibility permission is not granted"
+        );
+    }
+}
+
+#[test]
 fn ax_observation_nonsecure_text_and_provider_errors_are_preserved() {
     let mut read = Vec::new();
     let observed = finish_ax_fingerprint(fingerprint("AXGroup", None, false), |attribute| {

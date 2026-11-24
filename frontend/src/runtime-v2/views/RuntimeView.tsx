@@ -16,6 +16,7 @@ import type { RuntimeV2Client } from "../api/client.js";
 import type { Availability, RuntimeOverview } from "../model/types.js";
 import { AgentsPanel } from "../components/AgentsPanel.js";
 import { CopyIdentity } from "../components/ui/CopyIdentity.js";
+import { TraceSearch } from "../components/TraceSearch.js";
 import { PageHeader } from "../components/ui/PageHeader.js";
 
 const CONFIG_LABELS: Record<string, string> = {
@@ -25,7 +26,6 @@ const CONFIG_LABELS: Record<string, string> = {
   "oauth2_shared_key_bridge_enabled": "OAuth2 shared key bridge",
   "profile": "MCP host profile",
   "host_budget_secs": "Host request budget",
-  "initial_job_handoff_secs": "Legacy handoff hint (unused)",
   "max_sync_wait_secs": "Maximum synchronous wait",
   "continuation_wait_secs": "Continuation wait"
 };
@@ -58,6 +58,7 @@ type Props = {
   updatedAt?: number | null;
   refreshing?: boolean;
   onOpenWork: () => void;
+  onOpenWindow?: (key: string) => void;
   target?: { mode: "agents"; agentId: string } | null;
   onTargetConsumed?: () => void;
   onUnauthorized: () => void;
@@ -72,6 +73,7 @@ export function RuntimeView({
   updatedAt,
   refreshing,
   onOpenWork,
+  onOpenWindow,
   target,
   onTargetConsumed,
   onUnauthorized,
@@ -216,6 +218,9 @@ export function RuntimeView({
               <code>{runner.build_git_commit || "—"}</code>
             </div>)}
           </details>}
+          <section className="runtime-section runtime-diagnostics">
+            <TraceSearch title="Call diagnostics" client={client} language={language} onSelectWindow={key => onOpenWindow?.(key)} />
+          </section>
         </>
       ) : (
         <AgentsPanel client={client} language={language} onUnauthorized={onUnauthorized} selectedAgentId={requestedAgentId} onSelectedAgentConsumed={() => setRequestedAgentId("")} />

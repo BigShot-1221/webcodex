@@ -5,6 +5,75 @@ use super::support::*;
 use crate::runner_protocol::RunnerResultRequest;
 
 #[tokio::test]
+async fn project_unregister_must_not_strand_owned_session_closeout() {
+    let runtime = runtime_with_resolver_projects().await;
+    let owner = auth_context(None, true);
+    let started = runtime
+        .dispatch_with_auth(
+            ToolCall::StartSession {
+                project: Some("agent:workstation:my-repo".into()),
+                title: Some("retired project fixture".into()),
+                mode: SessionMode::Normal,
+                deny_write_tools: false,
+                deny_shell_tools: false,
+                execution_context: None,
+            },
+            Some(&owner),
+        )
+        .await;
+    assert!(started.success, "{:?}", started.error);
+    let session_id = started.output["session_id"].as_str().unwrap().to_string();
+    let runner_instance = runtime
+        .runner_registry
+        .get_runner_view("workstation")
+        .await
+        .unwrap()
+        .runner_instance_id;
+    assert!(runtime
+        .runner_registry
+        .remove_runner_project_for_instance("workstation", &runner_instance, "my-repo")
+        .await
+        .unwrap());
+
+    let attacker = shared_key_auth_context("different-session-owner");
+    let denied = runtime
+        .dispatch_with_auth(
+            ToolCall::SessionSummary {
+                session_id: session_id.clone(),
+                limit: Some(10),
+            },
+            Some(&attacker),
+        )
+        .await;
+    assert!(
+        !denied.success,
+        "another authority must not inherit Session ownership"
+    );
+    let history = runtime
+        .dispatch_with_auth(
+            ToolCall::SessionSummary {
+                session_id: session_id.clone(),
+                limit: Some(10),
+            },
+            Some(&owner),
+        )
+        .await;
+    assert!(history.success, "{:?}", history.error);
+    assert_eq!(history.output["session_id"], session_id);
+
+    let closed = runtime
+        .dispatch_with_auth(
+            ToolCall::CloseSession {
+                session_id: session_id.clone(),
+            },
+            Some(&owner),
+        )
+        .await;
+    assert!(closed.success, "{:?}", closed.error);
+    assert_eq!(closed.output["lifecycle"], "closed");
+}
+
+#[tokio::test]
 async fn project_resolver_resolves_full_id() {
     let runtime = runtime_with_resolver_projects().await;
     let resolved = runtime
@@ -100,16 +169,14 @@ async fn read_file_accepts_unique_short_id() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "workstation".to_string(),
-            runner_instance_id: "inst-workstation".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_output("hello\n", 1)),
-            stderr: None,
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "workstation".to_string(),
+                "inst-workstation".to_string(),
+                req.request_id,
+            )
         })
         .await
         .unwrap();
@@ -118,7 +185,7 @@ async fn read_file_accepts_unique_short_id() {
 }
 
 #[tokio::test]
-async fn read_files_short_id_continuation_binds_resolved_project_across_registry_churn() {
+async fn read_files_short_id_explicit_followup_binds_project_across_registry_churn() {
     let runtime = runtime_with_resolver_projects().await;
     let auth = auth_context(None, true);
     let first = tokio::spawn({
@@ -149,35 +216,40 @@ async fn read_files_short_id_continuation_binds_resolved_project_across_registry
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "workstation".to_string(),
-            runner_instance_id: "inst-workstation".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_range("one\ntwo", 1, 1)),
-            stderr: None,
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "workstation".to_string(),
+                "inst-workstation".to_string(),
+                req.request_id,
+            )
         })
         .await
         .unwrap();
     let first = first.await.unwrap();
     assert!(first.success, "{:?}", first.error);
-    let suggested = &first.output["suggested_call"];
-    assert_eq!(
-        suggested["arguments"]["project"],
-        "agent:workstation:other-repo"
-    );
-    assert!(suggested["arguments"].get("session_id").is_none());
-    let next_call = ToolCall::from_tool_name(
-        suggested["tool"].as_str().unwrap(),
-        suggested["arguments"].clone(),
-    )
-    .expect("short-id continuation suggested_call must parse");
+    // A completed explicit range must not suggest reading another page. A
+    // caller can still form an exact, revision-fenced request if needed.
+    assert!(first.output.get("suggested_call").is_none());
+    let revision = first.output["items"][0]["output"]["read_revision"]
+        .as_u64()
+        .expect("successful range must expose a revision");
+    let next_call = ToolCall::ReadFiles {
+        project: "agent:workstation:other-repo".to_string(),
+        items: vec![ReadFilesItem {
+            path: "README.md".to_string(),
+            start_line: Some(2),
+            limit: Some(1),
+            expected_read_revision: Some(revision),
+        }],
+        session_id: None,
+        with_line_numbers: None,
+        max_result_bytes: None,
+    };
 
-    // Make the original shorthand ambiguous after the first read. The already
-    // constructed recovery call must remain bound to workstation.
+    // Make the original shorthand ambiguous after the first read. The
+    // explicitly constructed, revision-fenced call remains bound to workstation.
     register_agent_projects(
         &runtime,
         "laptop",
@@ -224,16 +296,14 @@ async fn read_files_short_id_continuation_binds_resolved_project_across_registry
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "workstation".to_string(),
-            runner_instance_id: "inst-workstation".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_range("one\ntwo", 2, 1)),
-            stderr: None,
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "workstation".to_string(),
+                "inst-workstation".to_string(),
+                req.request_id,
+            )
         })
         .await
         .unwrap();
@@ -243,7 +313,7 @@ async fn read_files_short_id_continuation_binds_resolved_project_across_registry
 }
 
 #[tokio::test]
-async fn read_files_short_id_item_continuation_uses_resolved_project_id() {
+async fn read_files_short_id_explicit_range_has_no_automatic_continuation() {
     let runtime = runtime_with_resolver_projects().await;
     let auth = auth_context(None, true);
     let task = tokio::spawn({
@@ -273,28 +343,23 @@ async fn read_files_short_id_item_continuation_uses_resolved_project_id() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "workstation".to_string(),
-            runner_instance_id: "inst-workstation".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_range("one\ntwo", 1, 1)),
-            stderr: None,
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "workstation".to_string(),
+                "inst-workstation".to_string(),
+                req.request_id,
+            )
         })
         .await
         .unwrap();
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(
-        result.output["suggested_call"]["arguments"]["project"],
-        "agent:workstation:other-repo"
-    );
-    assert!(result.output["suggested_call"]["arguments"]
-        .get("session_id")
-        .is_none());
+    assert!(result.output.get("suggested_call").is_none());
+    assert!(result.output["items"][0]["output"]["read_revision"].is_u64());
+    assert_eq!(result.output["items"][0]["output"]["end_line"], 1);
+    assert_eq!(result.output["items"][0]["output"]["has_more"], true);
 }
 
 #[tokio::test]
@@ -320,16 +385,15 @@ async fn git_status_accepts_unique_short_id() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "workstation".to_string(),
-            runner_instance_id: "inst-workstation".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(String::new()),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "workstation".to_string(),
+                "inst-workstation".to_string(),
+                req.request_id,
+            )
         })
         .await
         .unwrap();
@@ -394,16 +458,14 @@ async fn full_id_remains_compatible_for_project_tools() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "workstation".to_string(),
-            runner_instance_id: "inst-workstation".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some(canonical_agent_file_read_output("hello\n", 1)),
-            stderr: None,
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request(
+                "workstation".to_string(),
+                "inst-workstation".to_string(),
+                req.request_id,
+            )
         })
         .await
         .unwrap();

@@ -1,6 +1,38 @@
 use super::*;
 
 #[test]
+fn permission_tool_call_title_is_optional_but_authorization_identity_is_exact() {
+    let params = json!({
+        "sessionId": "s1",
+        "toolCall": {"toolCallId": "t1"},
+        "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let slot = PermissionSlot::default();
+    let pending = slot.open_from_acp(&params, 1, "s1", deadline).unwrap();
+    assert_eq!(pending.title, "ACP tool call (title not provided)");
+    assert_eq!(pending.tool_call_id, "t1");
+    assert_eq!(pending.options[0].option_id, "allow");
+    assert!(PermissionSlot::default()
+        .open_from_acp(&params, 1, "other", deadline)
+        .is_err());
+    let mut duplicate = params.clone();
+    let option = duplicate["options"][0].clone();
+    duplicate["options"].as_array_mut().unwrap().push(option);
+    assert!(PermissionSlot::default()
+        .open_from_acp(&duplicate, 1, "s1", deadline)
+        .is_err());
+    let mut long = params;
+    long["toolCall"]["title"] = json!("标题".repeat(400));
+    let pending = PermissionSlot::default()
+        .open_from_acp(&long, 1, "s1", deadline)
+        .unwrap();
+    assert!(
+        pending.title.len() <= webcodex_core::coding_agent::CODING_AGENT_MAX_PERMISSION_TITLE_BYTES
+    );
+}
+
+#[test]
 fn outbound_writer_blocking_sink_does_not_block_lifecycle_owner() {
     let state = Arc::new((Mutex::new(BlockingWriteState::default()), Condvar::new()));
     let threads = BackgroundThreads::default();
@@ -190,11 +222,9 @@ fn explicit_config_is_ordered_and_invalid_config_never_prompts() {
         terminal.execution_state,
         CodingAgentExecutionState::NotStarted
     );
-    assert!(
-        !received_methods(&wire_log(&temp))
-            .iter()
-            .any(|method| method == "session/prompt")
-    );
+    assert!(!received_methods(&wire_log(&temp))
+        .iter()
+        .any(|method| method == "session/prompt"));
 }
 
 #[test]
@@ -207,15 +237,13 @@ fn cancel_permission_and_unsupported_requests_are_fail_closed() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_permcancel01";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects
+        )
+        .error
+        .is_none());
     wait_for_snapshot(&manager, run, |snapshot| {
         snapshot.state == CodingAgentRunState::WaitingPermission
     });
@@ -257,22 +285,19 @@ fn cancel_permission_and_unsupported_requests_are_fail_closed() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_unsupported1";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Cancelled);
     let log = wire_log(&temp);
-    assert!(
-        log.iter()
-            .any(|entry| entry.pointer("/recv/error/code").and_then(Value::as_i64) == Some(-32601))
-    );
+    assert!(log
+        .iter()
+        .any(|entry| entry.pointer("/recv/error/code").and_then(Value::as_i64) == Some(-32601)));
     assert!(log.iter().any(
         |entry| entry.pointer("/recv/method").and_then(Value::as_str) == Some("session/cancel")
     ));
@@ -311,15 +336,13 @@ fn event_ring_capacity_and_continuation_are_bounded() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_manyevents01";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects
+        )
+        .error
+        .is_none());
     wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     let entry = manager.runs.lock().unwrap().get(run).unwrap().clone();
     let first = entry.observe(Some(0), 32, 0).unwrap();
@@ -367,15 +390,13 @@ fn forced_config_is_applied_before_prompt() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_forcedapply01";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Completed);
     assert_eq!(
@@ -408,15 +429,13 @@ fn missing_forced_config_fails_without_prompt() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_forcedmissing01";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Failed);
     assert_eq!(
@@ -449,15 +468,13 @@ fn forced_config_must_be_reflected_by_provider() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_forcedreflect01";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Failed);
     assert_eq!(
@@ -490,23 +507,21 @@ fn caller_may_repeat_but_not_override_forced_config() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let same_run = "wc_agent_run_forcedsame0001";
-    assert!(
-        manager
-            .handle(
-                start_request(
-                    &manager,
-                    &root,
-                    same_run,
-                    BTreeMap::from([(
-                        "model".to_string(),
-                        CodingAgentConfigValue::String("policy-model".to_string()),
-                    )]),
-                ),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(
+                &manager,
+                &root,
+                same_run,
+                BTreeMap::from([(
+                    "model".to_string(),
+                    CodingAgentConfigValue::String("policy-model".to_string()),
+                )]),
+            ),
+            &projects,
+        )
+        .error
+        .is_none());
     assert_eq!(
         wait_for_snapshot(&manager, same_run, |snapshot| snapshot.state.terminal()).state,
         CodingAgentRunState::Completed
@@ -523,23 +538,21 @@ fn caller_may_repeat_but_not_override_forced_config() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let conflict_run = "wc_agent_run_forcedconflict01";
-    assert!(
-        manager
-            .handle(
-                start_request(
-                    &manager,
-                    &root,
-                    conflict_run,
-                    BTreeMap::from([(
-                        "model".to_string(),
-                        CodingAgentConfigValue::String("default-model".to_string()),
-                    )]),
-                ),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(
+                &manager,
+                &root,
+                conflict_run,
+                BTreeMap::from([(
+                    "model".to_string(),
+                    CodingAgentConfigValue::String("default-model".to_string()),
+                )]),
+            ),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, conflict_run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Failed);
     assert_eq!(
@@ -570,23 +583,21 @@ fn forced_config_is_reasserted_after_caller_side_effects() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_forcedreassert01";
-    assert!(
-        manager
-            .handle(
-                start_request(
-                    &manager,
-                    &root,
-                    run,
-                    BTreeMap::from([(
-                        "mode".to_string(),
-                        CodingAgentConfigValue::String("read-only".to_string()),
-                    )]),
-                ),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(
+                &manager,
+                &root,
+                run,
+                BTreeMap::from([(
+                    "mode".to_string(),
+                    CodingAgentConfigValue::String("read-only".to_string()),
+                )]),
+            ),
+            &projects,
+        )
+        .error
+        .is_none());
     assert_eq!(
         wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal()).state,
         CodingAgentRunState::Completed
@@ -627,21 +638,13 @@ fn global_forced_config_is_multi_provider_admission_policy() {
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
 
     let supported_run = "wc_agent_run_forcedmultiok";
-    assert!(
-        manager
-            .handle(
-                start_request_for_provider(
-                    &manager,
-                    &root,
-                    supported_run,
-                    "codex",
-                    BTreeMap::new(),
-                ),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request_for_provider(&manager, &root, supported_run, "codex", BTreeMap::new(),),
+            &projects,
+        )
+        .error
+        .is_none());
     assert_eq!(
         wait_for_snapshot(&manager, supported_run, |snapshot| snapshot
             .state
@@ -656,21 +659,13 @@ fn global_forced_config_is_multi_provider_admission_policy() {
     assert_eq!(prompts_after_supported, 1);
 
     let limited_run = "wc_agent_run_forcedmultifail";
-    assert!(
-        manager
-            .handle(
-                start_request_for_provider(
-                    &manager,
-                    &root,
-                    limited_run,
-                    "limited",
-                    BTreeMap::new(),
-                ),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request_for_provider(&manager, &root, limited_run, "limited", BTreeMap::new(),),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, limited_run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Failed);
     assert_eq!(
@@ -704,15 +699,13 @@ fn forced_boolean_config_is_applied_before_prompt() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_forcedbool0001";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Completed);
     assert_eq!(
@@ -751,15 +744,13 @@ fn duplicate_forced_config_id_fails_closed_without_prompt() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_forcedduplicate01";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Failed);
     assert_eq!(
@@ -793,15 +784,13 @@ fn illegal_forced_select_value_fails_without_prompt() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_forcedinvalid01";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects,
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects,
+        )
+        .error
+        .is_none());
     let terminal = wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     assert_eq!(terminal.state, CodingAgentRunState::Failed);
     assert_eq!(
@@ -834,21 +823,18 @@ fn fake_acp_normalizes_activity_and_terminal_matrix() {
         CodingAgentExecutionState::Completed
     );
     assert_eq!(durable.terminal, obs.run.terminal);
-    assert!(
-        obs.events
-            .iter()
-            .any(|e| e.kind == CodingAgentEventKind::AgentMessage)
-    );
-    assert!(
-        obs.events
-            .iter()
-            .any(|e| e.kind == CodingAgentEventKind::Reasoning)
-    );
-    assert!(
-        obs.events
-            .iter()
-            .any(|e| e.kind == CodingAgentEventKind::TerminalActivity)
-    );
+    assert!(obs
+        .events
+        .iter()
+        .any(|e| e.kind == CodingAgentEventKind::AgentMessage));
+    assert!(obs
+        .events
+        .iter()
+        .any(|e| e.kind == CodingAgentEventKind::Reasoning));
+    assert!(obs
+        .events
+        .iter()
+        .any(|e| e.kind == CodingAgentEventKind::TerminalActivity));
     for scenario in [
         "cancelled",
         "max_tokens",
@@ -891,10 +877,8 @@ fn config_and_permission_paths_are_fail_closed() {
     assert_eq!(obs.run.state, CodingAgentRunState::Completed);
     let (_, _, permission) = run_scenario("permission", BTreeMap::new());
     assert_eq!(permission.run.state, CodingAgentRunState::Cancelled);
-    assert!(
-        permission
-            .events
-            .iter()
-            .any(|e| e.kind == CodingAgentEventKind::PermissionRequest)
-    );
+    assert!(permission
+        .events
+        .iter()
+        .any(|e| e.kind == CodingAgentEventKind::PermissionRequest));
 }

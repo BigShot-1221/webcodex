@@ -806,13 +806,8 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
     register_agent(&runtime, client_id, None, RunnerCapabilities::default()).await;
     let project = agent_test_project_id(client_id);
     let auth = auth_context(None, true);
-    let coordinator = start_authorized_project_session(
-        &runtime,
-        &project,
-        Some("coordinator C"),
-        &auth,
-    )
-    .await;
+    let coordinator =
+        start_authorized_project_session(&runtime, &project, Some("coordinator C"), &auth).await;
     let worker =
         start_authorized_project_session(&runtime, &project, Some("worker W"), &auth).await;
     assert_ne!(coordinator.session_id, worker.session_id);
@@ -898,7 +893,19 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
     )
     .expect_err("caller-controlled completion author must fail closed");
     assert!(
-        forged_author_error.contains("unknown field `author_session_id`"),
+        forged_author_error.contains("[field]: unknown field"),
+        "{forged_author_error}"
+    );
+    assert!(
+        forged_author_error.contains("accepted top-level fields include"),
+        "{forged_author_error}"
+    );
+    assert!(
+        !forged_author_error.contains("author_session_id"),
+        "{forged_author_error}"
+    );
+    assert!(
+        !forged_author_error.contains("wc_sess_forged_should_be_ignored"),
         "{forged_author_error}"
     );
 
@@ -1059,8 +1066,7 @@ async fn collaboration_completion_without_recording_session_has_null_author_even
     register_agent(&runtime, client_id, None, RunnerCapabilities::default()).await;
     let project = agent_test_project_id(client_id);
     let auth = auth_context(None, true);
-    let coordinator =
-        start_authorized_project_session(&runtime, &project, None, &auth).await;
+    let coordinator = start_authorized_project_session(&runtime, &project, None, &auth).await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -1108,13 +1114,8 @@ async fn collaboration_explicit_recording_session_is_completion_author() {
     let auth = auth_context(None, true);
     let coordinator =
         start_authorized_project_session(&runtime, &project, Some("coordinator"), &auth).await;
-    let worker_recording = start_authorized_project_session(
-        &runtime,
-        &project,
-        Some("worker W1"),
-        &auth,
-    )
-    .await;
+    let worker_recording =
+        start_authorized_project_session(&runtime, &project, Some("worker W1"), &auth).await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -1691,7 +1692,7 @@ async fn project_scoped_session_authority_rejects_recycled_project_identity() {
         .unwrap()
         .assignment_fence;
     runtime.sessions.flush_persistence();
-    let persisted = std::fs::read_to_string(&ledger).unwrap();
+    let persisted = webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap();
     assert!(persisted.contains("owner_authority_fingerprint"));
     assert!(!persisted.contains("recycled-authority-a"));
 
@@ -1987,7 +1988,7 @@ async fn projectless_owner_fingerprint_survives_restart_without_raw_principal_ma
     assert!(started.success, "{:?}", started.error);
     let session_id = started.output["session_id"].as_str().unwrap().to_string();
     runtime.sessions.flush_persistence();
-    let persisted = std::fs::read_to_string(&ledger).unwrap();
+    let persisted = webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap();
     assert!(persisted.contains("owner_authority_fingerprint"));
     assert!(!persisted.contains(alice_identity));
     drop(runtime);
@@ -2048,8 +2049,10 @@ async fn legacy_projectless_owner_hash_is_not_accepted_after_restart() {
             .unwrap();
     assert_ne!(legacy_fingerprint, canonical_fingerprint);
 
-    let mut persisted: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let mut persisted: Value = serde_json::from_str(
+        &webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap(),
+    )
+    .unwrap();
     let row = persisted["sessions"]
         .as_array_mut()
         .unwrap()
@@ -2094,8 +2097,7 @@ async fn collaboration_foreign_owner_cannot_read_or_complete_known_session_and_t
     )
     .await;
     let project = "agent:alice-host:private".to_string();
-    let coordinator =
-        start_authorized_project_session(&runtime, &project, None, &alice).await;
+    let coordinator = start_authorized_project_session(&runtime, &project, None, &alice).await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {

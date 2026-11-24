@@ -26,7 +26,7 @@
 npm install -g @yyjeqhc/webcodex
 ```
 
-支持 Linux x64、Linux arm64、macOS x64、macOS arm64、Windows x64 与 Windows arm64。Windows 支持 CLI + Runner、显式前台 Server，以及显式本机 `webcodex share --tunnel cloudflare|openai|none`。Windows x64 支持 managed Cloudflare 获取；固定版本 upstream 没有官方 Windows ARM64 artifact，因此 ARM64 使用 Cloudflare 时需要受信任的显式/`PATH` binary。原生 OpenAI Tunnel 支持 Windows x64/arm64。旧 `server install` / `runner install` 命令不托管 Windows 服务，仍可使用下文前台流程。新的 `environment` 配置默认使用 user scope，在 Windows 上由已登录用户的计划任务托管。显式 `--scope system` 才选择 SCM 服务，并要求 OS 授权与账户配置；已有环境保留其已保存范围和所有者。user scope 不保证登录前或注销后运行；参见[统一安装指南](unified-installation.zh-CN.md#服务与凭据)及待完成的原生验收。npm 包装器要求 Node.js 18 或更新。Linux x64 native artifact 以 glibc 2.17 或更新为兼容基线。
+支持 Linux x64、Linux arm64、macOS x64、macOS arm64、Windows x64 与 Windows arm64。Windows 支持 CLI + Runner、显式前台 Server，以及显式本机 `webcodex share --tunnel cloudflare|openai|none`。Windows x64 支持 managed Cloudflare 获取；Windows ARM64 在系统确认支持 x64 用户程序时使用相同的已验证 x64 组件。其他 ARM64 系统需要显式指定可信的兼容程序或将其加入 `PATH`。原生 OpenAI Tunnel 支持 Windows x64/arm64。旧 `server install` / `runner install` 命令不托管 Windows 服务，仍可使用下文前台流程。新的 `environment` 配置默认使用 user scope，在 Windows 上由已登录用户的计划任务托管。显式 `--scope system` 才选择 SCM 服务，并要求 OS 授权与账户配置；已有环境保留其已保存范围和所有者。user scope 不保证登录前或注销后运行；参见[统一安装指南](unified-installation.zh-CN.md#服务与凭据)及待完成的原生验收。npm 包装器要求 Node.js 18 或更新。Linux x64 native artifact 以 glibc 2.17 或更新为兼容基线。
 
 从源码构建：
 
@@ -197,6 +197,8 @@ WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES=2147483648
 ```
 
 `full` 可能包含源码、patch、command/script 输入输出、user message，以及本身就出现在 tool payload 中的 secret。应像保护其它敏感诊断数据一样保护 trace 目录，并设置有界 retention/budget。Trace capture 只用于诊断；trace 写入失败不会改变 tool execution。
+
+Store 连接等待或持有达到 100 ms 时，会在 INFO 级别记录有界诊断标签。Metadata Trace 区分响应交接与审计持久化后的 Handler 收尾。Trace 尽力采集：诊断界面会标记已知遗漏，单独存在完成事件不代表整条 Trace 完整。
 
 精确的 trace 文件布局、correlation id、model-facing forensic reader、queue/compression 与 payload validation 规则属于 implementation/maintainer detail，有意不放在这份部署指南中。
 
@@ -375,7 +377,7 @@ max_output_bytes = 262144
 无效 candidate 保留旧 active snapshot/generation，`restart_required_fields` 明确列出仍需
 重启、且不会假装已经在线生效的 startup-only 变更。Unix service reload/SIGHUP 仍保留为
 调用同一 reload primitive 的兼容 trigger，但 first-class config control 不依赖它。身份、
-server/auth、项目来源、并发、能力与传输等字段在被报告为 restart-only 时仍需要重启。
+server/auth、项目来源、能力与传输等字段在被报告为 restart-only 时仍需要重启。
 
 `[instructions].files` 明确属于 hot-reloadable 字段：完成 check/reload 后，新 Project
 bootstrap 会立即使用新的路径列表，不需要重启 Runner。已配置 instruction 文件的内容
@@ -446,7 +448,7 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` 限制 OAuth client 最多可以请求哪些权限。WebCodex 新增 permission 时不会静默扩大已有 client。要修改现有 client，请把期望保留的完整、非空 allow-list 提交到 `POST /api/oauth/clients/update_scopes`。真实变化会让旧 OAuth grant 失效并要求重新授权；提交相同 canonical list 是 no-op。安全模型见[认证](AUTH_MODEL.zh-CN.md#oauth2)。
 
-ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OAuth client 只能从 OpenAI attachment host 导入：`files.oaiusercontent.com` 及其子域，以及严格匹配的 Sediment Azure Blob 账户 `oaisdmntpr<region>.blob.core.windows.net`；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
+ChatGPT MCP host-file import 采用两级 trust。手动配置且有效的 OAuth client 只能从 OpenAI attachment host 导入：`files.oaiusercontent.com` 及其子域，以及严格匹配的 Sediment Azure Blob 账户 `oaisdmntpr<region>.blob.core.windows.net`；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
 
 对于绑定到 loopback、并通过 OpenAI Secure Tunnel 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，仅当请求由允许的本地 credential 认证时才信任 ChatGPT host-file rewrite：普通 user API token，或 Desktop regular Tunnel 使用的已配置 Server bootstrap credential。该 Tunnel 从本机 `WEBCODEX_TOKEN` 配置派生 credential 并私下完成注入；不要复制或暴露它。非 loopback bind 和其它 credential class 都会忽略该 flag；network-accessible Server 应保持未设置。
 
@@ -457,9 +459,19 @@ DNS 地址固定、TLS 主机名校验、禁止代理与重定向、文件大小
 如果本机没有正确配置 TUN，该例外也不会让 Fake-IP 自动可达。
 
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
-撤销 client。OAuth 使用 authorization-code 流程；动态 client 注册、OIDC 与
+撤销 client。OAuth 使用 authorization-code 流程；OIDC 与
 device-code 流程未实现。宿主提供 `offline_access` 时保持勾选——它是协议级
 refresh-token scope，不授予额外 WebCodex 权限。
+
+### 动态客户端注册
+
+要让 Gemini 或其他 OAuth 客户端自行注册，请在常规托管 Server 上设置 `WEBCODEX_OAUTH2_ENABLED=true`，将 `WEBCODEX_PUBLIC_URL` 设为公网 HTTPS 来源地址，并将 `WEBCODEX_OAUTH2_DCR_OWNER_USER_ID` 设为 `webcodex users list` 返回的已有用户的固定 `id`。使用该配置启动 Server 后，`/.well-known/oauth-authorization-server` 的元数据中会出现 `registration_endpoint`。默认关闭动态注册。
+
+`POST /oauth/register` 接受 RFC 7591 JSON，要求提供非空的 `redirect_uris` 数组。每次注册均分配新的客户端 ID，授权时精确匹配回调地址。机密客户端使用 `client_secret_basic`（默认）或 `client_secret_post`，公共客户端可指定 `none`。三种方式都要求授权码和 S256 PKCE。需要轮换刷新令牌的客户端应在 `grant_types` 中同时申请 `authorization_code` 和 `refresh_token`。注册时默认采用本地用户的标准权限，也可申请其中的子集。指定用户登录后才能授予权限。动态注册的客户端不会继承内部管理员权限。移除 DCR 配置或更改所有者、签发者后，旧注册在新配置下无法使用。可通过 `/api/oauth/clients/revoke` 永久撤销客户端。
+
+部分 OAuth 宿主会请求授权服务器元数据公布的全部权限，即使动态注册时仅获准了更窄的范围。对于动态注册的客户端，WebCodex 只会在已知权限中取请求权限与注册允许权限的交集，并在 Token 响应中返回实际授予的权限；未知权限、没有任何可授予 WebCodex 权限的请求仍会被拒绝。此处理不会扩大客户端或用户权限；手动配置的客户端继续执行严格权限匹配。
+
+注册请求上限为 16 KiB。Server 最多保留 128 个动态客户端。达到上限时，如果某个注册已满 24 小时或已被撤销，且相关授权记录均已清理，Server 可回收它。否则返回 HTTP 429。Desktop 托管的 Cloudflare 使用独立的 Profile 开关，默认关闭。临时 Project Share 使用自身的客户端配置流程。[Desktop Cloudflare 配置](MCP.zh-CN.md#desktop-cloudflare-配置)[Gemini 接入说明](MCP.zh-CN.md#gemini-网页端)
 
 ## MCP 接入
 

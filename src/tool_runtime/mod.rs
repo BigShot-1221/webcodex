@@ -22,6 +22,7 @@ mod orchestration_host;
 mod validation;
 #[cfg(feature = "experimental-code-mode")]
 pub(crate) use code_mode::is_admitted_nested_tool as code_mode_nested_tool_is_admitted;
+mod closeout_evidence;
 mod closeout_facts;
 mod closeout_projection;
 mod coding_agent;
@@ -57,7 +58,9 @@ mod handoff;
 mod handoff_brief;
 mod handoff_tools;
 mod helpers;
-pub(crate) use helpers::{bounded_tail, COMMAND_STDIO_TAIL_CHARS};
+#[cfg(test)]
+pub(crate) use helpers::bounded_head_tail;
+pub(crate) use helpers::{bounded_tail, COMMAND_OUTPUT_MAX_LINES, COMMAND_STDIO_TAIL_CHARS};
 mod hygiene;
 mod hygiene_tools;
 mod instruction_projection;
@@ -101,7 +104,7 @@ pub(crate) use read_revisions::ReadRevisionTarget;
 mod optional_enrichment;
 pub(crate) mod resource_references;
 mod result_projection;
-mod return_timing;
+pub(crate) mod return_timing;
 mod runtime;
 mod runtime_compatibility;
 mod runtime_info;
@@ -138,8 +141,10 @@ pub(crate) mod window_activity_projection;
 pub(crate) use webcodex_core::{
     project_instructions, project_listing as file_listing, validation_evidence as validation_parser,
 };
+#[cfg(test)]
+pub(crate) use webcodex_tool_contracts::tool_catalog;
 pub(crate) use webcodex_tool_contracts::{
-    metadata, registry, tool_call, tool_catalog, tool_definition, tool_inputs,
+    metadata, registry, tool_call, tool_definition, tool_inputs,
 };
 #[cfg(test)]
 pub(crate) use webcodex_tool_runtime_contracts::recorder_metadata::parse_tool_call_with_recorder_metadata;
@@ -165,7 +170,7 @@ pub(crate) use files::{
 };
 #[cfg(test)]
 pub(crate) use permissions::{AuthorityMode, PermissionEvaluator};
-pub(crate) use projects::{ProjectInventoryPage, ProjectInventoryRow};
+pub(crate) use projects::{ConsoleProjectInventoryPage, ConsoleProjectInventoryRow};
 #[cfg(test)]
 pub(crate) use runner_authorization::required_runner_capability;
 pub use runtime::ToolRuntime;

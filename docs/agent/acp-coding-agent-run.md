@@ -34,8 +34,8 @@ fail before provider process start.
 
 The P1 Run primitive exposes five model tools: `start_coding_agent`,
 `observe_coding_agent`, `cancel_coding_agent`, `respond_coding_agent_permission`,
-and `inspect_coding_agent_config` (bounded config discovery; conservative
-Execute/JobRun + Standard `PermissionEvaluator` for the whole tool because
+and `diagnose_coding_agent` (bounded config discovery; observation by default,
+with start scope and fresh per-Project permission required when
 `include_live_acp=true` spawns a bounded ephemeral provider probe; live probe
 is opt-in via `include_live_acp`). The managed AgentTask entry
 below adds durable attempt ownership over this same primitive. These Run tools
@@ -520,14 +520,14 @@ advertised enum value (never arbitrary secret-like free text). Confirmed values
 reflect what ACP reported for that negotiation instant only; they do not prove
 billing tier, quota, or off-session provider policy.
 
-`inspect_coding_agent_config` reuses the typed Runner `Diagnose` operation:
+`diagnose_coding_agent` reuses the typed Runner `Diagnose` operation:
 without `include_live_acp` it returns env presence plus operator allowlist and
 forced-policy **key identities only** (no provider child); with
 `include_live_acp=true` it performs the same bounded `initialize` +
 `session/new` probe as diagnostics and projects live `configOptions` (still no
-`set_config_option` or prompt). Either path uses the same Execute/JobRun tool
-contract and may have provider-side side effects when a child is spawned; live
-currents are labeled as ephemeral-probe defaults only. Timeouts and rejections
+`set_config_option` or prompt). The live path requires the same execution authority as start and a fresh
+per-Project permission decision; the presence-only path does not spawn a child.
+Live currents describe the ephemeral probe only, not a future Run. Timeouts and rejections
 are not auto-retried.
 
 Per-agent `parameterized_model_picker = true` opts in to advertising
@@ -875,6 +875,38 @@ session/prompt successfully dispatched
 `session/load` support does not change this rule. Loading the conversation can
 recover a durable ACP session, but it does not by itself prove whether an
 in-flight prompt completed, partially acted, or never ran.
+
+### Protected terminal retention (personal fork)
+
+The 128-record Runner inventory is a hot recovery/control bound, not an
+instruction to erase uncertain execution history. A protected terminal record
+(`lost`, `outcome_unknown`, or terminal persistence uncertainty) is eligible
+for archival only after the Server durably publishes an immutable routing
+receipt for its exact Run identity and owning Runner. The negotiated
+`coding_agent_archive_lookup` capability and per-identity acknowledgements are
+internal protocol fields; they are not caller-supplied permission or retry
+policy. A missing acknowledgement, conflicting identity, or failed durable
+write retains the protected record. Ordinary definitive-terminal retention is
+unchanged. The archive contains recovery metadata, not event transcripts.
+
+Server receipts are stored under the runtime state directory in
+`private/coding-agent-archive-routes-v1`; the Runner archive is the sibling
+of its namespaced hot Run directory, with extension `archive-v1`. Keep the
+Runner hot directory (including `archive-required-v1`), archive directory,
+and Server receipts together when backing up or moving runtime state. A
+SQLite database backup alone does not include these files; database-only
+restore must leave these independent runtime-state files in place. Do not
+restore an older receipt set over newer Runner archives or remove the marker
+to bypass a downgrade guard. Full-state restore across inconsistent snapshots
+requires operator reconciliation; the implementation does not certify such a
+restore or guarantee global replay safety after arbitrary state loss.
+
+Exact archived recovery observes the original Runner and validates the same
+immutable identity. Missing archive roots, conflicting hot/archive records,
+unavailable owners, and incompatible peers are not evidence that a prompt
+was never executed. Do not downgrade either component after archival without
+a compatible recovery procedure. Archive receipts are not terminal outcome
+authority and do not change the current principal or Project authorization.
 
 ## 11. Observation delta contract
 

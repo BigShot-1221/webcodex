@@ -1,0 +1,8 @@
+isError: true
+ERROR: command failed
+completed; exit_code: 7
+stdout:
+<ROOT>/src
+stderr:
+denied
+cwd: src

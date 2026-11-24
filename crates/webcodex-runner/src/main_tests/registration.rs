@@ -218,6 +218,7 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.lsp_read_only_navigation);
     assert!(caps.lsp_call_hierarchy);
     assert!(caps.project_lifecycle);
+    assert!(caps.project_settings_update);
     assert!(caps.project_path_registration);
     assert_eq!(
         caps.project_format_v1,
@@ -284,6 +285,10 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
         cfg!(any(target_os = "macos", windows)),
         "computer key input is independently advertised only by native macOS/Windows implementations"
     );
+    assert_eq!(caps.computer_letter_shortcuts, cfg!(windows));
+    assert_eq!(caps.computer_selection, cfg!(windows));
+    assert_eq!(caps.computer_scroll, cfg!(windows));
+    assert_eq!(caps.computer_key_chords, cfg!(windows));
     assert_eq!(
         caps.computer_window_activate,
         cfg!(any(target_os = "macos", windows)),
@@ -300,7 +305,13 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
 fn phase_e2_register_request_reports_effective_job_concurrency_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = test_config(tmp.path().join("config/project-registry"));
-    for (configured, expected) in [(None, 4), (Some(1), 1), (Some(8), 8), (Some(64), 64)] {
+    for (configured, expected) in [
+        (None, 32),
+        (Some(1), 1),
+        (Some(4), 4),
+        (Some(32), 32),
+        (Some(64), 64),
+    ] {
         cfg.max_concurrent_jobs = configured;
         let body = build_register_request(&cfg, "inst-limit", 0);
         assert_eq!(

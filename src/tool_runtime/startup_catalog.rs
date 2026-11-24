@@ -1,8 +1,10 @@
 //! Bounded selection metadata for already-observed Skills and Plugins.
 //! Discovery and authorization stay in their domain owners; startup composition
 //! consumes these values without owning those services or reloading catalogs.
+use super::surface::discovery::TaskRelevance;
 use crate::json_measurement::serialized_json_len;
 use serde::Serialize;
+use std::cmp::Reverse;
 
 pub(crate) const STARTUP_EXTENSION_CATALOG_HARD_MAX_BYTES: usize = 6 * 1024;
 pub(crate) const STARTUP_SKILL_CATALOG_MAX_BYTES: usize = 2_900;
@@ -112,6 +114,23 @@ impl<Entry: Serialize> StartupCatalog<Entry> {
 }
 
 impl StartupSkillsCatalog {
+    pub(crate) fn available_for_task(
+        catalog_revision: String,
+        discovery_truncated: bool,
+        mut entries: Vec<StartupSkillEntry>,
+        relevance: &TaskRelevance,
+    ) -> Self {
+        entries.sort_by_cached_key(|entry| {
+            Reverse(relevance.score(&[&entry.name], &entry.description))
+        });
+        // Ranking consumes the complete, already-bounded Skill metadata. Only
+        // the startup display projection is clipped; explicit catalogs stay intact.
+        for entry in &mut entries {
+            entry.description = task_extension_description(&entry.description, relevance);
+        }
+        Self::available(catalog_revision, discovery_truncated, entries)
+    }
+
     pub(crate) fn unavailable(reason_code: &'static str) -> Self {
         Self::unavailable_with_hint(
             reason_code,
@@ -136,6 +155,26 @@ impl StartupSkillsCatalog {
 }
 
 impl StartupPluginsCatalog {
+    pub(crate) fn available_for_task(
+        catalog_revision: String,
+        total_count: usize,
+        mut entries: Vec<StartupPluginEntry>,
+        relevance: &TaskRelevance,
+    ) -> Self {
+        entries.sort_by_cached_key(|entry| {
+            Reverse(relevance.score(
+                &[
+                    &entry.plugin,
+                    &entry.name,
+                    &entry.tool,
+                    entry.title.as_deref().unwrap_or_default(),
+                ],
+                entry.description.as_deref().unwrap_or_default(),
+            ))
+        });
+        Self::available(catalog_revision, total_count, entries)
+    }
+
     pub(crate) fn unavailable(reason_code: &'static str) -> Self {
         Self::unavailable_with_hint(
             reason_code,
@@ -180,4 +219,32 @@ pub(crate) fn bounded_extension_description(value: &str) -> String {
         end -= 1;
     }
     value[..end].to_string()
+}
+
+/// Retain the old display prefix unless it hides all description evidence.
+/// Excerpts contain only original text; omission marks count toward the budget.
+fn task_extension_description(value: &str, relevance: &TaskRelevance) -> String {
+    let prefix = bounded_extension_description(value);
+    if value.len() <= STARTUP_EXTENSION_DESCRIPTION_MAX_BYTES || relevance.score(&[], &prefix).1 > 0
+    {
+        return prefix;
+    }
+    let Some(start) = relevance.first_description_hit(value) else {
+        return prefix;
+    };
+    const OMISSION: &str = "…";
+    let leading = if start > 0 { OMISSION } else { "" };
+    let mut end = value
+        .len()
+        .min(start + STARTUP_EXTENSION_DESCRIPTION_MAX_BYTES - leading.len());
+    let trailing = if end < value.len() {
+        end -= OMISSION.len();
+        OMISSION
+    } else {
+        ""
+    };
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{leading}{}{trailing}", &value[start..end])
 }

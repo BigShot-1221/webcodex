@@ -185,7 +185,11 @@ async fn complete_import_artifact_uploads(
         assert!(payload.get("download_url").is_none());
         assert!(payload.get("download_link").is_none());
         assert!(payload.get("openaiFileIdRefs").is_none());
-        assert_eq!(payload["max_bytes"], MAX_PROJECT_ARTIFACT_UPLOAD_BYTES);
+        let expected_limit = payload["expected_bytes"]
+            .as_u64()
+            .map(|bytes| bytes as usize)
+            .unwrap_or(MAX_PROJECT_ARTIFACT_UPLOAD_BYTES);
+        assert_eq!(payload["max_bytes"], expected_limit.max(1));
         let path = payload["path"].as_str().unwrap().to_string();
         let mime_type = payload["mime_type"].as_str().unwrap().to_string();
         let expected_bytes = payload["expected_bytes"].clone();
@@ -232,7 +236,7 @@ async fn complete_import_artifact_uploads(
                         "next_offset": 0,
                         "expected_bytes": expected_bytes,
                         "expected_sha256": null,
-                        "max_bytes": MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
+                        "max_bytes": expected_limit,
                         "mime_type": mime_type,
                         "committed": false
                     })
@@ -282,7 +286,7 @@ async fn complete_import_artifact_uploads(
                                     "next_offset": bytes.len(),
                                     "expected_bytes": expected_bytes,
                                     "expected_sha256": null,
-                                    "max_bytes": MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
+                                    "max_bytes": expected_limit,
                                     "mime_type": mime_type,
                                     "committed": false
                                 })
@@ -523,6 +527,8 @@ async fn runtime_conversation_import_host_ref_saves_pptx_through_artifact_path_b
         allowed_client_id: None,
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     };
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
@@ -603,6 +609,8 @@ async fn runtime_conversation_import_rejects_untrusted_api_transport() {
         allowed_client_id: None,
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     };
     let call = ToolCall::from_tool_name(
         "import_host_files",

@@ -44,6 +44,29 @@ and release jobs upload them even on failure. They never contain signing argv or
 environment dumps. Successful preflight does not guarantee later disk space,
 notarization, or signing availability; final checks remain authoritative.
 
+## CLI JSON map configurations
+
+CLI text must be identical with serde_json's default sorted map and its
+`preserve_order` map. Combined Server/Runner builds enable `preserve_order`
+through `agent-client-protocol-schema`; a Server-only test run does not cover
+that production dependency graph. Inspect the resolved graph with
+`cargo tree --locked -p webcodex -p webcodex-runner -e features -i serde_json`.
+
+Run the same CLI snapshots and order regressions in both configurations:
+
+```bash
+cargo test --locked -p webcodex --lib cli
+cargo test --locked -p webcodex --lib --features serde_json/preserve_order cli
+```
+
+The Linux Server CI lane runs the default suite and a second CLI pass with
+`preserve_order`. Both use the same checked-in snapshots. Reversed object
+insertion fixtures also cover inline recovery calls, manifests, generic fields,
+and the lossless JSON fallback. Tool-specific field order remains explicit;
+other object keys are lexical, while arrays, search hits, and log lines retain
+their source order. Canonical API JSON and third-party provider payloads do not
+adopt the CLI text ordering policy.
+
 ## Test Lanes
 
 | Lane | Purpose | Default resources | Typical command |
@@ -65,6 +88,7 @@ notarization, or signing availability; final checks remain authoritative.
 | real-process hosted-connect harness | Build the real Server, Runner, and CLI; start a shared-key-enabled loopback Server; run `webcodex connect`; verify same-key project visibility and a read, cross-key isolation, detached Runner survival, repeated-connect PID reuse, hosted `runner status`, explicit stop, secret-safe output/log/state, and an untouched Git checkout. | Local processes, isolated XDG config/state roots, a temp Git project, bounded curl and outer timeout, trap cleanup; never production. | `bash scripts/e2e_hosted_connect.sh` |
 | real-process job reconciliation harness | Boot a real server plus a WebSocket runner that advertises `job_state_reconciliation`. Scenario A keeps a raw async Job running across a SERVER-only restart and asserts the SAME runner instance, original `job_id`, preserved ownership/project/session, non-regressing sequence/log cursors, `recovered_after_server_restart`, original-process stop, and one side-effect set. Scenario B lets a Job complete while the Server is offline and reconciles the terminal result without duplicate logs or execution. Scenario C forces `run_process` past its synchronous grace window, then proves the handed-off structured Job survives a Server restart and an old Server-epoch observation token refreshes immediately for the same `job_id`. Scenario D uses a delayed Cargo fixture to force a real `cargo_check` validation handoff past its sync window, then proves the same restart/token-refresh/stop contract with the validation command started exactly once. Ordinary Runner-owned Jobs keep the Runner process alive for these scenarios; `run_detached_process` restart survival is a separate supervisor-ownership contract covered by its focused Runner suites and production dogfood. | Local processes, temp dirs/ports/tokens, and a temp project; no production services or QUIC certs. Scenario D intentionally takes roughly the validation sync window plus restart time. | `bash scripts/e2e_job_reconciliation_ws.sh` |
 | real-process job recovery failure/non-reconciliation harness | Cover the failure and non-reconciliation paths the happy-path reconciliation harness omits, using `WEBCODEX_JOB_RECOVERY_GRACE_SECS=10` (clamped, above the 5s floor) so the deadline is bounded without waiting the 120s default. Scenario C: kill the runner only (server stays up), let the job enter `recovering`, and assert the non-request-triggered recovery-timeout sweep transitions it to `lost` with `runner_recovery_deadline_exceeded`, `ended_at` set once, one list record, stop-on-lost stable, and the command never re-executes. Scenario D: instance B replaces instance A (same client_id, new `agent_instance_id`); A's job becomes `lost` with `runner_instance_replaced`, B starts its own new job, A's late update is rejected, first `ended_at`/reason preserved. Scenario E: a generation-2 Runner registered with `WEBCODEX_RUNNER_DISABLE_JOB_STATE_RECONCILIATION=1` (no capability, no inventory) dispatches a job and, on disconnect, deterministically fences it to `lost` with `runner_disconnected_without_reconciliation` (never `recovering`); after a server restart its public lost receipt remains observable within retention, and a same-client new no-reconciliation instance cannot revive execution. Scenario F: a long job across three server restarts keeps the same `job_id`, runs the command once, keeps `last_update_seq`/log cursors non-regressing and markers non-duplicating, and reaches a terminal `stopped` that survives a third restart with `ended_at` unchanged by terminal inventory replay. | Local processes, temp dirs/ports/tokens, and a temp project; no production services or QUIC certs. | `bash scripts/e2e_job_recovery_failures_ws.sh` |
+| project-scoped parent-root admission | Real `webcodex share --auth oauth --project-roots DIR` process with a real Server and WebSocket Runner: authorize with PKCE S256, then admit an already-registered project, a new Git directory and a new non-Git directory through the MCP `work_on_project` entry point, create and resume a managed worktree, collapse concurrent admissions to one project identity, and assert denials for out-of-root, prefix-sibling, symlink-escape and missing roots plus exact-path credentials keeping their fence. Also covers root replacement, omitted-flag restore and `--no-project-roots` clearing without revival. | Temporary state dir, loopback ports, a temp fixture root; re-authorizes each share launch instead of reusing a token. Unix only. | `python3 scripts/e2e_project_share_roots.py --bin-dir <dogfood bin dir>` |
 | security auth matrix | Cover OAuth, scope policy, shared-key behavior, token classes, read-only session guards, and denied mutations. | No external identity provider by default; use local fixtures and synthetic tokens. | `cargo test -p webcodex --lib oauth -- --nocapture`; `cargo test -p webcodex --lib scope -- --nocapture`; `cargo test -p webcodex --lib metadata -- --nocapture` |
 | MCP conformance baseline | Exercise the real Salvo `/mcp` handlers through a disposable loopback fixture against a pinned upstream referee, then gate on check-level coverage/classification rather than process exit alone. | Loopback product fixture; immutable external referee source/dependencies fetched only by the explicit script/CI lane; no production credentials. | `bash scripts/mcp_conformance.sh`; see [`MCP_CONFORMANCE.md`](MCP_CONFORMANCE.md). |
 
@@ -161,6 +185,80 @@ parallelism; keep the original failing entry point in the final regression evide
 
 ## Explicit High-Cost Local Evidence
 
+The opt-in local-agent execution acceptance uses real authenticated model accounts
+and process-local MCP configuration generated by `webcodex mcp-config`, with
+`low` reasoning/effort for both clients. Python 3.11+ is required for TOML parsing:
+
+```bash
+cargo build --locked --profile dogfood -p webcodex -p webcodex-runner --bin webcodex-server --bin webcodex-runner
+cargo build --locked --profile dogfood -p webcodex-cli
+python3 scripts/e2e_local_agent_execution.py --bin-dir target/dogfood --output-dir /tmp/new-local-agent-run
+```
+
+The output directory must be new. The harness starts an isolated loopback
+Server/Runner, gives each model a fresh remote Python fixture and unrelated local
+cwd, and compares three arms: MCP with native tools still advertised, MCP with
+native-tool suppression, and native tools in the fixture. For Claude Code 2.1.319,
+`--tools ""` removes native executable tools; its provider request still contains
+`DeferredToolPlaceholder`. Codex 0.166.0 `--disable shell_tool` removes
+`exec_command` / `write_stdin`, but leaves `apply_patch`, `view_image`, Code Mode
+and other tools. This arm is not a native-tool-free Codex. The report lists the
+remaining tools instead of assuming all duplicate schemas disappeared.
+It checks a 16-second foreground command, early handoff with output, tokenless
+terminal waiting, a mid-run observation followed by terminal stdout failure,
+a 65-second command with default lifetime and 50-second handoff, timeout Job identity,
+500-line head/tail previews and three retained-log pages (up to 200 lines each,
+starting after the displayed head), absolute
+paths, revision-fenced overwrite, stale-write rejection, bounded large reads,
+field-specific revision errors, symlink escape and resolved protected-path
+(`deps -> node_modules`) rejection with confirmed no effects, and cancellation
+without a second confirmation. Discovery checks the exact eight
+(or nine without a default Project) direct tools and 10,000 / 12,000-byte budgets.
+It also verifies gateway-only tools, hidden canonical `occurrence` edits through
+a direct call, executable `next:` lines without duplicate selectors/defaults,
+reset deduplication and sparse workspace-status output.
+Each model must pass
+independent unit tests and launch its long command exactly once, with zero
+Workflow Sessions. The prompt does not ask it to read instructions: a separate
+fixture rule records whether remote instructions were discovered and followed.
+MCP Codex uses a read-only local sandbox with explicit per-tool approval; MCP
+Claude permits only that connection's tools (`--allowedTools` controls permission,
+not schema removal). Native controls can edit the disposable fixture using their
+own tools. Claude runs with `--setting-sources project` in all three arms, keeping
+project instructions enabled while excluding user/local settings
+(see [Claude configuration diagnostics](https://code.claude.com/docs/en/debug-your-config)).
+Client tool search is counted separately. The report includes compact
+`tools/list` result bytes (Python `json.dumps(..., separators=(",", ":"))`, no RPC
+envelope), each tool's full descriptor and schema bytes, and Unicode character
+counts for each emitted tool response. Image/binary blocks are not counted as
+text. Missing responses are recorded as `null`, never zero: Codex file-change
+events, for example, omit the underlying tool response. Codex counts completed
+action events; command updates do not expose distinct native stdin polls, so
+`native_poll_calls` is `null` and total calls are not exact tool-invocation totals.
+Claude counts distinct tool-use IDs. Claude assistant-message usage is retained
+per message ID (latest receipt wins); result totals are separate, never added to
+those rounds. Codex `exec --json` exposes `turn.completed` totals, not usage for
+each model request; `model_round_usage` is therefore `null`. No missing token
+counts are estimated from bytes. Instruction compliance is recorded separately,
+including failures.
+
+Use `--probe-only` for deterministic Server/Runner checks and installed-client
+inventory checks **without paid model calls**. The inventory check uses the same
+client flags against a loopback provider with canned protocol responses. Codex
+Code Mode performs a fixed metadata-only `ALL_TOOLS` read to expose deferred MCP
+names; Claude also supplies its init inventory. No project work or real model is
+involved. The report retains provider-request tool names, removed tools and the
+remaining native tools; it does not retain requests, prompts or authorization
+headers. Counts of fake-provider tokens are not model-performance evidence.
+
+Model credential variables are omitted from the service and fake-provider client
+environments. Temporary credentials and raw logs are removed after process-group
+and service cleanup; bounded reports retain binary hashes, dirty source identity,
+client versions, discovery sizes, tool-result lengths, observed usage and model
+feedback. Running without `--probe-only` contacts paid model APIs; ordinary tests
+never run it. Byte counts are not tokenizer measurements, and model feedback is
+not proof until checked against actual receipts/fixture state.
+
 Cloudflare's isolated real Server/Runner/CLI acceptance harness is
 `python3 scripts/e2e_cloudflare_oauth.py --bin-dir target/debug`; its required
 native-TLS-root build and verified ephemeral-CA topology are documented in
@@ -187,28 +285,25 @@ change is ready for review.
 
 ## No-build guidance preflight
 
-Before compiling Rust after changing model-facing tool guidance or its literal
-test requirements, run `python3 scripts/check_builtin_guidance_contract.py`
-(Windows: `python`). It reads the canonical Direct and Host guidance
-contributors, the corresponding Rust test phrase arrays, and the Rust-owned
-item-count/character limits. It fails closed on unexpected source layouts or
-missing literal phrases; no Cargo command or network access is involved.
+Before compiling Rust after changing bundled guidance, run
+`python3 scripts/check_builtin_guidance_contract.py` (Windows: `python`).
+It groups contributors by their declared target and checks nonempty content,
+duplicate items and Rust-owned item/character targets. It does not parse Rust
+tests or freeze ordinary wording. Rust composition, schema and behavior tests
+remain the semantic authority.
 
-The ordinary Linux Server CI Rust shard runs this cheap preflight **before**
-the package compile. It catches straightforward guidance drift before the
-expensive Rust suite, but **does not replace** that suite or prove the dynamic
-standard startup payload is below 16 KiB. All existing Server, experimental
-Code Mode, permission, schema, and platform gates still run after a successful
-preflight. Changing a valid Rust guidance representation may require updating
-this intentionally strict static parser and its fixtures together.
+The Linux Server CI Rust shard runs this cheap size/shape preflight before
+compilation. It neither replaces the Rust suite nor proves aggregate startup or
+context payload bounds. A change to the supported Rust literal representation
+may require updating the small source reader; prose edits do not.
 
 Run `python3 -m unittest scripts.tests.test_check_builtin_guidance_contract`
-for focused non-compiling negative cases. They cover over-budget guidance,
-missing text required by Rust tests, malformed literals, and pre-Cargo CI
-ordering. The verifier also reproduced three historical failed PR guidance
-revisions in less than two milliseconds each, while accepting the corrected
-revision; actual CI savings depend on where the failing build would have
-stopped otherwise.
+for no-build negative cases. They cover empty/malformed contributors, combined
+target budgets, oversized items and invalid limits, and prove that rewording
+guidance needs no parallel phrase updates. The Rust tests cover task chapter
+selection, strategy isolation, closed schemas and critical authority/recovery
+semantics. Review meaningful prose changes in the diff; do not add broad golden
+snapshots or arrays of required editorial phrases.
 
 ## CI Mapping
 
@@ -245,7 +340,7 @@ The lanes above define test semantics; workflows decide when to run them.
   lifecycle boundary or investigating platform behavior. Computer, platform-specific,
   Desktop, npm, packaging, signing, and release surfaces retain their existing
   independent deterministic lanes. The stable `test-macos`,
-  `test-windows`, and `test-native` aggregates always resolve and verify each child
+  `test-windows`, and `test-native` aggregates resolve in non-cancelled workflows and verify each child
   lane is `success` when required or `skipped` when not required, avoiding a skipped
   required-check context that could leave branch protection pending.
   The stable `test` and `test-native` contexts are also emitted for `merge_group`.
@@ -294,6 +389,24 @@ The lanes above define test semantics; workflows decide when to run them.
   Manual real-process evidence remains separate and must never be inferred from a passing
   CI run. Follow [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) and
   `.github/workflows/release-readiness.yml`.
+
+### CI cancellation versus required lane results
+
+The four aggregate jobs use `!cancelled()` as their job-level status guard. GitHub
+[defines cancelled() as workflow cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#cancelled)
+and [re-evaluates job conditions during cancellation](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-cancellation).
+A concurrency-superseded workflow should stop instead of starting always-running
+aggregates that turn cancelled dependencies into additional failures. This does
+not convert cancellation into success, and does not waive branch protection.
+
+The unchanged aggregate scripts independently require successful required lanes;
+a child result of failure, cancelled, unexpected skipped, or missing is rejected.
+Only a classifier-disabled lane may be skipped.
+[`test_ci_aggregate_cancellation.py`](../scripts/tests/test_ci_aggregate_cancellation.py)
+pins those four scheduler guards and runs the actual checked-in Bash bodies over
+these cases. It is local contract evidence, not a hosted scheduler/concurrency
+simulation; final native CI and actual cancellation observations remain separate.
+
 ## Default Test Principles
 
 - No external network by default. Tests that need HTTP should use in-process

@@ -23,10 +23,11 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// Maximum raw byte size of the selected range text. A range whose text would
-/// exceed this budget fails with `ReadRangeError::RangeTooLarge` rather than
-/// being silently truncated. Callers must independently validate their complete
-/// serialized envelope because JSON escaping can expand this raw content.
+/// Maximum raw byte size of the selected range text. Strict range readers fail
+/// with `ReadFileReason::RangeTooLarge` when the selected text exceeds the
+/// budget. Opt-in page readers return a whole-line prefix instead. Callers must
+/// independently validate their complete serialized envelope because JSON
+/// escaping can expand this raw content.
 pub const MAX_RANGE_CONTENT_BYTES: usize = 192 * 1024;
 
 /// Hard ceiling for the final serialized model output. The shared reader does
@@ -74,6 +75,7 @@ impl EffectiveRange {
 #[serde(rename_all = "snake_case")]
 pub enum ReadFileReason {
     InvalidPath,
+    OutsideProject,
     SensitivePath,
     NotFound,
     NotFile,
@@ -93,6 +95,7 @@ impl ReadFileReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             ReadFileReason::InvalidPath => "invalid_path",
+            ReadFileReason::OutsideProject => "outside_project",
             ReadFileReason::SensitivePath => "sensitive_path",
             ReadFileReason::NotFound => "not_found",
             ReadFileReason::NotFile => "not_file",
@@ -110,6 +113,7 @@ impl ReadFileReason {
     pub fn from_code(value: &str) -> Option<Self> {
         Some(match value {
             "invalid_path" => ReadFileReason::InvalidPath,
+            "outside_project" => ReadFileReason::OutsideProject,
             "sensitive_path" => ReadFileReason::SensitivePath,
             "not_found" => ReadFileReason::NotFound,
             "not_file" => ReadFileReason::NotFile,
@@ -190,8 +194,13 @@ pub struct FileReadRange {
 }
 
 impl FileReadRange {
-    fn new(content: String, sha256: String, total_lines: usize, range: EffectiveRange) -> Self {
-        let returned_lines = count_returned_lines(&content, total_lines, range.start_line);
+    fn new(
+        content: String,
+        sha256: String,
+        total_lines: usize,
+        range: EffectiveRange,
+        returned_lines: usize,
+    ) -> Self {
         let end_line = if returned_lines > 0 {
             Some(range.start_line + returned_lines - 1)
         } else {
@@ -214,37 +223,6 @@ impl FileReadRange {
             has_more,
             next_start_line,
         }
-    }
-}
-
-/// Count how many original file lines the selected `content` represents.
-///
-/// A single blank selected line yields `content == ""` but `returned_lines ==
-/// 1`, so this must be derived from the range and total line count rather than
-/// from `content.lines().count()` (which would lose empty selections). The
-/// selected window is the intersection of `[start_line, start_line+limit)` with
-/// `[1, total_lines]`.
-fn count_returned_lines(content: &str, total_lines: usize, start_line: usize) -> usize {
-    if start_line > total_lines || total_lines == 0 {
-        return 0;
-    }
-    // The selected window length is min(limit, total - start + 1), but the
-    // streaming reader may return fewer than the window when the content budget
-    // truncates mid-range. When truncation happens the reader fails instead of
-    // returning a partial range, so `content` always carries the full window.
-    // Derive the count from the joined content to stay exact for the empty-line
-    // case: a non-empty window that is a single blank line has one segment.
-    if content.is_empty() {
-        // Disambiguate the single blank line from the empty file / overflow case
-        // using the window: a window that starts inside the file and has length
-        // 1 whose only line is blank still returns one line.
-        if start_line <= total_lines {
-            1
-        } else {
-            0
-        }
-    } else {
-        content.split('\n').count()
     }
 }
 
@@ -308,10 +286,16 @@ fn utf8_sequence_width(first: u8) -> Option<usize> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BudgetPolicy {
+    Strict,
+    WholeLinePage,
+}
+
 /// Fixed-memory scanner that hashes and validates every raw byte while keeping
-/// only the selected `[start_line, end_line]` window. A range overflow clears
-/// the partial selection and continues scanning so later invalid UTF-8 cannot
-/// be hidden by an early content-budget failure.
+/// only the selected `[start_line, end_line]` window. On overflow, strict reads
+/// clear the selection; whole-line pages roll back the incomplete line. Both
+/// continue scanning so invalid UTF-8 after the selection still fails closed.
 struct RangeScan {
     content: Vec<u8>,
     sha256: String,
@@ -321,10 +305,14 @@ struct RangeScan {
     selected_line_started: bool,
     pending_selected_cr: bool,
     range_too_large: bool,
+    policy: BudgetPolicy,
+    page_full: bool,
+    line_start: usize,
+    returned_lines: usize,
 }
 
 impl RangeScan {
-    fn new(content_budget: usize) -> Self {
+    fn new(content_budget: usize, policy: BudgetPolicy) -> Self {
         Self {
             content: Vec::with_capacity(content_budget),
             sha256: String::new(),
@@ -334,6 +322,10 @@ impl RangeScan {
             selected_line_started: false,
             pending_selected_cr: false,
             range_too_large: false,
+            policy,
+            page_full: false,
+            line_start: 0,
+            returned_lines: 0,
         }
     }
 
@@ -343,21 +335,32 @@ impl RangeScan {
     }
 
     fn push_selected_byte(&mut self, byte: u8, content_budget: usize) {
-        if self.range_too_large {
+        if self.range_too_large || self.page_full {
             return;
         }
         if self.content.len() >= content_budget {
-            self.content.clear();
-            self.range_too_large = true;
+            match self.policy {
+                BudgetPolicy::Strict => {
+                    self.content.clear();
+                    self.range_too_large = true;
+                }
+                BudgetPolicy::WholeLinePage => {
+                    // Discard this incomplete line, including its separator.
+                    self.content.truncate(self.line_start);
+                    self.page_full = true;
+                    self.range_too_large = self.returned_lines == 0;
+                }
+            }
             return;
         }
         self.content.push(byte);
     }
 
     fn start_selected_line(&mut self, content_budget: usize) {
-        if self.selected_line_started {
+        if self.selected_line_started || self.page_full || self.range_too_large {
             return;
         }
+        self.line_start = self.content.len();
         if self.wrote_any_line {
             self.push_selected_byte(b'\n', content_budget);
         }
@@ -369,6 +372,12 @@ impl RangeScan {
         if self.pending_selected_cr {
             self.push_selected_byte(b'\r', content_budget);
             self.pending_selected_cr = false;
+        }
+    }
+
+    fn finish_selected_line(&mut self) {
+        if !self.range_too_large && !self.page_full {
+            self.returned_lines += 1;
         }
     }
 
@@ -385,6 +394,7 @@ impl RangeScan {
                 if selected {
                     self.start_selected_line(content_budget);
                     self.pending_selected_cr = false;
+                    self.finish_selected_line();
                 }
                 self.total_lines = self.total_lines.saturating_add(1);
                 self.current_line_has_bytes = false;
@@ -432,6 +442,9 @@ impl RangeScan {
         }
         utf8.finish()?;
         if self.current_line_has_bytes {
+            if self.current_line_selected(start_line, end_line) {
+                self.finish_selected_line();
+            }
             self.pending_selected_cr = false;
             self.total_lines = self.total_lines.saturating_add(1);
         }
@@ -464,19 +477,8 @@ pub fn read_range_with_budget(
     range: EffectiveRange,
     content_budget: usize,
 ) -> Result<FileReadRange, ReadFileError> {
-    let end_line = range.end_line();
     let file = File::open(path).map_err(|e| ReadFileError::new(io_error_to_reason(&e)))?;
-    let budget = clamp_budget(content_budget);
-    let scan = RangeScan::new(budget).run(file, range.start_line, end_line, budget)?;
-    let content = String::from_utf8(scan.content)
-        .map_err(|_| ReadFileError::new(ReadFileReason::InvalidUtf8))?;
-
-    Ok(FileReadRange::new(
-        content,
-        scan.sha256,
-        scan.total_lines,
-        range,
-    ))
+    read_range_from_with_budget(file, range, content_budget)
 }
 
 /// Read a bounded UTF-8 text range from an already-open reader. Used by callers
@@ -497,9 +499,44 @@ pub fn read_range_from_with_budget(
     range: EffectiveRange,
     content_budget: usize,
 ) -> Result<FileReadRange, ReadFileError> {
-    let end_line = range.end_line();
+    read_with_policy(reader, range, content_budget, BudgetPolicy::Strict)
+}
+
+/// Read the largest whole-line prefix of a requested window that fits the
+/// content budget. Unlike [`read_range_with_budget`], a later line that exceeds
+/// the budget ends the page. An oversized first selected line still fails with
+/// `RangeTooLarge`. The complete file is hashed and validated as UTF-8 in the
+/// same bounded scan, including bytes after the returned page. The budget is
+/// clamped to [`MAX_RANGE_CONTENT_BYTES`].
+pub fn read_page_with_budget(
+    path: &Path,
+    range: EffectiveRange,
+    content_budget: usize,
+) -> Result<FileReadRange, ReadFileError> {
+    let file = File::open(path).map_err(|e| ReadFileError::new(io_error_to_reason(&e)))?;
+    read_page_from_with_budget(file, range, content_budget)
+}
+
+/// Like [`read_page_with_budget`] for a caller-owned, already-open reader.
+/// Keeps the requested line limit in the result; continuation starts after the
+/// last complete returned line, even when the byte budget ends the page early.
+pub fn read_page_from_with_budget(
+    reader: impl Read,
+    range: EffectiveRange,
+    content_budget: usize,
+) -> Result<FileReadRange, ReadFileError> {
+    read_with_policy(reader, range, content_budget, BudgetPolicy::WholeLinePage)
+}
+
+fn read_with_policy(
+    reader: impl Read,
+    range: EffectiveRange,
+    content_budget: usize,
+    policy: BudgetPolicy,
+) -> Result<FileReadRange, ReadFileError> {
     let budget = clamp_budget(content_budget);
-    let scan = RangeScan::new(budget).run(reader, range.start_line, end_line, budget)?;
+    let scan =
+        RangeScan::new(budget, policy).run(reader, range.start_line, range.end_line(), budget)?;
     let content = String::from_utf8(scan.content)
         .map_err(|_| ReadFileError::new(ReadFileReason::InvalidUtf8))?;
     Ok(FileReadRange::new(
@@ -507,6 +544,7 @@ pub fn read_range_from_with_budget(
         scan.sha256,
         scan.total_lines,
         range,
+        scan.returned_lines,
     ))
 }
 
@@ -887,6 +925,129 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.reason, ReadFileReason::NotFound);
+    }
+
+    #[test]
+    fn whole_line_pages_reconstruct_normalized_text_with_full_identity() {
+        let body = b"alpha\r\n\r\nbeta\rgamma\n\nlast\r";
+        let expected_lines = ["alpha", "", "beta\rgamma", "", "last"];
+        let file = write_tmp(body);
+        let mut actual_lines = Vec::new();
+        let mut start = 1;
+        loop {
+            let page =
+                read_page_with_budget(file.path(), EffectiveRange::new(Some(start), Some(4)), 12)
+                    .unwrap();
+            assert_eq!(page.sha256, full_sha(body));
+            assert_eq!(page.total_lines, expected_lines.len());
+            assert_eq!(page.start_line, start);
+            assert_eq!(page.limit, 4);
+            assert!(page.content.len() <= 12);
+            assert!(page.returned_lines > 0);
+            assert_eq!(page.end_line, Some(start + page.returned_lines - 1));
+            actual_lines.extend(page.content.split('\n').map(str::to_owned));
+            if let Some(next) = page.next_start_line {
+                assert!(page.has_more);
+                assert_eq!(next, start + page.returned_lines);
+                start = next;
+            } else {
+                assert!(!page.has_more);
+                break;
+            }
+        }
+        assert_eq!(actual_lines, expected_lines);
+    }
+
+    #[test]
+    fn whole_line_page_rolls_back_partial_line_and_preserves_requested_limit() {
+        let body = b"skip\none\ntwo-long\nlast";
+        let page =
+            read_page_from_with_budget(body.as_slice(), EffectiveRange::new(Some(2), Some(3)), 7)
+                .unwrap();
+        assert_eq!(page.content, "one");
+        assert_eq!(page.returned_lines, 1);
+        assert_eq!(page.limit, 3);
+        assert_eq!(page.end_line, Some(2));
+        assert_eq!(page.next_start_line, Some(3));
+        assert!(page.has_more);
+        assert_eq!(page.total_lines, 4);
+        assert_eq!(page.sha256, full_sha(body));
+        let strict =
+            read_range_from_with_budget(body.as_slice(), EffectiveRange::new(Some(2), Some(3)), 7)
+                .unwrap_err();
+        assert_eq!(strict.reason, ReadFileReason::RangeTooLarge);
+    }
+
+    #[test]
+    fn whole_line_page_budget_and_line_limit_bound_independently() {
+        let body = b"ab\ncd\nef\n";
+        let range = EffectiveRange::new(Some(1), Some(2));
+        let exact = read_page_from_with_budget(body.as_slice(), range, 5).unwrap();
+        assert_eq!(exact.content, "ab\ncd");
+        assert_eq!(exact.returned_lines, 2);
+        assert_eq!(exact.next_start_line, Some(3));
+        let byte_bound = read_page_from_with_budget(body.as_slice(), range, 4).unwrap();
+        assert_eq!(byte_bound.content, "ab");
+        assert_eq!(byte_bound.next_start_line, Some(2));
+        let past_eof =
+            read_page_from_with_budget(body.as_slice(), EffectiveRange::new(Some(4), Some(2)), 0)
+                .unwrap();
+        assert_eq!(past_eof.returned_lines, 0);
+        assert_eq!(past_eof.end_line, None);
+        assert!(!past_eof.has_more);
+        assert_eq!(past_eof.next_start_line, None);
+    }
+
+    #[test]
+    fn whole_line_page_blank_lines_make_progress_at_zero_budget() {
+        let page = read_page_from_with_budget(
+            b"\n\nlast".as_slice(),
+            EffectiveRange::new(None, Some(3)),
+            0,
+        )
+        .unwrap();
+        assert_eq!(page.content, "");
+        assert_eq!(page.returned_lines, 1);
+        assert_eq!(page.end_line, Some(1));
+        assert_eq!(page.next_start_line, Some(2));
+        let empty =
+            read_page_from_with_budget(b"".as_slice(), EffectiveRange::new(None, None), 0).unwrap();
+        assert_eq!(empty.returned_lines, 0);
+        assert!(!empty.has_more);
+    }
+
+    #[test]
+    fn whole_line_page_oversized_first_line_fails_without_zero_progress() {
+        let error = read_page_from_with_budget(
+            RepeatedByteReader::new(b'x', 65 * 1024 * 1024),
+            EffectiveRange::new(Some(1), Some(4)),
+            8,
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, ReadFileReason::RangeTooLarge);
+    }
+
+    #[test]
+    fn whole_line_page_validates_utf8_after_truncation_and_at_chunk_boundaries() {
+        let page = read_page_from_with_budget(
+            ChunkedReader::new([b"first\n\xe2".to_vec(), vec![0x82], b"\xac\nlast".to_vec()]),
+            EffectiveRange::new(None, Some(3)),
+            7,
+        )
+        .unwrap();
+        assert_eq!(page.content, "first");
+        assert_eq!(page.returned_lines, 1);
+        assert_eq!(page.next_start_line, Some(2));
+        assert_eq!(page.sha256, full_sha("first\n€\nlast".as_bytes()));
+        for invalid_tail in [vec![0xFF], vec![0xF0, 0x9F], vec![0xE2, 0x28, 0xA1]] {
+            let error = read_page_from_with_budget(
+                ChunkedReader::new([b"first\nlong-next-line\n".to_vec(), invalid_tail]),
+                EffectiveRange::new(None, Some(3)),
+                5,
+            )
+            .unwrap_err();
+            assert_eq!(error.reason, ReadFileReason::InvalidUtf8);
+        }
     }
 
     #[test]

@@ -7,6 +7,9 @@ impl Database {
     pub fn open(db_path: &PathBuf) -> anyhow::Result<Self> {
         let conn = Connection::open(db_path)?;
         // Reject unsupported persisted domains before WAL or schema writes.
+        // The explicit offline owner is the only Fork v1 migration entry.
+        webcodex_workflow_session::require_current_workflow_session_schema(&conn)
+            .context("Workflow Session startup schema preflight")?;
         Self::validate_agent_wake_schema(&conn)?;
         validate_supported_domain_schemas(&conn)?;
         // Single-operator deployment: prefer durability + predictable locking
@@ -74,6 +77,66 @@ impl Database {
              WHERE revoked_at IS NOT NULL",
             [],
         )?;
+        Ok(deleted)
+    }
+
+    /// Batched variant of [`Self::purge_stale_auth_rows`] for long-running
+    /// operation: identical predicates, but each table loses at most
+    /// `per_table_limit` rows per call, so a large backlog shrinks over
+    /// consecutive calls without any single unbounded bulk delete holding the
+    /// writer connection. Every denied row is rejected on presentation whether
+    /// its row is present (revoked/expired classification) or already purged
+    /// (unknown token), so the cleanup does not weaken the auth contract.
+    /// Returns the number of rows deleted in this call.
+    pub fn purge_stale_auth_rows_batch(
+        &self,
+        now: i64,
+        per_table_limit: i64,
+    ) -> anyhow::Result<usize> {
+        // Inline the (validated, positive) limit: DELETE .. LIMIT needs a
+        // compile-time SQLite option, the rowid subquery form does not.
+        let limit = per_table_limit.max(1);
+        let conn = self.lock_connection(crate::StoreDomain::Core);
+        let mut deleted = 0usize;
+        let tables: [(&str, &str, bool); 6] = [
+            (
+                "oauth_authorization_codes",
+                "expires_at <= ?1 OR used_at IS NOT NULL OR revoked_at IS NOT NULL",
+                true,
+            ),
+            (
+                "oauth_access_tokens",
+                "expires_at <= ?1 OR revoked_at IS NOT NULL",
+                true,
+            ),
+            (
+                "oauth_refresh_tokens",
+                "expires_at <= ?1 OR revoked_at IS NOT NULL",
+                true,
+            ),
+            (
+                "pairing_codes",
+                "expires_at <= ?1 OR used_at IS NOT NULL",
+                true,
+            ),
+            (
+                "api_keys",
+                "revoked_at IS NOT NULL OR (expires_at IS NOT NULL AND expires_at <= ?1)",
+                true,
+            ),
+            ("account_credentials", "revoked_at IS NOT NULL", false),
+        ];
+        for (table, predicate, binds_now) in tables {
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN
+                 (SELECT rowid FROM {table} WHERE ({predicate}) LIMIT {limit})"
+            );
+            deleted += if binds_now {
+                conn.execute(&sql, rusqlite::params![now])?
+            } else {
+                conn.execute(&sql, [])?
+            };
+        }
         Ok(deleted)
     }
 
@@ -440,6 +503,20 @@ impl Database {
                     tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN admin_authority INTEGER NOT NULL DEFAULT 0 CHECK(admin_authority IN (0, 1));"))?;
                 }
             }
+            if !table_columns(&tx, "oauth_clients")?
+                .iter()
+                .any(|name| name == "dynamic_registration")
+            {
+                tx.execute_batch(
+                    "ALTER TABLE oauth_clients ADD COLUMN dynamic_registration TEXT
+                    CHECK(dynamic_registration IS NULL OR
+                        owner_user_id IS NOT NULL);",
+                )?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_oauth_clients_dynamic ON oauth_clients(created_at)
+                WHERE dynamic_registration IS NOT NULL;",
+            )?;
             if !table_columns(&tx, "pairing_codes")?
                 .iter()
                 .any(|column| column == "runner_capabilities")
@@ -556,6 +633,16 @@ impl Database {
                 ON action_events(principal_correlation_kind, principal_correlation_id,
                     project, window_ended_at_ms DESC, client_window_key, client_window_source)
                 WHERE window_meaningful = 1 AND client_window_key IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS window_labels (
+                principal_kind TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                window_key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (principal_kind, principal_id, window_key)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_window_labels_window ON window_labels(window_key);
 
             CREATE TABLE IF NOT EXISTS window_operator_messages (
                 message_id TEXT PRIMARY KEY,
@@ -939,125 +1026,11 @@ fn validate_supported_domain_schemas(conn: &Connection) -> anyhow::Result<()> {
 
 // `schema_version = 1` mirrors `WORKFLOW_SESSION_STORAGE_SCHEMA_VERSION` in
 // `webcodex-workflow-session` (`persistence/database.rs`); update both together.
-const WORKFLOW_SESSION_BACKUP_SCHEMA_VERSION: u32 = 1;
-
-const WORKFLOW_SESSION_BACKUP_TABLES: &[(&str, &[&str])] = &[
-    (
-        "workflow_session_storage",
-        &["id", "schema_version", "legacy_imported"],
-    ),
-    (
-        "workflow_session_state",
-        &[
-            "session_id",
-            "project",
-            "owner_authority_fingerprint",
-            "created_at",
-            "updated_at",
-            "revision",
-            "previous_message_revision",
-            "message_observation_revision",
-            "events_observed",
-            "state_json",
-        ],
-    ),
-    (
-        "workflow_session_events",
-        &["session_id", "ordinal", "event_id", "event_json"],
-    ),
-    (
-        "workflow_session_messages",
-        &[
-            "session_id",
-            "message_id",
-            "observation_revision",
-            "message_json",
-        ],
-    ),
-    (
-        "workflow_session_message_delivery_replays",
-        &[
-            "session_id",
-            "scope_key",
-            "payload_fingerprint",
-            "message_id",
-        ],
-    ),
-    (
-        "workflow_session_retention_tombstones",
-        &[
-            "session_id",
-            "owner_authority_fingerprint",
-            "incarnation_fingerprint",
-            "expiry_ordinal",
-        ],
-    ),
-];
-
-fn workflow_session_backup_table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
-    let exists = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    Ok(exists)
-}
-
 fn validate_workflow_session_backup_domain(conn: &Connection) -> anyhow::Result<()> {
-    let table_count = WORKFLOW_SESSION_BACKUP_TABLES.len();
-    let mut present = 0usize;
-    for &(table, _) in WORKFLOW_SESSION_BACKUP_TABLES {
-        if workflow_session_backup_table_exists(conn, table)? {
-            present += 1;
-        }
-    }
-
-    match present {
-        0 => return Ok(()),
-        n if n == table_count => {}
-        n => anyhow::bail!(
-            "shared database backup has partial Workflow Session schema ({n} of {table_count} required tables present)"
-        ),
-    }
-
-    for &(table, required_columns) in WORKFLOW_SESSION_BACKUP_TABLES {
-        let columns = table_columns(conn, table)?;
-        if columns.is_empty() {
-            anyhow::bail!(
-                "shared database backup missing Workflow Session table `{table}`"
-            );
-        }
-        for required in required_columns {
-            if !columns.iter().any(|column| column.as_str() == *required) {
-                anyhow::bail!(
-                    "shared database backup Workflow Session table `{table}` missing required column `{required}`"
-                );
-            }
-        }
-    }
-
-    let marker_version: Option<u32> = conn
-        .query_row(
-            "SELECT schema_version FROM workflow_session_storage WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("read workflow_session_storage schema marker")?;
-    match marker_version {
-        Some(version) if version == WORKFLOW_SESSION_BACKUP_SCHEMA_VERSION => {}
-        Some(version) => anyhow::bail!(
-            "workflow_session_storage schema version {version} is not supported (expected {})",
-            WORKFLOW_SESSION_BACKUP_SCHEMA_VERSION
-        ),
-        None => anyhow::bail!(
-            "shared database backup missing workflow_session_storage marker row id=1"
-        ),
-    }
-
+    // The owning crate defines both exact layouts and marker validation.
+    // A backup may contain either supported format; this check never writes.
+    webcodex_workflow_session::detect_workflow_session_schema(conn)
+        .context("validate Workflow Session backup schema")?;
     Ok(())
 }
 
@@ -1110,7 +1083,7 @@ pub(crate) fn validate_shared_database_backup_schema(conn: &Connection) -> anyho
     Ok(())
 }
 
-fn table_columns(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
+pub(crate) fn table_columns(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
     let mut cols = Vec::new();

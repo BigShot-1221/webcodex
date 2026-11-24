@@ -16,6 +16,9 @@ use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_runner_registry::RuntimeJobAggregateSnapshot;
 
 const LIST_RUNNERS_MAX_CLIENT_IDS: usize = 8;
+const LIST_RUNNERS_DEFAULT_LIMIT: usize = 30;
+const LIST_RUNNERS_MAX_LIMIT: usize = 100;
+const LIST_RUNNERS_MAX_EMBEDDED_PROJECTS: usize = 100;
 const TARGET_CLIENT_ID_MAX_CHARS: usize = 128;
 
 #[derive(Debug, Default)]
@@ -23,10 +26,12 @@ pub(crate) struct ListRunnersOptions {
     pub(crate) client_id: Option<String>,
     pub(crate) client_ids: Option<Vec<String>>,
     pub(crate) include_projects: Option<bool>,
+    pub(crate) projects_offset: usize,
     pub(crate) summary_only: bool,
     pub(crate) query: Option<String>,
     pub(crate) status: Option<webcodex_tool_contracts::tool_call::RunnerStatusFilter>,
     pub(crate) limit: Option<usize>,
+    pub(crate) offset: usize,
 }
 
 /// No serialization on query facts: each output owns its projection.
@@ -63,9 +68,6 @@ impl RunnerInventoryPage {
                 "status": client.status,
                 "connected": client.connected,
                 "runner_protocol_generation": client.runner_protocol_generation.get(),
-                "transport": client.transport,
-                "last_seen_age_secs": row.last_seen_age_secs,
-                "pending_requests": client.pending_requests,
                 "projects_count": row.projects_count,
                 "active_jobs": row.active.active,
                 "job_concurrency": {
@@ -74,12 +76,15 @@ impl RunnerInventoryPage {
                     "queued": row.active.queued,
                 },
                 "coding_agent_providers": safe_provider_inventory(client.coding_agent_providers.as_deref()),
-                "build": client.build,
             });
             if let Some(availability) = client.computer_session_availability {
                 value["computer_session_availability"] = json!(availability);
             }
             if !options.summary_only {
+                value["build"] = json!(client.build);
+                value["transport"] = json!(client.transport);
+                value["last_seen_age_secs"] = json!(row.last_seen_age_secs);
+                value["pending_requests"] = json!(client.pending_requests);
                 value["owner"] = json!(client.owner);
                 value["hostname"] = json!(client.hostname);
                 value["host_context"] = host_context_projection(client.host_context.as_ref());
@@ -91,16 +96,42 @@ impl RunnerInventoryPage {
                     client.policy.as_ref().and_then(|policy| policy.shell_profiles.as_ref()),
                 );
                 value["tool_providers"] = json!(client.policy.as_ref().and_then(|policy| policy.tool_providers.as_ref()));
-                if options.include_projects.unwrap_or(true) {
-                    value["projects"] = json!(client.projects);
+            }
+            if options.include_projects.unwrap_or(false) {
+                let mut projects = client.projects.iter()
+                    .filter(|project| !project.disabled)
+                    .collect::<Vec<_>>();
+                projects.sort_by(|left, right| left.id.cmp(&right.id));
+                let total = projects.len();
+                let skip = options.projects_offset.min(total);
+                projects.drain(..skip);
+                projects.truncate(LIST_RUNNERS_MAX_EMBEDDED_PROJECTS);
+                let next = options.projects_offset.saturating_add(projects.len());
+                let next_offset = (next < total).then_some(next);
+                value["projects"] = json!(projects);
+                value["projects_returned_count"] = json!(projects.len());
+                value["projects_offset"] = json!(options.projects_offset);
+                value["projects_next_offset"] = json!(next_offset);
+                value["projects_truncated"] = json!(next_offset.is_some());
+                if let Some(next) = next_offset {
+                    value["projects_hint"] = json!(format!(
+                        "Continue list_runners(client_id={:?}, include_projects=true, projects_offset={next}).",
+                        client.client_id,
+                    ));
                 }
             }
             value
         }).collect();
-        ToolResult::ok(json!({
+        let next = options.offset.saturating_add(runners.len());
+        let has_more = next < self.matched_count;
+        let mut output = json!({
             "count": runners.len(),
             "matched_count": self.matched_count,
-            "truncated": runners.len() < self.matched_count,
+            "truncated": has_more,
+            "offset": options.offset,
+            "limit": options.limit,
+            "has_more": has_more,
+            "next_offset": has_more.then_some(next),
             "summary": {
                 "count": runners.len(),
                 "online": online,
@@ -108,7 +139,11 @@ impl RunnerInventoryPage {
                 "stale": stale,
             },
             "runners": runners,
-        }))
+        });
+        if self.matched_count == 0 {
+            output["hint"] = json!("No accessible Runners match this request. Check the filters and the current credential identity and authorization.");
+        }
+        ToolResult::ok(output)
     }
 }
 
@@ -145,7 +180,8 @@ pub struct RuntimeInfo {
     /// Effective MCP App exposure flag captured when this Runtime was built.
     /// Same startup-snapshot semantics as [`Self::mcp_compact_schemas`].
     pub mcp_apps_enabled: bool,
-    /// Effective MCP text-JSON compatibility projection captured at Runtime
+    pub(crate) mcp_tool_exposure: crate::mcp::tool_exposure::ToolExposureConfig,
+    /// Deployment-wide MCP text-JSON compatibility override captured at Runtime
     /// construction. Ordinary tool-result framing must not re-read ambient env.
     pub mcp_text_json_compat_enabled: bool,
 }
@@ -155,7 +191,7 @@ impl RuntimeInfo {
     /// production startup, plus the public URL and QUIC runtime configuration.
     #[cfg(test)]
     pub fn from_env() -> Self {
-        let config = crate::config::Config::from_env();
+        let config = crate::config::Config::from_env().unwrap();
         Self::from_config_with_quic_config(&config, &crate::config::QuicServerConfig::from_env())
     }
 
@@ -185,12 +221,21 @@ impl RuntimeInfo {
                 crate::config::mcp_compact_schemas_override(),
             ),
             mcp_apps_enabled: crate::config::mcp_apps_enabled(),
+            mcp_tool_exposure: Default::default(),
             mcp_text_json_compat_enabled: crate::config::mcp_text_json_compat_enabled(),
         }
     }
 }
 
 impl ToolRuntime {
+    fn mcp_host_profile_status(&self) -> Value {
+        json!({
+            "profile": self.mcp_host_policy.profile.as_str(),
+            "deployment_profile": self.deployment_mcp_host_policy.profile.as_str(),
+            "profile_source": self.mcp_host_profile_source,
+        })
+    }
+
     pub(crate) fn effective_config_status(&self) -> Value {
         json!({
             "auth": {
@@ -208,14 +253,15 @@ impl ToolRuntime {
             "mcp_host": {
                 "profile": self.deployment_mcp_host_policy.profile.as_str(),
                 "host_budget_secs": self.deployment_mcp_host_policy.host_budget_secs,
-                "initial_job_handoff_secs": self.deployment_mcp_host_policy.initial_job_handoff_secs,
                 "max_sync_wait_secs": self.deployment_mcp_host_policy.max_sync_wait_secs,
                 "continuation_wait_secs": self.deployment_mcp_host_policy.continuation_wait_secs,
             },
+            "mcp_tool_exposure": self.runtime_info.mcp_tool_exposure.status(),
             "tool_request_trace_mode": crate::config::tool_request_trace_mode().as_str(),
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_runners(&self, auth: Option<&AuthContext>) -> ToolResult {
         self.list_runners_with_options(auth, ListRunnersOptions::default())
             .await
@@ -224,8 +270,16 @@ impl ToolRuntime {
     pub(crate) async fn list_runners_with_options(
         &self,
         auth: Option<&AuthContext>,
-        options: ListRunnersOptions,
+        mut options: ListRunnersOptions,
     ) -> ToolResult {
+        // Public tools are always bounded. Console callers use the shared typed
+        // query explicitly, retaining their complete operator inventory.
+        options.limit = Some(
+            options
+                .limit
+                .unwrap_or(LIST_RUNNERS_DEFAULT_LIMIT)
+                .clamp(1, LIST_RUNNERS_MAX_LIMIT),
+        );
         match self.query_runner_inventory(auth, &options).await {
             Ok(page) => page.into_tool_result(&options),
             Err(result) => result,
@@ -301,20 +355,21 @@ impl ToolRuntime {
             .filter(|q| !q.is_empty())
             .map(str::to_lowercase);
         let access = crate::runner_http::runner_access_from_auth(auth);
-        let (mut clients, project_counts) = if options.summary_only {
-            let snapshot = self
-                .runner_registry
-                .console_registry_snapshot_for_auth(access.as_ref(), true)
-                .await;
-            (snapshot.runners, Some(snapshot.projects_by_runner))
-        } else {
-            (
-                self.runner_registry
-                    .list_runners_for_auth(access.as_ref())
-                    .await,
-                None,
-            )
-        };
+        let (mut clients, project_counts) =
+            if options.summary_only && !options.include_projects.unwrap_or(false) {
+                let snapshot = self
+                    .runner_registry
+                    .console_registry_snapshot_for_auth(access.as_ref(), true)
+                    .await;
+                (snapshot.runners, Some(snapshot.projects_by_runner))
+            } else {
+                (
+                    self.runner_registry
+                        .list_runners_for_auth(access.as_ref())
+                        .await,
+                    None,
+                )
+            };
         clients.sort_by(|a, b| a.client_id.cmp(&b.client_id));
         clients.retain(|client| {
             if let Some(expected) = options.client_id.as_deref() {
@@ -344,8 +399,10 @@ impl ToolRuntime {
                 })
         });
         let matched_count = clients.len();
+        let skip = options.offset.min(matched_count);
+        clients.drain(..skip);
         if let Some(limit) = options.limit {
-            clients.truncate(limit.clamp(1, 100));
+            clients.truncate(limit.clamp(1, LIST_RUNNERS_MAX_LIMIT));
         }
         let mut active_counts = self
             .runner_registry
@@ -514,6 +571,7 @@ impl ToolRuntime {
         // can overflow the default Tokio worker stack once a Runner is registered.
         let mut output = serde_json::Map::with_capacity(18);
         output.insert("service".to_string(), json!("webcodex"));
+        output.insert("mcp_host".to_string(), self.mcp_host_profile_status());
         output.insert(
             "mcp_compact_schemas".to_string(),
             json!(self.runtime_info.mcp_compact_schemas),
@@ -668,7 +726,7 @@ impl ToolRuntime {
             "service": "webcodex",
             "version": env!("CARGO_PKG_VERSION"),
             "build": {"git_commit": build.git_commit, "git_dirty": build.git_dirty},
-            "mcp_host": {"profile": self.deployment_mcp_host_policy.profile.as_str()},
+            "mcp_host": self.mcp_host_profile_status(),
             "projects": {"count": projects, "online_count": online_projects, "status": if projects > 0 { "ok" } else { "no_projects" }},
             "jobs": {
                 "active_count": jobs.active_count,
@@ -863,6 +921,7 @@ impl ToolRuntime {
         // status requests retain the same bounded worker-stack behavior.
         let mut output = serde_json::Map::with_capacity(17);
         output.insert("service".to_string(), json!("webcodex"));
+        output.insert("mcp_host".to_string(), self.mcp_host_profile_status());
         output.insert(
             "mcp_compact_schemas".to_string(),
             json!(self.runtime_info.mcp_compact_schemas),
@@ -909,59 +968,6 @@ impl ToolRuntime {
         );
         ToolResult::ok(Value::Object(output))
     }
-}
-
-/// Startup already needs full status for its owning-Runner brief. Its model
-/// projection shares the sparse field selection without preserving inventories.
-pub(crate) fn compact_runtime_status(status: &Value) -> Value {
-    let mut result = json!({
-        "service": status["service"],
-        "version": status["version"],
-        "build": {"git_commit": status["build"]["git_commit"], "git_dirty": status["build"]["git_dirty"]},
-        "mcp_host": {"profile": status["effective_config"]["mcp_host"]["profile"]},
-        "runners": {
-            "count": status["runners"]["count"],
-            "online_count": status["runners"]["online_count"],
-            "stale_count": status["runners"]["stale_count"]
-        },
-        "projects": {
-            "count": status["projects"]["count"],
-            "online_count": status["projects"]["runner_registered"]["online_count"],
-            "status": status["projects"]["effective"]["status"]
-        },
-        "compatibility": {
-            "protocol": status["protocol_compatibility"],
-            "build_alignment": status["build_alignment"],
-            "source_alignment": status["version_compatibility"]["source_alignment"]["status"]
-        }
-    });
-    result["jobs"] = sparse_job_counts(&status["jobs"]);
-    result["connection"] = sparse_connection_layers(&status["connection_layers"]);
-    result
-}
-
-fn sparse_job_counts(jobs: &Value) -> Value {
-    let mut result = serde_json::Map::new();
-    for key in [
-        "active_count",
-        "running_count",
-        "queued_count",
-        "recovering_count",
-        "lost_after_reconcile_count",
-    ] {
-        if let Some(value) = jobs.get(key) {
-            result.insert(key.into(), value.clone());
-        }
-    }
-    Value::Object(result)
-}
-
-fn sparse_connection_layers(layers: &Value) -> Value {
-    let mut result = serde_json::Map::new();
-    for key in ["runner_process", "server_transport", "project_registry"] {
-        result.insert(key.into(), layers[key]["status"].clone());
-    }
-    Value::Object(result)
 }
 
 fn runtime_job_counts(runner_jobs: &[ShellJobInfo]) -> Value {
@@ -1771,6 +1777,7 @@ impl Default for RuntimeInfo {
             // text-JSON compatibility remains opt-in.
             mcp_compact_schemas: true,
             mcp_apps_enabled: true,
+            mcp_tool_exposure: Default::default(),
             mcp_text_json_compat_enabled: false,
         }
     }

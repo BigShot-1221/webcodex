@@ -92,6 +92,7 @@ async fn runner_observability_has_one_collection_and_preserves_health_across_mod
     for arguments in [
         json!({}),
         json!({"summary_only":true}),
+        json!({"summary_only":false}),
         json!({"include_projects":false}),
     ] {
         let result = runtime
@@ -105,8 +106,10 @@ async fn runner_observability_has_one_collection_and_preserves_health_across_mod
         assert_eq!(runners.len(), 1);
         assert_eq!(runners[0]["runner_instance_id"], "projection-instance");
         assert_eq!(runners[0]["job_concurrency"]["limit"], 4);
-        if arguments.get("summary_only").is_none() {
+        if arguments.get("summary_only") == Some(&json!(false)) {
             assert_eq!(runners[0]["owner"], "projection-owner");
+        } else {
+            assert!(runners[0].get("owner").is_none());
         }
         if arguments.get("include_projects") == Some(&json!(false)) {
             assert!(runners[0].get("projects").is_none());
@@ -133,6 +136,7 @@ fn shared_key_auth(hash: &str) -> crate::auth::AuthContext {
         allowed_client_id: None,
         shared_key_hash: Some(hash.to_string()),
         project_grant_id: None,
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -155,6 +159,7 @@ fn open_auth() -> crate::auth::AuthContext {
         allowed_client_id: None,
         shared_key_hash: None,
         project_grant_id: None,
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -171,6 +176,7 @@ fn bootstrap_auth() -> crate::auth::AuthContext {
         allowed_client_id: None,
         shared_key_hash: None,
         project_grant_id: None,
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -185,6 +191,7 @@ fn runtime_status_call() -> ToolCall {
 fn list_projects_call() -> ToolCall {
     ToolCall::ListProjects {
         include_git_summary: false,
+        offset: 0,
         client_id: None,
         project: None,
         query: None,
@@ -195,6 +202,8 @@ fn list_projects_call() -> ToolCall {
 
 fn list_runners_call() -> ToolCall {
     ToolCall::ListRunners {
+        projects_offset: 0,
+        offset: 0,
         query: None,
         status: None,
         limit: None,
@@ -206,24 +215,11 @@ fn list_runners_call() -> ToolCall {
 }
 
 fn metadata_agent_registration(client_id: &str) -> RunnerRegisterRequest {
-    crate::test_support::current_runner_registration(RunnerRegisterRequest {
-        computer_session_availability: None,
-        process_started_at: None,
-        build: None,
-        job_concurrency_limit: None,
-        job_inventory: None,
-        coding_agent_providers: None,
-        coding_agent_inventory: None,
-        client_id: client_id.to_string(),
-        runner_instance_id: format!("inst-{client_id}"),
-        runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-        display_name: None,
-        owner: None,
-        hostname: None,
-        host_context: None,
-        capabilities: RunnerCapabilities::default(),
-        policy: None,
-    })
+    crate::test_support::runner_registration(
+        client_id,
+        &format!("inst-{client_id}"),
+        RunnerCapabilities::default(),
+    )
 }
 
 async fn register_computer_target_for_auth(
@@ -1686,16 +1682,11 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "oe".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: req.request_id,
             exit_code: Some(0),
             stdout: Some("hi\n".to_string()),
             stderr: Some(String::new()),
-            stdout_truncated: false,
-            stderr_truncated: false,
             duration_ms: Some(1),
-            error: None,
+            ..runner_result_request("oe".to_string(), "inst".to_string(), req.request_id)
         })
         .await
         .unwrap();
@@ -2267,17 +2258,13 @@ async fn runtime_status_with_no_projects_returns_configured_false() {
     assert_eq!(out["authority"]["mode"], "trusted_agent");
     assert_eq!(out["authority"]["human_approval_required"], false);
     let session_store = &out["session_store"];
-    assert_eq!(
-        session_store["max_sessions"],
-        session_store["hot_session_capacity_target"]
-    );
-    assert_eq!(session_store["retained_sessions"], 0);
-    assert_eq!(session_store["active_sessions"], 0);
-    assert_eq!(session_store["closed_sessions"], 0);
-    assert_eq!(session_store["hot_sessions"], 0);
-    assert_eq!(session_store["cold_sessions"], 0);
-    assert_eq!(session_store["historical_session_retention_limit"], 100);
-    assert_eq!(session_store["capacity_evictions"], 0);
+    assert!(session_store.get("max_sessions").is_none());
+    assert!(session_store
+        .get("historical_session_retention_limit")
+        .is_none());
+    assert!(session_store.get("max_messages_per_session").is_none());
+    assert!(session_store.get("capacity_evictions").is_none());
+    assert_eq!(session_store["recent_event_limit"], 2000);
     assert_eq!(session_store["retention_tombstones"], 0);
 
     assert_eq!(out["projects"]["mode"], "runner_registered");
@@ -2424,8 +2411,16 @@ async fn runtime_status_preserves_allowlisted_effective_config_across_projection
     let config_object = config.as_object().expect("effective_config object");
     assert_eq!(
         config_object.len(),
-        3,
+        4,
         "effective_config must stay allowlisted"
+    );
+    assert_eq!(
+        config["mcp_tool_exposure"],
+        json!({
+            "adaptive":{"goals":false,"agent_continuation":false,"job_continuation":false},
+            "cli":{"goals":false,"agent_continuation":false,"job_continuation":false},
+            "oauth_client_overrides":0
+        })
     );
     assert_eq!(config["tool_request_trace_mode"], "full");
     let auth = config["auth"].as_object().expect("effective auth object");
@@ -2441,12 +2436,11 @@ async fn runtime_status_preserves_allowlisted_effective_config_across_projection
         .expect("effective MCP Host policy");
     assert_eq!(
         mcp_host.len(),
-        5,
+        4,
         "effective MCP Host facts must stay allowlisted"
     );
     assert_eq!(mcp_host["profile"], "direct");
     assert_eq!(mcp_host["host_budget_secs"], 60);
-    assert_eq!(mcp_host["initial_job_handoff_secs"], 10);
     assert_eq!(mcp_host["max_sync_wait_secs"], 55);
     assert_eq!(mcp_host["continuation_wait_secs"], 55);
 
@@ -2501,7 +2495,6 @@ async fn runtime_status_reports_effective_mcp_host_budget_override() {
     let mcp_host = &result.output["effective_config"]["mcp_host"];
     assert_eq!(mcp_host["profile"], "host_code_mode");
     assert_eq!(mcp_host["host_budget_secs"], 9);
-    assert_eq!(mcp_host["initial_job_handoff_secs"], 4);
     assert_eq!(mcp_host["max_sync_wait_secs"], 4);
     assert_eq!(mcp_host["continuation_wait_secs"], 4);
 }
@@ -2526,7 +2519,6 @@ async fn runtime_status_reports_deployment_timing_overrides_without_exposing_sou
     assert_eq!(host["host_budget_secs"], 55);
     assert_eq!(host["max_sync_wait_secs"], 8);
     assert_eq!(host["continuation_wait_secs"], 12);
-    assert_eq!(host["initial_job_handoff_secs"], 5);
     assert!(host.get("timing_overrides").is_none());
     assert!(result
         .output
@@ -2543,11 +2535,13 @@ async fn runtime_status_reports_effective_mcp_compact_schema_policy() {
     let runtime_false = {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+        env.set("WEBCODEX_TOKEN", "test-bootstrap");
         runtime_with_info(RuntimeInfo::from_env())
     };
     let runtime_true = {
         let mut env = crate::test_support::TestEnvGuard::new();
         env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
+        env.set("WEBCODEX_TOKEN", "test-bootstrap");
         runtime_with_info(RuntimeInfo::from_env())
     };
     // Both guards are dropped now; the snapshots outlive the env mutations.

@@ -1,7 +1,9 @@
 mod cloudflare_connections;
 mod coding_agents;
 mod connections;
-pub use cloudflare_connections::{CloudflareConnectionRequest, CloudflareConnectionResponse};
+pub use cloudflare_connections::{
+    CloudflareConnectionRequest, CloudflareConnectionResponse, GeminiConnectionRequest,
+};
 mod diagnostics;
 mod environment;
 mod environment_invitation;
@@ -11,6 +13,8 @@ mod mcp_providers;
 mod operation_completion;
 mod path_inventory;
 pub use path_inventory::{ExportInventoryRequest, OpenInventoryRequest};
+#[cfg(all(test, windows, desktop_native_smoke))]
+pub(crate) mod computer_native_smoke;
 #[cfg(test)]
 mod projectless_tests;
 #[cfg(test)]
@@ -79,10 +83,12 @@ static NEXT_STATE_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 type SharedSupervisor = Arc<Mutex<ProcessSupervisor>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ChatGptActivityProbe {
     identity: ProjectRuntimeIdentity,
-    webcodex: PathBuf,
+    adapter: WebCodexAdapter,
+    runtime_source: crate::runtime_selection::RuntimeSource,
+    runtime_selection_revision: u64,
 }
 
 pub struct AppState {
@@ -94,6 +100,7 @@ pub struct AppState {
     supervisor: SharedSupervisor,
     activity: ActivityLog,
     operations: OperationController,
+    refresh_lock: tokio::sync::Mutex<()>,
     shutdown_signal: CancellationSignal,
     shutdown_started: AtomicBool,
     shutdown_complete: CancellationSignal,
@@ -108,3 +115,7 @@ include!("state/readiness.rs");
 include!("state/persistence.rs");
 include!("state/tunnel.rs");
 include!("state/tests.rs");
+
+#[cfg(test)]
+#[path = "state/legacy_upgrade_tests.rs"]
+mod legacy_upgrade_tests;

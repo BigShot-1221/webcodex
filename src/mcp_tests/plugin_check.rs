@@ -26,6 +26,7 @@ async fn register_plugin_runner(runtime: &ToolRuntime, client_id: &str, runner_i
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 client_id: client_id.to_string(),
                 runner_instance_id: runner_instance_id.to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -159,10 +160,13 @@ async fn plugin_check_tool_spec_and_argument_contract_fail_closed_before_dispatc
     )
     .await;
     match no_scope {
-        McpOutcome::Forbidden { required_scope, .. } => {
-            assert_eq!(required_scope, Some(crate::auth::SCOPE_PLUGIN_MANAGE));
-        }
-        other => panic!("check without plugin:manage must be forbidden: {other:?}"),
+        McpOutcome::Ok(body) => super::fixed_scope::assert_fixed_scope_failure(
+            &body,
+            crate::auth::SCOPE_PLUGIN_MANAGE,
+            false,
+            "fixed token",
+        ),
+        other => panic!("check without plugin:manage must be denied: {other:?}"),
     }
 
     let auth = plugin_auth(true);

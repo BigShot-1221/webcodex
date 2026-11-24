@@ -1,6 +1,6 @@
 use super::protocol::{
-    AcpOutboundWriter, OutboundInterruption, OutboundWriteOutcome, bounded_text,
-    wait_outbound_write,
+    bounded_text, wait_outbound_write, AcpOutboundWriter, OutboundInterruption,
+    OutboundWriteOutcome,
 };
 #[cfg(unix)]
 use super::protocol::{notification_frame, request_frame};
@@ -233,6 +233,7 @@ fn start_request(
         instruction: "inspect".to_string(),
         config,
         timeout_secs: 10,
+        archive_acknowledged_runs: None,
     })
 }
 
@@ -378,6 +379,7 @@ fn start_request_for_provider(
         instruction: "inspect".to_string(),
         config,
         timeout_secs: 10,
+        archive_acknowledged_runs: None,
     })
 }
 

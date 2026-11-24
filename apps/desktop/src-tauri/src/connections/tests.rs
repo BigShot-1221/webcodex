@@ -10,6 +10,7 @@ use std::process::Command;
 
 fn config(id: TunnelProfileId) -> TunnelProfileConfigSnapshot {
     TunnelProfileConfigSnapshot {
+        oauth_dynamic_registration_enabled: false,
         provider: webcodex_environment::TunnelProvider::Openai,
         configuration_id: None,
         id: id.to_string(),
@@ -264,6 +265,31 @@ fn desktop_supervision_allows_native_tunnel_startup() {
         })),
         Some(("tunnel_control_plane", "tunnel_auth_rejected"))
     );
+}
+
+#[test]
+fn binding_failure_evidence_preserves_only_exact_allowlisted_stage_and_reason() {
+    for code in [
+        "tunnel_protected_history_binding_changed",
+        "tunnel_receipts_binding_changed",
+        "tunnel_archive_binding_changed",
+    ] {
+        let mut event = json!({
+            "schema_version": 1,
+            "provider": "openai",
+            "failure_stage": "tunnel_recovery",
+            "reason_code": code,
+        });
+        assert_eq!(
+            safe_failure_evidence(&event),
+            Some(("tunnel_recovery", code))
+        );
+        event["failure_stage"] = json!("local_mcp");
+        assert!(safe_failure_evidence(&event).is_none());
+        event["failure_stage"] = json!("tunnel_recovery");
+        event["reason_code"] = json!("private credential");
+        assert!(safe_failure_evidence(&event).is_none());
+    }
 }
 
 #[tokio::test]

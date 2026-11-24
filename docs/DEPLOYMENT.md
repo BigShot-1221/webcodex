@@ -33,7 +33,7 @@ For existing published runtime/CLI artifacts, the npm thin installer/wrapper rem
 npm install -g @yyjeqhc/webcodex
 ```
 
-Supported package platforms are Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64, and Windows arm64. Windows supports CLI + Runner, explicit foreground Server, and explicit local `webcodex share --tunnel cloudflare|openai|none`. Windows x64 supports managed Cloudflare acquisition; Windows ARM64 Cloudflare requires a trusted explicit/PATH binary because the pinned upstream release has no official ARM64 artifact. Native OpenAI Tunnel supports Windows x64/arm64. The legacy `server install` / `runner install` commands do not manage Windows services; the foreground examples below remain available. New `environment` setups default to user scope, which uses signed-in user scheduled tasks on Windows. Explicit `--scope system` selects SCM services with OS authorization and account requirements; existing environments retain their saved scope and owner. User scope does not promise operation before login or after logout; see [Unified installation](unified-installation.md#services-and-credentials) and its pending native acceptance. The npm wrapper
+Supported package platforms are Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64, and Windows arm64. Windows supports CLI + Runner, explicit foreground Server, and explicit local `webcodex share --tunnel cloudflare|openai|none`. Windows x64 supports managed Cloudflare acquisition; Windows ARM64 can use the same verified x64 asset when the OS reports x64 user-mode support. Other ARM64 systems require a trusted compatible explicit/PATH binary. Native OpenAI Tunnel supports Windows x64/arm64. The legacy `server install` / `runner install` commands do not manage Windows services; the foreground examples below remain available. New `environment` setups default to user scope, which uses signed-in user scheduled tasks on Windows. Explicit `--scope system` selects SCM services with OS authorization and account requirements; existing environments retain their saved scope and owner. User scope does not promise operation before login or after logout; see [Unified installation](unified-installation.md#services-and-credentials) and its pending native acceptance. The npm wrapper
 requires Node.js 18 or newer. The native Linux x64 artifact targets glibc 2.17
 or newer.
 
@@ -222,6 +222,8 @@ WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES=2147483648
 ```
 
 `full` tracing can contain source text, patches, command/script input and output, user messages, and secrets that were themselves present inside captured tool payloads. Protect the trace directory like other sensitive diagnostic data and keep retention/budget bounded. Trace capture is diagnostic only; trace-write failure does not change tool execution.
+
+Slow Store connection waits/holds (100 ms or more) are reported at INFO with bounded diagnostic labels. Metadata traces distinguish response handoff from Handler completion after audit persistence. Trace capture is best effort: the diagnostic view marks known gaps, and a completion event alone does not prove a complete trace.
 
 The exact trace file layout, correlation ids, model-facing forensic reader, queueing, compression, and payload-validation rules are implementation/maintainer details and are intentionally omitted here.
 
@@ -424,7 +426,7 @@ writes the file. Invalid candidates preserve the active snapshot/generation, and
 `restart_required_fields` names startup-only changes that are not claimed live
 until restart. Unix service reload/SIGHUP remains a compatibility trigger for the
 same reload primitive, but is not required for first-class config control. Identity,
-server/auth, project source, concurrency, capabilities, and transport changes
+server/auth, project source, capabilities, and transport changes
 remain restart-only where reported.
 
 `[instructions].files` is explicitly hot-reloadable: after check/reload, new
@@ -499,7 +501,7 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` limits what an OAuth client may request. Existing clients are not silently widened when WebCodex adds new permissions. To change an existing client, submit the complete desired non-empty allow-list to `POST /api/oauth/clients/update_scopes`. A real change invalidates the client's old OAuth grants and requires reauthorization; submitting the same canonical list is a no-op. See [Authentication](AUTH_MODEL.md#oauth2) for the security model.
 
-ChatGPT MCP host-file import uses two trust tiers. An active authenticated OAuth client may import only from OpenAI attachment hosts: `files.oaiusercontent.com` and its subdomains, plus the narrowly matched Sediment Azure Blob accounts `oaisdmntpr<region>.blob.core.windows.net`; those URLs still require HTTPS, public DNS resolution with address pinning, port 443, no userinfo, no redirects, and the normal bounded download/write policy. Configure an exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS` only when that client must also import from arbitrary public HTTPS hosts under the same SSRF controls. Reprovisioning changes the client id but does not break ordinary OpenAI-host attachment import; update the setting to restore the broader Tier 1 trust. Client display names and redirect URIs never grant Tier 1 trust.
+ChatGPT MCP host-file import uses two trust tiers. An active manually provisioned OAuth client may import only from OpenAI attachment hosts: `files.oaiusercontent.com` and its subdomains, plus the narrowly matched Sediment Azure Blob accounts `oaisdmntpr<region>.blob.core.windows.net`; those URLs still require HTTPS, public DNS resolution with address pinning, port 443, no userinfo, no redirects, and the normal bounded download/write policy. Configure an exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS` only when that client must also import from arbitrary public HTTPS hosts under the same SSRF controls. Reprovisioning changes the client id but does not break ordinary OpenAI-host attachment import; update the setting to restore the broader Tier 1 trust. Client display names and redirect URIs never grant Tier 1 trust.
 
 A separate local-only exception exists for an operator-controlled Server that is
 bound to loopback and reached through OpenAI Secure Tunnel. Set
@@ -522,9 +524,19 @@ configured local TUN.
 
 List and revoke clients with `POST /api/oauth/clients/list` and
 `POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow;
-dynamic client registration, OIDC, and the device-code flow are not
+OIDC and the device-code flow are not
 implemented. Keep `offline_access` enabled when a host offers it — it is a
 protocol-level refresh-token scope and grants no extra WebCodex permission.
+
+### Dynamic client registration
+
+To let Gemini or another OAuth client register itself, configure the regular managed Server with `WEBCODEX_OAUTH2_ENABLED=true`, set `WEBCODEX_PUBLIC_URL` to the public HTTPS origin, and set `WEBCODEX_OAUTH2_DCR_OWNER_USER_ID` to the existing user's immutable `id` from `webcodex users list`. Apply the settings when starting the Server. The authorization server metadata at `/.well-known/oauth-authorization-server` then publishes `registration_endpoint`. The default leaves registration disabled.
+
+`POST /oauth/register` accepts RFC 7591 JSON with a nonempty `redirect_uris` array. Each registration gets a fresh client ID and exact callbacks. Confidential clients use `client_secret_basic` (default) or `client_secret_post`. Public clients request `none`. All three require an authorization code and S256 PKCE. Clients that need rotation must include `refresh_token` in `grant_types` alongside `authorization_code`. The registration scope defaults to the regular local-user profile and may request a subset. The designated user signs in to delegate scopes. Dynamic registrations never inherit internal admin authority. Removing the DCR setting or changing the owner or issuer blocks use of the old registration under the new configuration. Revoke a client permanently with `/api/oauth/clients/revoke`.
+
+Some OAuth hosts request all permissions advertised in authorization-server discovery, even when their dynamically registered client has a narrower scope ceiling. For dynamic clients only, WebCodex narrows known requested scopes to the registered allow-list and returns the actually granted scopes in the token response; unknown scopes and requests with no permitted WebCodex permission are rejected. This does not widen the client or user authority. Manually provisioned clients retain strict scope matching.
+
+The register request limit is 16 KiB. The Server retains up to 128 dynamic clients. At capacity it can reclaim a registration at least 24 hours old, or a revoked registration, once its grants have been cleaned up. Otherwise it returns HTTP 429. Desktop-managed Cloudflare has a separate, default-off profile switch. Temporary Project Share uses its own provisioning flow. [Desktop Cloudflare setup](MCP.md#desktop-cloudflare-setup) [Gemini setup](MCP.md#gemini-web-app)
 
 ## MCP integration
 

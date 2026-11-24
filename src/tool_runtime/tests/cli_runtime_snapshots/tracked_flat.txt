@@ -1,0 +1,3 @@
+isError: false
+apps/main.txt
+src/sample.txt

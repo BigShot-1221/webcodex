@@ -1,3 +1,6 @@
+pub(crate) mod registration;
+use registration::{valid_dynamic_client_scopes, valid_s256_challenge};
+
 use super::Database;
 use crate::models::{
     OAuthAccessTokenRecord, OAuthAuthorizationCodeRecord, OAuthClientRecord,
@@ -5,7 +8,7 @@ use crate::models::{
 };
 use crate::public_ingress::{self, GrantBinding};
 use crate::PublicIngressFence;
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 fn validate_shared_key_owner_hash(value: &str) -> anyhow::Result<()> {
     if value.len() == 64
@@ -130,26 +133,11 @@ impl Database {
     pub fn insert_oauth_client(&self, record: &OAuthClientRecord) -> anyhow::Result<()> {
         validate_oauth_client_owner(record)?;
         let conn = self.lock_connection(crate::StoreDomain::OAuth);
-        conn.execute(
-            "INSERT INTO oauth_clients (
-                id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
-                owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                record.id,
-                record.client_id,
-                record.client_secret_hash,
-                record.name,
-                record.owner_user_id,
-                record.owner_project_grant_id,
-                record.owner_shared_key_hash,
-                record.redirect_uris,
-                record.allowed_scopes,
-                record.created_at,
-                record.revoked_at,
-            ],
-        )?;
-        Ok(())
+        anyhow::ensure!(
+            record.dynamic_registration.is_none(),
+            "dynamic clients require bounded registration"
+        );
+        insert_client(&conn, record)
     }
 
     pub fn get_oauth_client_by_client_id(
@@ -159,7 +147,7 @@ impl Database {
         let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
-                    owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
+                    owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at, dynamic_registration
              FROM oauth_clients WHERE client_id = ?1 AND revoked_at IS NULL",
         )?;
         let mut rows = stmt.query_map(params![client_id], row_to_oauth_client)?;
@@ -188,7 +176,7 @@ impl Database {
         let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
-                    owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
+                    owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at, dynamic_registration
              FROM oauth_clients WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], row_to_oauth_client)?;
@@ -213,7 +201,7 @@ impl Database {
         let conn = self.lock_connection(crate::StoreDomain::OAuth);
         let mut stmt = conn.prepare(
             "SELECT id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
-                    owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at
+                    owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at, dynamic_registration
              FROM oauth_clients ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_oauth_client)?;
@@ -221,7 +209,7 @@ impl Database {
     }
 
     /// Active clients bound to this ingress, in the same order as client management.
-    pub fn list_oauth_clients_for_public_ingress(
+    pub fn list_manual_oauth_clients_for_public_ingress(
         &self,
         entry_id: &str,
     ) -> anyhow::Result<Vec<OAuthClientRecord>> {
@@ -229,9 +217,9 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT c.id, c.client_id, c.client_secret_hash, c.name, c.owner_user_id,
                     c.owner_project_grant_id, c.owner_shared_key_hash, c.redirect_uris,
-                    c.allowed_scopes, c.created_at, c.revoked_at
+                    c.allowed_scopes, c.created_at, c.revoked_at, c.dynamic_registration
              FROM oauth_clients c JOIN oauth_public_ingress_clients b ON b.client_id=c.client_id
-             WHERE b.entry_id=?1 AND c.revoked_at IS NULL ORDER BY c.created_at DESC",
+             WHERE b.entry_id=?1 AND c.dynamic_registration IS NULL AND c.revoked_at IS NULL ORDER BY c.created_at DESC",
         )?;
         let rows = stmt.query_map([entry_id], row_to_oauth_client)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -420,6 +408,35 @@ impl Database {
         )? {
             return Ok(false);
         }
+        // Local management can narrow scopes or edit callbacks between consent
+        // validation and this write. Bind the code to the current client policy.
+        let policy: Option<(String, String)> = tx
+            .query_row(
+                "SELECT redirect_uris, allowed_scopes FROM oauth_clients
+             WHERE client_id = ?1 AND dynamic_registration IS NOT NULL",
+                [&record.client_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((redirects, scopes)) = policy {
+            if record.admin_authority
+                || !valid_dynamic_client_scopes(&scopes)
+                || !redirects.lines().any(|uri| uri == record.redirect_uri)
+                || !record.scopes.split_ascii_whitespace().all(|scope| {
+                    scope == "offline_access"
+                        || scopes
+                            .split_ascii_whitespace()
+                            .any(|allowed| allowed == scope)
+                })
+                || record.code_challenge_method.as_deref() != Some("S256")
+                || !record
+                    .code_challenge
+                    .as_deref()
+                    .is_some_and(valid_s256_challenge)
+            {
+                return Ok(false);
+            }
+        }
         insert_authorization_code(&tx, record, code_hash)?;
         public_ingress::insert_binding(&tx, "oauth_public_ingress_codes", &record.id, &binding)?;
         tx.commit()?;
@@ -448,6 +465,7 @@ impl Database {
     /// Atomically consume an authorization code by its hash. The code is
     /// consumed (used_at set) only if **all** of the following hold:
     ///
+    /// - the client belongs to the request listener and its current fence
     /// - `code_hash` matches
     /// - `revoked_at IS NULL`
     /// - `used_at IS NULL`
@@ -463,21 +481,30 @@ impl Database {
         &self,
         code_hash: &str,
         now: i64,
+        ingress: Option<&PublicIngressFence>,
     ) -> anyhow::Result<Option<OAuthAuthorizationCodeRecord>> {
-        let conn = self.lock_connection(crate::StoreDomain::OAuth);
-        let changed = conn.execute(
-            "UPDATE oauth_authorization_codes
+        let mut conn = self.lock_connection(crate::StoreDomain::OAuth);
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let client_id: Option<String> = tx
+            .query_row(
+                "UPDATE oauth_authorization_codes
              SET used_at = ?2
              WHERE code_hash = ?1
                AND revoked_at IS NULL
                AND used_at IS NULL
-               AND expires_at > ?2",
-            params![code_hash, now],
-        )?;
-        if changed == 0 {
+               AND expires_at > ?2 RETURNING client_id",
+                params![code_hash, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(client_id) = client_id else {
+            return Ok(None);
+        };
+        if !public_ingress::client_allowed_on_listener(&tx, &client_id, ingress)? {
             return Ok(None);
         }
         // The UPDATE succeeded; fetch the consumed record.
+        tx.commit()?;
         drop(conn);
         self.get_oauth_authorization_code_by_hash_for_consume(code_hash)
     }
@@ -527,30 +554,40 @@ impl Database {
     /// - `Ok(None)` — code invalid, expired, used, or revoked.
     /// - `Err(_)` — DB error; nothing is committed.
     ///
-    /// Pre-condition: client authentication must be verified before calling
-    /// this method. Post-condition: client_id / redirect_uri / PKCE checks
-    /// are **not** performed here — the caller must validate them after.
-    pub fn exchange_oauth_authorization_code_for_tokens(
+    /// The caller verifies client authentication, client ID, redirect URI and PKCE
+    /// before entering this transaction. The writer rechecks the listener fence.
+    pub fn exchange_oauth_authorization_code_for_tokens<'a>(
         &self,
+        ingress: Option<&PublicIngressFence>,
         code_hash: &str,
         now: i64,
         access_token_record: &OAuthAccessTokenRecord,
-        refresh_token_record: &OAuthRefreshTokenRecord,
+        refresh_token_record: impl Into<Option<&'a OAuthRefreshTokenRecord>>,
     ) -> anyhow::Result<Option<OAuthAuthorizationCodeRecord>> {
         validate_oauth_access_token_subject(access_token_record)?;
-        validate_oauth_refresh_token_subject(refresh_token_record)?;
-        validate_oauth_subjects_match(
-            &access_token_record.subject_kind,
-            &access_token_record.subject_id,
-            &refresh_token_record.subject_kind,
-            &refresh_token_record.subject_id,
-        )?;
+        let refresh_token_record = refresh_token_record.into();
+        if let Some(refresh_token_record) = refresh_token_record {
+            validate_oauth_refresh_token_subject(refresh_token_record)?;
+            validate_oauth_subjects_match(
+                &access_token_record.subject_kind,
+                &access_token_record.subject_id,
+                &refresh_token_record.subject_kind,
+                &refresh_token_record.subject_id,
+            )?;
+        }
         // Scope the transaction so the MutexGuard is dropped after commit,
         // allowing get_oauth_authorization_code_by_hash_for_consume to
         // re-acquire the lock.
         {
             let mut conn = self.lock_connection(crate::StoreDomain::OAuth);
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !public_ingress::client_allowed_on_listener(
+                &tx,
+                &access_token_record.client_id,
+                ingress,
+            )? {
+                return Ok(None);
+            }
 
             // 1. Consume the authorization code atomically.
             let changed = tx.execute(
@@ -584,7 +621,8 @@ impl Database {
             };
             validate_oauth_authorization_code_subject(&code_record)?;
             if access_token_record.admin_authority != code_record.admin_authority
-                || refresh_token_record.admin_authority != code_record.admin_authority
+                || refresh_token_record
+                    .is_some_and(|r| r.admin_authority != code_record.admin_authority)
             {
                 anyhow::bail!("OAuth exchange authority mismatch");
             }
@@ -634,31 +672,32 @@ impl Database {
                 ],
             )?;
 
-            // 3. Insert refresh token.
-            tx.execute(
-                "INSERT INTO oauth_refresh_tokens (
+            if let Some(refresh_token_record) = refresh_token_record {
+                tx.execute(
+                    "INSERT INTO oauth_refresh_tokens (
                     id, token_hash, client_id, subject_kind, subject_id, user_id,
                     scopes, resource, shared_key_hash, created_at, expires_at,
                     revoked_at, last_used_at, rotated_from_id, admin_authority
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![
-                    refresh_token_record.id,
-                    refresh_token_record.token_hash,
-                    refresh_token_record.client_id,
-                    refresh_token_record.subject_kind,
-                    refresh_token_record.subject_id,
-                    refresh_token_record.user_id,
-                    refresh_token_record.scopes,
-                    refresh_token_record.resource,
-                    refresh_token_record.shared_key_hash,
-                    refresh_token_record.created_at,
-                    refresh_token_record.expires_at,
-                    refresh_token_record.revoked_at,
-                    refresh_token_record.last_used_at,
-                    refresh_token_record.rotated_from_id,
-                    refresh_token_record.admin_authority,
-                ],
-            )?;
+                    params![
+                        refresh_token_record.id,
+                        refresh_token_record.token_hash,
+                        refresh_token_record.client_id,
+                        refresh_token_record.subject_kind,
+                        refresh_token_record.subject_id,
+                        refresh_token_record.user_id,
+                        refresh_token_record.scopes,
+                        refresh_token_record.resource,
+                        refresh_token_record.shared_key_hash,
+                        refresh_token_record.created_at,
+                        refresh_token_record.expires_at,
+                        refresh_token_record.revoked_at,
+                        refresh_token_record.last_used_at,
+                        refresh_token_record.rotated_from_id,
+                        refresh_token_record.admin_authority,
+                    ],
+                )?;
+            }
 
             if let Some(binding) = &binding {
                 public_ingress::insert_binding(
@@ -667,12 +706,14 @@ impl Database {
                     &access_token_record.id,
                     binding,
                 )?;
-                public_ingress::insert_binding(
-                    &tx,
-                    "oauth_public_ingress_refresh",
-                    &refresh_token_record.id,
-                    binding,
-                )?;
+                if let Some(refresh_token_record) = refresh_token_record {
+                    public_ingress::insert_binding(
+                        &tx,
+                        "oauth_public_ingress_refresh",
+                        &refresh_token_record.id,
+                        binding,
+                    )?;
+                }
             }
             tx.commit()?;
         } // MutexGuard dropped here.
@@ -753,24 +794,27 @@ impl Database {
         Ok(())
     }
 
-    /// Revoke an access token by its hash, but only if it belongs to the given
-    /// `client_id`. Returns `true` if a row was updated (i.e. the token was
-    /// found for this client and marked revoked — or was already revoked).
-    ///
-    /// This does **not** update `last_used_at`; revocation is not a "use".
-    pub fn revoke_oauth_access_token_by_hash_for_client(
+    /// RFC 7009 is idempotent within the authenticated client's listener.
+    pub fn revoke_oauth_token_for_client(
         &self,
         token_hash: &str,
         client_id: &str,
+        hint: Option<&str>,
         ts: i64,
-    ) -> anyhow::Result<bool> {
-        let conn = self.lock_connection(crate::StoreDomain::OAuth);
-        let updated = conn.execute(
-            "UPDATE oauth_access_tokens SET revoked_at = COALESCE(revoked_at, ?3) \
-             WHERE token_hash = ?1 AND client_id = ?2",
-            params![token_hash, client_id, ts],
-        )?;
-        Ok(updated > 0)
+        ingress: Option<&PublicIngressFence>,
+    ) -> anyhow::Result<()> {
+        let mut conn = self.lock_connection(crate::StoreDomain::OAuth);
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if public_ingress::client_allowed_on_listener(&tx, client_id, ingress)? {
+            if hint != Some("refresh_token") {
+                tx.execute("UPDATE oauth_access_tokens SET revoked_at=COALESCE(revoked_at, ?3) WHERE token_hash=?1 AND client_id=?2", params![token_hash,client_id,ts])?;
+            }
+            if hint != Some("access_token") {
+                tx.execute("UPDATE oauth_refresh_tokens SET revoked_at=COALESCE(revoked_at, ?3) WHERE token_hash=?1 AND client_id=?2", params![token_hash,client_id,ts])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // --- OAuth refresh tokens ---
@@ -848,26 +892,6 @@ impl Database {
         Ok(())
     }
 
-    /// Revoke a refresh token by its hash, but only if it belongs to the given
-    /// `client_id`. Returns `true` if a row was updated (i.e. the token was
-    /// found for this client and marked revoked — or was already revoked).
-    ///
-    /// This does **not** update `last_used_at`; revocation is not a "use".
-    pub fn revoke_oauth_refresh_token_by_hash_for_client(
-        &self,
-        token_hash: &str,
-        client_id: &str,
-        ts: i64,
-    ) -> anyhow::Result<bool> {
-        let conn = self.lock_connection(crate::StoreDomain::OAuth);
-        let updated = conn.execute(
-            "UPDATE oauth_refresh_tokens SET revoked_at = COALESCE(revoked_at, ?3) \
-             WHERE token_hash = ?1 AND client_id = ?2",
-            params![token_hash, client_id, ts],
-        )?;
-        Ok(updated > 0)
-    }
-
     /// Internal helper: fetch a refresh token by hash **including** revoked and
     /// expired rows. Used by `rotate_oauth_refresh_token` and the refresh_token
     /// grant handler to distinguish "not found" from "revoked/expired" for
@@ -911,6 +935,7 @@ impl Database {
     /// construct the success response.
     pub fn rotate_oauth_refresh_token(
         &self,
+        ingress: Option<&PublicIngressFence>,
         refresh_token_hash: &str,
         client_id: &str,
         now: i64,
@@ -929,6 +954,13 @@ impl Database {
         {
             let mut conn = self.lock_connection(crate::StoreDomain::OAuth);
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !public_ingress::client_allowed_on_listener(
+                &tx,
+                &access_token_record.client_id,
+                ingress,
+            )? {
+                return Ok(RotateResult::Revoked);
+            }
 
             // 1. Look up old refresh token (including revoked/expired).
             let old = {
@@ -984,7 +1016,7 @@ impl Database {
                 old.user_id.as_deref(),
                 old.resource.as_deref(),
                 access_token_record,
-                new_refresh_token_record,
+                Some(new_refresh_token_record),
             )? {
                 return Ok(RotateResult::Revoked);
             }
@@ -1096,11 +1128,47 @@ pub enum RotateResult {
     ClientMismatch,
 }
 
+fn insert_client(conn: &Connection, record: &OAuthClientRecord) -> anyhow::Result<()> {
+    conn.execute(
+            "INSERT INTO oauth_clients (
+                id, client_id, client_secret_hash, name, owner_user_id, owner_project_grant_id,
+                owner_shared_key_hash, redirect_uris, allowed_scopes, created_at, revoked_at, dynamic_registration
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                record.id,
+                record.client_id,
+                record.client_secret_hash,
+                record.name,
+                record.owner_user_id,
+                record.owner_project_grant_id,
+                record.owner_shared_key_hash,
+                record.redirect_uris,
+                record.allowed_scopes,
+                record.created_at,
+                record.revoked_at,
+                record.dynamic_registration.as_ref().map(serde_json::to_string).transpose()?,
+            ],
+        )?;
+    Ok(())
+}
+
 fn row_to_oauth_client(row: &rusqlite::Row) -> rusqlite::Result<OAuthClientRecord> {
     Ok(OAuthClientRecord {
         id: row.get(0)?,
         client_id: row.get(1)?,
         client_secret_hash: row.get(2)?,
+        dynamic_registration: row
+            .get::<_, Option<String>>(11)?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        Box::new(err),
+                    )
+                })
+            })
+            .transpose()?,
         name: row.get(3)?,
         owner_user_id: row.get(4)?,
         owner_project_grant_id: row.get(5)?,
@@ -1216,15 +1284,19 @@ fn validate_issuance_binding(
     source_user_id: Option<&str>,
     source_resource: Option<&str>,
     access: &OAuthAccessTokenRecord,
-    refresh: &OAuthRefreshTokenRecord,
+    refresh: Option<&OAuthRefreshTokenRecord>,
 ) -> anyhow::Result<bool> {
     let Some(binding) = binding else {
         public_ingress::require_unbound_client(conn, source_client_id)?;
         public_ingress::require_unbound_client(conn, &access.client_id)?;
-        public_ingress::require_unbound_client(conn, &refresh.client_id)?;
+        if let Some(refresh) = refresh {
+            public_ingress::require_unbound_client(conn, &refresh.client_id)?;
+        }
         return Ok(true);
     };
-    if access.client_id != source_client_id || refresh.client_id != source_client_id {
+    if access.client_id != source_client_id
+        || refresh.is_some_and(|r| r.client_id != source_client_id)
+    {
         return Ok(false);
     }
     // Check the canonical epoch even when the OAuth resource parameter is
@@ -1241,11 +1313,14 @@ fn validate_issuance_binding(
         &access.client_id,
         access.user_id.as_deref(),
         access.resource.as_deref(),
-    )? && public_ingress::binding_is_current(
-        conn,
-        binding,
-        &refresh.client_id,
-        refresh.user_id.as_deref(),
-        refresh.resource.as_deref(),
-    )?)
+    )? && match refresh {
+        Some(refresh) => public_ingress::binding_is_current(
+            conn,
+            binding,
+            &refresh.client_id,
+            refresh.user_id.as_deref(),
+            refresh.resource.as_deref(),
+        )?,
+        None => true,
+    })
 }

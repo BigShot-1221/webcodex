@@ -283,6 +283,7 @@ mod tests {
             ("GET", "/.well-known/oauth-protected-resource"),
             ("GET", "/.well-known/oauth-authorization-server"),
             ("POST", "/oauth/token"),
+            ("POST", "/oauth/register"),
             ("POST", "/oauth/revoke"),
             ("POST", "/oauth/authorize/login"),
             ("POST", "/oauth/authorize/consent"),
@@ -395,7 +396,6 @@ mod tests {
                 "/api/runtime-console/workflow-session",
                 SCOPE_PROJECT_READ,
             ),
-            ("POST", "/api/shell/job", SCOPE_JOB_RUN),
             ("POST", "/api/users/me", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/tokens/list", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/audit/stats", SCOPE_ACCOUNT_MANAGE),
@@ -410,6 +410,36 @@ mod tests {
                 Some(scope),
                 "{method} {path}"
             );
+        }
+    }
+
+    #[test]
+    fn retired_shell_routes_do_not_grant_execution_to_scoped_principals() {
+        let mut pat = AuthContext::new(super::super::context::AuthKind::ApiToken);
+        pat.scopes = vec![
+            SCOPE_RUNTIME_READ.to_string(),
+            SCOPE_PROJECT_READ.to_string(),
+            SCOPE_PROJECT_WRITE.to_string(),
+            SCOPE_JOB_RUN.to_string(),
+        ];
+        let mut oauth = AuthContext::new(super::super::context::AuthKind::OAuth2Token);
+        oauth.scopes = pat.scopes.clone();
+        for path in [
+            "/api/shell/run",
+            "/api/shell/file",
+            "/api/shell/job",
+            "/api/shell/jobs/status",
+            "/api/shell/jobs/log",
+            "/api/shell/jobs/stop",
+            "/api/shell/jobs/list",
+        ] {
+            assert_eq!(
+                oauth_route_scope_policy_for_path_method("POST", path),
+                OAuthRouteScopePolicy::Unknown,
+            );
+            for auth in [&pat, &oauth] {
+                assert!(enforce_route_scope(auth, "POST", path).is_err(), "{path}");
+            }
         }
     }
 
@@ -776,8 +806,8 @@ mod tests {
                 OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE]),
             ),
             (
-                "inspect_coding_agent_config",
-                OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN]),
+                "diagnose_coding_agent",
+                OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
             ),
         ] {
             assert_eq!(oauth_scope_policy_for_runtime_tool(tool), policy, "{tool}");

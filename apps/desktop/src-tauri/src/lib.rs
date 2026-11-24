@@ -1,6 +1,7 @@
 mod activity;
 mod coding_agents;
 mod commands;
+mod computer_control;
 mod connection_id;
 mod connections;
 mod deadline;
@@ -75,17 +76,26 @@ fn desktop_builder() -> tauri::Builder<tauri::Wry> {
             app.manage(desktop_locale::DesktopLocaleState::load(
                 &data_dir.effective,
             ));
+            let effective_data_dir = data_dir.effective.clone();
             app.manage(AppState::new_resolved(data_dir, resource_dir)?);
             app.manage(desktop_shell::DesktopShellState::default());
+            app.manage(desktop_shell::DockIconState::load(&effective_data_dir));
             app.manage(tray::TrayPresentationCache::default());
+            app.manage(computer_control::presentation::Presentation::default());
             platform::install_session_shutdown(app.handle())?;
             tray::setup(app.handle())?;
             tray::start_background_observer(app.handle());
+            #[cfg(windows)]
+            tray::start_computer_observer(app.handle());
+            #[cfg(windows)]
+            computer_control::presentation::start_shortcut_listener(app.handle());
 
             let snapshot = app.state::<AppState>().get_state();
             tray::refresh_from_snapshot(app.handle(), &snapshot);
             if !desktop_shell::is_background_launch(std::env::args()) {
                 desktop_shell::show_main_window(app.handle())?;
+            } else {
+                desktop_shell::sync_dock_icon(app.handle());
             }
             Ok(())
         })
@@ -153,9 +163,12 @@ fn desktop_builder() -> tauri::Builder<tauri::Wry> {
             commands::runner_capability_authorization,
             commands::tunnel_profile_action,
             commands::cloudflare_connection,
+            commands::connect_gemini,
             commands::inspect_project,
             commands::inspect_project_access,
             commands::configure_local_setup,
+            commands::inspect_local_migration,
+            commands::reset_local_migration,
             commands::configure_environment,
             commands::create_environment_invitation,
             commands::environment_service_action,

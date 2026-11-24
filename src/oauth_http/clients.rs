@@ -1,12 +1,12 @@
 use salvo::prelude::*;
+use webcodex_store::{validate_redirect_uri, MAX_CLIENT_REDIRECT_URIS};
 
 use crate::auth::{hash_token, AuthContext};
 
 use super::responses::{parse_management_json, OAuthManagementError as ManagementError};
 use super::{apply_oauth_no_store_headers, is_authorize_identity_allowed, oauth_scopes_supported};
 
-const MAX_CLIENT_NAME_LEN: usize = 128;
-const MAX_CLIENT_REDIRECT_URIS: usize = 16;
+pub(super) const MAX_CLIENT_NAME_LEN: usize = 128;
 
 #[derive(Debug, serde::Deserialize)]
 struct CreateOAuthClientRequest {
@@ -81,44 +81,29 @@ mod detached_scope_tests {
     }
 }
 
-/// Validate a redirect URI for OAuth client registration.
-///
-/// Rules:
-/// - Must parse as an absolute URL.
-/// - Scheme must be `http` or `https`.
-/// - `http` is only allowed for loopback hosts (`localhost`, `127.0.0.1`,
-///   `[::1]`). All other hosts must use `https`.
-pub(crate) fn validate_redirect_uri(uri: &str) -> Result<(), String> {
-    let trimmed = uri.trim();
-    if trimmed.is_empty() {
-        return Err("redirect_uri cannot be empty".to_string());
+pub(super) fn registration_redirect_uris(redirect_uris: &[String]) -> Result<Vec<String>, String> {
+    if redirect_uris.is_empty() {
+        return Err("redirect_uris must be a non-empty array".into());
     }
-    if trimmed.chars().any(|ch| ch.is_ascii_control()) {
-        return Err("redirect_uri must not contain ASCII control characters".to_string());
+    if redirect_uris.len() > MAX_CLIENT_REDIRECT_URIS {
+        return Err(format!(
+            "too many redirect_uris; maximum is {}",
+            MAX_CLIENT_REDIRECT_URIS
+        ));
     }
-    let parsed =
-        url::Url::parse(trimmed).map_err(|_| "redirect_uri is not a valid URL".to_string())?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("redirect_uri must not contain userinfo".to_string());
-    }
-    if parsed.fragment().is_some() {
-        return Err("redirect_uri must not contain a fragment".to_string());
-    }
-    let scheme = parsed.scheme().to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        return Err("redirect_uri must use http or https".to_string());
-    }
-    let host = parsed.host_str().unwrap_or("");
-    if scheme == "http" {
-        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
-        if !is_loopback {
-            return Err("http redirect_uri is only allowed for localhost/127.0.0.1; use https for other hosts".to_string());
+    // Trim each redirect URI, validate the trimmed value, and dedup the
+    // trimmed values so whitespace-padded duplicates collapse and the stored
+    // record contains no leading/trailing whitespace.
+    let mut seen = std::collections::HashSet::new();
+    let mut trimmed_uris: Vec<String> = Vec::new();
+    for uri in redirect_uris {
+        let trimmed = uri.trim().to_string();
+        validate_redirect_uri(&trimmed)?;
+        if seen.insert(trimmed.clone()) {
+            trimmed_uris.push(trimmed);
         }
     }
-    if host.is_empty() {
-        return Err("redirect_uri must have a host".to_string());
-    }
-    Ok(())
+    Ok(trimmed_uris)
 }
 
 /// Normalize an `allowed_scopes` input for client registration. When `input`
@@ -222,29 +207,8 @@ pub(crate) async fn oauth_clients_create(
     }
 
     let redirect_uris: Vec<String> = body.redirect_uris.unwrap_or_default();
-    if redirect_uris.is_empty() {
-        return Err(ManagementError::bad_request(
-            "redirect_uris must be a non-empty array",
-        ));
-    }
-    if redirect_uris.len() > MAX_CLIENT_REDIRECT_URIS {
-        return Err(ManagementError::bad_request(format!(
-            "too many redirect_uris; maximum is {}",
-            MAX_CLIENT_REDIRECT_URIS
-        )));
-    }
-    // Trim each redirect URI, validate the trimmed value, and dedup the
-    // trimmed values so whitespace-padded duplicates collapse and the stored
-    // record contains no leading/trailing whitespace.
-    let mut seen = std::collections::HashSet::new();
-    let mut trimmed_uris: Vec<String> = Vec::new();
-    for uri in &redirect_uris {
-        let trimmed = uri.trim().to_string();
-        validate_redirect_uri(&trimmed).map_err(ManagementError::bad_request)?;
-        if seen.insert(trimmed.clone()) {
-            trimmed_uris.push(trimmed);
-        }
-    }
+    let trimmed_uris =
+        registration_redirect_uris(&redirect_uris).map_err(ManagementError::bad_request)?;
     let redirect_uris_str = trimmed_uris.join("\n");
 
     let allowed_scopes = normalize_client_allowed_scopes(body.allowed_scopes.as_deref())
@@ -273,6 +237,7 @@ pub(crate) async fn oauth_clients_create(
     let record = crate::models::OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: crate::auth::generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: secret_hash,
         name: name.clone(),
         owner_user_id: Some(owner_user_id),
@@ -448,6 +413,17 @@ pub(crate) async fn oauth_clients_update_scopes(
     let current = managed_client(&db, auth, &client_id)?
         .ok_or_else(|| ManagementError::new(StatusCode::NOT_FOUND, "OAuth client not found"))?;
 
+    if current.dynamic_registration.is_some()
+        && !webcodex_store::valid_dynamic_client_scopes(&allowed_scopes_str)
+        && db
+            .oauth_client_public_ingress_entry_id(&client_id)
+            .map_err(|e| ManagementError::internal("failed to read client binding").with_detail(e))?
+            .is_some()
+    {
+        return Err(ManagementError::bad_request(
+            "scope exceeds dynamic registration ceiling",
+        ));
+    }
     let now = chrono::Utc::now().timestamp();
     let (changed, access_tokens, refresh_tokens, authorization_codes) = match db
         .update_oauth_client_allowed_scopes_and_revoke_grants(

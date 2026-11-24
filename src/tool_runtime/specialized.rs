@@ -631,10 +631,26 @@ impl ToolRuntime {
             None
         };
 
-        if recording_session_id.is_some() && session_start.is_none() {
-            let mut result = session_persistence_unavailable_result(recording_session_id);
-            result.output["dispatch_certainty"] = Value::String("not_started".to_string());
-            return Err(SpecializedGovernanceDenial::Tool(result));
+        if recording_session_id.is_some() {
+            let evidence_confirmed = if session_start.is_none() {
+                false
+            } else if policy.effect.consequential() {
+                self.sessions.await_persistence_barrier().await.is_ok()
+            } else {
+                self.sessions.prepare_request().await.is_ok()
+            };
+            if !evidence_confirmed {
+                let mut result = session_persistence_unavailable_result(recording_session_id);
+                result.output["dispatch_certainty"] = Value::String("not_started".to_string());
+                self.sessions.record_tool_call_finished(
+                    session_start,
+                    false,
+                    &denial_terminal_projection(policy, "persistence_unavailable"),
+                    result.error.as_deref(),
+                    Some("session_persistence_unavailable"),
+                );
+                return Err(SpecializedGovernanceDenial::Tool(result));
+            }
         }
 
         Ok(SpecializedInvocationPermit {

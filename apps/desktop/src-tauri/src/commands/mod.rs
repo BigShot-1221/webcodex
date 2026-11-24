@@ -166,6 +166,15 @@ pub async fn tunnel_profile_action(
 }
 
 #[tauri::command]
+pub async fn connect_gemini(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::state::GeminiConnectionRequest,
+) -> DesktopResult<DesktopStateSnapshot> {
+    project_state_result(&app, state.connect_gemini(request).await)
+}
+
+#[tauri::command]
 pub async fn cloudflare_connection(
     state: State<'_, AppState>,
     request: crate::state::CloudflareConnectionRequest,
@@ -402,6 +411,21 @@ pub async fn environment_service_action(
     state: State<'_, AppState>,
 ) -> Result<DesktopStateSnapshot, DesktopError> {
     project_state_result(&app, state.environment_service_action(request).await)
+}
+
+#[tauri::command]
+pub async fn inspect_local_migration(
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::models::LocalMigrationPreview> {
+    state.inspect_local_migration().await
+}
+
+#[tauri::command]
+pub async fn reset_local_migration(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> DesktopResult<DesktopStateSnapshot> {
+    project_state_result(&app, state.reset_local_migration().await)
 }
 
 #[tauri::command]

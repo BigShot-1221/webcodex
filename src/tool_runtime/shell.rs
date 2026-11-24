@@ -11,17 +11,19 @@ use super::process::{
     outcome_unknown_result, process_tool_failure_result, success_output,
 };
 use super::structured_execution::{
-    await_structured_job_result, await_structured_request_response, structured_response_result,
-    StructuredExecutionBudget, StructuredRequestKind,
+    add_timeout_cap_notice, apply_runner_timeout_cap, await_structured_job_result,
+    await_structured_request_response, structured_response_result, StructuredExecutionBudget,
+    StructuredRequestKind,
 };
 use super::tool_result::ToolResult;
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{
-    command_preview, RunnerFeature, ShellJobStartMetadata, ShellJobVisibility,
+    command_preview, JobShellTarget, JobStartContext, JobStartExecution, JobStartRequest,
+    RunnerFeature, ShellJobVisibility,
 };
 use crate::runner_protocol::{
-    ShellCommandExecutionState, ShellJobInfo, ShellJobOpRequest, ShellRunRequest, ShellRunResponse,
+    ShellCommandExecutionState, ShellJobInfo, ShellRunRequest, ShellRunResponse,
 };
 
 pub(crate) struct ProjectCommandOutput {
@@ -436,6 +438,15 @@ impl ToolRuntime {
         let declared_purpose = purpose.unwrap_or_default();
         let command_summary = command_preview(&command);
         let client_id = proj.client_id.clone();
+        let (budget, timeout_notice) = apply_runner_timeout_cap(
+            &self.runner_registry,
+            &client_id,
+            auth,
+            timeout_secs,
+            budget,
+        )
+        .await;
+        let timeout = budget.effective_timeout_secs;
         let (effective_cwd, resolved_cwd) = if ssh_resource.is_some() {
             let remote_cwd = cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty());
             if remote_cwd.is_some_and(|cwd| cwd.len() > 4096 || cwd.chars().any(char::is_control)) {
@@ -576,32 +587,29 @@ impl ToolRuntime {
         if async_handoff_available {
             let job = self
                 .runner_registry
-                .start_job_with_metadata_for_access_typed(
-                    ShellJobOpRequest {
-                        op: "start".to_string(),
-                        client_id: Some(client_id.clone()),
+                .start_job(
+                    JobStartRequest {
+                        client_id: client_id.clone(),
                         cwd: effective_cwd.clone(),
-                        command: Some(dispatched_command.clone()),
-                        login,
-                        timeout_secs: Some(timeout),
-                        job_id: None,
-                        since_stdout_line: None,
-                        since_stderr_line: None,
-                        tail_lines: None,
-                        limit: None,
+                        timeout_secs: timeout,
+                        execution: JobStartExecution::Shell {
+                            command: dispatched_command.clone(),
+                            target: JobShellTarget::Local {
+                                shell: if ssh_resource.is_none() { shell } else { None },
+                                login,
+                            },
+                        },
+                        context: JobStartContext {
+                            project_id: Some(project.clone()),
+                            session_id: session_id.map(str::to_string),
+                            project_cwd: Some(resolved_cwd.clone()),
+                            purpose: Some(declared_purpose.as_str().to_string()),
+                            shell: Some(actual_shell.to_string()),
+                            visibility: ShellJobVisibility::HiddenUntilHandoff,
+                        },
                         codex: None,
                     },
                     "tool_runtime".to_string(),
-                    ShellJobStartMetadata {
-                        project_id: Some(project.clone()),
-                        session_id: session_id.map(str::to_string),
-                        project_cwd: Some(resolved_cwd.clone()),
-                        purpose: Some(declared_purpose.as_str().to_string()),
-                        shell: Some(actual_shell.to_string()),
-                        explicit_shell: if ssh_resource.is_none() { shell } else { None },
-                        visibility: ShellJobVisibility::HiddenUntilHandoff,
-                        ..Default::default()
-                    },
                     crate::runner_http::runner_access_from_auth(auth).as_ref(),
                     None,
                 )
@@ -645,6 +653,7 @@ impl ToolRuntime {
                 Ok(result) => result,
                 Err(failure) => return failure.into_tool_result(&project, budget),
             };
+            add_timeout_cap_notice(&mut result, timeout_notice);
             decorate_execution_output(
                 &mut result.output,
                 declared_purpose,

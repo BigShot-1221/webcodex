@@ -17,8 +17,12 @@ pub(crate) fn is_computer(feature: RunnerFeature) -> bool {
             | RunnerFeature::ComputerAccessibilityObserve
             | RunnerFeature::ComputerElementState
             | RunnerFeature::ComputerControl
+            | RunnerFeature::ComputerSelection
+            | RunnerFeature::ComputerScroll
             | RunnerFeature::ComputerScrollToElement
             | RunnerFeature::ComputerKeyInput
+            | RunnerFeature::ComputerLetterShortcuts
+            | RunnerFeature::ComputerKeyChords
             | RunnerFeature::ComputerWindowActivate
             | RunnerFeature::ComputerTextInput
     )

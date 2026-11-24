@@ -139,44 +139,25 @@ it("shows active Window work without any Workflow Session and keeps observe call
   expect(activeRow.textContent).toContain("apply_text_edits");
   expect(activeRow.textContent).toContain("WebCodex");
   expect(activeRow.textContent).toContain("webcodex-activity-fix");
-  expect(activeRow.textContent).toContain("1 active");
+  expect(activeRow.textContent).toContain("Running");
   expect(activeRow.textContent).toContain("special");
-  expect(activeRow.textContent).not.toContain("/root/.webcodex-managed-worktrees/webcodex-activity-fix");
-  expect(activeRow.querySelector(".window-work-row-context")?.getAttribute("title")).toContain("/root/.webcodex-managed-worktrees/webcodex-activity-fix");
-  expect(activeRow.querySelector(".window-work-row-context")?.getAttribute("title")).toContain(activeKey);
-  expect(activeRow.querySelectorAll(".window-work-row-main > small")).toHaveLength(2);
+  expect(activeRow.querySelector("code")?.getAttribute("title")).toBe(worktree.path);
   expect(activeRow.textContent).not.toContain(activeKey.slice(0, 8));
-  expect(within(activeRow).getByText("webcodex-activity-fix")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Filter" }));
   const projectPicker = screen.getByRole("button", { name: "Projects: All projects" });
   fireEvent.click(projectPicker);
   const projectDialog = screen.getByRole("dialog", { name: "Projects" });
   expect(projectDialog.textContent).toContain("2 Windows");
   expect(projectDialog.textContent).toContain("1 active");
   fireEvent.click(projectPicker);
-  expect(await screen.findByRole("heading", { name: "webcodex-activity-fix" })).toBeTruthy();
-  const header = screen.getByRole("heading", { name: "webcodex-activity-fix" }).closest("header");
-  const details = header!.querySelector("details")!;
-  expect(details.querySelector("summary")?.textContent).toBe("Window details");
-  expect(details.open).toBe(false);
-  fireEvent.click(details.querySelector("summary")!);
-  expect(header?.textContent).toContain("WebCodex");
-  expect(header?.textContent).toContain("apply_text_edits");
-  expect(header?.textContent).toContain("Runner ID");
-  expect(header?.textContent).toContain("special");
-  expect(header?.textContent).toContain("Directory");
-  expect(header?.textContent).toContain("/root/.webcodex-managed-worktrees/webcodex-activity-fix");
-  expect(header?.textContent).toContain("Project ID");
-  expect(header?.textContent).toContain(worktree.id);
-  expect(header?.textContent).toContain(activeKey);
-  for (const [label, value] of [["Window ID", activeKey], ["Runner ID", "special"], ["Directory", worktree.path], ["Project ID", worktree.id]]) {
-    const term = within(header!).getByText(label, { selector: "dt" });
-    expect(term.nextElementSibling?.tagName).toBe("DD");
-    expect(term.nextElementSibling?.querySelector("code")?.textContent).toBe(value);
-  }
-
-  for (const label of ["Window ID", "Runner ID", "Directory", "Project ID"]) {
-    expect(within(header!).getByRole("button", { name: "Copy " + label })).toBeTruthy();
-  }
+  fireEvent.click(screen.getByRole("button", { name: "Filter" }));
+  fireEvent.click(activeRow);
+  expect(await screen.findByRole("heading", { name: "webcodex-activity-fix · aaaa" })).toBeTruthy();
+  const details = screen.getByLabelText("Window details");
+  expect(details.textContent).toContain("apply_text_edits");
+  for (const value of ["special", worktree.path, worktree.id, activeKey]) expect(details.textContent).toContain(value);
+  for (const label of ["Window ID", "Project ID"]) expect(within(details).getByRole("button", { name: "Copy " + label })).toBeTruthy();
+  await screen.findAllByTestId("window-workflow-step");
 
   expect(screen.queryByText("Each call is shown separately, from first to last.")).toBeNull();
   expect(screen.queryByRole("heading", { name: "Tool calls" })).toBeNull();
@@ -333,6 +314,7 @@ it("uses exact Session tags to focus contiguous Window call segments", async () 
     />,
   );
 
+  fireEvent.click(await screen.findByTestId("work-window-row-" + windowKey));
   expect(await screen.findByRole("tab", { name: /^Window/ })).toBeTruthy();
   expect(screen.queryByRole("tab", { name: /Work Sessions/ })).toBeNull();
   expect(screen.getByRole("tab", { name: "Collaboration" })).toBeTruthy();
@@ -455,6 +437,7 @@ it("shows background Job identity on handoff calls and observe_jobs", async () =
     />,
   );
 
+  fireEvent.click(await screen.findByTestId("work-window-row-" + windowKey));
   const jobTags = await screen.findAllByTitle(jobId);
   expect(jobTags).toHaveLength(2);
   const backgroundTag = jobTags.find((tag) => tag.textContent?.includes("Background running"));
@@ -538,11 +521,12 @@ it("renders Window identity from inventory before recent activity and hydrates f
 
   // Window inventory already carries enough human identity to make selection
   // feel instant; the detail endpoint is still pending here.
-  expect(await screen.findByRole("heading", { name: "webcodex-activity-fix" })).toBeTruthy();
-  const header = screen.getByRole("heading", { name: "webcodex-activity-fix" }).closest("header");
+  fireEvent.click(await screen.findByTestId("work-window-row-" + key));
+  expect(await screen.findByRole("heading", { name: "webcodex-activity-fix · " + key.slice(0, 4) })).toBeTruthy();
+  const header = screen.getByLabelText("Window details");
   expect(header?.textContent).toContain("special");
   expect(header?.textContent).toContain("/root/.webcodex-managed-worktrees/webcodex-activity-fix");
-  expect(header?.textContent).toContain("First observed");
+  expect(header?.textContent).toContain("First active");
   expect(screen.getByText("Loading recent activity…")).toBeTruthy();
   await waitFor(() => expect(windowPayloads).toHaveLength(1));
   expect(windowPayloads[0]).toMatchObject({
@@ -663,7 +647,8 @@ it("keeps collaboration history and draft on the same Window across Runner chang
     throw new Error("unexpected path " + path);
   });
   render(<WindowWorkbench client={client} projects={[source, next]} language="en" onUnauthorized={vi.fn()} />);
-  await screen.findByRole("heading", { name: "WebCodex" });
+  fireEvent.click(await screen.findByTestId("work-window-row-" + key));
+  await screen.findByRole("heading", { name: "WebCodex · " + key.slice(0, 4) });
   // Inventory can render the heading before the initial Window selection settles.
   // Wait for its activity to render before activating the collaboration pane.
   await screen.findByTestId("window-workflow-step");
@@ -673,7 +658,7 @@ it("keeps collaboration history and draft on the same Window across Runner chang
   fireEvent.change(composer, { target: { value: "Draft for this Window" } });
   moved = true;
   await act(async () => { window.dispatchEvent(new Event("focus")); });
-  await screen.findByRole("heading", { name: "Other project" });
+  await screen.findByRole("heading", { name: "Other project · " + key.slice(0, 4) });
   expect(screen.getByRole("tab", { name: "Collaboration" }).getAttribute("aria-selected")).toBe("true");
   expect(screen.getByText("Retained instruction")).toBeTruthy();
   expect(screen.getByRole("textbox", { name: "Message this Window" })).toBe(composer);
@@ -681,4 +666,45 @@ it("keeps collaboration history and draft on the same Window across Runner chang
   expect(screen.getByTestId("work-window-row-" + key).closest(".window-current-selection")).toBeTruthy();
   expect(vi.mocked(client.post).mock.calls.filter(([path]) => path === "window-collaboration")
     .every(([, payload]) => (payload as any).client_window_key === key)).toBe(true);
+});
+
+it("keeps the Collaboration view across Windows and shares one Session focus with its composer", async () => {
+  const [source] = projectFamily();
+  const first = "e".repeat(64);
+  const second = "f".repeat(64);
+  const sessionId = "wc_sess_eeeeeeeeeeeeeeee";
+  const summary = (key: string, seen: number) => ({
+    client_window_key: key, last_project: source.id, source: "openai-session", last_seen_at_ms: seen,
+    active_count: 0, linked_session_count: 0, recorder_gap_count: 0,
+  });
+  const client = fakeClient((path, payload) => {
+    if (path === "windows") return ok({ windows: [summary(first, 2_000), summary(second, 1_000)], returned: 2, total: 2, truncated: false, visibility: { scope: "principal" } });
+    if (path === "window") return ok(windowDetail({
+      client_window_key: payload.client_window_key,
+      linked_sessions: payload.client_window_key === first ? [{
+        workflow_session_id: sessionId, project: source.id, first_linked_at_ms: 1_000, last_linked_at_ms: 2_000,
+        relations: ["work_on_project"], relation_count: 1, title: "Fix collaboration",
+      }] : [],
+      sessions_returned: payload.client_window_key === first ? 1 : 0,
+    }));
+    if (path === "window-collaboration") return ok({ available: true, can_send: true, truncated: false, messages: [] });
+    throw new Error("unexpected path " + path);
+  });
+  render(<WindowWorkbench client={client} projects={[source]} language="en" onUnauthorized={vi.fn()} />);
+  await screen.findByTestId("work-window-row-" + second);
+  fireEvent.click(screen.getByTestId("work-window-row-" + first));
+  await waitFor(() => expect(screen.getByTestId("work-window-row-" + first).getAttribute("aria-current")).toBe("true"));
+  fireEvent.click(screen.getByRole("tab", { name: "Collaboration" }));
+  // The composer edits the same Session focus that filters this Window's calls.
+  fireEvent.click(await screen.findByRole("combobox", { name: "Session context" }));
+  fireEvent.click(await screen.findByRole("option", { name: /Fix collaboration/ }));
+  await waitFor(() => expect((screen.getByRole("combobox", { name: "Session filter", hidden: true }) as HTMLInputElement).value).toContain("Fix collaboration"));
+  expect(screen.getByLabelText("Window details")).toBeTruthy();
+
+  fireEvent.click(screen.getByTestId("work-window-row-" + second));
+  await waitFor(() => expect(vi.mocked(client.post).mock.calls.some(([path, payload]) =>
+    path === "window-collaboration" && (payload as any).client_window_key === second)).toBe(true));
+  expect(screen.getByRole("tab", { name: "Collaboration" }).getAttribute("aria-selected")).toBe("true");
+  expect(screen.getByLabelText("Window details")).toBeTruthy();
+  expect(screen.queryByRole("combobox", { name: "Session context" })).toBeNull();
 });

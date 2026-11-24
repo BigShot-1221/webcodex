@@ -15,7 +15,7 @@ mod project_addition;
 
 const HTTP_LIMIT: usize = 1024 * 1024;
 use webcodex_core::authority::{
-    profiles::LOCAL_USER as USER_SCOPES, AGENT_SCOPES as RUNNER_SCOPES,
+    profiles::LOCAL_USER as USER_SCOPES, validate_username, AGENT_SCOPES as RUNNER_SCOPES,
 };
 
 /// The production adapter. Neither frontend supplies its own deployment backend.
@@ -446,7 +446,7 @@ impl NativeEnvironment {
                 &record.request.server_url,
                 "/api/tools/call",
                 Some(token.expose()),
-                json!({"tool":"list_projects","params":{}}),
+                json!({"tool":"list_projects","params":{"project":selector,"limit":1,"summary_only":false}}),
             )
             .await?;
         let projects = tool_output(&inventory)?
@@ -799,6 +799,7 @@ impl NativeEnvironment {
         token: Option<&str>,
         body: Value,
     ) -> SetupResultValue<Value> {
+        let stage = route_stage(route);
         let mut request = self
             .client_for_server(server)
             .post(format!("{server}{route}"))
@@ -811,14 +812,21 @@ impl NativeEnvironment {
                 "server_unreachable",
                 "The Server request did not produce a verified response",
             )
+            .with_component("server")
+            .with_stage(stage)
         })?;
         let status = response.status();
-        let bytes = read_bounded_http_body(response).await?;
+        let bytes = read_bounded_http_body(response)
+            .await
+            .map_err(|error| error.with_component("server").with_stage(stage))?;
         if !status.is_success() {
-            return Err(server_http_error(status, &bytes));
+            return Err(server_http_error(status, &bytes).with_stage(stage));
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|_| diagnostic("response_invalid", "The Server response was invalid"))
+        serde_json::from_slice(&bytes).map_err(|_| {
+            diagnostic("response_invalid", "The Server response was invalid")
+                .with_component("server")
+                .with_stage(stage)
+        })
     }
 
     async fn authenticated(
@@ -833,7 +841,9 @@ impl NativeEnvironment {
             return Err(diagnostic(
                 "user_credential_required",
                 "Use a user API credential for the Runtime Console",
-            ));
+            )
+            .with_component("auth")
+            .with_stage("user_authentication"));
         }
         let overview = self
             .post(
@@ -847,7 +857,9 @@ impl NativeEnvironment {
             return Err(diagnostic(
                 "server_identity_contract",
                 "The address did not return a WebCodex Runtime Console",
-            ));
+            )
+            .with_component("server")
+            .with_stage("user_authentication"));
         }
         Ok(overview)
     }
@@ -858,7 +870,11 @@ impl NativeEnvironment {
             .get(format!("{}/runtime", record.request.server_url))
             .send()
             .await
-            .map_err(|_| diagnostic("server_unreachable", "The Server address is not reachable"))?;
+            .map_err(|_| {
+                diagnostic("server_unreachable", "The Server address is not reachable")
+                    .with_component("server")
+                    .with_stage("server_reachability")
+            })?;
         if response.status().is_success()
             && response
                 .headers()
@@ -871,7 +887,10 @@ impl NativeEnvironment {
             Err(diagnostic(
                 "server_unreachable",
                 "The address did not return a healthy WebCodex Server",
-            ))
+            )
+            .with_component("server")
+            .with_stage("server_reachability")
+            .with_http_status(response.status().as_u16()))
         }
     }
 
@@ -888,7 +907,9 @@ impl NativeEnvironment {
                 return Err(diagnostic(
                     "server_not_ready",
                     "Server startup did not become healthy before its deadline",
-                ));
+                )
+                .with_component("server")
+                .with_stage("server_reachability"));
             }
             tokio::time::sleep_until(
                 (tokio::time::Instant::now() + Duration::from_millis(250)).min(deadline),
@@ -920,6 +941,14 @@ impl NativeEnvironment {
             ensure_provisioning_username(record);
         }
         let username = record.username.clone().expect("provisioning username");
+        validate_username(&username).map_err(|_| {
+            diagnostic(
+                "user_identity_conflict",
+                "The saved local username is invalid; resume the original setup to check recovery",
+            )
+            .with_component("auth")
+            .with_stage("user_create")
+        })?;
         match self
             .post(
                 &record.request.server_url,
@@ -937,7 +966,9 @@ impl NativeEnvironment {
                 return Err(diagnostic(
                     "response_invalid",
                     "Server did not confirm the created user identity",
-                ))
+                )
+                .with_component("server")
+                .with_stage("user_create"))
             }
             Err(error) if error.code == "server_conflict" => {
                 if path.exists() {
@@ -951,7 +982,10 @@ impl NativeEnvironment {
                 }
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(mut error) => {
+                error.message = format!("Local user creation failed: {}", error.message);
+                return Err(error.with_stage("user_create"));
+            }
         }
         if !path.exists() {
             atomic_private_write(&path, generate_token("wc_pat_").as_bytes())?;
@@ -1221,7 +1255,14 @@ impl EnvironmentBackend for NativeEnvironment {
         use Reconciliation::*;
         use SetupStep::*;
         match step {
-            Preflight | ServerReachability | Readiness => Ok(Missing),
+            Preflight => {
+                // Inspect the original failed journal before starting another
+                // step clears its diagnostic. The engine saves any correction
+                // before applying preflight or sending a provisioning request.
+                recover_uncreated_username(store, record)?;
+                Ok(Missing)
+            }
+            ServerReachability | Readiness => Ok(Missing),
             ServerConfiguration => {
                 let path = store.root().join("server/webcodex.env");
                 if !path.exists() {
@@ -1312,7 +1353,11 @@ impl EnvironmentBackend for NativeEnvironment {
                                 "Saved project registration is invalid",
                             )
                         })?;
-                    if value.get("path").and_then(toml::Value::as_str) != project.to_str() {
+                    if !value
+                        .get("path")
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|recorded| same_project_path(recorded, project))
+                    {
                         return Err(diagnostic(
                             "project_conflict",
                             "The project identifier is registered to another directory",
@@ -1432,13 +1477,9 @@ impl EnvironmentBackend for NativeEnvironment {
                     ensure_provisioning_username(record);
                 }
                 if record.request.local_runner() && record.runner_client_id.is_none() {
-                    let base = record
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| account_username(&record.request.account.name));
                     record.runner_client_id = Some(format!(
                         "{}-{}",
-                        base,
+                        account_client_id_prefix(&record.request.account.name),
                         &record.environment_id.replace('-', "")[..16]
                     ));
                 }
@@ -1541,6 +1582,11 @@ impl EnvironmentBackend for NativeEnvironment {
                 } else {
                     Component::Runner
                 };
+                if component == Component::Server
+                    && record.request.service_scope == service::ServiceScope::User
+                {
+                    crate::cloudflare_tunnel::prepare_user_ingress(store)?;
+                }
                 let credential = secrets
                     .service_password
                     .as_ref()
@@ -1578,7 +1624,8 @@ impl EnvironmentBackend for NativeEnvironment {
                         tokio::time::timeout_at(deadline, self.observe(store, record)).await;
                     if let Ok(Ok(observation)) = observed {
                         if observation.authenticated
-                            && observation.runner_online != Some(false)
+                            && (!record.request.local_runner()
+                                || observation.runner_online == Some(true))
                             && record
                                 .projects
                                 .iter()
@@ -1866,6 +1913,23 @@ fn read_enrollment(
     Ok(result)
 }
 
+pub(crate) fn same_project_path(recorded: &str, expected: &Path) -> bool {
+    let candidate = Path::new(recorded);
+    if !candidate.is_absolute() {
+        return false;
+    }
+    if candidate == expected {
+        return true;
+    }
+    let Ok(recorded_canonical) = std::fs::canonicalize(candidate) else {
+        return false;
+    };
+    let Ok(expected_canonical) = std::fs::canonicalize(expected) else {
+        return false;
+    };
+    recorded_canonical == expected_canonical
+}
+
 fn runner_config_matches(
     store: &EnvironmentStore,
     record: &mut EnvironmentRecord,
@@ -1880,8 +1944,13 @@ fn runner_config_matches(
             "Existing Runner configuration is invalid",
         )
     })?;
-    if value.get("server_url").and_then(toml::Value::as_str)
-        != Some(record.request.server_url.as_str())
+    let recorded_server = value
+        .get("server_url")
+        .and_then(toml::Value::as_str)
+        .and_then(|url| canonical_server_url(url).ok());
+    let expected_server = canonical_server_url(&record.request.server_url).ok();
+    if recorded_server.is_none()
+        || recorded_server != expected_server
         || value.get("client_id").and_then(toml::Value::as_str)
             != record.runner_client_id.as_deref()
     {
@@ -2217,6 +2286,21 @@ pub fn service_spec(
     })
 }
 
+fn route_stage(route: &str) -> &'static str {
+    match route {
+        "/api/users/create" => "user_create",
+        "/api/tokens/register_hash" => "user_token_registration",
+        "/api/agent-tokens/register_hash" => "runner_token_registration",
+        "/api/runtime-console/overview" => "user_authentication",
+        "/api/runtime-console/runner" => "runner_observation",
+        "/api/runtime-console/projects" => "project_inventory",
+        "/api/pairing/enroll" => "runner_enrollment",
+        "/api/pairing/create" => "device_invitation",
+        "/api/tools/call" => "project_operation",
+        _ => "server_request",
+    }
+}
+
 fn diagnostic(code: &str, message: &str) -> SetupDiagnostic {
     SetupDiagnostic::new(code, message, "Inspect environment status and resume the saved setup after correcting the reported condition")
 }
@@ -2226,6 +2310,7 @@ pub(crate) fn service_error(error: service::ServiceError) -> SetupDiagnostic {
         &error.message,
         error.recovery_hint,
     )
+    .with_component("service")
 }
 fn response_string(value: &Value, key: &str) -> SetupResultValue<String> {
     value
@@ -2312,6 +2397,23 @@ fn account_username(name: &str) -> String {
     }
 }
 
+// Runner IDs retain their historical prefix format, independent of Server usernames.
+fn account_client_id_prefix(name: &str) -> String {
+    let value: String = name
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("user")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(48)
+        .collect();
+    if value.is_empty() {
+        "user".into()
+    } else {
+        value
+    }
+}
+
 fn ensure_provisioning_username(record: &mut EnvironmentRecord) {
     if record
         .username
@@ -2352,25 +2454,115 @@ async fn read_bounded_http_body(response: reqwest::Response) -> SetupResultValue
 }
 
 fn server_http_error(status: reqwest::StatusCode, _bytes: &[u8]) -> SetupDiagnostic {
-    match status.as_u16() {
-        401 => diagnostic(
+    let status_code = status.as_u16();
+    let (code, message, recovery, component) = match status_code {
+        401 => (
             "authentication_required",
             "The user credential was not accepted",
+            "Restore or repair the saved user credential, then retry",
+            "auth",
         ),
-        403 => diagnostic(
+        403 => (
             "permission_denied",
             "The authenticated user is not authorized for this operation",
+            "Verify the account permissions on the Server before retrying",
+            "auth",
         ),
-        409 => diagnostic(
+        409 => (
             "server_conflict",
             "The Server reports an existing or conflicting resource",
+            "Inspect the existing Server state before retrying",
+            "server",
         ),
-        400 => diagnostic(
+        400 => (
             "request_validation_failed",
-            "The Server rejected the request parameters (HTTP 400)",
+            "The Server rejected the request parameters",
+            "Check the setup inputs and account or project configuration for this stage, then retry",
+            "server",
         ),
-        _ => diagnostic("server_request_failed", "The Server rejected the operation"),
+        503 => (
+            "server_request_failed",
+            "The Server is temporarily unavailable or still starting",
+            "Wait a moment for the Server to finish starting, then check Server status",
+            "server",
+        ),
+        500..=599 => (
+            "server_request_failed",
+            "The Server reported an internal failure",
+            "Inspect Server diagnostics and Activity before retrying",
+            "server",
+        ),
+        _ => (
+            "server_request_failed",
+            "The Server rejected the operation",
+            "Inspect environment status and resume the saved setup after correcting the reported condition",
+            "server",
+        ),
+    };
+    // Status is bounded protocol metadata. Never expose the response
+    // body, request URL, credentials or user-controlled error text.
+    SetupDiagnostic::new(code, &format!("{message} (HTTP {status_code})"), recovery)
+            .with_component(component)
+            .with_http_status(status_code)
+}
+
+fn recover_uncreated_username(
+    store: &EnvironmentStore,
+    record: &mut EnvironmentRecord,
+) -> SetupResultValue<()> {
+    let Some(username) = record.username.as_deref() else {
+        return Ok(());
+    };
+    if !record.request.local_server() || validate_username(username).is_ok() {
+        return Ok(());
     }
+    let conflict = || {
+        diagnostic(
+            "user_identity_conflict",
+            "The invalid saved username cannot be recovered without changing an established or uncertain identity",
+        )
+    };
+    let journal = store.load_journal()?.ok_or_else(conflict)?;
+    // v0.5.0 saved the OS-derived name after /users/create rejected uppercase
+    // or dots. The Server grammar proves that name could not have been created.
+    // Only repair that exact unfinished step, before any credential/Runner state.
+    if record.configured
+        || journal.environment.configured
+        || !record.projects.is_empty()
+        || !journal.environment.projects.is_empty()
+        || username != account_client_id_prefix(&record.request.account.name)
+        || journal.environment.environment_id != record.environment_id
+        || journal.environment.request != record.request
+        || journal.environment.username != record.username
+        || journal.steps.get(&SetupStep::UserAuthentication) != Some(&StepState::Started)
+        || journal
+            .steps
+            .keys()
+            .any(|step| *step > SetupStep::UserAuthentication)
+        || journal
+            .last_diagnostic
+            .as_ref()
+            .map(|error| error.code.as_str())
+            != Some("server_request_failed")
+        || store.load_environment()?.is_some()
+    {
+        return Err(conflict());
+    }
+    for name in [
+        "webcodex-user-token",
+        "runner.toml",
+        "enrollment-recovery.json",
+    ] {
+        match std::fs::symlink_metadata(store.root().join(name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SetupDiagnostic::io()),
+            Ok(_) => return Err(conflict()),
+        }
+    }
+    // The setup engine persists this correction before applying the step. Keep
+    // the environment, OS owner and already allocated Runner ID unchanged.
+    record.username = Some(account_username(&record.request.account.name));
+    Ok(())
 }
 fn project_record(path: &Path) -> ProjectRecord {
     ProjectRecord {

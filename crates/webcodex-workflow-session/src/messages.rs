@@ -10,8 +10,8 @@ use super::model::{
     SessionDiscussionSummary, SessionInboxHint, SessionMessage, SessionMessageDelivery,
     SessionMessageDeliveryOutcome, SessionMessageError, SessionMessageObservationError,
     SessionMessageObservationOutcome, SessionMessageStatus, WithdrawSessionMessageOutcome,
-    DEFAULT_MAX_MESSAGES_PER_SESSION, DEFAULT_MESSAGE_LIST_LIMIT, MAX_MESSAGE_LIST_LIMIT,
-    MAX_SESSION_MESSAGE_OBSERVATION_TOKEN_LEN, MAX_TOOL_CALL_ACK_REF_CHARS,
+    DEFAULT_MESSAGE_LIST_LIMIT, MAX_MESSAGE_LIST_LIMIT, MAX_SESSION_MESSAGE_OBSERVATION_TOKEN_LEN,
+    MAX_TOOL_CALL_ACK_REF_CHARS,
 };
 use super::query::{build_discussion_summary, build_inbox_hint};
 use super::store::SessionStore;
@@ -213,7 +213,7 @@ impl SessionStore {
             while membership.last().is_some_and(|byte| *byte == 0) {
                 membership.pop();
             }
-            if membership.is_empty() {
+            if membership.is_empty() || membership.len() > ACK_REF_MAX_MEMBERSHIP_BYTES {
                 return None;
             }
 
@@ -245,7 +245,9 @@ impl SessionStore {
         let payload = general_purpose::URL_SAFE_NO_PAD
             .decode(ack_ref.strip_prefix(ACK_REF_PREFIX)?)
             .ok()?;
-        if payload.len() < ACK_REF_TAG_BYTES {
+        if payload.len() <= ACK_REF_TAG_BYTES
+            || payload.len() > ACK_REF_TAG_BYTES + ACK_REF_MAX_MEMBERSHIP_BYTES
+        {
             return None;
         }
         let (tag, membership) = payload.split_at(ACK_REF_TAG_BYTES);
@@ -254,13 +256,12 @@ impl SessionStore {
             if membership.len() != open_ids.len().div_ceil(8) {
                 return None;
             }
-            let expected =
-                ack_set_digest(
-                    session_id,
-                    &record.owner_authority_fingerprint,
-                    open_ids.iter().map(String::as_str),
-                    membership,
-                );
+            let expected = ack_set_digest(
+                session_id,
+                &record.owner_authority_fingerprint,
+                open_ids.iter().map(String::as_str),
+                membership,
+            );
             if tag != &expected[..ACK_REF_TAG_BYTES] {
                 return None;
             }
@@ -693,6 +694,8 @@ const OBSERVATION_TOKEN_PREFIX: &str = "wsm2_";
 const OBSERVATION_TOKEN_BYTES: usize = 24;
 const ACK_REF_PREFIX: &str = "wc_ack1_";
 const ACK_REF_TAG_BYTES: usize = 12;
+const ACK_REF_MAX_MEMBERSHIP_BYTES: usize =
+    (MAX_TOOL_CALL_ACK_REF_CHARS - ACK_REF_PREFIX.len()) * 3 / 4 - ACK_REF_TAG_BYTES;
 
 pub fn encode_observation_token(
     session_id: &str,
@@ -735,8 +738,7 @@ fn parse_observation_token(
     if payload.len() != OBSERVATION_TOKEN_BYTES {
         return Err(SessionMessageObservationError::MalformedToken);
     }
-    let revision =
-        u64::from_be_bytes(payload[..8].try_into().expect("observation revision bytes"));
+    let revision = u64::from_be_bytes(payload[..8].try_into().expect("observation revision bytes"));
     let expected = observation_revision_tag(session_id, revision);
     if payload[8..] != expected[..16] {
         return Err(SessionMessageObservationError::MalformedToken);

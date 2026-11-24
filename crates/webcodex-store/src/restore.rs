@@ -43,7 +43,7 @@
 //! # Workflow Session domain policy
 //!
 //! K.2c [`crate::schema::validate_shared_database_backup_schema`] accepts a **tri-state** Workflow
-//! Session layout: **0/6** tables (Store-only snapshot) or **6/6** with marker `schema_version = 1`.
+//! Session layout: absent, exact personal Fork v1, or exact current v1. Both v1 formats are distinct.
 //! Isolated worktrees that open the ledger with `with_session_ledger` may legally omit Session tables;
 //! production Server startup on `main` uses `with_session_database`, so production restore through
 //! [`OfflineRestoreOwner::restore_from_backup`] uses [`RestoreWorkflowSessionRequirement::RequirePresent`].
@@ -53,6 +53,7 @@
 mod journal;
 mod preserve;
 mod recovery;
+mod session_migration;
 mod staging;
 
 pub use recovery::PendingRestoreStartup;
@@ -170,9 +171,8 @@ impl OfflineRestoreOwner {
         }
         ensure_candidate_not_same_file_as_production(&resolved, &self.production_db_path)?;
 
-        let meta = fs::symlink_metadata(&resolved).with_context(|| {
-            format!("stat restore candidate {}", resolved.display())
-        })?;
+        let meta = fs::symlink_metadata(&resolved)
+            .with_context(|| format!("stat restore candidate {}", resolved.display()))?;
         if meta.len() == 0 {
             bail!("restore candidate must not be empty");
         }
@@ -207,9 +207,8 @@ impl OfflineRestoreOwner {
 
     fn resolve_and_harden_candidate(&self, candidate: &Path) -> anyhow::Result<PathBuf> {
         let absolute = absolute_lexical_path(candidate)?;
-        let requested_meta = fs::symlink_metadata(&absolute).with_context(|| {
-            format!("stat restore candidate {}", absolute.display())
-        })?;
+        let requested_meta = fs::symlink_metadata(&absolute)
+            .with_context(|| format!("stat restore candidate {}", absolute.display()))?;
         if requested_meta.file_type().is_symlink() || is_reparse_point(&requested_meta) {
             bail!("restore candidate path must not be a symlink or reparse point");
         }
@@ -217,12 +216,10 @@ impl OfflineRestoreOwner {
             bail!("restore candidate path is not a regular file");
         }
 
-        let canonical = fs::canonicalize(&absolute).with_context(|| {
-            format!("canonicalize restore candidate {}", absolute.display())
-        })?;
-        let canonical_meta = fs::symlink_metadata(&canonical).with_context(|| {
-            format!("stat canonical restore candidate {}", canonical.display())
-        })?;
+        let canonical = fs::canonicalize(&absolute)
+            .with_context(|| format!("canonicalize restore candidate {}", absolute.display()))?;
+        let canonical_meta = fs::symlink_metadata(&canonical)
+            .with_context(|| format!("stat canonical restore candidate {}", canonical.display()))?;
         if canonical_meta.file_type().is_symlink() || is_reparse_point(&canonical_meta) {
             bail!("restore candidate must not be a symlink or reparse point");
         }
@@ -352,13 +349,11 @@ fn canonical_data_directory(production_db_path: &Path) -> anyhow::Result<PathBuf
     let parent = production_db_path
         .parent()
         .context("production database path has no parent directory")?;
-    let data_dir = fs::canonicalize(parent).with_context(|| {
-        format!("canonicalize data directory {}", parent.display())
-    })?;
+    let data_dir = fs::canonicalize(parent)
+        .with_context(|| format!("canonicalize data directory {}", parent.display()))?;
     validate_trusted_directory_parent(&data_dir)?;
-    let meta = fs::symlink_metadata(&data_dir).with_context(|| {
-        format!("stat data directory {}", data_dir.display())
-    })?;
+    let meta = fs::symlink_metadata(&data_dir)
+        .with_context(|| format!("stat data directory {}", data_dir.display()))?;
     if meta.file_type().is_symlink() || is_reparse_point(&meta) {
         bail!("data directory must not be a symlink or reparse point");
     }
@@ -377,18 +372,16 @@ fn expected_backups_directory(data_dir: &Path) -> PathBuf {
 
 fn canonical_backups_dir(data_dir: &Path) -> anyhow::Result<PathBuf> {
     let backup_dir = data_dir.join(BACKUP_DIR_NAME);
-    let meta = fs::symlink_metadata(&backup_dir).with_context(|| {
-        format!("stat backup directory {}", backup_dir.display())
-    })?;
+    let meta = fs::symlink_metadata(&backup_dir)
+        .with_context(|| format!("stat backup directory {}", backup_dir.display()))?;
     if meta.file_type().is_symlink() || is_reparse_point(&meta) {
         bail!("backup directory must not be a symlink or reparse point");
     }
     if !meta.is_dir() {
         bail!("backup directory is not a directory");
     }
-    let canonical_backup = fs::canonicalize(&backup_dir).with_context(|| {
-        format!("canonicalize backup directory {}", backup_dir.display())
-    })?;
+    let canonical_backup = fs::canonicalize(&backup_dir)
+        .with_context(|| format!("canonicalize backup directory {}", backup_dir.display()))?;
     if !path_starts_with(&canonical_backup, data_dir) {
         bail!("backup directory escapes data directory");
     }
@@ -448,9 +441,13 @@ fn sidecar_path(base: &Path, suffix: &str) -> PathBuf {
 }
 
 fn validate_trusted_directory_parent(dir: &Path) -> anyhow::Result<()> {
-    let meta = fs::symlink_metadata(dir).with_context(|| format!("stat directory {}", dir.display()))?;
+    let meta =
+        fs::symlink_metadata(dir).with_context(|| format!("stat directory {}", dir.display()))?;
     if meta.file_type().is_symlink() || is_reparse_point(&meta) {
-        bail!("directory {} must not be a symlink or reparse point", dir.display());
+        bail!(
+            "directory {} must not be a symlink or reparse point",
+            dir.display()
+        );
     }
     if !meta.is_dir() {
         bail!("path {} is not a directory", dir.display());
@@ -461,9 +458,8 @@ fn validate_trusted_directory_parent(dir: &Path) -> anyhow::Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
-    let parent_meta = fs::symlink_metadata(parent).with_context(|| {
-        format!("stat parent of directory {}", dir.display())
-    })?;
+    let parent_meta = fs::symlink_metadata(parent)
+        .with_context(|| format!("stat parent of directory {}", dir.display()))?;
     if parent_meta.file_type().is_symlink() || is_reparse_point(&parent_meta) {
         bail!(
             "parent of directory {} must not be a symlink or reparse point",

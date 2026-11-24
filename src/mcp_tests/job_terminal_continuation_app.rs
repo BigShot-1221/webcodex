@@ -119,9 +119,9 @@ fn job_terminal_wait_suggests_only_an_admitted_still_waiting_host_carrier() {
 async fn job_terminal_continuation_app_surface_is_explicit_sparse_and_app_only() {
     assert_eq!(
         MCP_JOB_TERMINAL_CONTINUATION_UI_RESOURCE_URI,
-        "ui://webcodex/job-terminal-continuation/v2"
+        "ui://webcodex/job-terminal-continuation/v4"
     );
-    let runtime = ToolRuntime::new_for_tests();
+    let runtime = workflow_runtime();
     let auth = job_app_auth();
     let ui = handle_with_apps(
         &runtime,
@@ -274,7 +274,7 @@ async fn job_terminal_hidden_kernel_entry_is_fail_closed_without_protocol_capabi
         ToolProtocolCapabilities, ToolTransport,
     };
 
-    let runtime = ToolRuntime::new_for_tests();
+    let runtime = workflow_runtime();
     let auth = job_app_auth();
     let wait_id = "wc_job_wait_q6urq6urq6urq6ur";
     let binding_id = "wc_host_binding_qqqqqqqqqqqqqqqqqqqqqg";

@@ -1,141 +1,136 @@
 //! Non-destructive materialized working-set policy, under the Session store lock.
-//! Cold bytes are owned in RAM, so dirty data and in-flight Job/Agent identities
-//! are not discarded or delegated to an older disk image. Active is not a pin.
-use std::sync::Arc;
-
-use super::dirty::retained_event_start_for_record;
+//! SQLite Cold entries hold metadata and an exact committed revision. Only clean
+//! state can leave RAM; failed writes and later dirty generations stay resident.
 use super::*;
 use crate::persistence::cold_session_from_record;
-use crate::persistence::materialize_cold_session;
-
-/// Outcome of resolving the mutation target while `sessions` may be mutably borrowed.
-enum RetainedRecordBranch {
-    Hot {
-        updated: bool,
-        pending_upsert: Option<(u64, Arc<SessionEvent>, u64)>,
-        closed: bool,
-    },
-    Cold(ColdSessionRecord),
-    Missing,
-}
 
 impl SessionStore {
     /// Update retained evidence without duplicating Hot/Cold ownership handling.
-    /// Active Cold records hydrate; Closed records stay Cold. The callback owns
-    /// event selection/timestamps and must be replay-safe: a Cold CAS conflict
-    /// reapplies it to the newer record. Persistence remains the caller's duty.
-    pub(super) fn update_retained_record<T: Clone>(
+    /// The exact target hydrates before a mutation, including late evidence for
+    /// Closed history. Persistence remains the caller's duty.
+    pub(super) fn update_retained_record<T>(
         &self,
         session_id: &str,
         value: T,
-        update: impl Fn(&mut SessionRecord, T) -> Option<(u64, Arc<SessionEvent>)>,
+        update: impl FnOnce(&mut SessionRecord, T) -> bool,
     ) -> bool {
-        let mut hot_value = Some(value);
-        let cold = {
-            let mut inner = self.lock_inner();
-            if !inner.prepare_active_session(session_id) {
-                return false;
-            }
-            let branch = match inner.sessions.get_mut(session_id) {
-                Some(StoredSession::Hot(record)) => {
-                    // Move, rather than clone, the evidence on the ordinary Hot path.
-                    let (updated, pending_upsert, closed) = match update(record, hot_value.take().expect("hot update consumes value once")) {
-                        Some((ordinal, event)) => {
-                            let retained_event_start = retained_event_start_for_record(record);
-                            (
-                                true,
-                                Some((ordinal, event, retained_event_start)),
-                                !record.lifecycle.allows_mutation(),
-                            )
-                        }
-                        None => (false, None, !record.lifecycle.allows_mutation()),
-                    };
-                    RetainedRecordBranch::Hot {
-                        updated,
-                        pending_upsert,
-                        closed,
-                    }
-                }
-                Some(StoredSession::Cold(record)) => RetainedRecordBranch::Cold(record.clone()),
-                None => RetainedRecordBranch::Missing,
-            };
-            match branch {
-                RetainedRecordBranch::Hot {
-                    updated,
-                    pending_upsert,
-                    closed,
-                } => {
-                    if let Some((ordinal, event, retained_event_start)) = pending_upsert {
-                        inner.mark_session_event_upsert(
-                            session_id,
-                            ordinal,
-                            event,
-                            retained_event_start,
-                        );
-                    }
-                    drop(inner);
-                    if updated && closed {
-                        self.coldify_closed_session(session_id);
-                    }
-                    return updated;
-                }
-                RetainedRecordBranch::Cold(cold) => cold,
-                RetainedRecordBranch::Missing => return false,
-            }
+        let mut inner = self.inner.lock().expect("session store mutex poisoned");
+        if !inner.prepare_record_mutation(session_id) {
+            return false;
+        }
+        let Some(record) = inner
+            .sessions
+            .get_mut_for_validation(session_id)
+            .and_then(StoredSession::hot_mut)
+        else {
+            return false;
         };
-        let value = hot_value.expect("cold update retains value");
-        self.rewrite_cold_record(session_id, cold, false, |record, _| {
-            update(record, value.clone()).map(|(ordinal, event)| {
-                let retained_event_start = retained_event_start_for_record(record);
-                ColdRewriteOutcome::EventUpsert {
-                    ordinal,
-                    event,
-                    retained_event_start,
-                }
-            })
-        })
+        let updated = update(record, value);
+        let closed = !record.lifecycle.allows_mutation();
+        if updated {
+            inner.sessions.mark(session_id);
+        }
+        drop(inner);
+        if updated && closed {
+            self.coldify_closed_session(session_id);
+        }
+        updated
     }
 }
 
 impl SessionStoreInner {
-    /// Prepare the Active mutation residency target before business fields change.
-    ///
-    /// Missing sessions return `true` so callers retain their own Unknown/Missing
-    /// branches. When the session exists, SQLite seeded mode runs revision preflight
-    /// admission via [`DatabasePersistenceQueue::ensure_revision_capacity`]; admission
-    /// failure records `last_persist_error` when empty and returns `false` without
-    /// touching session bytes, LRU, or hot working-set compaction. Already-Hot sessions
-    /// return `true` after admission. Cold Active sessions materialize to Hot only after
-    /// admission succeeds.
-    pub(super) fn prepare_active_session(&mut self, session_id: &str) -> bool {
-        if !self.sessions.contains_key(session_id) {
-            return true;
-        }
-        if !self.database_persistence.ensure_revision_capacity(session_id) {
-            self.note_revision_admission_failure(session_id);
+    /// Prepare only the exact mutation target. Reads use an ephemeral
+    /// snapshot instead and therefore cannot promote a history scan into Hot RAM.
+    /// Missing/Closed targets are left to their original semantic checks.
+    pub(super) fn prepare_record_mutation(&mut self, session_id: &str) -> bool {
+        if !self.sessions.can_mark() {
             return false;
         }
         let Some(StoredSession::Cold(cold)) = self.sessions.get(session_id) else {
             return true;
         };
-        if !cold.lifecycle.allows_mutation() {
-            return true;
-        }
-        let Some(record) = materialize_cold_session(cold, self.max_events_per_session) else {
-            tracing::warn!("canonical Active Session payload unavailable; mutation rejected");
+        let Some(record) = materialize_cold_session(cold, self.recent_event_limit) else {
+            tracing::warn!("canonical Session payload unavailable; mutation rejected");
             return false;
         };
         self.sessions
-            .insert(session_id.to_owned(), StoredSession::Hot(record));
+            .replace_residency(session_id.to_owned(), StoredSession::Hot(record));
         self.touch(session_id);
         self.compact_hot_sessions(session_id);
         true
+    }
+
+    /// Only an exact, clean committed projection may replace live RAM.
+    /// Use this same predicate for ordinary LRU and explicit Closed compaction.
+    pub(super) fn committed_cold_for_eviction(
+        &self,
+        session_id: &str,
+    ) -> Option<ColdSessionRecord> {
+        let persistence = self.persistence.as_ref()?;
+        if self.sessions.dirty.contains_key(session_id) {
+            return None;
+        }
+        let record = self.sessions.get(session_id)?.hot()?;
+        let cold = record.durable.as_ref()?;
+        if !record.pending_events.is_empty()
+            || cold.database_revision == 0
+            || !cold
+                .database
+                .as_ref()
+                .is_some_and(|db| Arc::ptr_eq(db, &persistence.database))
+            || cold.session_id != record.session_id
+            || cold.project != record.project
+            || cold.project_identity != record.project_identity
+            || cold.owner_authority_fingerprint != record.owner_authority_fingerprint
+            || cold.lifecycle != record.lifecycle
+            || cold.mode != record.mode
+            || cold.guards != record.guards
+            || cold.created_at != record.created_at
+            || cold.updated_at != record.updated_at
+            || cold.retained_events_observed != record.events_observed
+            || cold.retained_message_revision != record.message_observation_revision
+        {
+            return None;
+        }
+        Some(cold.clone())
     }
 
     /// Reuse the existing access order rather than adding a CLOCK/SLRU index.
     /// This runs only on admission, not every event. No full-record borrow can
     /// race the transition because both are protected by the same store mutex.
     pub(super) fn compact_hot_sessions(&mut self, protected: &str) {
+        if self.persistence.is_some() {
+            // Only successfully committed, unchanged records can leave RAM.
+            // Active lifecycle never pins history. Dirty data survives I/O errors.
+            let cache_bytes = self.cache_target_bytes;
+            let mut bytes: usize = self
+                .sessions
+                .values()
+                .filter_map(StoredSession::hot)
+                .map(resident_bytes)
+                .fold(0usize, usize::saturating_add);
+            let candidates = self
+                .lru
+                .iter()
+                .filter(|id| id.as_str() != protected)
+                .cloned()
+                .collect::<Vec<_>>();
+            for id in candidates {
+                let Some(record) = self.sessions.get(&id).and_then(StoredSession::hot) else {
+                    continue;
+                };
+                if bytes <= cache_bytes && record.lifecycle.allows_mutation() {
+                    continue;
+                }
+                let Some(cold) = self.committed_cold_for_eviction(&id) else {
+                    continue;
+                };
+                bytes = bytes.saturating_sub(resident_bytes(record));
+                self.sessions
+                    .replace_residency(id, StoredSession::Cold(cold));
+            }
+            return;
+        }
         let target = self.hot_session_capacity_target.max(1);
         let hot = self
             .sessions
@@ -164,9 +159,10 @@ impl SessionStoreInner {
             let Some(record) = self.sessions.get(&id).and_then(StoredSession::hot) else {
                 continue;
             };
-            match cold_session_from_record(record, self.max_events_per_session) {
+            match cold_session_from_record(record, self.recent_event_limit) {
                 Ok(cold) => {
-                    self.sessions.insert(id, StoredSession::Cold(cold));
+                    self.sessions
+                        .replace_residency(id, StoredSession::Cold(cold));
                     remaining -= 1;
                 }
                 Err(_) => tracing::warn!("Session compaction failed; retaining Hot data"),
@@ -177,3 +173,34 @@ impl SessionStoreInner {
 
 #[cfg(test)]
 mod tests;
+
+// A conservative working-set weight, not a process RSS measurement. Include
+// event/message bodies rather than counting every Session as an equal object.
+fn resident_bytes(record: &SessionRecord) -> usize {
+    let events = record
+        .events
+        .iter()
+        .map(|event| {
+            std::mem::size_of::<SessionEvent>()
+                + event.tool_name.len()
+                + event.session_id.len()
+                + event.instruction.as_ref().map_or(0, String::len)
+                + event.changed_paths.iter().map(String::len).sum::<usize>()
+                + event.observed_paths.iter().map(String::len).sum::<usize>()
+                + event
+                    .input_summary
+                    .as_ref()
+                    .map_or(0, |value| value.to_string().len())
+                + event
+                    .validation_output_summary
+                    .as_ref()
+                    .map_or(0, |value| value.to_string().len())
+        })
+        .sum::<usize>();
+    let messages = record
+        .messages
+        .iter()
+        .map(|message| std::mem::size_of::<SessionMessage>() + message.message.len())
+        .sum::<usize>();
+    (std::mem::size_of::<SessionRecord>() + events + messages).saturating_mul(2)
+}

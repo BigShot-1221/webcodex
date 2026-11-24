@@ -356,6 +356,23 @@ fn validate_workspace_member_pattern(member: &str) -> Result<(), ProjectRecipeRe
 pub fn digest_project_cargo_all_packages_provenance(
     resolved: &ResolvedProjectRecipeRoot,
 ) -> Result<String, ProjectRecipeResolutionError> {
+    project_cargo_all_packages_provenance_inner(resolved, false).map(|(digest, _)| digest)
+}
+
+/// Return the canonical bounded workspace provenance and exact package names
+/// visible to Cargo `--workspace`. Exclusions are validated against this list,
+/// never against directory names or glob patterns.
+pub fn project_cargo_all_packages_provenance(
+    resolved: &ResolvedProjectRecipeRoot,
+) -> Result<(String, Vec<String>), ProjectRecipeResolutionError> {
+    let (digest, package_names) = project_cargo_all_packages_provenance_inner(resolved, true)?;
+    Ok((digest, package_names.expect("package names requested")))
+}
+
+fn project_cargo_all_packages_provenance_inner(
+    resolved: &ResolvedProjectRecipeRoot,
+    include_package_names: bool,
+) -> Result<(String, Option<Vec<String>>), ProjectRecipeResolutionError> {
     let mut files = project_cargo_all_packages_provenance_files(resolved)?
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -462,7 +479,25 @@ pub fn digest_project_cargo_all_packages_provenance(
         hash_field(&mut hasher, &entry.logical);
         hash_field(&mut hasher, &entry.resolved);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let package_names = if include_package_names {
+        let mut package_names = BTreeSet::new();
+        for route in workspace_member_routes {
+            let manifest = parse_cargo_manifest(&workspace_root, &route.canonical)?;
+            let name = manifest
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str)
+                .ok_or(ProjectRecipeResolutionError::SourceFileInvalid)?;
+            package_names.insert(name.to_string());
+        }
+        if package_names.is_empty() {
+            return Err(ProjectRecipeResolutionError::SourceFileInvalid);
+        }
+        Some(package_names.into_iter().collect())
+    } else {
+        None
+    };
+    Ok((format!("{:x}", hasher.finalize()), package_names))
 }
 
 const CARGO_ALL_PACKAGES_MAX_MANIFESTS: usize = 256;

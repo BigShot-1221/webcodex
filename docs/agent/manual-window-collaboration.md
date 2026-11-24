@@ -77,6 +77,19 @@ instead of falling back to older visible history. Project-scoped model credentia
 remain exact-principal bounded. The card uses its Host-derived current ClientWindow
 and independently authorizes its Project.
 
+For projectless, unanchored managed OAuth activity, the Console recognizes a
+personal API token as the operator of that same user's OAuth Windows. This uses
+the exact observation's server-authored user/client attribution, including live
+request admission; it does not infer ownership from an older Project or Window
+selection. OAuth callers still require the exact user **and client**. Other
+credential classes gain no user-based visibility. Explicit Project and Workflow
+Session Project anchors must still be authorized, and missing attribution or a
+newest observation belonging to another user remains unavailable. Inventory,
+detail, liveness, and collaboration use the same rule. The recipient's Operator
+mailbox and Peer principal are unchanged. This keeps a PAT-authenticated WebUI
+conversation available when its model's latest call has no Project, including
+after OAuth renewal while the browser is in the background.
+
 Transcript reads never consume attention. Only model-visible tool activity
 projects pending Operator messages and updates projection timestamps;
 `present_work_result`, `get_work_result_state`, `send_work_result_message`, and
@@ -90,7 +103,11 @@ accepted or executed.
 
 The WebUI keeps its selected Window when a bounded inventory omits it or an exact
 Window detail becomes unavailable; only user selection changes the communication
-target. Authority failures still clear unavailable data. A successful send receipt
+target. The WebUI composer's Session context is the same single Session focus as the
+Window activity filter and is always visible and editable before sending. The Work
+Result card sends kind and priority (low/normal/high) with the exact retry payload and
+shows the receipt-confirmed message immediately; the following history read only
+reconciles it. Authority failures still clear unavailable data. A successful send receipt
 releases the composer immediately and replaces any pre-send transcript read, so a
 slow refresh cannot delay draft completion or postpone the new read until polling.
 
@@ -98,8 +115,10 @@ The WebUI follows new messages while the reader is near the end of the thread.
 Reading earlier messages keeps the scroll position and offers **View new messages**.
 Both surfaces offer **Load earlier messages** and **Return to latest messages**.
 The DOM keeps at most 200 messages while the database retains earlier history.
-New head slices do not delete previously displayed messages; explicit older-page
-navigation is not overwritten by polling. Reply quotations use exact message IDs,
+New head slices do not delete previously displayed messages unless a truncated head
+no longer reaches them: that gap is never spliced, the view restarts at the new head
+and earlier pages stay reachable through the cursor. Explicit older-page navigation
+is not overwritten by polling. Reply quotations use exact message IDs,
 not text/title matching. Message kind and ACK are conversational semantics, not
 execution approval. Already-deleted records cannot be reconstructed by this upgrade.
 Ctrl/Command + Enter does not submit while an input method is composing. The card
@@ -220,6 +239,36 @@ The Server-hosted `/runtime` page presents the same authoritative runtime and Wo
 
 The collaboration panel establishes an observation baseline before reading the retained snapshot, then uses bounded long-polls and merges deltas by `message_id`. `has_more` is drained before the next wait, while `history_lost` causes a retained-board reload and a new baseline rather than claiming complete history. Manual Refresh reports visible refreshing/success/failure state and preserves prior usable data; a healthy live collaboration loop is not restarted merely because Refresh was clicked, while a paused/failed loop performs a retained reload, new baseline, and bounded reconnect. Session liveness is derived only from WebCodex facts such as a running call, owned running Job, or recent retained activity; it never claims to know whether the host/model is processing, frozen, or present. All aggregate counts remain bounded/truncation-aware. Browser observation remains UI refresh only: it is not a model wake-up, subscription, participant-presence mechanism, scheduler, worker claim, or execution lease.
 
+### Human Window labels
+
+`POST /api/runtime-console/window-label` accepts `{ "client_window_key": string,
+"label": string | null }` and returns the same shape with the stored value. It
+requires `runtime:read` and `session:collaborate`. The owner is resolved by the
+same freshly authorized exact inventory read that projects the label: the
+principal of the newest historical activity cell visible to the caller. A saved
+name is therefore always the name that caller's board and detail display.
+Collaboration's latest-recipient rule is deliberately not reused: a newest
+projectless event can be invisible to a non-admin operator while an older
+Project cell still shows the Window, and an in-flight request may belong to a
+different cell. Administrator writes belong to that owner, not the administrator.
+Principal-scoped credentials cannot rename another principal's Window. The stored
+key includes principal kind, principal ID and Window key, including for legacy
+ChatGPT Window keys that do not themselves include principal scope.
+
+A label is an operator display annotation, never identity, authority, Session
+selection or Peer routing. It appears only in Runtime Console label writes and inventory/detail;
+it is excluded from liveness, tool results, Peer awareness, MCP/Work Result App
+responses, telemetry and log bodies. Reads retain the existing Project/principal
+visibility rules. Inventory search can match the label of the latest visible
+historical recipient cell. Live-only Windows have no historical label projection.
+
+Names are trimmed, limited to 80 Unicode characters and reject remaining control
+characters. Empty strings or null clear the name. Unknown fields are rejected;
+invalid input returns 400, missing collaboration scope 403, unknown/invisible
+Windows 404, and a visible Window with only live, not yet recorded activity 409. Repeating a value preserves its update timestamp. When retained
+history is deleted, repair of each affected Window removes labels only for
+principals with no remaining cell on that Window. Other principals' labels remain.
+
 ## Provenance is metadata, not authority
 
 A completed answer can identify the independent worker with `author_session_id` only when the completion carries an already-authorized explicit recorder; without that recorder, no author Session is inferred from caller auth, client window, or other ambient state. It is not a caller-authored claim. In Stateless MCP 2026, that recorder is `_wc.record`: explicit invocation provenance metadata, not a transport Session and not an authority grant; the legacy `mcp-session-id` header remains irrelevant.
@@ -297,7 +346,7 @@ Long-lived Agent communication now belongs to the separate durable Agent domain:
 Durable Agent / Conversation
   Message -> recipient Delivery -> Wake opportunity
             |
-            | explicit accept/create work (planned)
+            | explicit create_agent_task
             v
 Agent Task -> exact fenced TaskAttempt
             |
@@ -313,12 +362,13 @@ These arrows are correlations, not authority inheritance. Conversation membershi
 Message authorship, Delivery state, Wake state, Session todo state, and object
 references never grant Project or execution authority.
 
-A Workflow Session todo and future Agent Task are deliberately different. The todo
-is a bounded explicit assignment inside one Session collaboration ledger. An Agent
-Task will represent asynchronous work that survives model/window turns and owns
-independent TaskAttempt/lease/fencing state. Do not silently convert historical or
-current Session todos into Agent Tasks, and do not use `assignment_fence` as an
-Agent Task execution lease.
+A Workflow Session todo and an Agent Task are deliberately different. The todo
+is a bounded explicit assignment inside one Session collaboration ledger. The
+implemented Agent Task owns durable work and independent TaskAttempt/lease/fencing
+state across model/window turns. Task creation and Attempt execution require
+explicit authorized operations; consuming a Message or Wake does not create or
+accept work. Do not silently convert historical or current Session todos into
+Agent Tasks, and do not use `assignment_fence` as an Agent Task execution lease.
 
 The standing naming and boundary rules for Agent Tasks are in [`../architecture/durable-agent-runtime.md`](../architecture/durable-agent-runtime.md). Ordinary coding continuity remains the Workflow Session/Job model and is not an Agent Task lease.
 

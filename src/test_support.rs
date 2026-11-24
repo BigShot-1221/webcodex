@@ -8,6 +8,21 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Bind a manually seeded Session fixture to the Project root already
+/// registered by its Runner. This models the real Session creation boundary;
+/// an unknown Project stays unbound rather than guessing an identity.
+pub(crate) async fn registered_session_project_identity(
+    runtime: &crate::tool_runtime::ToolRuntime,
+    project: &str,
+    auth: Option<&crate::auth::AuthContext>,
+) -> Option<webcodex_workflow_session::SessionProjectIdentity> {
+    let resolved = runtime
+        .resolve_project_input_for_auth(project, auth)
+        .await
+        .ok()?;
+    crate::tool_runtime::ToolRuntime::session_project_identity_from_resolved(&resolved)
+}
+
 /// Create a test temp directory on the Cargo build filesystem.
 ///
 /// Some hardened hosts mount the system temp directory with `noexec`. Tests
@@ -182,6 +197,7 @@ pub(crate) fn runner_registration(
 ) -> crate::runner_protocol::RunnerRegisterRequest {
     crate::runner_protocol::RunnerRegisterRequest {
         computer_session_availability: None,
+        computer_control_epoch: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -372,6 +388,7 @@ fn seed_oauth_client_record(
     let record = crate::models::OAuthClientRecord {
         id: uuid::Uuid::new_v4().to_string(),
         client_id: crate::auth::generate_oauth_client_id(),
+        dynamic_registration: None,
         client_secret_hash: crate::auth::hash_token(&plaintext_secret),
         name: name.to_string(),
         owner_user_id: Some(user.id.clone()),
@@ -410,4 +427,31 @@ pub(crate) fn seed_oauth_client_named(
     name: &str,
 ) -> (crate::models::OAuthClientRecord, String) {
     seed_oauth_client_record(db, user, name, "runtime:read project:read")
+}
+
+pub(crate) fn seed_user_token_with_scopes(
+    db: &crate::Database,
+    user: &crate::models::UserRecord,
+    scopes: &str,
+) -> String {
+    use crate::auth::{generate_api_token, hash_token, token_prefix};
+    use crate::models::{ApiKeyRecord, TOKEN_KIND_USER};
+    let plaintext = generate_api_token();
+    let hash = hash_token(&plaintext);
+    let now = chrono::Utc::now().timestamp();
+    let record = ApiKeyRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        user_id: user.id.clone(),
+        name: "authorize-user-token".to_string(),
+        key_prefix: token_prefix(&plaintext),
+        created_at: now,
+        last_used_at: None,
+        revoked_at: None,
+        scopes: scopes.to_string(),
+        expires_at: None,
+        kind: TOKEN_KIND_USER.to_string(),
+        allowed_client_id: None,
+    };
+    db.insert_api_key(&record, &hash).unwrap();
+    plaintext
 }

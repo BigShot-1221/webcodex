@@ -1,13 +1,13 @@
-use crate::{
-    continuation_feedback_value, validation_delta_value, CodingSessionRequest,
-    ContinuationFeedbackInput, ContinuationProjectionHooks, ContinuationToolFailureSnapshot,
-    ContinuationValidationSnapshot, ListSessionMessagesFilter, PostSessionMessageInput,
-    SessionDiscussionCounts, SessionDiscussionSummary, SessionGuards, SessionMessageKind,
-    SessionMessagePriority, SessionPathHint, SessionStore, SessionToolContract, SessionTransport,
-    ToolCallRecorderMetadata, TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT,
-};
 use crate::continuation::retained_history_has_unclosed_mutating_tool_calls;
 use crate::task_context::RECONCILE_ACTION;
+use crate::{
+    continuation_feedback_value, validation_delta_value, CodingSessionRequest,
+    ContinuationFeedbackInput, ContinuationJobSnapshot, ContinuationProjectionHooks,
+    ContinuationToolFailureSnapshot, ContinuationValidationSnapshot, ListSessionMessagesFilter,
+    PostSessionMessageInput, SessionDiscussionCounts, SessionDiscussionSummary, SessionGuards,
+    SessionMessageKind, SessionMessagePriority, SessionPathHint, SessionStore, SessionToolContract,
+    SessionTransport, ToolCallRecorderMetadata, TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT,
+};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use webcodex_core::workflow_session_contract::SessionMode;
@@ -178,7 +178,7 @@ fn feedback_for(store: &SessionStore, session_id: &str) -> Value {
     continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: &summary,
         validation: &validation,
-        jobs: &jobs,
+        jobs: ContinuationJobSnapshot::from_json(&jobs),
         discussion: &discussion,
         continuation: "continued",
         suggest_exploration_continuity: true,
@@ -199,7 +199,7 @@ fn feedback_with_jobs(store: &SessionStore, session_id: &str, jobs: &Value) -> V
     continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: &summary,
         validation: &validation,
-        jobs,
+        jobs: ContinuationJobSnapshot::from_json(jobs),
         discussion: &discussion,
         continuation: "continued",
         suggest_exploration_continuity: true,
@@ -233,6 +233,473 @@ fn validation_event(
 
 fn validation_summary(events: Vec<Value>) -> Value {
     json!({"events": events})
+}
+
+#[tokio::test]
+async fn unfinished_mutation_survives_sqlite_reload_and_new_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.json");
+    let initial = SessionStore::with_persistence(&path, 16, 200);
+    let session = create_session(&initial, "uncertain write");
+    add_instruction(&initial, &session, "first attempt");
+    let pending = initial.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/pending.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    initial.flush().await.unwrap();
+    drop(initial);
+
+    let restored = SessionStore::with_persistence(&path, 16, 200);
+    add_instruction(&restored, &session, "continue after disconnect");
+    let feedback = feedback_for(&restored, &session);
+    assert_eq!(feedback["attempt"]["activity"]["meaningful_tool_calls"], 0);
+    assert_eq!(feedback["attempt"]["outcome"]["status"], "blocked");
+    assert!(feedback["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+    assert!(feedback["attempt"]["suggested_next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item.as_str().is_some_and(|text| text.contains("reconcile"))));
+
+    restored.record_tool_call_finished(pending, true, &json!({"applied": true}), None, None);
+    let confirmed = feedback_for(&restored, &session);
+    assert!(!confirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+}
+
+#[test]
+fn unfinished_mutation_without_explicit_project_still_blocks_continuation() {
+    let store = store(200);
+    let session = create_session(&store, "implicit project");
+    add_instruction(&store, &session, "write using session project");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"paths": ["src/implicit.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let unconfirmed = feedback_for(&store, &session);
+    assert_eq!(unconfirmed["attempt"]["outcome"]["status"], "blocked");
+    assert!(unconfirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+#[test]
+fn unfinished_mutation_on_different_project_still_blocks_owning_session() {
+    let store = store(200);
+    let session = create_session(&store, "other project");
+    add_instruction(&store, &session, "record external project invocation");
+    let started = store.record_tool_call_started_with_metadata(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": "other-project", "paths": ["src/other.rs"]}),
+        Some("other-project".into()),
+        ToolCallRecorderMetadata::default(),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let unconfirmed = feedback_for(&store, &session);
+    assert_eq!(unconfirmed["attempt"]["outcome"]["status"], "blocked");
+    assert!(unconfirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+/// Reused or corrupted invocation identities cannot let one finish certify
+/// multiple write-like starts, even when their exact identity collides.
+#[test]
+fn duplicate_mutating_starts_with_one_finish_remain_unconfirmed() {
+    let store = store(20);
+    let session = create_session(&store, "duplicate mutating identity");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/a.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    let summary = store.summary(&session, Some(20)).unwrap();
+    let start = summary
+        .events
+        .iter()
+        .find(|e| e.kind == "tool_call_started")
+        .unwrap()
+        .clone();
+    let finish = summary
+        .events
+        .iter()
+        .find(|e| e.kind == "tool_call_finished")
+        .unwrap()
+        .clone();
+    let duplicate_history = [start.clone(), start, finish];
+    assert!(
+        crate::continuation::retained_history_has_unclosed_mutating_tool_calls(
+            duplicate_history.iter(),
+            &session
+        )
+    );
+}
+
+/// The unclosed-call check must run over the full retained history, not only
+/// the bounded summary window: an unfinished mutation pushed past the
+/// model-facing tail by later completed calls still blocks a resume.
+#[test]
+fn unfinished_mutation_beyond_summary_window_still_blocks_continuation() {
+    let store = store(600);
+    let session = create_session(&store, "old unfinished write");
+    add_instruction(&store, &session, "attempt");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/old.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let started_event_id = started.as_ref().unwrap().event_id.clone();
+    // Completed reads push the mutation start past the 200-event summary
+    // window while the store still retains it.
+    for index in 0..220 {
+        record_read(
+            &store,
+            &session,
+            &format!("filler-{index}.rs"),
+            json!({"ok": true}),
+        );
+    }
+    let summary = store.summary(&session, Some(200)).unwrap();
+    assert!(summary.events_truncated, "window must be exceeded");
+    assert!(!summary.retention_truncated, "start must still be retained");
+    assert!(
+        !summary
+            .events
+            .iter()
+            .any(|event| event.event_id == started_event_id),
+        "start must be outside the returned window"
+    );
+
+    let unconfirmed = feedback_for(&store, &session);
+    assert_eq!(unconfirmed["attempt"]["outcome"]["status"], "blocked");
+    assert!(unconfirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+
+    // Confirming the old mutation clears the block.
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+/// A finished mutation beyond the window must not keep the attempt blocked;
+/// only genuinely unfinished ones do.
+#[test]
+fn finished_mutation_beyond_summary_window_does_not_block_continuation() {
+    let store = store(600);
+    let session = create_session(&store, "old finished write");
+    add_instruction(&store, &session, "attempt");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/old.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    for index in 0..220 {
+        record_read(
+            &store,
+            &session,
+            &format!("filler-{index}.rs"),
+            json!({"ok": true}),
+        );
+    }
+    let confirmed = feedback_for(&store, &session);
+    assert!(!confirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+}
+
+/// Two mutations beyond the window: finishing one must not confirm the other.
+#[test]
+fn unfinished_mutation_beyond_window_is_not_confirmed_by_sibling_finish() {
+    let store = store(600);
+    let session = create_session(&store, "sibling writes");
+    add_instruction(&store, &session, "attempt");
+    let first = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/first.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let second = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/second.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(second, true, &json!({"applied": true}), None, None);
+    for index in 0..220 {
+        record_read(
+            &store,
+            &session,
+            &format!("filler-{index}.rs"),
+            json!({"ok": true}),
+        );
+    }
+    let unconfirmed = feedback_for(&store, &session);
+    assert_eq!(unconfirmed["attempt"]["outcome"]["status"], "blocked");
+    assert!(unconfirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+    store.record_tool_call_finished(first, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+#[test]
+fn unfinished_shell_call_without_explicit_project_is_unconfirmed() {
+    let store = store(200);
+    let session = create_session(&store, "implicit shell");
+    add_instruction(&store, &session, "run shell in default project");
+    let mut contract = synthetic_contract(false, false, SessionPathHint::None);
+    contract.shell_like = true;
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_shell",
+        &json!({"command": "echo test"}),
+        contract,
+    );
+    assert!(
+        feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+    store.record_tool_call_finished(started, true, &json!({"exit_code": 0}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+#[test]
+fn unfinished_mutation_in_unbound_session_does_not_disappear() {
+    let store = store(200);
+    let session = store
+        .start_session(None, Some("unbound session".to_string()))
+        .session_id;
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/unbound.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    assert!(
+        feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+#[test]
+fn unfinished_mutation_requires_exact_call_and_logical_invocation_identity() {
+    let store = store(200);
+    let session = create_session(&store, "exact invocation");
+    add_instruction(&store, &session, "mutate");
+    let args = json!({"project": PROJECT, "paths": ["src/identity.rs"]});
+    let mut metadata = ToolCallRecorderMetadata::default();
+    metadata.assign_logical_invocation();
+    let start = store.record_tool_call_started_with_metadata(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &args,
+        Some(PROJECT.to_string()),
+        metadata,
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let mut wrong_role = start.clone().unwrap();
+    wrong_role.logical_invocation_role = Some("business".to_string());
+    store.record_tool_call_finished(
+        Some(wrong_role),
+        true,
+        &json!({"applied": true}),
+        None,
+        None,
+    );
+    assert!(
+        feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+
+    let mut wrong_call = start.clone().unwrap();
+    wrong_call.call_id.push_str("_different");
+    store.record_tool_call_finished(
+        Some(wrong_call),
+        true,
+        &json!({"applied": true}),
+        None,
+        None,
+    );
+    assert!(
+        feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+
+    let mut wrong_project = start.clone().unwrap();
+    wrong_project.resolved_project = Some("different-project".to_string());
+    store.record_tool_call_finished(
+        Some(wrong_project),
+        true,
+        &json!({"applied": true}),
+        None,
+        None,
+    );
+    assert!(
+        feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+
+    store.record_tool_call_finished(start, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+#[test]
+fn interrupted_read_only_call_does_not_block_continuation() {
+    let store = store(200);
+    let session = create_session(&store, "read-only");
+    add_instruction(&store, &session, "inspect");
+    store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "read_files",
+        &json!({"project": PROJECT, "items": [{"path": "src/lib.rs"}]}),
+        synthetic_contract(true, false, SessionPathHint::None),
+    );
+    let feedback = feedback_for(&store, &session);
+    assert!(!feedback["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+    assert_ne!(feedback["attempt"]["outcome"]["status"], "blocked");
+}
+
+#[test]
+fn accepted_job_with_matching_tool_finish_uses_job_lifecycle_not_unknown_effect() {
+    let store = store(200);
+    let session = create_session(&store, "accepted job");
+    add_instruction(&store, &session, "run a job");
+    let start = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/job.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({
+            "promoted_to_job": true, "job_id": "wc_job_Accepted123",
+            "job_status": "running", "execution_state": "running",
+        }),
+        None,
+        None,
+    );
+    let feedback = feedback_with_jobs(
+        &store,
+        &session,
+        &json!({"active_count":1, "running_count":1, "recovering_count":0,
+            "terminal_pending_count":0, "truncated":false,
+            "recent":[{"status":"running", "job_id":"wc_job_Accepted123"}]}),
+    );
+    assert!(!feedback["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+    assert_eq!(feedback["attempt"]["jobs"]["recovery_state"], "active");
+}
+
+#[test]
+fn incomplete_event_tail_is_not_evidence_of_no_prior_mutation() {
+    let store = store(20);
+    let session = create_session(&store, "historical evidence");
+    add_instruction(&store, &session, "work");
+    for index in 0..30 {
+        record_write(&store, &session, &[&format!("src/{index}.rs")]);
+    }
+    assert!(store.summary(&session, Some(200)).unwrap().events_truncated);
+    let feedback = feedback_for(&store, &session);
+    assert!(feedback["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("mutating_call_history_incomplete")));
+    assert!(!feedback["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
 }
 
 #[test]
@@ -301,7 +768,7 @@ fn attempt_without_task_instruction_falls_back_to_session_start() {
 }
 
 #[test]
-fn evicted_task_instruction_reports_unavailable_boundary_not_session_start() {
+fn instruction_survives_outside_activity_window_without_claiming_complete_history() {
     let store = store(20);
     let session = create_session(&store, "evicted instruction");
     add_instruction(&store, &session, "do the work");
@@ -311,10 +778,13 @@ fn evicted_task_instruction_reports_unavailable_boundary_not_session_start() {
     record_read(&store, &session, "src/retained-tail.rs", json!({}));
     assert!(store.summary(&session, Some(200)).unwrap().events_truncated);
     let feedback = feedback_for(&store, &session);
-    assert_eq!(feedback["attempt"]["boundary"]["source"], "unavailable");
+    assert_eq!(
+        feedback["attempt"]["boundary"]["source"],
+        "task_instruction"
+    );
     assert_eq!(
         feedback["attempt"]["boundary"]["reason_code"],
-        "attempt_boundary_evicted"
+        "attempt_history_outside_window"
     );
     assert_eq!(feedback["attempt"]["event_range"]["complete"], false);
     assert_eq!(
@@ -1003,7 +1473,10 @@ fn unclosed_mutating_tool_call_blocks_continuation() {
     assert_eq!(stall["status"], "reconcile_required");
     assert_eq!(stall["reason_code"], "unconfirmed_tool_execution");
     assert_eq!(stall["recommendation"], RECONCILE_ACTION);
-    assert_eq!(feedback["attempt"]["suggested_next_actions"][0], RECONCILE_ACTION);
+    assert_eq!(
+        feedback["attempt"]["suggested_next_actions"][0],
+        RECONCILE_ACTION
+    );
 }
 
 #[test]
@@ -1082,7 +1555,9 @@ fn restored_session_with_unclosed_mutating_call_stays_restored_and_blocked() {
 
 #[test]
 fn unclosed_mutating_before_summary_tail_still_blocks_resume() {
-    let store = store(200);
+    let temporary = tempfile::tempdir().unwrap();
+    let ledger = temporary.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 10, 20);
     let session = create_session(&store, "unclosed head");
     let mut metadata = ToolCallRecorderMetadata::default();
     metadata.assign_logical_invocation();
@@ -1101,7 +1576,21 @@ fn unclosed_mutating_before_summary_tail_still_blocks_resume() {
     let summary = store.summary(&session, Some(5)).unwrap();
     assert!(summary.events_truncated);
     assert!(summary.retained_unclosed_mutating_tool_call);
-    assert_eq!(feedback_for(&store, &session)["attempt"]["outcome"]["status"], "blocked");
+    assert_eq!(
+        feedback_for(&store, &session)["attempt"]["outcome"]["status"],
+        "blocked"
+    );
+    store.flush_persistence();
+    assert!(store.status().last_persist_error.is_none());
+    drop(store);
+    let restored = SessionStore::with_persistence(&ledger, 10, 20);
+    let summary = restored.summary(&session, Some(5)).unwrap();
+    assert!(!summary.retention_truncated);
+    assert!(summary.retained_unclosed_mutating_tool_call);
+    assert_eq!(
+        feedback_for(&restored, &session)["attempt"]["outcome"]["status"],
+        "blocked"
+    );
 }
 
 #[test]
@@ -1223,8 +1712,12 @@ fn retention_truncated_without_unclosed_adds_history_incomplete_not_blocked() {
     let reasons = feedback["attempt"]["outcome"]["reason_codes"]
         .as_array()
         .unwrap();
-    assert!(reasons.iter().any(|code| code == "mutating_call_history_incomplete"));
-    assert!(!reasons.iter().any(|code| code == "unconfirmed_tool_execution"));
+    assert!(reasons
+        .iter()
+        .any(|code| code == "mutating_call_history_incomplete"));
+    assert!(!reasons
+        .iter()
+        .any(|code| code == "unconfirmed_tool_execution"));
     assert!(feedback["attempt"]["suggested_next_actions"]
         .as_array()
         .unwrap()
@@ -1262,7 +1755,9 @@ fn unclosed_mutating_outcome_keeps_other_reason_codes() {
         .as_array()
         .unwrap()
         .clone();
-    assert!(reasons.iter().any(|code| code == "unconfirmed_tool_execution"));
+    assert!(reasons
+        .iter()
+        .any(|code| code == "unconfirmed_tool_execution"));
     assert!(reasons.iter().any(|code| code == "open_guidance"));
     assert!(reasons.iter().any(|code| code == "validation_not_run"));
 }

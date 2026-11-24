@@ -412,16 +412,11 @@ pub(super) fn normalize_update(message: &Value) -> Option<CodingAgentEvent> {
     }
 }
 
-pub(super) fn permission_event(params: &Value) -> CodingAgentEvent {
-    let label = params
-        .pointer("/toolCall/title")
-        .and_then(Value::as_str)
-        .map(bounded_text);
-    let count = params
-        .get("options")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
+pub(super) fn permission_event(
+    pending: &webcodex_core::coding_agent::CodingAgentPendingPermission,
+) -> CodingAgentEvent {
+    let label = Some(pending.title.clone());
+    let count = pending.options.len();
     CodingAgentEvent {
         sequence: 0,
         kind: CodingAgentEventKind::PermissionRequest,

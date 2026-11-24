@@ -344,7 +344,7 @@ impl Database {
             .spawn(move || {
                 let _owner_lease = instance_owner;
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    backup_worker(db, options, worker_control.clone())
+                    backup_worker(db.state_path(), options, worker_control.clone())
                 }))
                 .unwrap_or_else(|_| {
                     let detail = bounded_error("backup worker panicked".to_string());
@@ -361,6 +361,28 @@ impl Database {
             join_handle: Some(join_handle),
         })
     }
+}
+
+/// Offline maintenance already owns the instance lock and holds an IMMEDIATE
+/// source transaction (no writes yet). Reuse the canonical bounded SQLite
+/// backup, verification and hardened artifact publication path without opening
+/// or upgrading the general Store before its rollback snapshot exists.
+pub(crate) fn create_offline_migration_backup(
+    owner: &ServerInstanceGuard,
+) -> anyhow::Result<BackupArtifact> {
+    let options = BackupOptions::default();
+    validate_backup_options(&options)?;
+    let control = BackupControl {
+        cancel: Arc::new(AtomicBool::new(false)),
+        status: Arc::new(Mutex::new(BackupStatusSnapshot {
+            phase: BackupPhase::Queued,
+            pagecount: None,
+            remaining: None,
+            error_kind: None,
+            error_detail: None,
+        })),
+    };
+    backup_worker(owner.database_path(), options, control).into_result()
 }
 
 fn validate_backup_options(options: &BackupOptions) -> anyhow::Result<()> {
@@ -424,7 +446,9 @@ fn backup_worker_fail(
     let mut detail = bounded_error(detail);
     if let Some(guard) = partial_guard.as_mut() {
         if let Some(path) = guard.path() {
-            if let Err(cleanup_detail) = remove_partial_db_and_sidecars_result(path, &guard.created_file) {
+            if let Err(cleanup_detail) =
+                remove_partial_db_and_sidecars_result(path, &guard.created_file)
+            {
                 detail = merge_cleanup_into_detail(detail, cleanup_detail);
             }
         }
@@ -440,7 +464,7 @@ fn backup_worker_fail(
 }
 
 fn backup_worker(
-    db: Arc<Database>,
+    state_path: &Path,
     options: BackupOptions,
     control: BackupControl,
 ) -> BackupWorkerOutcome {
@@ -467,7 +491,7 @@ fn backup_worker(
 
     update_phase(&control, BackupPhase::AcquiringLock, None, None);
 
-    let backup_dir = match ensure_hardened_backup_dir(&db) {
+    let backup_dir = match ensure_hardened_backup_dir(state_path) {
         Ok(dir) => dir,
         Err(error) => {
             return backup_worker_fail(
@@ -573,15 +597,21 @@ fn backup_worker(
 
     let created_file = match open_new_partial_backup_file(&partial) {
         Ok(file) => file,
-        Err(error) => return backup_worker_fail(
-            &control,
-            BackupErrorKind::Io,
-            format!("create partial backup file: {error}"),
-            &mut partial_guard,
-        ),
+        Err(error) => {
+            return backup_worker_fail(
+                &control,
+                BackupErrorKind::Io,
+                format!("create partial backup file: {error}"),
+                &mut partial_guard,
+            )
+        }
     };
 
-    partial_guard = Some(PartialCleanupGuard::new(&control, partial.clone(), created_file));
+    partial_guard = Some(PartialCleanupGuard::new(
+        &control,
+        partial.clone(),
+        created_file,
+    ));
 
     if let Err(error) = sync_new_partial_and_parent(&partial) {
         return backup_worker_fail(
@@ -592,7 +622,7 @@ fn backup_worker(
         );
     }
 
-    let source = match open_backup_source(db.state_path()) {
+    let source = match open_backup_source(state_path) {
         Ok(conn) => conn,
         Err(error) => {
             return backup_worker_fail(
@@ -619,14 +649,8 @@ fn backup_worker(
 
     update_phase(&control, BackupPhase::Copying, None, None);
 
-    match run_backup_copy(
-        &control,
-        &source,
-        &mut destination,
-        &options,
-        deadline,
-    ).map(drop) {
-        Ok(()) => {},
+    match run_backup_copy(&control, &source, &mut destination, &options, deadline).map(drop) {
+        Ok(()) => {}
         Err(kind) => {
             let detail = match kind {
                 BackupErrorKind::Cancelled => "backup cancelled during copy",
@@ -747,7 +771,10 @@ fn backup_worker(
     let publication = publish_partial_hard_link(
         &partial,
         &final_name,
-        &partial_guard.as_ref().expect("created partial owner before publication").created_file,
+        &partial_guard
+            .as_ref()
+            .expect("created partial owner before publication")
+            .created_file,
     );
     match publication {
         Ok((artifact, cleanup_warning)) => {
@@ -826,7 +853,11 @@ fn run_backup_copy<'source, 'destination>(
 
 fn next_busy_backoff(current: Duration, cap: Duration) -> Duration {
     let doubled = current.saturating_mul(2);
-    if doubled > cap { cap } else { doubled }
+    if doubled > cap {
+        cap
+    } else {
+        doubled
+    }
 }
 
 fn backup_progress_counts(progress: &rusqlite::backup::Progress) -> (Option<u32>, Option<u32>) {
@@ -842,9 +873,8 @@ fn open_backup_source(state_path: &Path) -> anyhow::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .context("open backup source")?;
-    connection.execute_batch(
-        "PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;",
-    )?;
+    connection
+        .execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;")?;
     Ok(connection)
 }
 
@@ -909,10 +939,15 @@ fn open_nofollow_regular_file(path: &Path, write: bool) -> anyhow::Result<File> 
     let mut options = OpenOptions::new();
     options.read(true).write(write);
     set_nofollow_options(&mut options)?;
-    let file = options.open(path).with_context(|| format!("open backup file {}", path.display()))?;
+    let file = options
+        .open(path)
+        .with_context(|| format!("open backup file {}", path.display()))?;
     let meta = file.metadata().context("stat opened backup file")?;
     if !meta.is_file() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
-        anyhow::bail!("backup file is not a regular no-follow file: {}", path.display());
+        anyhow::bail!(
+            "backup file is not a regular no-follow file: {}",
+            path.display()
+        );
     }
     Ok(file)
 }
@@ -926,35 +961,39 @@ fn same_open_file_object(left: &File, right: &File) -> anyhow::Result<bool> {
 }
 
 fn ensure_open_file_matches_path(file: &File, path: &Path) -> anyhow::Result<()> {
-    let meta = file.metadata().context("stat retained backup file handle")?;
+    let meta = file
+        .metadata()
+        .context("stat retained backup file handle")?;
     if !meta.is_file() || meta.file_type().is_symlink() || is_reparse_point(&meta) {
         anyhow::bail!("retained backup handle is not a regular no-follow file");
     }
     let current = open_nofollow_regular_file(path, false)?;
     if !same_open_file_object(file, &current)? {
-        anyhow::bail!("backup path no longer names retained file object: {}", path.display());
+        anyhow::bail!(
+            "backup path no longer names retained file object: {}",
+            path.display()
+        );
     }
     Ok(())
 }
 
-fn ensure_hardened_backup_dir(db: &Database) -> anyhow::Result<PathBuf> {
-    let data_dir = data_directory(db)?;
+fn ensure_hardened_backup_dir(state_path: &Path) -> anyhow::Result<PathBuf> {
+    let data_dir = data_directory(state_path)?;
     let backup_dir = data_dir.join(BACKUP_DIR_NAME);
     match fs::symlink_metadata(&backup_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             create_hardened_backup_dir(&backup_dir)?;
         }
         Err(error) => {
-            return Err(error).with_context(|| {
-                format!("stat backup directory {}", backup_dir.display())
-            });
+            return Err(error)
+                .with_context(|| format!("stat backup directory {}", backup_dir.display()));
         }
         Ok(meta) => {
             validate_backup_dir_metadata(&meta)?;
             enforce_hardened_backup_dir_permissions(&backup_dir, &meta)?;
         }
     }
-    canonical_dir_under_data_root(&backup_dir, db.state_path())
+    canonical_dir_under_data_root(&backup_dir, state_path)
 }
 
 fn create_hardened_backup_dir(backup_dir: &Path) -> anyhow::Result<()> {
@@ -968,15 +1007,14 @@ fn create_hardened_backup_dir(backup_dir: &Path) -> anyhow::Result<()> {
     match builder.create(backup_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let meta = fs::symlink_metadata(backup_dir).with_context(|| {
-                format!("stat backup directory {}", backup_dir.display())
-            })?;
+            let meta = fs::symlink_metadata(backup_dir)
+                .with_context(|| format!("stat backup directory {}", backup_dir.display()))?;
             validate_backup_dir_metadata(&meta)?;
             enforce_hardened_backup_dir_permissions(backup_dir, &meta)
         }
-        Err(error) => Err(error).with_context(|| {
-            format!("create backup directory {}", backup_dir.display())
-        }),
+        Err(error) => {
+            Err(error).with_context(|| format!("create backup directory {}", backup_dir.display()))
+        }
     }
 }
 
@@ -1068,18 +1106,14 @@ fn append_bounded_cleanup_note(primary: &mut String, cleanup: String) {
     *primary = bounded_error(combined);
 }
 
-fn data_directory(db: &Database) -> anyhow::Result<PathBuf> {
-    let parent = db
-        .state_path()
+fn data_directory(state_path: &Path) -> anyhow::Result<PathBuf> {
+    let parent = state_path
         .parent()
         .context("database state path has no parent directory")?;
     fs::canonicalize(parent).context("canonicalize data directory")
 }
 
-fn canonical_dir_under_data_root(
-    backup_dir: &Path,
-    state_path: &Path,
-) -> anyhow::Result<PathBuf> {
+fn canonical_dir_under_data_root(backup_dir: &Path, state_path: &Path) -> anyhow::Result<PathBuf> {
     let data_dir = state_path
         .parent()
         .and_then(|parent| fs::canonicalize(parent).ok())
@@ -1114,8 +1148,7 @@ fn validate_lock_target(lock_path: &Path, backup_dir: &Path) -> anyhow::Result<(
     let meta = match fs::symlink_metadata(lock_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("stat backup lock {}", lock_path.display()));
+            return Err(error).with_context(|| format!("stat backup lock {}", lock_path.display()));
         }
         Ok(meta) => meta,
     };
@@ -1167,8 +1200,7 @@ fn is_module_partial_file_name(name: &str) -> bool {
     let Some(uuid_str) = body.strip_suffix(PARTIAL_NAME_SUFFIX) else {
         return false;
     };
-    Uuid::parse_str(uuid_str)
-        .is_ok_and(|operation_id| operation_id.to_string() == uuid_str)
+    Uuid::parse_str(uuid_str).is_ok_and(|operation_id| operation_id.to_string() == uuid_str)
 }
 
 fn cleanup_stale_module_partials(
@@ -1203,9 +1235,8 @@ fn cleanup_stale_module_partials(
         if file_type.is_symlink() {
             continue;
         }
-        let meta = fs::symlink_metadata(entry.path()).with_context(|| {
-            format!("stat partial backup {}", entry.path().display())
-        })?;
+        let meta = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("stat partial backup {}", entry.path().display()))?;
         if is_reparse_point(&meta) {
             continue;
         }
@@ -1214,7 +1245,8 @@ fn cleanup_stale_module_partials(
         }
         let candidate = open_nofollow_regular_file(&entry.path(), false)?;
         ensure_open_file_matches_path(&candidate, &entry.path())?;
-        remove_partial_db_and_sidecars_result(&entry.path(), &candidate).map_err(anyhow::Error::msg)?;
+        remove_partial_db_and_sidecars_result(&entry.path(), &candidate)
+            .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -1322,7 +1354,18 @@ fn validate_closed_partial_candidate(
         }
 
         crate::schema::validate_shared_database_backup_schema(&connection).map_err(|error| {
-            if let Some(sqlite) = error.downcast_ref::<rusqlite::Error>() {
+            // The shared Session detector reports io::Error while retaining
+            // the original SQLite error. Keep BUSY/cancellation/deadline
+            // classification identical to the other Store schema validators.
+            let sqlite = error.chain().find_map(|cause| {
+                cause.downcast_ref::<rusqlite::Error>().or_else(|| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                        .and_then(|inner| inner.downcast_ref::<rusqlite::Error>())
+                })
+            });
+            if let Some(sqlite) = sqlite {
                 return classification_for_sqlite(control, deadline, sqlite);
             }
             BackupErrorKind::Validation
@@ -1402,7 +1445,10 @@ fn publish_partial_hard_link(
     partial_file: &File,
 ) -> Result<(BackupArtifact, Option<String>), (BackupErrorKind, String)> {
     ensure_open_file_matches_path(partial_file, partial).map_err(|error| {
-        (BackupErrorKind::Publish, format!("verify partial before publish: {error}"))
+        (
+            BackupErrorKind::Publish,
+            format!("verify partial before publish: {error}"),
+        )
     })?;
     match fs::hard_link(partial, final_path) {
         Ok(()) => {}
@@ -1421,7 +1467,10 @@ fn publish_partial_hard_link(
     }
 
     let final_file = open_nofollow_regular_file(final_path, true).map_err(|error| {
-        (BackupErrorKind::Publish, format!("open published identity; names preserved: {error}"))
+        (
+            BackupErrorKind::Publish,
+            format!("open published identity; names preserved: {error}"),
+        )
     })?;
     let identities_match = same_open_file_object(partial_file, &final_file).and_then(|same| {
         if !same {
@@ -1431,12 +1480,18 @@ fn publish_partial_hard_link(
         ensure_open_file_matches_path(&final_file, final_path)
     });
     identities_match.map_err(|error| {
-        (BackupErrorKind::Publish, format!("published identity uncertain; names preserved: {error}"))
+        (
+            BackupErrorKind::Publish,
+            format!("published identity uncertain; names preserved: {error}"),
+        )
     })?;
     sync_published_artifact(&final_file, final_path).map_err(|error| {
         (
             BackupErrorKind::Io,
-            format!("publication durability unconfirmed; names preserved at {}: {error}", final_path.display()),
+            format!(
+                "publication durability unconfirmed; names preserved at {}: {error}",
+                final_path.display()
+            ),
         )
     })?;
 
@@ -1463,7 +1518,10 @@ fn sync_published_artifact(file: &File, final_path: &Path) -> anyhow::Result<()>
     sync_parent_directory(final_path)
 }
 
-fn remove_partial_db_and_sidecars_result(partial: &Path, expected_file: &File) -> Result<(), String> {
+fn remove_partial_db_and_sidecars_result(
+    partial: &Path,
+    expected_file: &File,
+) -> Result<(), String> {
     ensure_open_file_matches_path(expected_file, partial)
         .map_err(|error| bounded_error(format!("verify partial cleanup ownership: {error}")))?;
     // Keep the main partial as the stale scanner's retry anchor until every
@@ -1565,14 +1623,16 @@ fn set_failure(control: &BackupControl, kind: BackupErrorKind, detail: String) {
             guard.error_detail = Some(detail);
         }
         if guard.error_kind.is_none() {
-            guard.error_kind = Some(if guard.phase == BackupPhase::Cancelled
-                || kind == BackupErrorKind::Cancelled
-                || cancellation_requested(control)
-            {
-                BackupErrorKind::Cancelled
-            } else {
-                kind
-            });
+            guard.error_kind = Some(
+                if guard.phase == BackupPhase::Cancelled
+                    || kind == BackupErrorKind::Cancelled
+                    || cancellation_requested(control)
+                {
+                    BackupErrorKind::Cancelled
+                } else {
+                    kind
+                },
+            );
         }
         return;
     }

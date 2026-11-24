@@ -157,15 +157,13 @@ fn pre_barrier_restart_is_not_started_and_child_tree_is_reaped() {
     let root = temp.path().join("repo");
     let manager = CodingAgentManager::with_store(&cfg, temp.path().join("store")).unwrap();
     let run = "wc_agent_run_reaptree0001";
-    assert!(
-        manager
-            .handle(
-                start_request(&manager, &root, run, BTreeMap::new()),
-                &projects
-            )
-            .error
-            .is_none()
-    );
+    assert!(manager
+        .handle(
+            start_request(&manager, &root, run, BTreeMap::new()),
+            &projects
+        )
+        .error
+        .is_none());
     wait_for_snapshot(&manager, run, |snapshot| snapshot.state.terminal());
     let descendant = wire_log(&temp)
         .iter()
@@ -276,20 +274,16 @@ fn cleanup_expired_retains_terminal_within_twenty_four_hours() {
     );
     store.write(&durable_terminal_record(&expired)).unwrap();
     manager.inventory();
-    assert!(
-        manager
-            .runs
-            .lock()
-            .unwrap()
-            .contains_key("wc_agent_run_recent_terminal")
-    );
-    assert!(
-        !manager
-            .runs
-            .lock()
-            .unwrap()
-            .contains_key("wc_agent_run_expired_terminal")
-    );
+    assert!(manager
+        .runs
+        .lock()
+        .unwrap()
+        .contains_key("wc_agent_run_recent_terminal"));
+    assert!(!manager
+        .runs
+        .lock()
+        .unwrap()
+        .contains_key("wc_agent_run_expired_terminal"));
 }
 
 #[test]
@@ -328,20 +322,16 @@ fn cleanup_expired_retains_protected_terminal_past_twenty_four_hours() {
     );
     store.write(&durable_terminal_record(&uncertain)).unwrap();
     manager.inventory();
-    assert!(
-        manager
-            .runs
-            .lock()
-            .unwrap()
-            .contains_key("wc_agent_run_old_lost")
-    );
-    assert!(
-        manager
-            .runs
-            .lock()
-            .unwrap()
-            .contains_key("wc_agent_run_old_uncertain")
-    );
+    assert!(manager
+        .runs
+        .lock()
+        .unwrap()
+        .contains_key("wc_agent_run_old_lost"));
+    assert!(manager
+        .runs
+        .lock()
+        .unwrap()
+        .contains_key("wc_agent_run_old_uncertain"));
 }
 
 #[test]
@@ -411,7 +401,7 @@ fn enforce_durable_capacity_evicts_oldest_terminal_before_new_claim() {
 }
 
 #[test]
-fn enforce_durable_capacity_fails_closed_when_only_protected_runs_remain() {
+fn enforce_durable_capacity_archives_uncertain_without_losing_replay_identity() {
     let temp = TempDir::new().unwrap();
     let store = DurableRunStore::new(temp.path().join("store"));
     let cfg = AcpConfig {
@@ -433,6 +423,12 @@ fn enforce_durable_capacity_fails_closed_when_only_protected_runs_remain() {
         let mut lost = terminal_snapshot(&run_id, index as i64 + 1);
         lost.state = CodingAgentRunState::Lost;
         lost.execution_state = CodingAgentExecutionState::OutcomeUnknown;
+        lost.terminal = Some(CodingAgentTerminal {
+            stop_reason: None,
+            error_code: Some("runner_restart_uncertain".to_string()),
+            message: None,
+            completed_at: lost.updated_at,
+        });
         store.write(&durable_terminal_record(&lost)).unwrap();
         manager
             .runs
@@ -440,10 +436,43 @@ fn enforce_durable_capacity_fails_closed_when_only_protected_runs_remain() {
             .unwrap()
             .insert(run_id.clone(), Arc::new(RunEntry::new(lost)));
     }
-    assert!(
-        manager
-            .enforce_durable_capacity_for_admission_for_test(None)
-            .is_err()
+    // Without exact durable Server acknowledgements no uncertain identity may leave inventory.
+    assert!(manager
+        .enforce_durable_capacity_for_admission(None, &[])
+        .is_err());
+    let acknowledgements = (0..2)
+        .map(|index| {
+            let id = format!("wc_agent_run_uncertain_{index:03}");
+            let run = store.read(&id).unwrap().unwrap().snapshot(0);
+            webcodex_core::coding_agent::archive_identity_fingerprint(&run)
+        })
+        .collect::<Vec<_>>();
+    manager
+        .enforce_durable_capacity_for_admission(None, &acknowledgements)
+        .unwrap();
+    assert!(store.archive_required().unwrap());
+    assert_eq!(
+        store.list_records_for_retention().unwrap().entry_count,
+        CODING_AGENT_MAX_INVENTORY_RUNS - 1
+    );
+    assert!(store.read("wc_agent_run_active_only").unwrap().is_some());
+    for index in 0..2 {
+        let id = format!("wc_agent_run_uncertain_{index:03}");
+        assert!(!manager.runs.lock().unwrap().contains_key(&id));
+        let archived = store.read_archived(&id).unwrap().unwrap();
+        assert_eq!(archived.state, CodingAgentRunState::Lost);
+        assert_eq!(
+            store.read(&id).unwrap().unwrap().snapshot(0),
+            archived.snapshot(0)
+        );
+    }
+    drop(manager);
+    let restarted = CodingAgentManager::with_store(&cfg, store.root.clone()).unwrap();
+    let id = "wc_agent_run_uncertain_000";
+    assert!(!restarted.runs.lock().unwrap().contains_key(id));
+    assert_eq!(
+        restarted.store.read(id).unwrap().unwrap().state,
+        CodingAgentRunState::Lost
     );
 }
 

@@ -42,6 +42,22 @@ impl OfflineRestoreOwner {
     /// Returns the restore `operation_id` for startup recovery and commit. Does not open SQLite on
     /// the installed production database or transition to **Committed**.
     pub fn restore_from_backup(&self, candidate: &Path) -> anyhow::Result<Uuid> {
+        self.restore_from_backup_with_schema(candidate, false)
+    }
+
+    /// Explicitly authorized old-Fork restore. Convert only the private stage,
+    /// not the source backup or the production database. The existing journal
+    /// preserves/rolls back production exactly as for an ordinary restore.
+    pub fn restore_from_fork_backup(&self, candidate: &Path) -> anyhow::Result<Uuid> {
+        self.restore_from_backup_with_schema(candidate, true)
+    }
+
+    fn restore_from_backup_with_schema(
+        &self,
+        candidate: &Path,
+        migrate_fork: bool,
+    ) -> anyhow::Result<Uuid> {
+        use webcodex_workflow_session::{detect_workflow_session_schema, WorkflowSessionSchema};
         let workflow_session_requirement = RestoreWorkflowSessionRequirement::RequirePresent;
         let preflight = self.preflight_candidate(candidate, workflow_session_requirement)?;
         let backup_path = preflight.candidate_path;
@@ -55,7 +71,7 @@ impl OfflineRestoreOwner {
 
         let mut stage_cleanup = StageCleanupGuard::new(stage_path.clone());
 
-        let (candidate_size_bytes, candidate_sha256_hex) = stage_candidate_from_backup(
+        let (mut candidate_size_bytes, mut candidate_sha256_hex) = stage_candidate_from_backup(
             &backup_path,
             &stage_path,
             preflight.file_size_bytes,
@@ -63,13 +79,53 @@ impl OfflineRestoreOwner {
         )?;
 
         validate_stage_sqlite(&stage_path, workflow_session_requirement)?;
-        verify_staged_regular_file(
-            &stage_path,
-            candidate_size_bytes,
-            &candidate_sha256_hex,
-        )?;
+        verify_staged_regular_file(&stage_path, candidate_size_bytes, &candidate_sha256_hex)?;
         super::require_no_sidecars(&stage_path)?;
         let staged_main_identity = stage_cleanup.verify_owned_stage()?;
+        let stage_schema = {
+            let connection = open_readonly_restore_candidate(&stage_path)?;
+            let schema = detect_workflow_session_schema(&connection);
+            super::close_readonly_connection(connection)?;
+            schema?
+        };
+        match (stage_schema, migrate_fork) {
+            (WorkflowSessionSchema::CurrentV1, false) => {}
+            (WorkflowSessionSchema::ForkV1, true) => {
+                // The original candidate hash above fenced the input copy.
+                // A new hash fences the explicitly converted output bytes.
+                if let Err(err) =
+                    super::session_migration::migrate_private_restore_stage(&stage_path)
+                {
+                    // If SQLite left a sidecar, retain the owned stage for
+                    // diagnosis instead of deleting its main file alone.
+                    if super::require_no_sidecars(&stage_path).is_err() {
+                        stage_cleanup.disarm();
+                    }
+                    return Err(err.context(
+                        "private Fork backup conversion failed; production not replaced",
+                    ));
+                }
+                if stage_cleanup.verify_owned_stage()? != staged_main_identity {
+                    bail!("converted stage identity changed");
+                }
+                let mut file = open_nofollow_read(&stage_path)?;
+                candidate_size_bytes = file.metadata()?.len();
+                candidate_sha256_hex = hash_open_file(&mut file, candidate_size_bytes)?;
+                drop(file);
+                validate_stage_sqlite(&stage_path, workflow_session_requirement)?;
+                verify_staged_regular_file(
+                    &stage_path,
+                    candidate_size_bytes,
+                    &candidate_sha256_hex,
+                )?;
+                super::require_no_sidecars(&stage_path)?;
+                sync_parent_directory(&stage_path)?;
+            }
+            (WorkflowSessionSchema::ForkV1, false) => {
+                bail!("Fork backup requires explicit restore_from_fork_backup authorization")
+            }
+            _ => bail!("restore candidate does not match the selected Workflow Session format"),
+        }
 
         let preservation = self
             .preserve_original(operation_id)
@@ -77,11 +133,7 @@ impl OfflineRestoreOwner {
 
         let production_db_file_name = production_db_basename(self.production_database_path())?;
         let candidate_backup_file_name = backup_basename(&backup_path)?;
-        ensure_preservation_matches_staging(
-            &preservation,
-            operation_id,
-            &production_db_file_name,
-        )?;
+        ensure_preservation_matches_staging(&preservation, operation_id, &production_db_file_name)?;
 
         let journal_payload = RestoreJournalPayload::new_prepared(
             operation_id,
@@ -177,7 +229,10 @@ impl StageCleanupGuard {
     }
 
     fn verify_owned_stage(&self) -> anyhow::Result<SourceFileIdentity> {
-        let expected = self.identity.as_ref().context("candidate stage has no creation identity")?;
+        let expected = self
+            .identity
+            .as_ref()
+            .context("candidate stage has no creation identity")?;
         let file = open_nofollow_read(&self.stage_path)?;
         ensure_single_link_file(&file, &self.stage_path)?;
         if SourceFileIdentity::from_open_file(&file)? != *expected
@@ -234,9 +289,8 @@ fn best_effort_remove_stage(
             if SourceFileIdentity::from_source_path(stage_path)? != *expected_identity {
                 bail!("candidate stage path changed; refusing pre-journal cleanup");
             }
-            fs::remove_file(stage_path).with_context(|| {
-                format!("remove candidate stage {}", stage_path.display())
-            })?;
+            fs::remove_file(stage_path)
+                .with_context(|| format!("remove candidate stage {}", stage_path.display()))?;
             sync_parent_directory(stage_path)
         }
     }
@@ -250,13 +304,11 @@ fn canonical_data_directory(production_db_path: &Path) -> anyhow::Result<PathBuf
     let parent = production_db_path
         .parent()
         .context("production database path has no parent directory")?;
-    let data_dir = fs::canonicalize(parent).with_context(|| {
-        format!("canonicalize data directory {}", parent.display())
-    })?;
+    let data_dir = fs::canonicalize(parent)
+        .with_context(|| format!("canonicalize data directory {}", parent.display()))?;
     super::validate_trusted_directory_parent(&data_dir)?;
-    let meta = fs::symlink_metadata(&data_dir).with_context(|| {
-        format!("stat data directory {}", data_dir.display())
-    })?;
+    let meta = fs::symlink_metadata(&data_dir)
+        .with_context(|| format!("stat data directory {}", data_dir.display()))?;
     if meta.file_type().is_symlink() || super::is_reparse_point(&meta) {
         bail!("data directory must not be a symlink or reparse point");
     }
@@ -275,7 +327,10 @@ fn ensure_direct_child_of_data_dir(
     label: &str,
 ) -> anyhow::Result<()> {
     if child.parent() != Some(data_dir) {
-        bail!("{label} path must be a direct child of {}", data_dir.display());
+        bail!(
+            "{label} path must be a direct child of {}",
+            data_dir.display()
+        );
     }
     let Some(name) = child.file_name().and_then(OsStr::to_str) else {
         bail!("{label} file name is not UTF-8");
@@ -322,9 +377,8 @@ fn stage_candidate_from_backup(
     expected_source_size: u64,
     cleanup: &mut StageCleanupGuard,
 ) -> anyhow::Result<(u64, String)> {
-    let backup_meta = fs::symlink_metadata(backup_path).with_context(|| {
-        format!("stat backup candidate {}", backup_path.display())
-    })?;
+    let backup_meta = fs::symlink_metadata(backup_path)
+        .with_context(|| format!("stat backup candidate {}", backup_path.display()))?;
     if backup_meta.file_type().is_symlink() || super::is_reparse_point(&backup_meta) {
         bail!(
             "backup candidate {} must not be a symlink or reparse point",
@@ -363,9 +417,14 @@ fn stage_candidate_from_backup(
 
     let mut destination = open_create_new_stage(stage_path)?;
     // Arm only after create_new succeeds: a collision never grants deletion authority.
-    cleanup.identity = Some(SourceFileIdentity::from_open_file(&destination).with_context(|| {
-        format!("capture newly created candidate stage identity {}; preserve on failure", stage_path.display())
-    })?);
+    cleanup.identity = Some(
+        SourceFileIdentity::from_open_file(&destination).with_context(|| {
+            format!(
+                "capture newly created candidate stage identity {}; preserve on failure",
+                stage_path.display()
+            )
+        })?,
+    );
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; COPY_BUFFER_BYTES];
     let mut copied: u64 = 0;
@@ -375,8 +434,10 @@ fn stage_candidate_from_backup(
         .context("rewind backup candidate for staging copy")?;
 
     loop {
-        let limit = (expected_source_size.saturating_sub(copied).saturating_add(1))
-            .min(buffer.len() as u64) as usize;
+        let limit = (expected_source_size
+            .saturating_sub(copied)
+            .saturating_add(1))
+        .min(buffer.len() as u64) as usize;
         let read = source
             .read(&mut buffer[..limit])
             .with_context(|| format!("read backup candidate {}", backup_path.display()))?;
@@ -438,7 +499,8 @@ fn verify_staged_regular_file(
 ) -> anyhow::Result<()> {
     validate_sha256_hex(expected_sha256, "candidate_sha256_hex")?;
 
-    let meta = fs::symlink_metadata(path).with_context(|| format!("stat staged candidate {}", path.display()))?;
+    let meta = fs::symlink_metadata(path)
+        .with_context(|| format!("stat staged candidate {}", path.display()))?;
     if meta.file_type().is_symlink() || super::is_reparse_point(&meta) {
         bail!(
             "staged candidate {} must not be a symlink or reparse point",
@@ -459,7 +521,10 @@ fn verify_staged_regular_file(
     let mut file = open_nofollow_read(path)?;
     ensure_single_link_file(&file, path)?;
     if file.metadata()?.len() != expected_size {
-        bail!("staged candidate {} open handle size mismatch", path.display());
+        bail!(
+            "staged candidate {} open handle size mismatch",
+            path.display()
+        );
     }
     let identity = file_identity_from_open(&file)?;
     let actual = hash_open_file(&mut file, expected_size)?;
@@ -487,7 +552,9 @@ fn remove_production_sidecars(production_db_path: &Path, data_dir: &Path) -> any
 fn safe_remove_production_sidecar(path: &Path) -> anyhow::Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("stat production sidecar {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("stat production sidecar {}", path.display()))
+        }
         Ok(meta) => {
             if meta.file_type().is_symlink() || super::is_reparse_point(&meta) {
                 bail!(
@@ -496,11 +563,15 @@ fn safe_remove_production_sidecar(path: &Path) -> anyhow::Result<()> {
                 );
             }
             if !meta.is_file() {
-                bail!("production sidecar {} is not a regular file", path.display());
+                bail!(
+                    "production sidecar {} is not a regular file",
+                    path.display()
+                );
             }
             let file = open_nofollow_read(path)?;
             ensure_single_link_file(&file, path)?;
-            fs::remove_file(path).with_context(|| format!("remove production sidecar {}", path.display()))
+            fs::remove_file(path)
+                .with_context(|| format!("remove production sidecar {}", path.display()))
         }
     }
 }
@@ -515,7 +586,10 @@ fn atomic_install_stage_over_production(
     ensure_direct_child_of_data_dir(data_dir, production_db_path, "production database")?;
 
     let stage_meta = fs::symlink_metadata(stage_path).with_context(|| {
-        format!("stat candidate stage before install {}", stage_path.display())
+        format!(
+            "stat candidate stage before install {}",
+            stage_path.display()
+        )
     })?;
     if stage_meta.file_type().is_symlink() || super::is_reparse_point(&stage_meta) {
         bail!(
@@ -533,7 +607,8 @@ fn atomic_install_stage_over_production(
     ensure_single_link_file(&stage_file, stage_path)?;
 
     verify_candidate_stage_for_install(stage_path, payload)?;
-    let expected_identity = payload.candidate_production_db_identity()
+    let expected_identity = payload
+        .candidate_production_db_identity()
         .context("candidate install missing journaled identity")?;
     if SourceFileIdentity::from_open_file(&stage_file)? != *expected_identity {
         bail!("candidate install handle does not match journaled identity");
@@ -605,7 +680,8 @@ fn verify_candidate_stage_for_install(
     stage_path: &Path,
     payload: &RestoreJournalPayload,
 ) -> anyhow::Result<()> {
-    let expected = payload.candidate_production_db_identity()
+    let expected = payload
+        .candidate_production_db_identity()
         .context("candidate stage missing journaled identity")?;
     let actual = super::recovery::verify_hardened_regular_file_sha256(
         stage_path,
@@ -696,10 +772,7 @@ fn ensure_single_link_file(file: &File, path: &Path) -> anyhow::Result<()> {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            bail!(
-                "opened path {} must not be a reparse point",
-                path.display()
-            );
+            bail!("opened path {} must not be a reparse point", path.display());
         }
     }
 
@@ -833,7 +906,9 @@ fn verify_source_stable_after_copy(
         .seek(SeekFrom::Start(0))
         .context("rewind backup candidate for post-copy stability hash")?;
     let actual = hash_open_file(source, size_start)?;
-    if file_identity_from_path(source_path)? != *identity_start || source.metadata()?.len() != size_start {
+    if file_identity_from_path(source_path)? != *identity_start
+        || source.metadata()?.len() != size_start
+    {
         bail!("backup candidate path or size changed during post-copy verification");
     }
     if actual != expected_sha256 {
@@ -854,7 +929,9 @@ fn hash_open_file(file: &mut File, expected_size: u64) -> anyhow::Result<String>
     loop {
         let limit = (expected_size.saturating_sub(hashed).saturating_add(1))
             .min(buffer.len() as u64) as usize;
-        let read = file.read(&mut buffer[..limit]).context("read file for SHA-256")?;
+        let read = file
+            .read(&mut buffer[..limit])
+            .context("read file for SHA-256")?;
         if read == 0 {
             break;
         }

@@ -13,6 +13,29 @@ beforeEach(() => {
 });
 
 describe("Connection advanced details", () => {
+
+  it.each(PRODUCT_LOCALES)("acknowledges a requested stop or restart immediately in %s", (locale) => {
+    localStorage.setItem("webcodex.desktop.locale", locale);
+    const profile = connectionFixture({ lifecycle: "running", ready: true });
+    const props = { profile, canStart: true, busy: true, copied: false,
+      onAction: () => undefined, onEdit: () => undefined, onDelete: () => undefined,
+      onCopy: () => undefined, onSettings: () => undefined };
+    const { container, rerender } = render(
+      <LocaleProvider><ConnectionCard {...props} pendingAction="stop" /></LocaleProvider>,
+    );
+    const card = container.querySelector("article.connection-profile")!;
+    const status = card.querySelector('[role="status"]')!;
+    expect(card).toHaveAttribute("aria-busy", "true");
+    expect(status).toHaveTextContent(connectionsToolsText(locale, "stopping"));
+    expect(status.querySelector(".status-dot")).not.toHaveClass("ready");
+
+    rerender(<LocaleProvider><ConnectionCard {...props} pendingAction="restart" /></LocaleProvider>);
+    expect(status).toHaveTextContent(connectionsToolsText(locale, "restarting"));
+    expect(card).toHaveAttribute("aria-busy", "true");
+
+    rerender(<LocaleProvider><ConnectionCard {...props} busy={false} pendingAction={null} /></LocaleProvider>);
+    expect(card).toHaveAttribute("aria-busy", "false");
+  });
   it.each(PRODUCT_LOCALES)("keeps the two-column metadata and translated labels in %s", (locale) => {
     localStorage.setItem("webcodex.desktop.locale", locale);
     const profile = connectionFixture({
@@ -64,6 +87,39 @@ describe("Connection advanced details", () => {
     expect(pairs.get(connectionsToolsText(locale, "runtimeDirectory"))).toBe(path);
     expect(details?.querySelectorAll("dd.connection-meta-path code")).toHaveLength(2);
     expect(details?.querySelector("dd.connection-meta-path code:last-child")).toBeTruthy();
+  });
+
+  it.each(PRODUCT_LOCALES)("explains binding changes without suggesting an MCP restart in %s", (locale) => {
+    localStorage.setItem("webcodex.desktop.locale", locale);
+    for (const reason_code of [
+      "tunnel_protected_history_binding_changed",
+      "tunnel_receipts_binding_changed",
+      "tunnel_archive_binding_changed",
+    ]) {
+      const profile = connectionFixture({
+        host_mode: "embedded",
+        lifecycle: "error",
+        ready: false,
+        last_error: "local_mcp_unavailable",
+        reason_code,
+        tunnel_ready: false,
+        local_mcp_ready: false,
+      });
+      const { container, unmount } = render(
+        <LocaleProvider>
+          <ConnectionCard profile={profile} canStart={true} busy={false} copied={false}
+            onAction={() => undefined} onEdit={() => undefined} onDelete={() => undefined}
+            onCopy={() => undefined} onSettings={() => undefined} />
+        </LocaleProvider>,
+      );
+      const recovery = container.querySelector(".connection-recovery")!;
+      expect(recovery.textContent).toContain(connectionsToolsText(locale, "tunnelBindingChanged"));
+      expect(recovery.textContent).toContain(connectionsToolsText(locale, "tunnelBindingRecovery"));
+      expect(recovery.textContent).not.toContain(connectionsToolsText(locale, "localMcpRecovery"));
+      expect(recovery.textContent).not.toContain(connectionsToolsText(locale, "restartUncertainRecovery"));
+      expect(container.querySelector(".connection-actions .primary-button")).toBeNull();
+      unmount();
+    }
   });
 
   it("omits unavailable optional diagnostics without creating empty labels", () => {

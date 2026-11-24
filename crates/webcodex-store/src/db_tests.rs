@@ -37,8 +37,8 @@ fn pairing_capability_migration_preserves_old_codes_without_granting_scopes() {
 
 use super::*;
 use crate::models::{
-    ApiKeyRecord, OAuthAccessTokenRecord, OAuthAuthorizationCodeRecord, OAuthClientRecord,
-    OAuthRefreshTokenRecord, UserRecord,
+    AccountCredentialRecord, ApiKeyRecord, OAuthAccessTokenRecord, OAuthAuthorizationCodeRecord,
+    OAuthClientRecord, OAuthRefreshTokenRecord, UserRecord,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -2072,4 +2072,294 @@ fn oauth_admin_authority_migration_is_additive_idempotent_and_fail_closed() {
                 .is_err());
         }
     }
+}
+
+fn sqlite_row_changes_during(db: &Database, action: impl FnOnce()) -> u64 {
+    let baseline = {
+        let conn = db.conn_for_tests();
+        conn.total_changes()
+    };
+    action();
+    let observed = {
+        let conn = db.conn_for_tests();
+        conn.total_changes()
+    };
+    observed.saturating_sub(baseline)
+}
+
+#[test]
+fn last_used_at_updates_are_floored_to_one_write_per_window() {
+    let floor = LAST_USED_UPDATE_FLOOR_SECS;
+    assert_eq!(floor, 60);
+    let t0 = 1_710_000_000_i64;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("last-used-floor.db")).unwrap();
+
+    let user = UserRecord {
+        id: "floor-user".to_string(),
+        username: "floor-user".to_string(),
+        created_at: t0,
+        disabled: 0,
+        display_name: None,
+        role: "user".to_string(),
+        disabled_at: None,
+        updated_at: Some(t0),
+    };
+    db.create_user(&user).unwrap();
+
+    let api_key = ApiKeyRecord {
+        id: "floor-api-key".to_string(),
+        user_id: user.id.clone(),
+        name: "floor".to_string(),
+        key_prefix: "pk_floor".to_string(),
+        created_at: t0,
+        last_used_at: None,
+        revoked_at: None,
+        scopes: "runtime:read".to_string(),
+        expires_at: None,
+        kind: "user".to_string(),
+        allowed_client_id: None,
+    };
+    db.insert_api_key(&api_key, "hash-floor-api-key").unwrap();
+    assert!(db.get_api_key_by_id(&api_key.id).unwrap().unwrap().last_used_at.is_none());
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_api_key_last_used(&api_key.id, t0).unwrap();
+        }),
+        1,
+        "first api key last_used_at update should perform exactly one row write"
+    );
+    assert_eq!(
+        db.get_api_key_by_id(&api_key.id)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0)
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_api_key_last_used(&api_key.id, t0 + 1).unwrap();
+        }),
+        0,
+        "api key last_used_at update inside the floor window should skip the row write"
+    );
+    assert_eq!(
+        db.get_api_key_by_id(&api_key.id)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0),
+        "api key last_used_at should not change inside the floor window"
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_api_key_last_used(&api_key.id, t0 + floor - 1).unwrap();
+        }),
+        0,
+        "api key last_used_at update at floor boundary minus one should skip the row write"
+    );
+    assert_eq!(
+        db.get_api_key_by_id(&api_key.id)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0)
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_api_key_last_used(&api_key.id, t0 + floor).unwrap();
+        }),
+        1,
+        "api key last_used_at update at the next floor window should perform exactly one row write"
+    );
+    assert_eq!(
+        db.get_api_key_by_id(&api_key.id)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0 + floor)
+    );
+
+    let account_credential = AccountCredentialRecord {
+        id: "floor-account-credential".to_string(),
+        user_id: user.id.clone(),
+        credential_prefix: "ac_floor".to_string(),
+        created_at: t0,
+        last_used_at: None,
+        revoked_at: None,
+    };
+    let credential_hash = "hash-floor-account-credential";
+    db.insert_account_credential(&account_credential, credential_hash)
+        .unwrap();
+    assert!(
+        db.get_account_credential_by_hash(credential_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .is_none()
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_account_credential_last_used(&account_credential.id, t0)
+                .unwrap();
+        }),
+        1,
+        "first account credential last_used_at update should perform exactly one row write"
+    );
+    assert_eq!(
+        db.get_account_credential_by_hash(credential_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0)
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_account_credential_last_used(&account_credential.id, t0 + 1)
+                .unwrap();
+        }),
+        0,
+        "account credential last_used_at update inside the floor window should skip the row write"
+    );
+    assert_eq!(
+        db.get_account_credential_by_hash(credential_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0),
+        "account credential last_used_at should not change inside the floor window"
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_account_credential_last_used(&account_credential.id, t0 + floor - 1)
+                .unwrap();
+        }),
+        0,
+        "account credential last_used_at update at floor boundary minus one should skip the row write"
+    );
+    assert_eq!(
+        db.get_account_credential_by_hash(credential_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0)
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_account_credential_last_used(&account_credential.id, t0 + floor)
+                .unwrap();
+        }),
+        1,
+        "account credential last_used_at update at the next floor window should perform exactly one row write"
+    );
+    assert_eq!(
+        db.get_account_credential_by_hash(credential_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0 + floor)
+    );
+
+    let oauth_user = oauth_seed_user(&db, "floor-oauth");
+    let (client, _) = oauth_seed_client(&db, &oauth_user, "Floor OAuth");
+    let plaintext_token = oauth_fixture_plaintext("access_token_floor");
+    let token_hash = oauth_fixture_hash(&plaintext_token);
+    let access_token = OAuthAccessTokenRecord {
+        admin_authority: false,
+        id: uuid::Uuid::new_v4().to_string(),
+        token_hash: token_hash.clone(),
+        client_id: client.client_id.clone(),
+        subject_kind: "managed_user".to_string(),
+        subject_id: oauth_user.id.clone(),
+        user_id: Some(oauth_user.id.clone()),
+        scopes: "runtime:read".to_string(),
+        resource: None,
+        shared_key_hash: None,
+        created_at: t0,
+        expires_at: t0 + 3600,
+        revoked_at: None,
+        last_used_at: None,
+    };
+    db.insert_oauth_access_token(&access_token).unwrap();
+    assert!(
+        db.get_oauth_access_token_by_hash(&token_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at
+            .is_none()
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_oauth_access_token_last_used(&access_token.id, t0)
+                .unwrap();
+        }),
+        1,
+        "first oauth access token last_used_at update should perform exactly one row write"
+    );
+    assert_eq!(
+        db.get_oauth_access_token_by_hash(&token_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0)
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_oauth_access_token_last_used(&access_token.id, t0 + 1)
+                .unwrap();
+        }),
+        0,
+        "oauth access token last_used_at update inside the floor window should skip the row write"
+    );
+    assert_eq!(
+        db.get_oauth_access_token_by_hash(&token_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0),
+        "oauth access token last_used_at should not change inside the floor window"
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_oauth_access_token_last_used(&access_token.id, t0 + floor - 1)
+                .unwrap();
+        }),
+        0,
+        "oauth access token last_used_at update at floor boundary minus one should skip the row write"
+    );
+    assert_eq!(
+        db.get_oauth_access_token_by_hash(&token_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0)
+    );
+
+    assert_eq!(
+        sqlite_row_changes_during(&db, || {
+            db.update_oauth_access_token_last_used(&access_token.id, t0 + floor)
+                .unwrap();
+        }),
+        1,
+        "oauth access token last_used_at update at the next floor window should perform exactly one row write"
+    );
+    assert_eq!(
+        db.get_oauth_access_token_by_hash(&token_hash)
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        Some(t0 + floor)
+    );
 }

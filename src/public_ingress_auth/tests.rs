@@ -692,3 +692,149 @@ async fn public_authorize_browser_session_is_bound_to_entry_and_epoch() {
     .await;
     assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
 }
+
+#[handler]
+async fn client_ingress_gate_probe(depot: &mut Depot, res: &mut Response) {
+    res.render(Json(
+        serde_json::json!({"passed": true, "public": entry(depot).is_some()}),
+    ));
+}
+
+fn client_ingress_gate_router(
+    db: Arc<crate::Database>,
+    public: Option<PublicIngressEntry>,
+) -> Router {
+    let mut router = Router::new()
+        .hoop(affix_state::inject(db))
+        .hoop(affix_state::inject(config(public.as_ref(), true)));
+    if let Some(public) = public {
+        router = router.hoop(affix_state::inject(PublicIngressRequest(public)));
+    }
+    router.push(
+        Router::with_path("oauth/token")
+            .hoop(ClientIngressGate::ClientId)
+            .post(client_ingress_gate_probe),
+    )
+}
+
+/// Structural proof that ingress client checks cross the blocking boundary. With
+/// the store writer held on a dedicated thread, the runtime must stay schedulable
+/// while the gate waits for the lock; inline synchronous SQLite on the worker
+/// blocks the current-thread executor until the holder gives up, failing the
+/// heartbeat rather than deadlocking.
+#[tokio::test(flavor = "current_thread")]
+async fn client_ingress_gate_database_work_runs_on_the_blocking_pool() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "ingress-gate-owner");
+    let (client, secret) = seed_oauth_client_named(&db, &user, "private listener client");
+    let service = Service::new(client_ingress_gate_router(db.clone(), None));
+
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (heartbeat_tx, heartbeat_rx) = mpsc::channel();
+    let db_holder = db.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = db_holder.conn_for_tests();
+        locked_tx.send(()).unwrap();
+        heartbeat_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer lock holder must acquire the store connection");
+
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client.client_id),
+        ("client_secret", &secret),
+        ("code", "unused"),
+    ]);
+    let task = tokio::spawn(async move {
+        post_form("http://localhost/oauth/token", body)
+            .send(&service)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::time::sleep(Duration::from_millis(50)),
+    )
+    .await
+    .expect("runtime thread must stay responsive while the gate waits for the store lock");
+    heartbeat_tx
+        .send(())
+        .expect("heartbeat must reach lock holder while the connection stays locked");
+    let heartbeat_seen = holder
+        .join()
+        .expect("writer lock holder thread must not panic");
+    assert!(
+        heartbeat_seen,
+        "runtime must make progress while the store connection remains locked"
+    );
+    let mut response = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("client ingress gate must complete once the store lock is released")
+        .unwrap();
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    assert_eq!(
+        response.take_json::<serde_json::Value>().await.unwrap()["passed"],
+        true
+    );
+}
+
+/// Structural proof that MCP public-ingress OAuth2 verification crosses the
+/// blocking boundary. With the store writer held on a dedicated thread, the
+/// runtime must stay schedulable while `authenticate_mcp` waits on the lock;
+/// inline synchronous SQLite on the current-thread executor blocks until the
+/// holder gives up, failing the heartbeat rather than deadlocking.
+#[tokio::test(flavor = "current_thread")]
+async fn authenticate_mcp_oauth_ingress_verification_runs_on_the_blocking_pool() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _env = AuthEnvGuard::auth_required();
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "mcp-ingress-owner");
+    let entry = public_entry(&db, &user, PublicIngressMode::Named, ORIGIN);
+    let service = service(db.clone(), Some(entry), true, sessions());
+    let token = crate::auth::generate_oauth_access_token();
+
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (heartbeat_tx, heartbeat_rx) = mpsc::channel();
+    let db_holder = db.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = db_holder.conn_for_tests();
+        locked_tx.send(()).unwrap();
+        heartbeat_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer lock holder must acquire the store connection");
+
+    let task = tokio::spawn(async move {
+        TestClient::get(&format!("{ORIGIN}/mcp"))
+            .bearer_auth(&token)
+            .send(&service)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::time::sleep(Duration::from_millis(50)),
+    )
+    .await
+    .expect("runtime thread must stay responsive while MCP auth waits for the store lock");
+    heartbeat_tx
+        .send(())
+        .expect("heartbeat must reach lock holder while the connection stays locked");
+    let heartbeat_seen = holder
+        .join()
+        .expect("writer lock holder thread must not panic");
+    assert!(
+        heartbeat_seen,
+        "runtime must make progress while the store connection remains locked; \
+         inline OAuth2 ingress verification on the executor prevents the heartbeat"
+    );
+    let response = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("MCP authentication must complete once the store lock is released")
+        .unwrap();
+    assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+}

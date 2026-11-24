@@ -11,6 +11,7 @@ pub(super) fn materialize(
     let PersistedSessionRecord {
         session_id,
         project,
+        project_identity,
         owner_authority_fingerprint,
         title,
         mode,
@@ -48,6 +49,7 @@ pub(super) fn materialize(
     SessionRecord {
         session_id,
         project,
+        project_identity,
         owner_authority_fingerprint,
         title,
         mode,

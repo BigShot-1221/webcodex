@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub(crate) const SESSION_PROJECT_MISMATCH_KIND: &str = "session_project_mismatch";
+pub(crate) const SESSION_PROJECT_IDENTITY_CHANGED_KIND: &str = "session_project_identity_changed";
 pub(crate) const SESSION_ATTENTION_MAX_MESSAGES: usize = 3;
 const SESSION_ATTENTION_MAX_BODY_BYTES: usize = 3072;
 
@@ -70,6 +71,93 @@ pub(crate) fn session_authority_denied_result(session_id: &str, tool_name: &str)
         }),
     )
     .with_recovery(RecoveryKind::UserAction)
+}
+
+pub(crate) fn session_project_identity_changed_result(
+    session_id: &str,
+    tool_name: &str,
+) -> ToolResult {
+    ToolResult::err_with_output(
+        format!(
+            "session_project_identity_changed: session {session_id} is bound to a different Project registration than the currently resolved Project"
+        ),
+        json!({
+            "error_kind": SESSION_PROJECT_IDENTITY_CHANGED_KIND,
+            "failure_kind": SESSION_PROJECT_IDENTITY_CHANGED_KIND,
+            "session_id": session_id,
+            "tool_name": tool_name,
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::FixInput)
+}
+
+pub(crate) fn project_root_fingerprint_unavailable_result(tool_name: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        "project_root_fingerprint_unavailable",
+        json!({
+            "error_kind": "project_root_fingerprint_unavailable",
+            "failure_kind": "project_identity_unavailable",
+            "tool_name": tool_name,
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::FixInput)
+}
+
+pub(crate) fn project_registration_incarnation_unavailable_result(tool_name: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        "project_registration_incarnation_unavailable",
+        json!({
+            "error_kind": "project_registration_incarnation_unavailable",
+            "failure_kind": "project_identity_unavailable",
+            "tool_name": tool_name,
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::FixInput)
+}
+
+pub(crate) fn session_close_persistence_uncertain_result(session_id: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        "session_close_persistence_uncertain",
+        json!({
+            "error_kind": "session_close_persistence_uncertain",
+            "failure_kind": "outcome_unknown",
+            "session_id": session_id,
+            "state_changed": true,
+            "retry_same_session": true,
+        }),
+    )
+    .with_recovery(RecoveryKind::RetrySame)
+}
+
+pub(crate) fn session_persistence_uncertain_result(session_id: Option<&str>) -> ToolResult {
+    let mut output = json!({
+        "error_kind": "session_persistence_uncertain",
+        "failure_kind": "outcome_unknown",
+        "state_changed": true,
+        "reobserve_required": true,
+    });
+    if let Some(session_id) = session_id {
+        output["session_id"] = json!(session_id);
+    }
+    ToolResult::err_with_output("session_persistence_uncertain", output)
+        .with_recovery(RecoveryKind::NoAction)
+}
+
+pub(crate) fn session_persistence_unavailable_result(session_id: Option<&str>) -> ToolResult {
+    let mut output = json!({
+        "error_kind": "session_persistence_unavailable",
+        "failure_kind": "persistence_unavailable",
+        "state_changed": false,
+        "reobserve_required": true,
+    });
+    if let Some(session_id) = session_id {
+        output["session_id"] = json!(session_id);
+    }
+    ToolResult::err_with_output("session_persistence_unavailable", output)
+        .with_recovery(RecoveryKind::NoAction)
 }
 
 pub(crate) fn session_project_mismatch_result(
@@ -319,18 +407,23 @@ pub(crate) fn session_message_error_result(
             }),
         )
         .with_recovery(RecoveryKind::NoAction),
-        sessions::SessionMessageError::PersistenceUncertain => ToolResult::err_with_output(
-            "completion_persistence_uncertain",
-            json!({
-                "error_kind": "completion_persistence_uncertain",
+        sessions::SessionMessageError::PersistenceUncertain => {
+            let mut output = json!({
+                "error_kind": "session_message_persistence_uncertain",
                 "failure_kind": "outcome_unknown",
                 "session_id": session_id,
-                "message_id": message_id,
                 "state_changed": true,
-                "retry_same_completion": true,
-            }),
-        )
-        .with_recovery(RecoveryKind::RetrySame),
+                "reobserve_required": true,
+            });
+            if let Some(message_id) = message_id {
+                output["message_id"] = json!(message_id);
+            }
+            ToolResult::err_with_output("session_message_persistence_uncertain", output)
+                .with_recovery(RecoveryKind::NoAction)
+        }
+        sessions::SessionMessageError::PersistenceUnavailable => {
+            session_persistence_unavailable_result(Some(session_id))
+        }
         sessions::SessionMessageError::SessionClosed { lifecycle } => ToolResult::err_with_output(
             "session_closed: session message mutation blocked",
             json!({
@@ -354,7 +447,7 @@ pub(crate) fn session_message_error_result(
 
 #[cfg(test)]
 #[test]
-fn completion_persistence_uncertain_exposes_exact_retry_same_recovery() {
+fn session_message_persistence_uncertain_requires_reobserve_without_retry() {
     let store = sessions::SessionStore::new(1, 1);
     let result = session_message_error_result(
         &store,
@@ -366,13 +459,30 @@ fn completion_persistence_uncertain_exposes_exact_retry_same_recovery() {
     assert!(!result.success);
     assert_eq!(
         result.output["error_kind"],
-        "completion_persistence_uncertain"
+        "session_message_persistence_uncertain"
     );
     assert_eq!(result.output["failure_kind"], "outcome_unknown");
     assert_eq!(result.output["state_changed"], true);
-    assert_eq!(result.output["retry_same_completion"], true);
-    assert_eq!(result.output["recovery_kind"], "retry_same");
+    assert_eq!(result.output["reobserve_required"], true);
+    assert_eq!(result.output["session_id"], "wc_sess_test");
+    assert_eq!(result.output["message_id"], "wc_msg_test");
+    assert!(result.output.get("retry_same_session").is_none());
+    assert_eq!(result.output["recovery_kind"], "none");
     assert!(result.output.get("recovery_tool").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn session_persistence_uncertain_requires_reobserve_without_retry() {
+    let result = session_persistence_uncertain_result(Some("wc_sess_test"));
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "session_persistence_uncertain");
+    assert_eq!(result.output["failure_kind"], "outcome_unknown");
+    assert_eq!(result.output["state_changed"], true);
+    assert_eq!(result.output["reobserve_required"], true);
+    assert_eq!(result.output["session_id"], "wc_sess_test");
+    assert!(result.output.get("retry_same_session").is_none());
+    assert_eq!(result.output["recovery_kind"], "none");
 }
 
 pub(crate) fn add_session_hint(

@@ -1390,6 +1390,11 @@ pub struct RunnerProjectSummary {
     /// intentionally preserved at this wire boundary for rolling upgrades.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_source: Option<String>,
+    /// Stable UUID minted when a Project registration record is created or
+    /// re-registered. Missing on the wire preserves rolling-upgrade
+    /// compatibility with peers that omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_incarnation: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]

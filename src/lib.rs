@@ -55,6 +55,7 @@ mod runtime_console_http;
 mod runtime_http;
 mod upgrade_http;
 mod upgrade_maintenance_store;
+pub(crate) use webcodex_store::BackupMaintenanceOwner;
 pub(crate) use webcodex_store::ServerInstanceGuard;
 mod server_listener;
 mod server_shutdown;
@@ -206,6 +207,11 @@ const SERVER_GRACEFUL_RESPONSE_MARGIN_SECS: u64 = 15;
 pub const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 =
     REQUEST_HARD_TIMEOUT_SECS + SERVER_GRACEFUL_RESPONSE_MARGIN_SECS;
 
+/// Bounded wait for the backup maintenance worker to finish after cooperative
+/// shutdown. The owner's [`ServerInstanceGuard`] lease remains the fail-closed
+/// barrier when drain times out without confirming worker exit/join.
+const BACKUP_MAINTENANCE_DRAIN_TIMEOUT_SECS: u64 = 15;
+
 /// systemd must outlive the application's own graceful/forced stop lifecycle
 /// so PID 1 does not SIGKILL the Server before WebCodex's bounded deadline.
 const SERVER_SYSTEMD_STOP_MARGIN_SECS: u64 = 15;
@@ -333,10 +339,25 @@ explicitly allow remote shared-key auth."
         tracing::info!("Console assets directory: {}", directory.display());
     }
     std::fs::create_dir_all(&config.data_dir)?;
-    let db = Database::open(&config.db_path())?;
-    let server_instance_guard = ServerInstanceGuard::acquire(&db)?;
+    let db_path = config.db_path();
+    let server_instance_owner = Arc::new(ServerInstanceGuard::acquire_for_path(&db_path)?);
+    // K.2d Phase 6 — `pending_restore` must be declared before production `Database::open` and every
+    // downstream local (`db`, registries, backup maintenance, `ToolRuntime` / session writer). Locals
+    // drop in reverse declaration order; uncommitted `PendingRestoreStartup` must drop only after
+    // those handles close so RAII rollback does not race open SQLite handles. Do not `drop` early.
+    let mut pending_restore = webcodex_store::OfflineRestoreOwner::from_shared_guard(
+        server_instance_owner.clone(),
+    )?
+    .recover_startup_before_database_open()?;
+    let db = Database::open(&server_instance_owner.database_path().to_path_buf())?;
+    if !server_instance_owner.owns_database(&db) {
+        return Err(anyhow::anyhow!(
+            "server instance guard does not match opened database state path"
+        )
+        .into());
+    }
     db.recover_agent_wakes_for_server_takeover(
-        &server_instance_guard,
+        &server_instance_owner,
         chrono::Utc::now().timestamp_millis(),
     )
     .map_err(anyhow::Error::from)?;
@@ -352,6 +373,10 @@ explicitly allow remote shared-key auth."
     let cors = Cors::permissive();
     let config = Arc::new(config);
     let db = Arc::new(db);
+    let backup_maintenance = Arc::new(BackupMaintenanceOwner::new(
+        db.clone(),
+        server_instance_owner.clone(),
+    )?);
     // First-party authorize browser session store (in-memory, short-lived).
     // Holds the opaque session id -> user mapping bridging the authorize
     // login form to the consent decision. PAT/bootstrap plaintext is never
@@ -392,9 +417,15 @@ explicitly allow remote shared-key auth."
             .with_project_reference_database(db.clone())
             .with_communication_database(db.clone())
             .with_job_terminal_attention(db.clone(), job_terminal_continuations)
-            .with_session_ledger(config.session_ledger_path())
-            .with_persistent_coding_agent_observation_state(&runtime_state_dir)
-            .map_err(std::io::Error::other)?;
+            .with_backup_maintenance(backup_maintenance.clone());
+    tool_runtime_builder = tool_runtime_builder
+        .with_session_database(
+            server_instance_owner.database_path().to_path_buf(),
+            config.session_ledger_path(),
+        )?;
+    tool_runtime_builder = tool_runtime_builder
+        .with_persistent_coding_agent_observation_state(&runtime_state_dir)
+        .map_err(std::io::Error::other)?;
     #[cfg(feature = "workspace-checkpoints")]
     {
         tool_runtime_builder =
@@ -405,16 +436,48 @@ explicitly allow remote shared-key auth."
             tool_runtime_builder.with_activity_recorder(Arc::new(activity_store));
     }
     let tool_runtime = Arc::new(tool_runtime_builder);
+    // K.2d Commit barrier: only after session DB wiring, observation state, optional
+    // workspace-checkpoints, activity recorder, and full `ToolRuntimeBuilder` → `ToolRuntime`
+    // succeed. Uncommitted `pending_restore` on earlier builder failure drops after those
+    // handles (reverse order) so RAII rollback does not race open SQLite/session writers.
+    // Must run before persistence watcher / QUIC / Cloudflare spawns that retain `Database` Arc.
+    if let Some(pending) = pending_restore.as_mut() {
+        pending.commit_after_session_database(db.as_ref())?;
+    }
     tracing::info!(
         project_scoped = project_auth.is_configured(),
         "Adaptive Runtime enabled"
     );
+    {
+        let mut persistence_fatal = tool_runtime.sessions.persistence_fatal_receiver();
+        let shutdown_for_fatal = shutdown_coordinator.clone();
+        tokio::spawn(async move {
+            if let Some(detail) = persistence_fatal.borrow().clone() {
+                log_workflow_session_persistence_fatal(&detail);
+                shutdown_for_fatal
+                    .request_shutdown(server_shutdown::ShutdownReason::PersistenceFailure);
+                return;
+            }
+            loop {
+                if persistence_fatal.changed().await.is_err() {
+                    break;
+                }
+                if let Some(detail) = persistence_fatal.borrow().clone() {
+                    log_workflow_session_persistence_fatal(&detail);
+                    shutdown_for_fatal
+                        .request_shutdown(server_shutdown::ShutdownReason::PersistenceFailure);
+                    break;
+                }
+            }
+        });
+    }
 
     // Custom QUIC Runner transport. Default disabled;
     // only starts when WEBCODEX_QUIC_ENABLED=true. Runs a separate quinn UDP
     // listener in parallel with the HTTP server. HTTP/WebSocket/polling and
     // the MCP / Nginx path are completely unaffected. This is NOT
     // HTTP/3 and Nginx does not terminate QUIC.
+    let mut quic_listener: Option<tokio::task::JoinHandle<()>> = None;
     if quic_cfg.enabled {
         if let Err(e) = quic_cfg.validate() {
             if let Some(status) = runtime_info.quic.as_ref() {
@@ -433,13 +496,15 @@ explicitly allow remote shared-key auth."
             let quic_registry = runner_registry.clone();
             let quic_cfg_task = quic_cfg.clone();
             let quic_status = runtime_info.quic.clone();
-            tokio::spawn(async move {
+            let quic_shutdown = shutdown_coordinator.background_services_stop_receiver();
+            quic_listener = Some(tokio::spawn(async move {
                 if let Err(e) = runner_quic::run_runner_quic_listener(
                     quic_config,
                     Some(quic_db),
                     quic_registry,
                     quic_cfg_task,
                     quic_status,
+                    quic_shutdown,
                 )
                 .await
                 {
@@ -448,7 +513,7 @@ explicitly allow remote shared-key auth."
                         e
                     );
                 }
-            });
+            }));
             tracing::info!(
                 "Runner QUIC configured on UDP {} ALPN {}",
                 quic_cfg.listen,
@@ -868,7 +933,37 @@ explicitly allow remote shared-key auth."
         )
         .map_err(std::io::Error::other)?;
     }
-    server_shutdown::serve_until_termination(
+    let backup_maintenance_for_stop = backup_maintenance.clone();
+    let mut backup_services_stop = shutdown_coordinator.background_services_stop_receiver();
+    let backup_shutdown_watcher = tokio::spawn(async move {
+        let request_owner_shutdown = |owner: &BackupMaintenanceOwner, context: &'static str| {
+            if let Err(error) = owner.request_shutdown() {
+                tracing::warn!(
+                    error = %error,
+                    context,
+                    "backup maintenance request_shutdown failed"
+                );
+            }
+        };
+        if backup_services_stop.borrow().is_some() {
+            request_owner_shutdown(backup_maintenance_for_stop.as_ref(), "initial background stop");
+            return;
+        }
+        loop {
+            if backup_services_stop.changed().await.is_err() {
+                request_owner_shutdown(
+                    backup_maintenance_for_stop.as_ref(),
+                    "background services stop channel closed",
+                );
+                break;
+            }
+            if backup_services_stop.borrow().is_some() {
+                request_owner_shutdown(backup_maintenance_for_stop.as_ref(), "background stop");
+                break;
+            }
+        }
+    });
+    let serve_result = server_shutdown::serve_until_termination(
         Server::new(acceptor),
         router,
         shutdown_coordinator,
@@ -877,12 +972,96 @@ explicitly allow remote shared-key auth."
         service_stop,
         tunnels,
     )
-    .await?;
+    .await;
+    if let Some(mut listener) = quic_listener.take() {
+        match tokio::time::timeout(
+            runner_quic::QUIC_LISTENER_JOIN_TIMEOUT,
+            &mut listener,
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if error.is_panic() {
+                    tracing::error!("Runner QUIC listener task panicked during shutdown");
+                } else if error.is_cancelled() {
+                    tracing::warn!("Runner QUIC listener task was cancelled during shutdown");
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    join_deadline_seconds = runner_quic::QUIC_LISTENER_JOIN_TIMEOUT.as_secs(),
+                    "Runner QUIC listener join deadline elapsed; aborting listener task"
+                );
+                listener.abort();
+                let _ = listener.await;
+            }
+        }
+    }
+    if let Err(error) = backup_maintenance.request_shutdown() {
+        tracing::warn!(
+            error = %error,
+            "backup maintenance request_shutdown during server teardown failed"
+        );
+    }
+    backup_shutdown_watcher.abort();
+    let _ = backup_shutdown_watcher.await;
+    let backup_drain_timeout =
+        std::time::Duration::from_secs(BACKUP_MAINTENANCE_DRAIN_TIMEOUT_SECS);
+    let backup_owner = backup_maintenance.clone();
+    let backup_drain_result = match tokio::task::spawn_blocking(move || {
+        backup_owner.shutdown_and_drain(backup_drain_timeout)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join_error) => Err(anyhow::anyhow!(
+            "backup maintenance drain blocking task failed to join: {join_error}"
+        )),
+    };
+    if let Err(drain_err) = &backup_drain_result {
+        tracing::error!(
+            error = %drain_err,
+            drain_deadline_seconds = BACKUP_MAINTENANCE_DRAIN_TIMEOUT_SECS,
+            "backup maintenance shutdown drain failed; backup worker exit/join was not confirmed"
+        );
+    }
+    let flush_result = tool_runtime.sessions.shutdown_persistence().await;
+    if let Err(flush_err) = &flush_result {
+        tracing::error!(
+            error = %flush_err,
+            "workflow session persistence shutdown flush failed"
+        );
+    }
+    if let Err(serve_err) = serve_result {
+        return Err(serve_err.into());
+    }
+    if let Err(drain_err) = backup_drain_result {
+        return Err(drain_err.into());
+    }
+    flush_result?;
     #[cfg(target_os = "macos")]
     if let Some(log) = service_log.as_mut() {
         log.stopped().map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+fn log_workflow_session_persistence_fatal(detail: &str) {
+    const MAX_SUMMARY_CHARS: usize = 200;
+    let summary: String = detail
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_SUMMARY_CHARS)
+        .collect();
+    let truncated = detail.chars().count() > MAX_SUMMARY_CHARS;
+    tracing::error!(
+        persistence_fatal = true,
+        detail_len = detail.len(),
+        detail_truncated = truncated,
+        summary = %summary,
+        "Workflow Session persistence entered a fatal state; requesting server shutdown for supervisor restart"
+    );
 }
 
 #[cfg(test)]

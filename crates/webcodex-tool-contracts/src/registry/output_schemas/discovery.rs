@@ -127,6 +127,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "quic",
                 open_object_schema("QUIC transport status, when enabled."),
             ),
+            (
+                "shared_database_wal",
+                shared_database_wal_observation_schema(),
+            ),
         ])),
         "read_tool_trace" => Some(wrapped_output_schema(vec![
             ("trace_mode", schema_type("string", "Observed captured mode: metadata, full, or unknown.")),
@@ -541,6 +545,27 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         }
         _ => None,
     }
+}
+
+fn shared_database_wal_observation_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Bounded read-only shared Store database WAL observation. Emitted only on successful full get_runtime_status diagnostics when a shared Database handle is wired; omitted in compact, summary_only, bootstrap, focused error, and no-database configurations. No paths, SQL text, or credentials.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["available", "no_wal", "busy", "unavailable"]
+            },
+            "wal_bytes": {"type": "integer", "minimum": 0},
+            "log_frames": {"type": "integer", "minimum": 0},
+            "checkpointed_frames": {"type": "integer", "minimum": 0},
+            "uncheckpointed_frames": {"type": "integer", "minimum": 0},
+            "checkpoint_busy": {"type": "boolean"},
+            "error_kind": {"type": "string", "maxLength": 80}
+        },
+        "required": ["status"]
+    })
 }
 
 fn current_window_activity_summary_schema() -> Value {

@@ -1255,6 +1255,10 @@ fn parse_project_summary_from_result(
             .get("revision")
             .and_then(Value::as_str)
             .map(str::to_string),
+        registration_incarnation: result
+            .get("registration_incarnation")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         root_fingerprint: result
             .get("root_fingerprint")
             .and_then(Value::as_str)

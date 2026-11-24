@@ -218,6 +218,9 @@ pub struct ToolRuntime {
     pub(crate) job_ergonomics_salt: Arc<[u8; 16]>,
     /// Process-local, bounded, non-authoritative passive Job attention cursor.
     pub(crate) job_attention_cursor: Arc<super::job_attention::JobAttentionCursor>,
+    /// Process-lifetime online backup worker registry (K.2c). Clones share the
+    /// same owner; production server wiring injects one instance per Database.
+    pub(crate) backup_maintenance: Option<Arc<webcodex_store::BackupMaintenanceOwner>>,
 }
 
 impl ToolRuntime {
@@ -285,6 +288,7 @@ impl ToolRuntime {
             ),
             job_ergonomics_salt: Arc::new(*uuid::Uuid::new_v4().as_bytes()),
             job_attention_cursor: Arc::new(super::job_attention::JobAttentionCursor::default()),
+            backup_maintenance: None,
         }
     }
 
@@ -370,6 +374,30 @@ impl ToolRuntime {
         self
     }
 
+    pub(crate) fn with_backup_maintenance(
+        mut self,
+        owner: Arc<webcodex_store::BackupMaintenanceOwner>,
+    ) -> Self {
+        self.backup_maintenance = Some(owner);
+        self
+    }
+
+    pub(crate) fn backup_maintenance_owner(
+        &self,
+    ) -> Option<Arc<webcodex_store::BackupMaintenanceOwner>> {
+        self.backup_maintenance.clone()
+    }
+
+    /// First shared `config.db_path()` handle when the server wired a Store database.
+    pub(crate) fn shared_database(&self) -> Option<&Arc<crate::Database>> {
+        self.window_activity_db
+            .as_ref()
+            .or(self.memory_db.as_ref())
+            .or(self.project_reference_db.as_ref())
+            .or(self.communication_db.as_ref())
+            .or(self.job_terminal_db.as_ref())
+    }
+
     #[cfg(test)]
     pub(crate) fn with_job_terminal_registration_test_hook(
         mut self,
@@ -397,6 +425,23 @@ impl ToolRuntime {
             sessions::DEFAULT_MAX_EVENTS_PER_SESSION,
         );
         self
+    }
+
+    /// Production SessionStore: shared `webcodex.db` writer with one-time legacy
+    /// JSON migration source. Fails closed when restore or seed cannot complete.
+    pub fn with_session_database(
+        mut self,
+        db_path: impl Into<PathBuf>,
+        legacy_ledger_path: impl Into<PathBuf>,
+    ) -> std::io::Result<Self> {
+        self.sessions = sessions::SessionStore::with_persistence_database_limits(
+            db_path,
+            legacy_ledger_path,
+            sessions::DEFAULT_MAX_SESSIONS,
+            sessions::DEFAULT_MAX_RETAINED_CLOSED_SESSIONS,
+            sessions::DEFAULT_MAX_EVENTS_PER_SESSION,
+        )?;
+        Ok(self)
     }
 
     pub(crate) fn workflow_sessions_console_list(

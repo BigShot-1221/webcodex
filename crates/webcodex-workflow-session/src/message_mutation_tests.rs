@@ -107,7 +107,7 @@ fn withdraw_open_message_is_history_preserving() {
     );
 
     let outcome = store
-        .withdraw_message(&session.session_id, &original.message_id)
+        .withdraw_message_for_test(&session.session_id, &original.message_id)
         .unwrap();
     assert!(!outcome.replayed);
     assert_eq!(outcome.message.message_id, original.message_id);
@@ -131,7 +131,7 @@ fn withdraw_before_ack_makes_stale_ack_ignored() {
     let session = store.start_session(None, None);
     let guidance = post_ack_guidance(&store, &session.session_id, "withdraw before ACK");
     store
-        .withdraw_message(&session.session_id, &guidance.message_id)
+        .withdraw_message_for_test(&session.session_id, &guidance.message_id)
         .unwrap();
 
     let ack = store.observe_message_acks(
@@ -167,7 +167,7 @@ fn ack_before_withdraw_preserves_first_ack_history() {
         .expect("ACK timestamp");
 
     let withdrawn = store
-        .withdraw_message(&session.session_id, &guidance.message_id)
+        .withdraw_message_for_test(&session.session_id, &guidance.message_id)
         .unwrap();
     assert_eq!(withdrawn.message.first_ack_observed_at, Some(first_ack));
     assert_eq!(
@@ -188,7 +188,7 @@ fn replace_creates_fresh_message_id() {
         SessionMessagePriority::Normal,
     );
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "correct question",
@@ -242,7 +242,7 @@ fn replace_preserves_kind_priority_tags_reply_to_and_requires_ack() {
         )
         .unwrap();
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "new guidance",
@@ -271,7 +271,7 @@ fn replace_never_carries_first_ack_to_new_message() {
         1
     );
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "replacement guidance",
@@ -287,7 +287,7 @@ fn stale_old_ack_does_not_ack_replacement() {
     let session = store.start_session(None, None);
     let original = post_ack_guidance(&store, &session.session_id, "replace first");
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "fresh replacement",
@@ -315,7 +315,7 @@ fn replacement_requires_fresh_ack() {
     let session = store.start_session(None, None);
     let original = post_ack_guidance(&store, &session.session_id, "old ACK target");
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "new ACK target",
@@ -360,6 +360,7 @@ async fn replace_allocates_two_ordered_observation_revisions() {
             &original.message_id,
             "new",
         ))
+        .await
         .unwrap();
 
     let first = store
@@ -400,6 +401,7 @@ async fn withdraw_allocates_one_observation_revision() {
     let token = baseline(&store, &session.session_id).await;
     store
         .withdraw_message(&session.session_id, &message.message_id)
+        .await
         .unwrap();
     let delta = store
         .observe_messages(&session.session_id, Some(&token), None, Some(100))
@@ -436,7 +438,7 @@ fn replace_retention_keeps_old_and_new_transactionally() {
         );
     }
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "protected replacement",
@@ -456,7 +458,7 @@ fn replace_retention_keeps_old_and_new_transactionally() {
         "protected replacement"
     );
     let replay = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "protected replacement",
@@ -481,10 +483,10 @@ fn withdraw_replay_is_idempotent() {
         SessionMessagePriority::Normal,
     );
     let first = store
-        .withdraw_message(&session.session_id, &original.message_id)
+        .withdraw_message_for_test(&session.session_id, &original.message_id)
         .unwrap();
     let replay = store
-        .withdraw_message(&session.session_id, &original.message_id)
+        .withdraw_message_for_test(&session.session_id, &original.message_id)
         .unwrap();
     assert!(!first.replayed);
     assert!(replay.replayed);
@@ -504,14 +506,14 @@ fn replace_same_body_replay_returns_same_new_message() {
         SessionMessagePriority::Normal,
     );
     let first = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "new",
         ))
         .unwrap();
     let replay = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "new",
@@ -533,14 +535,14 @@ fn replace_different_body_after_supersede_conflicts() {
         SessionMessagePriority::Normal,
     );
     let first = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "new A",
         ))
         .unwrap();
     assert!(matches!(
-        store.replace_message(replace_input(
+        store.replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "new B"
@@ -571,18 +573,18 @@ fn completion_first_then_replace_fails_without_mutation() {
         SessionMessagePriority::Normal,
     );
     let fence = store
-        .get_assignment(&session.session_id, &todo.message_id)
+        .get_assignment_for_test(&session.session_id, &todo.message_id)
         .unwrap()
         .assignment_fence;
     let completion = store
-        .complete_message(completion_input(
+        .complete_message_for_test(completion_input(
             &session.session_id,
             &todo.message_id,
             fence,
         ))
         .unwrap();
     assert!(matches!(
-        store.replace_message(replace_input(
+        store.replace_message_for_test(replace_input(
             &session.session_id,
             &todo.message_id,
             "late edit"
@@ -609,18 +611,18 @@ fn replace_first_then_old_completion_fails_without_answer() {
         SessionMessagePriority::Normal,
     );
     let old_fence = store
-        .get_assignment(&session.session_id, &todo.message_id)
+        .get_assignment_for_test(&session.session_id, &todo.message_id)
         .unwrap()
         .assignment_fence;
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &todo.message_id,
             "new work",
         ))
         .unwrap();
     assert!(matches!(
-        store.complete_message(completion_input(
+        store.complete_message_for_test(completion_input(
             &session.session_id,
             &todo.message_id,
             old_fence,
@@ -661,18 +663,18 @@ fn completion_first_then_withdraw_does_not_overwrite_completion() {
         SessionMessagePriority::Normal,
     );
     let fence = store
-        .get_assignment(&session.session_id, &todo.message_id)
+        .get_assignment_for_test(&session.session_id, &todo.message_id)
         .unwrap()
         .assignment_fence;
     let completion = store
-        .complete_message(completion_input(
+        .complete_message_for_test(completion_input(
             &session.session_id,
             &todo.message_id,
             fence,
         ))
         .unwrap();
     assert!(matches!(
-        store.withdraw_message(&session.session_id, &todo.message_id),
+        store.withdraw_message_for_test(&session.session_id, &todo.message_id),
         Err(SessionMessageError::MessageNotOpen)
     ));
     let retained = exact(&store, &session.session_id, &todo.message_id);
@@ -702,7 +704,7 @@ fn ordinary_resolve_first_then_replace_fails() {
         )
         .unwrap();
     assert!(matches!(
-        store.replace_message(replace_input(
+        store.replace_message_for_test(replace_input(
             &session.session_id,
             &note.message_id,
             "edited"
@@ -736,7 +738,7 @@ fn ordinary_resolve_first_then_withdraw_does_not_relabel_resolution() {
         )
         .unwrap();
     assert!(matches!(
-        store.withdraw_message(&session.session_id, &note.message_id),
+        store.withdraw_message_for_test(&session.session_id, &note.message_id),
         Err(SessionMessageError::MessageNotOpen)
     ));
     let retained = exact(&store, &session.session_id, &note.message_id);
@@ -754,7 +756,7 @@ fn ack_first_then_replace_requires_fresh_new_ack() {
         std::slice::from_ref(&original.message_id),
     );
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &original.message_id,
             "fresh body",
@@ -800,6 +802,7 @@ async fn observation_delta_for_replace_contains_old_then_new_and_pages_without_d
     let token = baseline(&store, &session.session_id).await;
     let replaced = store
         .replace_message(replace_input(&session.session_id, &old.message_id, "after"))
+        .await
         .unwrap();
     let first = store
         .observe_messages(&session.session_id, Some(&token), None, Some(1))
@@ -844,7 +847,7 @@ fn withdraw_and_replace_observation_revisions_are_durable_and_consecutive() {
         .as_u64()
         .unwrap();
     store
-        .withdraw_message(&session.session_id, &withdraw.message_id)
+        .withdraw_message_for_test(&session.session_id, &withdraw.message_id)
         .unwrap();
     let after_withdraw: Value =
         serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
@@ -873,7 +876,7 @@ fn withdraw_and_replace_observation_revisions_are_durable_and_consecutive() {
         .as_u64()
         .unwrap();
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &source.message_id,
             "replacement",
@@ -904,7 +907,7 @@ fn withdraw_durable_restart_stays_withdrawn_and_out_of_attention() {
     let session = store.start_session(None, None);
     let guidance = post_ack_guidance(&store, &session.session_id, "withdraw durably");
     store
-        .withdraw_message(&session.session_id, &guidance.message_id)
+        .withdraw_message_for_test(&session.session_id, &guidance.message_id)
         .unwrap();
     drop(store);
 
@@ -933,7 +936,7 @@ fn replace_durable_restart_preserves_links_and_fresh_ack_requirement() {
         std::slice::from_ref(&guidance.message_id),
     );
     let replaced = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &guidance.message_id,
             "new durable guidance",
@@ -989,7 +992,7 @@ fn withdraw_persistence_failure_is_uncertain_then_exact_replay_recovers() {
     std::fs::write(&ledger_dir, b"block directory recreation").unwrap();
 
     assert!(matches!(
-        store.withdraw_message(&session.session_id, &message.message_id),
+        store.withdraw_message_for_test(&session.session_id, &message.message_id),
         Err(SessionMessageError::PersistenceUncertain)
     ));
     assert_eq!(
@@ -1000,7 +1003,7 @@ fn withdraw_persistence_failure_is_uncertain_then_exact_replay_recovers() {
     std::fs::remove_file(&ledger_dir).unwrap();
     std::fs::create_dir_all(&ledger_dir).unwrap();
     let replay = store
-        .withdraw_message(&session.session_id, &message.message_id)
+        .withdraw_message_for_test(&session.session_id, &message.message_id)
         .unwrap();
     assert!(replay.replayed);
     drop(store);
@@ -1031,7 +1034,7 @@ fn replace_persistence_failure_replays_same_id_and_conflicts_on_different_body()
     std::fs::write(&ledger_dir, b"block directory recreation").unwrap();
 
     assert!(matches!(
-        store.replace_message(replace_input(
+        store.replace_message_for_test(replace_input(
             &session.session_id,
             &message.message_id,
             "durable replacement",
@@ -1044,7 +1047,7 @@ fn replace_persistence_failure_replays_same_id_and_conflicts_on_different_body()
         .clone()
         .expect("live replacement id");
     assert!(matches!(
-        store.replace_message(replace_input(
+        store.replace_message_for_test(replace_input(
             &session.session_id,
             &message.message_id,
             "different replacement",
@@ -1055,7 +1058,7 @@ fn replace_persistence_failure_replays_same_id_and_conflicts_on_different_body()
     std::fs::remove_file(&ledger_dir).unwrap();
     std::fs::create_dir_all(&ledger_dir).unwrap();
     let replay = store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &message.message_id,
             "durable replacement",
@@ -1138,7 +1141,7 @@ fn resolve_cannot_relabel_withdrawn_or_superseded_closure() {
         SessionMessagePriority::Normal,
     );
     store
-        .withdraw_message(&session.session_id, &withdrawn.message_id)
+        .withdraw_message_for_test(&session.session_id, &withdrawn.message_id)
         .unwrap();
     assert!(matches!(
         store.resolve_message(
@@ -1160,7 +1163,7 @@ fn resolve_cannot_relabel_withdrawn_or_superseded_closure() {
         SessionMessagePriority::Normal,
     );
     store
-        .replace_message(replace_input(
+        .replace_message_for_test(replace_input(
             &session.session_id,
             &source.message_id,
             "replacement",

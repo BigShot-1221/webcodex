@@ -1,4 +1,5 @@
 use crate::auth::AuthContext;
+use webcodex_core::runtime_contract::validate_project_op_path;
 use crate::db::AdminProjectAudit;
 use crate::json_digest::update_sha256_with_json;
 use crate::runner_http::{RunnerFeature, RunnerRegistry};
@@ -687,6 +688,10 @@ fn lifecycle_summary(output: &Value, id: &str) -> Option<RunnerProjectSummary> {
             .get("revision")
             .and_then(Value::as_str)
             .map(str::to_string),
+        registration_incarnation: output
+            .get("registration_incarnation")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         root_fingerprint: output
             .get("root_fingerprint")
             .and_then(Value::as_str)
@@ -728,11 +733,14 @@ fn validate_common(
     }
     if name.trim().is_empty()
         || name.len() > 120
-        || path.is_empty()
-        || path.len() > 4096
-        || !path.starts_with('/')
         || description.is_some_and(|v| v.len() > 500)
     {
+        return Err(api_error(400, "invalid_request"));
+    }
+    if path.len() > 4096 {
+        return Err(api_error(400, "invalid_request"));
+    }
+    if validate_project_op_path(path).is_err() {
         return Err(api_error(400, "invalid_request"));
     }
     Ok(())

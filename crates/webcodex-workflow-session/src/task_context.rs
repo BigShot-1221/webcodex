@@ -361,6 +361,16 @@ fn stall_diagnostic(
     actionable: Option<ContinuationToolFailureSnapshot<'_>>,
     failure_evidence: Option<fn(&SessionEvent) -> Option<Value>>,
 ) -> Value {
+    if summary.retained_unclosed_mutating_tool_call {
+        return json!({
+            "status": "reconcile_required",
+            "reason_code": "unconfirmed_tool_execution",
+            "scanned_events": 0,
+            "event_ids": [],
+            "recommendation": RECONCILE_ACTION,
+            "advisory_only": true,
+        });
+    }
     let relevant = events
         .iter()
         .copied()

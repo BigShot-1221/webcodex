@@ -298,7 +298,7 @@ impl Handler for AuthMiddleware {
         let db = get_db(depot);
         if crate::public_ingress_auth::entry(depot).is_some() {
             let context =
-                crate::public_ingress_auth::authenticate_mcp(req, depot, &config, db.as_ref())
+                crate::public_ingress_auth::authenticate_mcp(req, depot, config.clone(), db.clone())
                     .await;
             let Some(context) = context else {
                 res.status_code(StatusCode::UNAUTHORIZED);
@@ -443,8 +443,37 @@ impl Handler for AuthMiddleware {
             return;
         }
 
+        // Pre-reject account credentials outside account control paths before
+        // running the verifier chain. PatVerifier updates last_used_at on
+        // success, so we must not let it run on a surface that will
+        // ultimately reject the token.
+        let path = req.uri().path();
+        if !is_account_control_path(path) && token.starts_with("wc_acct_") {
+            reject(
+                res,
+                ctrl,
+                StatusCode::FORBIDDEN,
+                "account credentials may only access account control endpoints",
+            );
+            return;
+        }
+
+        // Pre-reject agent tokens outside Runner transport paths before
+        // running the verifier chain. PatVerifier updates last_used_at on
+        // success, so we must not let it run on a surface that will
+        // ultimately reject the token.
+        if !is_runner_transport_path(path) && token.starts_with("wc_agent_") {
+            reject(
+                res,
+                ctrl,
+                StatusCode::FORBIDDEN,
+                "agent tokens are only allowed on Runner transport endpoints",
+            );
+            return;
+        }
+
         // Run the verifier chain (PatVerifier → OAuth2Verifier).
-        match authenticate(&config, db.as_ref(), &token).await {
+        match authenticate(config.clone(), db.clone(), token.clone()).await {
             Ok(Some(ctx)) => {
                 // Enforce token-kind surface restrictions (agent tokens,
                 // account credentials) before the handler runs.

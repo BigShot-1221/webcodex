@@ -593,19 +593,35 @@ impl ToolRuntime {
         // The bootstrap runtime_status path and all sparse/error paths stay cheap.
         if result.success && !sparse {
             let sessions = self.sessions.clone();
+            let shared_database = self.shared_database().cloned();
+            let report_shared_database_wal = shared_database.is_some();
             let observed = tokio::task::spawn_blocking(move || {
                 (
                     resources::observe(),
                     serde_json::to_value(sessions.persistence_observation()),
+                    shared_database.as_ref().map(|db| {
+                        serde_json::to_value(db.shared_database_wal_observation())
+                    }),
                 )
             })
             .await;
             if let Some(output) = result.output.as_object_mut() {
                 match observed {
-                    Ok((resources, persistence)) => {
+                    Ok((resources, persistence, shared_database_wal)) => {
                         output.insert("resources".into(), resources);
                         if let Ok(persistence) = persistence {
                             output.insert("session_persistence".into(), persistence);
+                        }
+                        if let Some(observation) = shared_database_wal {
+                            output.insert(
+                                "shared_database_wal".into(),
+                                observation.unwrap_or_else(|_| {
+                                    json!({
+                                        "status": "unavailable",
+                                        "error_kind": "serialization_failed"
+                                    })
+                                }),
+                            );
                         }
                     }
                     Err(_) => {
@@ -613,6 +629,12 @@ impl ToolRuntime {
                             "resources".into(),
                             json!({"scope":"server_process", "status":"unavailable"}),
                         );
+                        if report_shared_database_wal {
+                            output.insert(
+                                "shared_database_wal".into(),
+                                json!({"status":"unavailable", "error_kind":"observation_join_failed"}),
+                            );
+                        }
                     }
                 }
             }

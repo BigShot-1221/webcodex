@@ -91,10 +91,14 @@ async fn e2a_validation_runtime(client_id: &str) -> (ToolRuntime, String, String
     )
     .await;
     let project = agent_test_project_id(client_id);
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("Code Mode E2a integration".to_string()),
-    );
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("Code Mode E2a integration"),
+    )
+    .await;
     (runtime, project, session.session_id)
 }
 
@@ -1071,6 +1075,7 @@ async fn e2a_cpu_timeout_after_child_dispatch_preserves_started_job_truth() {
 async fn e2a_denies_mutation_shell_recursion_and_invalid_validator_before_business_dispatch() {
     let client_id = "code-mode-e2a-denied-effects";
     let (runtime, project, _) = e2a_validation_runtime(client_id).await;
+    let auth = bootstrap_auth_context();
     for (label, source) in [
         (
             "edit_project_files",
@@ -1089,9 +1094,13 @@ async fn e2a_denies_mutation_shell_recursion_and_invalid_validator_before_busine
             "await tools.execute_effectful_code_mode({source: `text('nested')`});",
         ),
     ] {
-        let session = runtime
-            .sessions
-            .start_session(Some(project.clone()), Some(format!("deny {label}")));
+        let session = start_registered_project_session(
+            &runtime,
+            &project,
+            &auth,
+            Some(&format!("deny {label}")),
+        )
+        .await;
         let outcome = spawn_code_mode_call(
             &runtime,
             "execute_effectful_code_mode",
@@ -1108,9 +1117,13 @@ async fn e2a_denies_mutation_shell_recursion_and_invalid_validator_before_busine
             .is_none());
     }
 
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("invalid sync wait".to_string()));
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("invalid sync wait"),
+    )
+    .await;
     let outcome = spawn_code_mode_call(
         &runtime,
         "execute_effectful_code_mode",
@@ -1266,10 +1279,13 @@ async fn e2a_outer_job_run_scope_denial_starts_no_validation_process() {
     )
     .await;
     let project = agent_test_project_id(client_id);
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("Code Mode E2a scope denial".to_string()),
-    );
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("Code Mode E2a scope denial"),
+    )
+    .await;
     let session_id = session.session_id;
     let outcome = runtime
         .call_tool_with_context(
@@ -1334,10 +1350,13 @@ async fn canonical_orchestration_host_distinguishes_child_scope_denial_from_inva
     )
     .await;
     let project = agent_test_project_id(client_id);
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("orchestration child scope denial".to_string()),
-    );
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("orchestration child scope denial"),
+    )
+    .await;
     let policy = OrchestrationPolicy {
         frontend: "test_structured_plan",
         policy_name: "test structured plan",
@@ -1386,11 +1405,14 @@ async fn canonical_orchestration_host_runs_without_the_v8_frontend() {
     let client_id = "orchestration-host-direct";
     let exact_project =
         register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(exact_project.clone()),
-        Some("orchestration host direct test".to_string()),
-    );
     let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(
+        &runtime,
+        &exact_project,
+        &auth,
+        Some("orchestration host direct test"),
+    )
+    .await;
     let policy = OrchestrationPolicy {
         frontend: "test_structured_plan",
         policy_name: "test structured plan",
@@ -1587,10 +1609,14 @@ async fn code_mode_binds_exact_project_and_session_through_real_canonical_reads(
     let client_id = "code-mode-exact";
     let exact_project =
         register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(exact_project.clone()),
-        Some("code mode integration".to_string()),
-    );
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(
+        &runtime,
+        &exact_project,
+        &auth,
+        Some("code mode integration"),
+    )
+    .await;
 
     // The outer caller deliberately uses the project shorthand. The root resolver
     // must bind it once and nested calls must receive the exact resolved id.
@@ -1800,10 +1826,14 @@ async fn code_mode_rejects_nested_target_override_before_runner_dispatch() {
         register_runner_project_at_path(&runtime, "code-mode-a", "alpha", root_a.path()).await;
     let project_b =
         register_runner_project_at_path(&runtime, "code-mode-b", "bravo", root_b.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(project_a.clone()),
-        Some("code mode target guard".to_string()),
-    );
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(
+        &runtime,
+        &project_a,
+        &auth,
+        Some("code mode target guard"),
+    )
+    .await;
     let source = format!(
         "await tools.read_files({{project: {project_b:?}, items: [{{path: 'README.md'}}]}});"
     );
@@ -1845,9 +1875,14 @@ async fn code_mode_failure_detail_is_bounded_without_persisting_source_derived_t
     let runtime = test_runtime();
     let client_id = "code-mode-error-privacy";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", tmp.path()).await;
-    let session = runtime
-        .sessions
-        .start_session(Some(project), Some("code mode error privacy".to_string()));
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("code mode error privacy"),
+    )
+    .await;
     let (outcome, observed) = call_code_mode_with_local_runners(
         &runtime,
         &[client_id],
@@ -1902,6 +1937,7 @@ async fn code_mode_does_not_admit_effectful_or_recursive_tools() {
     let runtime = test_runtime();
     let project =
         register_runner_project_at_path(&runtime, "code-mode-effects", "demo", tmp.path()).await;
+    let auth = bootstrap_auth_context();
     for (label, source) in [
         (
             "run_shell",
@@ -1944,9 +1980,13 @@ async fn code_mode_does_not_admit_effectful_or_recursive_tools() {
             "await tools.observe_jobs({items: [{job_id: 'wc_job_forbidden'}]});",
         ),
     ] {
-        let session = runtime
-            .sessions
-            .start_session(Some(project.clone()), Some(format!("code mode {label}")));
+        let session = start_registered_project_session(
+            &runtime,
+            &project,
+            &auth,
+            Some(&format!("code mode {label}")),
+        )
+        .await;
         let (outcome, observed) = call_code_mode_with_local_runners(
             &runtime,
             &["code-mode-effects"],

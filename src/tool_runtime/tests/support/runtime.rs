@@ -187,3 +187,56 @@ pub(in crate::tool_runtime::tests) fn mcp_recording_context<'a>(
         host_file_import_trust: HostFileImportTrust::Untrusted,
     }
 }
+
+/// Start a Workflow Session for a live registered Project with stored
+/// `project_identity` and owner authority aligned to `auth`.
+pub(in crate::tool_runtime::tests) async fn start_registered_project_session(
+    runtime: &ToolRuntime,
+    project: &str,
+    auth: &AuthContext,
+    title: Option<&str>,
+) -> crate::tool_runtime::sessions::SessionSummary {
+    start_registered_project_session_with_options(
+        runtime,
+        project,
+        auth,
+        title,
+        crate::tool_runtime::SessionMode::Normal,
+        crate::tool_runtime::sessions::SessionGuards::default(),
+    )
+    .await
+}
+
+pub(in crate::tool_runtime::tests) async fn start_registered_project_session_with_options(
+    runtime: &ToolRuntime,
+    project: &str,
+    auth: &AuthContext,
+    title: Option<&str>,
+    mode: crate::tool_runtime::SessionMode,
+    guards: crate::tool_runtime::sessions::SessionGuards,
+) -> crate::tool_runtime::sessions::SessionSummary {
+    use crate::tool_runtime::session_context::workflow_session_authority_fingerprint;
+    use crate::tool_runtime::sessions::SessionCreateOptions;
+
+    let resolved = runtime
+        .resolve_project_input_for_auth(project, Some(auth))
+        .await
+        .expect("registered project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved)
+        .expect("registered project must expose registration incarnation");
+    let fingerprint =
+        workflow_session_authority_fingerprint(Some(auth)).expect("stable test authority");
+    runtime
+        .sessions
+        .start_session_with_options(
+            SessionCreateOptions::new(
+                Some(project.to_string()),
+                title.map(str::to_string),
+                mode,
+                guards,
+            )
+            .with_project_identity(Some(project_identity))
+            .with_owner_authority_fingerprint(Some(fingerprint)),
+        )
+        .unwrap()
+}

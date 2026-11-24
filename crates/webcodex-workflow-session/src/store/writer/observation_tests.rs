@@ -8,6 +8,8 @@ fn fixture() -> (tempfile::TempDir, SessionStore) {
         path: tmp.path().join("sessions.json"),
         restored_sessions: 0,
         last_persist_error: None,
+        database: None,
+        durable_db_path: None,
     });
     store.writer = LedgerWriterGuard::spawn_with_window(
         store.inner.clone(),
@@ -92,7 +94,7 @@ fn persistence_observation_distinguishes_failed_attempt_from_committed_bytes() {
     assert!(attempt.written_bytes.is_none());
     assert!(store.contains_session(&id));
     std::fs::remove_file(&blocker).unwrap();
-    assert!(store.persist_after_mutation_durable().is_ok());
+    assert!(store.persist_after_mutation_durable_blocking().is_ok());
     let recovered = store.persistence_observation().writer.unwrap();
     assert_eq!(recovered.failed_attempts, 1);
     assert!(recovered.last_attempt.unwrap().success);
@@ -111,6 +113,8 @@ fn persistence_observation_memory_and_sync_fallback_are_explicit() {
         path: tmp.path().join("sessions.json"),
         restored_sessions: 0,
         last_persist_error: None,
+        database: None,
+        durable_db_path: None,
     });
     store.start_session(None, None);
     let observed = store.persistence_observation();

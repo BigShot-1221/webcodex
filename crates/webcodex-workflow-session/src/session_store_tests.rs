@@ -165,6 +165,7 @@ fn retained_task_instruction_identity_survives_summary_tail_and_fences_later_att
     let store = SessionStore::new(10, DEFAULT_MAX_EVENTS_PER_SESSION);
     let request = |resume_session_id: Option<String>, instruction: &str| CodingSessionRequest {
         project: "agent:test:attempt-fence".to_string(),
+        project_identity: None,
         authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
         resume_session_id,
         instruction: Some(instruction.to_string()),
@@ -332,6 +333,7 @@ fn coding_git_baseline_and_repository_edit_fact_persist_resume_and_default_legac
     fn request(resume_session_id: Option<String>) -> CodingSessionRequest {
         CodingSessionRequest {
             project: "agent:oe:private-drop".to_string(),
+            project_identity: None,
             authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
             resume_session_id,
             instruction: Some("final changes persistence".to_string()),
@@ -494,6 +496,7 @@ fn coding_session_context_precommit_failure_leaves_memory_unchanged() {
     ) -> CodingSessionRequest {
         CodingSessionRequest {
             project: "agent:oe:private-drop".to_string(),
+            project_identity: None,
             authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
             resume_session_id,
             instruction: Some("continue".to_string()),
@@ -1312,6 +1315,7 @@ fn active_session_survives_capacity_churn_and_keeps_exact_identity_and_fences() 
 
     let resume = |project: &str, authority_fingerprint: &str| CodingSessionRequest {
         project: project.to_string(),
+        project_identity: None,
         authority_fingerprint: authority_fingerprint.to_string(),
         resume_session_id: Some(canonical_id.clone()),
         instruction: Some("resume exact identity".to_string()),
@@ -1365,6 +1369,7 @@ fn active_session_survives_persistence_restart_after_capacity_churn() {
     let request =
         |resume_session_id: Option<String>, project: &str, authority: &str| CodingSessionRequest {
             project: project.to_string(),
+            project_identity: None,
             authority_fingerprint: authority.to_string(),
             resume_session_id,
             instruction: Some("durable active".to_string()),
@@ -1942,6 +1947,7 @@ fn commit_instruction_observation(
     store
         .ensure_coding_session(CodingSessionRequest {
             project: "agent:instructions:demo".into(),
+            project_identity: None,
             authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.into(),
             resume_session_id: session_id.map(str::to_string),
             instruction: Some("observe instructions".into()),

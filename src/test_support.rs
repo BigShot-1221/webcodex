@@ -217,7 +217,49 @@ static TEST_PROJECT_INVENTORY_SEQUENCE: std::sync::atomic::AtomicU64 =
 /// Publish one authoritative paged project-inventory snapshot for a registered
 /// test Runner. Tests must use the same post-registration protocol as production
 /// rather than smuggling projects through the retired inline registration field.
-pub(crate) async fn apply_project_inventory_snapshot(
+pub(crate) fn ensure_test_project_inventory_identity(
+    mut project: crate::runner_protocol::RunnerProjectSummary,
+) -> crate::runner_protocol::RunnerProjectSummary {
+    use sha2::{Digest, Sha256};
+    use webcodex_core::runner_protocol::PROJECT_ROOT_FINGERPRINT_PREFIX;
+
+    if project
+        .registration_incarnation
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        let digest = Sha256::digest(
+            format!(
+                "webcodex-test-project-inventory-registration-incarnation-v1\u{1f}{}\u{1f}{}",
+                project.id, project.updated_at
+            )
+            .as_bytes(),
+        );
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        project.registration_incarnation = Some(uuid::Uuid::from_bytes(bytes).to_string());
+    }
+    if project
+        .root_fingerprint
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        let digest = Sha256::digest(
+            format!(
+                "webcodex-test-project-inventory-root-fingerprint-v1\u{1f}{}",
+                project.path
+            )
+            .as_bytes(),
+        );
+        project.root_fingerprint =
+            Some(format!("{PROJECT_ROOT_FINGERPRINT_PREFIX}{digest:x}"));
+    }
+    project
+}
+
+async fn apply_project_inventory_pages(
     registry: &crate::runner_http::RunnerRegistry,
     client_id: &str,
     runner_instance_id: &str,
@@ -267,6 +309,28 @@ pub(crate) async fn apply_project_inventory_snapshot(
             .await
             .expect("test project inventory page");
     }
+}
+
+pub(crate) async fn apply_project_inventory_snapshot(
+    registry: &crate::runner_http::RunnerRegistry,
+    client_id: &str,
+    runner_instance_id: &str,
+    projects: Vec<crate::runner_protocol::RunnerProjectSummary>,
+) {
+    let projects = projects
+        .into_iter()
+        .map(ensure_test_project_inventory_identity)
+        .collect::<Vec<_>>();
+    apply_project_inventory_pages(registry, client_id, runner_instance_id, projects).await;
+}
+
+pub(crate) async fn apply_project_inventory_snapshot_unmodified(
+    registry: &crate::runner_http::RunnerRegistry,
+    client_id: &str,
+    runner_instance_id: &str,
+    projects: Vec<crate::runner_protocol::RunnerProjectSummary>,
+) {
+    apply_project_inventory_pages(registry, client_id, runner_instance_id, projects).await;
 }
 
 /// Bootstrap helper: create a user with the given role directly via the DB

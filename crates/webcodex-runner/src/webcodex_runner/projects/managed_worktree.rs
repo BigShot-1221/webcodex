@@ -300,6 +300,7 @@ fn managed_worktree_success(
             "path": worktree.to_string_lossy(),
             "kind": project_wire_kind(project),
             "registration_source": effective_registration_source(project).as_str(),
+            "registration_incarnation": project.registration_incarnation,
             "description": project.description,
             "allow_patch": project.allow_patch,
             "disabled": project.disabled,

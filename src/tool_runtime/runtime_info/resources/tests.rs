@@ -22,22 +22,60 @@ async fn resource_diagnostics_only_attach_to_successful_explicit_full_status() {
         assert!(result.success);
         assert!(result.output.get("resources").is_none());
         assert!(result.output.get("session_persistence").is_none());
+        assert!(result.output.get("shared_database_wal").is_none());
     }
     let bootstrap = runtime.runtime_status(None).await;
     assert!(bootstrap.success);
     assert!(bootstrap.output.get("resources").is_none());
+    assert!(bootstrap.output.get("shared_database_wal").is_none());
     let full = runtime
         .runtime_status_with_options(None, false, false, None)
         .await;
     assert!(full.success);
     assert_eq!(full.output["resources"]["scope"], "server_process");
     assert_eq!(full.output["session_persistence"]["mode"], "memory");
+    assert!(full.output.get("shared_database_wal").is_none());
     let failed = runtime
         .runtime_status_with_options(None, false, false, Some("missing-runner".into()))
         .await;
     assert!(!failed.success);
     assert!(failed.output.get("resources").is_none());
     assert!(failed.output.get("session_persistence").is_none());
+    assert!(failed.output.get("shared_database_wal").is_none());
+}
+
+#[tokio::test]
+async fn shared_database_wal_attaches_only_on_successful_full_status_with_shared_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        crate::Database::open(&tmp.path().join("runtime-status-wal.db")).unwrap(),
+    );
+    let runtime = ToolRuntime::new_for_tests().with_window_activity_database(db);
+    let full = runtime
+        .runtime_status_with_options(None, false, false, None)
+        .await;
+    assert!(full.success);
+    let wal = full
+        .output
+        .get("shared_database_wal")
+        .expect("full diagnostics must include shared_database_wal when a Database handle is wired");
+    let status = wal["status"].as_str().expect("status");
+    assert!(
+        matches!(status, "available" | "no_wal" | "busy" | "unavailable"),
+        "unexpected wal status: {status}"
+    );
+    for (compact, summary_only) in [(true, false), (false, true), (true, true)] {
+        let result = runtime
+            .runtime_status_with_options(None, compact, summary_only, None)
+            .await;
+        assert!(result.success);
+        assert!(result.output.get("shared_database_wal").is_none());
+    }
+    let failed = runtime
+        .runtime_status_with_options(None, false, false, Some("missing-runner".into()))
+        .await;
+    assert!(!failed.success);
+    assert!(failed.output.get("shared_database_wal").is_none());
 }
 
 #[tokio::test]

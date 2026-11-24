@@ -1,13 +1,18 @@
 //! Durable WebCodex state persistence and SQLite storage semantics.
 
+/// Minimum spacing between successive `last_used_at` writes on live credentials.
+/// Used for audit display only; not part of authentication or authorization.
+pub const LAST_USED_UPDATE_FLOOR_SECS: i64 = 60;
+
 use self::connection_observation::{
     lock_connection as observed_lock_connection, StoreConnectionGuard, StoreConnectionObserver,
     TracingStoreConnectionObserver,
 };
 use crate::models::PairingCodeRecord;
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 mod accounts;
 mod activity;
@@ -18,6 +23,8 @@ mod agent_wait;
 mod agent_wake;
 mod artifact_handoff;
 mod audit;
+mod backup;
+mod backup_maintenance;
 mod trace_query;
 pub use trace_query::{ToolTraceCallRecord, ToolTraceQueryFilter};
 mod communication;
@@ -62,6 +69,7 @@ mod window_history;
 mod window_operator_migration;
 pub use window_collaboration::*;
 mod project_reference;
+mod restore;
 mod schema;
 mod server_instance;
 mod window_activity;
@@ -155,6 +163,17 @@ pub use self::peer_collaboration::{
     MAX_PEER_MESSAGE_LIMIT,
 };
 pub use self::project_reference::{ProjectReferenceRecord, ProjectReferenceStoreError};
+pub use self::backup::{
+    BackupArtifact, BackupControl, BackupErrorKind, BackupOptions, BackupPhase, BackupStatusSnapshot,
+};
+pub use self::backup_maintenance::BackupMaintenanceOwner;
+pub use self::restore::{
+    OfflineRestoreOwner, PendingRestoreStartup, RestorePreflightFacts,
+    RestoreWorkflowSessionRequirement,
+};
+pub(crate) use self::restore::{
+    OriginalPreservation, OriginalPreservationManifest, PreservedFileRecord, SourceFileIdentity,
+};
 pub use self::server_instance::ServerInstanceGuard;
 pub use self::store_primitives::{
     CommunicationPrincipal, CommunicationStoreError, COMMUNICATION_PRINCIPAL_DIGEST_PREFIX,
@@ -166,6 +185,10 @@ pub struct Database {
     // Exactly one additional, read-only WAL connection for potentially long history.
     // Fast authority/reference/receipt reads stay on the canonical writer lane.
     history_reader: std::sync::OnceLock<Mutex<Connection>>,
+    /// Lazy SQL query-only diagnostics connection for `PRAGMA wal_checkpoint(NOOP)`.
+    /// Opened OS read-write (NO_MUTEX) so SQLite can take the checkpoint lock; `query_only=ON`
+    /// blocks DML. Failures here never affect `Database::open` or the canonical writer.
+    wal_diagnostic_connection: OnceLock<Mutex<Connection>>,
     #[cfg(any(test, feature = "root-test-support"))]
     window_history_reads: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "root-test-support"))]
@@ -179,6 +202,7 @@ impl Database {
         Self {
             conn: Mutex::new(conn),
             history_reader: std::sync::OnceLock::new(),
+            wal_diagnostic_connection: OnceLock::new(),
             #[cfg(any(test, feature = "root-test-support"))]
             window_history_reads: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "root-test-support"))]
@@ -217,6 +241,182 @@ impl Database {
 
     pub(crate) fn state_path(&self) -> &Path {
         &self.state_path
+    }
+
+    fn wal_sidecar_path(&self) -> PathBuf {
+        let mut os = self.state_path.as_os_str().to_os_string();
+        os.push("-wal");
+        PathBuf::from(os)
+    }
+
+    fn observe_wal_bytes(&self) -> Option<u64> {
+        match std::fs::metadata(self.wal_sidecar_path()) {
+            Ok(metadata) if metadata.is_file() => Some(metadata.len()),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(_) => None,
+        }
+    }
+
+    fn ensure_wal_diagnostic_connection(&self) -> Result<&Mutex<Connection>, &'static str> {
+        if let Some(connection) = self.wal_diagnostic_connection.get() {
+            return Ok(connection);
+        }
+        let connection = Connection::open_with_flags(
+            &self.state_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| "connection_open")?;
+        connection
+            .execute_batch(
+                "PRAGMA query_only=ON; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0; PRAGMA cache_size=-512;",
+            )
+            .map_err(|_| "connection_open")?;
+        let _ = self
+            .wal_diagnostic_connection
+            .set(Mutex::new(connection));
+        self.wal_diagnostic_connection
+            .get()
+            .ok_or("connection_open")
+    }
+
+    /// Shared `webcodex.db` file-level WAL observation. SQL query-only `NOOP` checkpoint
+    /// lock probe and `-wal` metadata only; never checkpoints frames, never signals persistence fatal.
+    pub fn shared_database_wal_observation(&self) -> SharedDatabaseWalObservation {
+        let wal_bytes = self.observe_wal_bytes();
+        let connection = match self.ensure_wal_diagnostic_connection() {
+            Ok(connection) => connection,
+            Err(error_kind) => {
+                return SharedDatabaseWalObservation::unavailable(wal_bytes, error_kind);
+            }
+        };
+        let guard = match connection.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => {
+                return SharedDatabaseWalObservation::busy(wal_bytes, None);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return SharedDatabaseWalObservation::unavailable(wal_bytes, "mutex_poisoned");
+            }
+        };
+        let checkpoint = match guard.query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
+        }) {
+            Ok(values) => values,
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if matches!(
+                    failure.code,
+                    ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                ) =>
+            {
+                return SharedDatabaseWalObservation::busy(wal_bytes, Some(true));
+            }
+            Err(_) => {
+                return SharedDatabaseWalObservation::unavailable(wal_bytes, "query_failed");
+            }
+        };
+        SharedDatabaseWalObservation::from_noop(wal_bytes, checkpoint)
+    }
+}
+
+/// Bounded diagnostics for the shared Store database WAL file. Observation only.
+#[derive(Debug, Clone, Serialize)]
+pub struct SharedDatabaseWalObservation {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wal_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_frames: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpointed_frames: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncheckpointed_frames: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_busy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<&'static str>,
+}
+
+impl SharedDatabaseWalObservation {
+    fn unavailable(wal_bytes: Option<u64>, error_kind: &'static str) -> Self {
+        Self {
+            status: "unavailable",
+            wal_bytes,
+            log_frames: None,
+            checkpointed_frames: None,
+            uncheckpointed_frames: None,
+            checkpoint_busy: None,
+            error_kind: Some(error_kind),
+        }
+    }
+
+    fn busy(wal_bytes: Option<u64>, checkpoint_busy: Option<bool>) -> Self {
+        Self {
+            status: "busy",
+            wal_bytes,
+            log_frames: None,
+            checkpointed_frames: None,
+            uncheckpointed_frames: None,
+            checkpoint_busy,
+            error_kind: None,
+        }
+    }
+
+    fn noop_frame_metrics(log: i32, checkpointed: i32) -> (Option<i64>, Option<i64>, Option<i64>) {
+        if log >= 0 && checkpointed >= 0 {
+            let log_frames = i64::from(log);
+            let checkpointed_frames = i64::from(checkpointed);
+            let uncheckpointed_frames = log_frames.saturating_sub(checkpointed_frames);
+            (
+                Some(log_frames),
+                Some(checkpointed_frames),
+                Some(uncheckpointed_frames),
+            )
+        } else {
+            (None, None, None)
+        }
+    }
+
+    fn from_noop(wal_bytes: Option<u64>, (busy, log, checkpointed): (i32, i32, i32)) -> Self {
+        if busy != 0 {
+            let (log_frames, checkpointed_frames, uncheckpointed_frames) =
+                Self::noop_frame_metrics(log, checkpointed);
+            return Self {
+                status: "busy",
+                wal_bytes,
+                log_frames,
+                checkpointed_frames,
+                uncheckpointed_frames,
+                checkpoint_busy: Some(true),
+                error_kind: None,
+            };
+        }
+        if log == -1 && checkpointed == -1 {
+            return Self {
+                status: "no_wal",
+                wal_bytes,
+                log_frames: None,
+                checkpointed_frames: None,
+                uncheckpointed_frames: None,
+                checkpoint_busy: None,
+                error_kind: None,
+            };
+        }
+        if log < 0 || checkpointed < 0 {
+            return Self::unavailable(wal_bytes, "invalid_checkpoint_stats");
+        }
+        let (log_frames, checkpointed_frames, uncheckpointed_frames) =
+            Self::noop_frame_metrics(log, checkpointed);
+        Self {
+            status: "available",
+            wal_bytes,
+            log_frames,
+            checkpointed_frames,
+            uncheckpointed_frames,
+            checkpoint_busy: Some(false),
+            error_kind: None,
+        }
     }
 }
 

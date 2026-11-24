@@ -25,9 +25,10 @@
 //!
 //! ## Token Verifier Chain
 //!
-//! The [`TokenVerifier`] trait is the extension point for bearer token
-//! verification. The verifier chain currently runs [`PatVerifier`] followed by
-//! [`OAuth2Verifier`].
+//! SQLite-backed verification runs on the blocking thread pool via
+//! [`tokens::authenticate`]. The [`TokenVerifier`] trait remains for unit tests;
+//! production paths use [`PatVerifier::verify_sync`] and
+//! [`OAuth2Verifier::verify_sync`].
 
 use crate::{Config, Database};
 use std::sync::Arc;
@@ -271,10 +272,10 @@ fn restore_test_env(name: &str, value: &Option<std::ffi::OsString>) {
 ///   The agent-transport path gate does NOT apply here: the QUIC listener is
 ///   inherently an agent-only transport, so an agent token reaching it is
 ///   already on an allowed surface.
-/// - **Account credential (`wc_acct_*`)**: **rejected** — returns `None`.
-///   Account credentials are only valid on HTTP account-control endpoints.
-///   The QUIC/Runner transport has no use for them, and accepting them would
-///   silently update `last_used_at` before the caller rejects the connection.
+/// - **Account credential (`wc_acct_*`)**: **rejected** — returns `None`
+///   *before* running the verifier chain, so `last_used_at` is not updated.
+///   Account credentials are only valid on HTTP account-control endpoints;
+///   the QUIC/Runner transport does not accept them.
 /// - **OAuth2 access token (`wc_oat_*`)**: **rejected** — returns `None`
 ///   *before* running the verifier chain, so `last_used_at` is not updated.
 ///   OAuth2 tokens are accepted on regular HTTP surfaces via `AuthMiddleware`,
@@ -284,8 +285,8 @@ fn restore_test_env(name: &str, value: &Option<std::ffi::OsString>) {
 /// but rejected (disabled user, expired token, account credential). The
 /// caller MUST treat `None` as "reject the connection".
 pub(crate) async fn authenticate_bearer(
-    config: &Config,
-    db: Option<&Arc<Database>>,
+    config: Arc<Config>,
+    db: Option<Arc<Database>>,
     token: Option<&str>,
 ) -> Option<AuthContext> {
     // Auth disabled in development -> bootstrap (full access), identical to
@@ -311,11 +312,18 @@ pub(crate) async fn authenticate_bearer(
     if is_oauth2_access_token(token) {
         return None;
     }
+    // Pre-reject account credentials before running the verifier chain.
+    // PatVerifier updates last_used_at on success, so we must not let it run on
+    // a surface that will ultimately reject the token. The QUIC/agent transport
+    // surface does not accept account credentials.
+    if token.starts_with("wc_acct_") {
+        return None;
+    }
     // Run the same verifier chain as the HTTP path (PatVerifier →
     // OAuth2Verifier). Any error (disabled user, expired token) is treated
     // the same as "unknown" for the QUIC transport — the caller rejects
     // the connection either way.
-    match authenticate(config, db, token).await {
+    match authenticate(config.clone(), db, token.to_string()).await {
         Ok(Some(ctx)) => {
             // Account credentials are not valid on the Runner transport surface.
             // Reject them here so they don't silently update last_used_at and then
@@ -332,7 +340,7 @@ pub(crate) async fn authenticate_bearer(
             // non-empty after trimming, and it does not look like a WebCodex
             // managed credential.
             let trimmed = token.trim();
-            if direct_shared_key_enabled(config)
+            if direct_shared_key_enabled(&config)
                 && !trimmed.is_empty()
                 && !is_managed_token_prefix(trimmed)
             {

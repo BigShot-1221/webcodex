@@ -1,7 +1,23 @@
 //! Listener-derived public authority. No request header can manufacture this context.
 use salvo::prelude::*;
 use std::sync::Arc;
-use webcodex_store::PublicIngressEntry;
+use webcodex_store::{PublicIngressEntry, PublicIngressFence};
+
+fn oauth_client_ingress_allowed(
+    db: &crate::Database,
+    client_id: &str,
+    fence: Option<PublicIngressFence>,
+) -> bool {
+    match fence {
+        Some(fence) => db
+            .oauth_client_matches_public_ingress(client_id, &fence)
+            .unwrap_or(false),
+        None => matches!(
+            db.oauth_client_public_ingress_entry_id(client_id),
+            Ok(None)
+        ),
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct PublicIngressRequest(pub(crate) PublicIngressEntry);
@@ -135,15 +151,25 @@ impl Handler for ClientIngressGate {
             }
         }
         if let Some(client_id) = client_id {
-            let allowed = crate::auth::get_db(depot).is_some_and(|db| match entry(depot) {
-                Some(entry) => db
-                    .oauth_client_matches_public_ingress(&client_id, &entry.fence())
-                    .unwrap_or(false),
-                None => matches!(
-                    db.oauth_client_public_ingress_entry_id(&client_id),
-                    Ok(None)
-                ),
-            });
+            let Some(db) = crate::auth::get_db(depot) else {
+                res.status_code(StatusCode::BAD_REQUEST);
+                res.headers_mut().insert(
+                    "cache-control",
+                    salvo::http::HeaderValue::from_static("no-store"),
+                );
+                res.render(Json(serde_json::json!({"error":"invalid_client"})));
+                ctrl.skip_rest();
+                return;
+            };
+            let fence = entry(depot).map(|entry| entry.fence());
+            let allowed = match tokio::task::spawn_blocking(move || {
+                oauth_client_ingress_allowed(&db, &client_id, fence)
+            })
+            .await
+            {
+                Ok(allowed) => allowed,
+                Err(_) => false,
+            };
             if !allowed {
                 res.status_code(StatusCode::BAD_REQUEST);
                 res.headers_mut().insert(
@@ -162,20 +188,28 @@ impl Handler for ClientIngressGate {
 pub(crate) async fn authenticate_mcp(
     req: &Request,
     depot: &Depot,
-    config: &crate::Config,
-    db: Option<&Arc<crate::Database>>,
+    config: Arc<crate::Config>,
+    db: Option<Arc<crate::Database>>,
 ) -> Option<crate::auth::AuthContext> {
     let entry = entry(depot)?;
     let token = crate::auth::bearer_token(req)?;
-    crate::auth::tokens::OAuth2Verifier::verify_for_ingress(
-        config,
-        db,
-        &token,
-        Some(&entry.fence()),
-    )
-    .await
-    .ok()
-    .flatten()
+    let fence = entry.fence();
+    let Some(db) = db else {
+        return None;
+    };
+    let join = tokio::task::spawn_blocking(move || {
+        crate::auth::tokens::OAuth2Verifier::verify_for_ingress_sync(
+            &config,
+            Some(&db),
+            &token,
+            Some(&fence),
+        )
+    })
+    .await;
+    match join {
+        Ok(Ok(Some(ctx))) => Some(ctx),
+        _ => None,
+    }
 }
 #[cfg(test)]
 mod tests;

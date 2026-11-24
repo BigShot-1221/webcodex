@@ -74,6 +74,7 @@ async fn collaboration_message_projection_reuses_authority_fence_and_hides_compl
     let assignment_fence = runtime
         .sessions
         .get_assignment(&session.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     runtime
@@ -88,6 +89,7 @@ async fn collaboration_message_projection_reuses_authority_fence_and_hides_compl
             author_session_id: Some("wc_sess_worker0000000000".to_string()),
             expected_assignment_fence: assignment_fence,
         })
+        .await
         .unwrap();
 
     let board = session_messages_for_auth(
@@ -500,6 +502,7 @@ async fn browser_message_mutations_fail_closed_on_authority_and_state_conflicts(
     let assignment_fence = runtime
         .sessions
         .get_assignment(&session.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     runtime
@@ -514,6 +517,7 @@ async fn browser_message_mutations_fail_closed_on_authority_and_state_conflicts(
             author_session_id: None,
             expected_assignment_fence: assignment_fence,
         })
+        .await
         .unwrap();
     assert_eq!(
         session_replace_message_for_auth(
@@ -586,6 +590,35 @@ async fn browser_message_mutation_json_and_uncertain_errors_are_distinct() {
     let body = response.take_string().await.unwrap();
     assert!(body.contains("Outcome may have happened"));
     assert!(body.contains("refresh retained messages before retrying"));
+
+    assert_eq!(
+        session_message_mutation_error(
+            crate::tool_runtime::sessions::SessionMessageError::PersistenceUnavailable,
+        ),
+        RuntimeConsoleError::PersistenceUnavailable
+    );
+    assert_ne!(
+        session_message_mutation_error(
+            crate::tool_runtime::sessions::SessionMessageError::PersistenceUnavailable,
+        ),
+        RuntimeConsoleError::PersistenceUncertain
+    );
+    let mut response = Response::new();
+    render_error(&mut response, RuntimeConsoleError::PersistenceUnavailable);
+    assert_eq!(response.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+    let body = response.take_string().await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["status"], 503);
+    assert_eq!(
+        parsed["error"],
+        "Session persistence is temporarily unavailable; retry after recovery"
+    );
+    assert_eq!(parsed["error_kind"], "session_persistence_unavailable");
+    assert_eq!(parsed["failure_kind"], "persistence_unavailable");
+    assert_eq!(parsed["state_changed"], false);
+    assert_eq!(parsed["reobserve_required"], true);
+    assert!(!body.to_ascii_lowercase().contains("sqlite"));
+    assert!(!body.contains(".db"));
 }
 
 #[tokio::test]

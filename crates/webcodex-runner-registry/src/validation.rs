@@ -660,6 +660,13 @@ fn valid_git_sha(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_project_registration_incarnation(value: &str) -> bool {
+    const MAX_REGISTRATION_INCARNATION_LEN: usize = 36;
+    !value.is_empty()
+        && value.len() <= MAX_REGISTRATION_INCARNATION_LEN
+        && uuid::Uuid::parse_str(value).is_ok()
+}
+
 pub(super) fn validate_project_summary(project: &RunnerProjectSummary) -> Result<(), &'static str> {
     if project.id.is_empty()
         || project.id.len() > 64
@@ -746,6 +753,13 @@ pub(super) fn validate_project_summary(project: &RunnerProjectSummary) -> Result
         hex.len() != 64 || !hex.chars().all(|character| character.is_ascii_hexdigit())
     }) {
         return Err("project_summary_invalid_revision");
+    }
+    if project
+        .registration_incarnation
+        .as_deref()
+        .is_some_and(|value| !valid_project_registration_incarnation(value))
+    {
+        return Err("project_summary_invalid_registration_incarnation");
     }
     Ok(())
 }
@@ -937,5 +951,56 @@ mod provider_status_tests {
             plugin_failure.last_reload_error_code.as_deref(),
             Some("plugin_reload_failed")
         );
+    }
+}
+
+#[cfg(test)]
+mod project_summary_registration_incarnation_tests {
+    use super::*;
+    use webcodex_core::runner_protocol::RunnerProjectSummary;
+
+    fn minimal_project_summary() -> RunnerProjectSummary {
+        RunnerProjectSummary {
+            id: "demo".to_string(),
+            name: Some("Demo".to_string()),
+            path: "/tmp/demo".to_string(),
+            allow_patch: true,
+            kind: None,
+            registration_source: None,
+            registration_incarnation: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: None,
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 1,
+            shell_profile: None,
+        }
+    }
+
+    #[test]
+    fn project_summary_without_registration_incarnation_passes_for_legacy_peers() {
+        validate_project_summary(&minimal_project_summary()).expect("legacy omission is allowed");
+    }
+
+    #[test]
+    fn project_summary_rejects_non_canonical_registration_incarnation() {
+        let mut project = minimal_project_summary();
+        project.registration_incarnation = Some("not-a-uuid".to_string());
+        assert_eq!(
+            validate_project_summary(&project),
+            Err("project_summary_invalid_registration_incarnation")
+        );
+    }
+
+    #[test]
+    fn project_summary_accepts_canonical_uuid_registration_incarnation() {
+        let mut project = minimal_project_summary();
+        project.registration_incarnation = Some("11111111-1111-1111-1111-111111111111".to_string());
+        validate_project_summary(&project).expect("canonical uuid must be accepted");
     }
 }

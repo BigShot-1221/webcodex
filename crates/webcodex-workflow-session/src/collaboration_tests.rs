@@ -21,7 +21,15 @@ async fn baseline(store: &SessionStore, session_id: &str) -> SessionMessageObser
 
 fn assignment_fence(store: &SessionStore, session_id: &str, todo_id: &str) -> String {
     store
+        .get_assignment_for_test(session_id, todo_id)
+        .unwrap()
+        .assignment_fence
+}
+
+async fn assignment_fence_async(store: &SessionStore, session_id: &str, todo_id: &str) -> String {
+    store
         .get_assignment(session_id, todo_id)
+        .await
         .unwrap()
         .assignment_fence
 }
@@ -152,13 +160,14 @@ async fn observe_session_messages_baseline_append_resolve_completion_and_replay(
         priority: SessionMessagePriority::Normal,
         completion_id: completion_id('a'),
         author_session_id: None,
-        expected_assignment_fence: assignment_fence(
+        expected_assignment_fence: assignment_fence_async(
             &store,
             &session.session_id,
             &completion_todo.message_id,
-        ),
+        )
+        .await,
     };
-    let completion = store.complete_message(input.clone()).unwrap();
+    let completion = store.complete_message(input.clone()).await.unwrap();
     assert!(!completion.replayed);
     let completion_delta = store
         .observe_messages(
@@ -183,7 +192,7 @@ async fn observe_session_messages_baseline_append_resolve_completion_and_replay(
         completion.answer.message_id
     );
 
-    let replay = store.complete_message(input).unwrap();
+    let replay = store.complete_message(input).await.unwrap();
     assert!(replay.replayed);
     let after_replay = store
         .observe_messages(
@@ -277,12 +286,14 @@ async fn observe_session_messages_retention_reports_history_loss_for_protected_t
             priority: SessionMessagePriority::Normal,
             completion_id: completion_id('b'),
             author_session_id: None,
-            expected_assignment_fence: assignment_fence(
+            expected_assignment_fence: assignment_fence_async(
                 &store,
                 &session.session_id,
                 &todo.message_id,
-            ),
+            )
+            .await,
         })
+        .await
         .unwrap();
 
     let retained_todo = store
@@ -493,7 +504,7 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
     };
 
     let first = store
-        .post_message_with_ack_and_delivery(
+        .post_message_with_ack_and_delivery_for_test(
             input("parser review complete"),
             false,
             Some(delivery()),
@@ -502,7 +513,7 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
     assert!(!first.replayed);
     assert!(first.state_changed);
     let replay = store
-        .post_message_with_ack_and_delivery(
+        .post_message_with_ack_and_delivery_for_test(
             input("parser review complete"),
             false,
             Some(delivery()),
@@ -519,7 +530,7 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
         1
     );
     assert!(matches!(
-        store.post_message_with_ack_and_delivery(
+        store.post_message_with_ack_and_delivery_for_test(
             input("different payload"),
             false,
             Some(delivery())
@@ -530,7 +541,7 @@ fn session_message_delivery_key_replays_conflicts_and_survives_restart() {
     store.flush_persistence();
     let restored = SessionStore::with_persistence(&ledger, 10, 50);
     let replay_after_restart = restored
-        .post_message_with_ack_and_delivery(
+        .post_message_with_ack_and_delivery_for_test(
             input("parser review complete"),
             false,
             Some(delivery()),
@@ -577,7 +588,11 @@ fn session_message_delivery_retry_reestablishes_durable_barrier_after_persist_fa
     std::fs::remove_dir_all(&ledger_dir).unwrap();
     std::fs::write(&ledger_dir, b"block directory recreation").unwrap();
     assert!(matches!(
-        store.post_message_with_ack_and_delivery(input(), false, Some(delivery())),
+        store.post_message_with_ack_and_delivery_for_test(
+            input(),
+            false,
+            Some(delivery()),
+        ),
         Err(SessionMessageError::DeliveryPersistenceUncertain)
     ));
     let in_memory = store
@@ -589,7 +604,7 @@ fn session_message_delivery_retry_reestablishes_durable_barrier_after_persist_fa
     std::fs::remove_file(&ledger_dir).unwrap();
     std::fs::create_dir_all(&ledger_dir).unwrap();
     let replay = store
-        .post_message_with_ack_and_delivery(input(), false, Some(delivery()))
+        .post_message_with_ack_and_delivery_for_test(input(), false, Some(delivery()))
         .unwrap();
     assert!(replay.replayed);
     assert!(!replay.state_changed);
@@ -799,7 +814,7 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
         ),
     };
 
-    let completed = store.complete_message(input.clone()).unwrap();
+    let completed = store.complete_message_for_test(input.clone()).unwrap();
     assert!(!completed.replayed);
     assert_eq!(completed.todo.status, SessionMessageStatus::Resolved);
     assert_eq!(
@@ -859,7 +874,7 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
     assert_eq!(replies.len(), 1);
     assert_eq!(replies[0].message_id, completed.answer.message_id);
 
-    let replay = store.complete_message(input.clone()).unwrap();
+    let replay = store.complete_message_for_test(input.clone()).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.answer.message_id, completed.answer.message_id);
     assert_eq!(replay.todo.resolved_at, completed.todo.resolved_at);
@@ -874,7 +889,7 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
         .unwrap();
     assert_eq!(answers.len(), 1, "retry must not duplicate answers");
 
-    let conflict = store.complete_message(CompleteSessionMessageInput {
+    let conflict = store.complete_message_for_test(CompleteSessionMessageInput {
         answer: "different answer".to_string(),
         ..input.clone()
     });
@@ -882,7 +897,7 @@ fn collaboration_session_message_atomic_completion_is_correlated_and_idempotent(
         conflict,
         Err(SessionMessageError::IdempotencyConflict)
     ));
-    let already = store.complete_message(CompleteSessionMessageInput {
+    let already = store.complete_message_for_test(CompleteSessionMessageInput {
         completion_id: completion_id('b'),
         ..input
     });
@@ -940,11 +955,11 @@ fn collaboration_session_message_completion_rejects_invalid_targets_and_author()
         expected_assignment_fence: assignment_fence(&store, &session.session_id, &todo.message_id),
     };
     assert!(matches!(
-        store.complete_message(base.clone()),
+        store.complete_message_for_test(base.clone()),
         Err(SessionMessageError::NotTodo)
     ));
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
+        store.complete_message_for_test(CompleteSessionMessageInput {
             message_id: "wc_msg_missing".to_string(),
             ..base.clone()
         }),
@@ -952,7 +967,7 @@ fn collaboration_session_message_completion_rejects_invalid_targets_and_author()
     ));
 
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
+        store.complete_message_for_test(CompleteSessionMessageInput {
             message_id: todo.message_id.clone(),
             author_session_id: Some("forged-author".to_string()),
             ..base.clone()
@@ -960,7 +975,7 @@ fn collaboration_session_message_completion_rejects_invalid_targets_and_author()
         Err(SessionMessageError::InvalidInput(_))
     ));
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
+        store.complete_message_for_test(CompleteSessionMessageInput {
             message_id: todo.message_id.clone(),
             answer: "x".repeat(8001),
             ..base.clone()
@@ -968,7 +983,7 @@ fn collaboration_session_message_completion_rejects_invalid_targets_and_author()
         Err(SessionMessageError::InvalidInput(_))
     ));
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
+        store.complete_message_for_test(CompleteSessionMessageInput {
             message_id: todo.message_id.clone(),
             tags: (0..17).map(|index| format!("tag-{index}")).collect(),
             ..base.clone()
@@ -992,7 +1007,7 @@ fn collaboration_session_message_completion_rejects_invalid_targets_and_author()
     );
     store.close_session(&session.session_id).unwrap();
     assert!(matches!(
-        store.complete_message(CompleteSessionMessageInput {
+        store.complete_message_for_test(CompleteSessionMessageInput {
             message_id: todo.message_id,
             ..base
         }),
@@ -1073,12 +1088,12 @@ fn collaboration_session_message_completion_replays_after_current_v2_restart() {
             &todo.message_id,
         ),
     };
-    let first = store.complete_message(input.clone()).unwrap();
+    let first = store.complete_message_for_test(input.clone()).unwrap();
 
     // Completion success durably fences the accepted intent, so a fresh
     // current-v2 store can replay it without a test-only flush or graceful Drop.
     let restored = SessionStore::with_persistence(&ledger, 10, 50);
-    let replay = restored.complete_message(input).unwrap();
+    let replay = restored.complete_message_for_test(input).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.answer.message_id, first.answer.message_id);
     assert_eq!(
@@ -1127,7 +1142,7 @@ fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_
         expected_assignment_fence: assignment_fence,
     };
     assert!(matches!(
-        store.complete_message(input.clone()),
+        store.complete_message_for_test(input.clone()),
         Err(SessionMessageError::PersistenceUncertain)
     ));
     let in_memory = store
@@ -1147,7 +1162,7 @@ fn collaboration_session_message_persistence_failure_is_uncertain_then_same_key_
 
     std::fs::remove_file(&ledger_dir).unwrap();
     std::fs::create_dir_all(&ledger_dir).unwrap();
-    let replay = store.complete_message(input).unwrap();
+    let replay = store.complete_message_for_test(input).unwrap();
     assert!(replay.replayed);
     store.flush_persistence();
     let restored = SessionStore::with_persistence(&ledger, 10, 50);
@@ -1187,7 +1202,7 @@ fn collaboration_session_message_partial_persisted_completion_fails_closed() {
         author_session_id: None,
         expected_assignment_fence: assignment_fence(&store, &session.session_id, &todo.message_id),
     };
-    store.complete_message(input.clone()).unwrap();
+    store.complete_message_for_test(input.clone()).unwrap();
     store.flush_persistence();
     drop(store);
 
@@ -1208,7 +1223,7 @@ fn collaboration_session_message_partial_persisted_completion_fails_closed() {
     todo_raw.remove("resolved_by_message_id");
     std::fs::write(&ledger, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
     let restored = SessionStore::with_persistence(&ledger, 10, 50);
-    let err = restored.complete_message(input).unwrap_err();
+    let err = restored.complete_message_for_test(input).unwrap_err();
     assert!(matches!(err, SessionMessageError::InvalidCompletionState));
     let persisted_todo = restored
         .list_messages(

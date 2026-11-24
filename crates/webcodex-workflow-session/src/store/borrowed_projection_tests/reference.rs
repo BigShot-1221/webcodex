@@ -81,6 +81,11 @@ pub(super) fn reference_summary(
         events_retained: retained_total,
         events_evicted: observed_total.saturating_sub(retained_total),
         retention_truncated: observed_total > retained_total,
+        retained_unclosed_mutating_tool_call:
+            crate::continuation::retained_history_has_unclosed_mutating_tool_calls(
+                record.events.iter().map(|event| event.as_ref()),
+                &record.session_id,
+            ),
         ledger_first_retained_sequence: observed_total.saturating_sub(retained_total),
         events_returned,
         events_truncated: observed_total > events_returned,

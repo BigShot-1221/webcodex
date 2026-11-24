@@ -3,7 +3,7 @@ use salvo::prelude::*;
 use salvo::{Server, Service};
 use std::future::Future;
 use std::io;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,18 +14,27 @@ pub(crate) enum ShutdownReason {
     Sigterm,
     ParentEof,
     ServiceStop,
+    PersistenceFailure,
 }
 
 impl ShutdownReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::Sigint => "SIGINT",
             #[cfg(any(unix, test))]
             Self::Sigterm => "SIGTERM",
             Self::ParentEof => "parent_stdin_eof",
             Self::ServiceStop => "SCM_STOP",
+            Self::PersistenceFailure => "workflow_session_persistence_failure",
         }
     }
+}
+
+pub(crate) fn persistence_failure_exit_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        "workflow session persistence failed; restart required",
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,12 +47,29 @@ enum ShutdownState {
 #[derive(Debug)]
 pub(crate) struct ShutdownCoordinator {
     state: AtomicU8,
+    /// Fatal or operator-requested shutdown may close root admission before the
+    /// authoritative `Running -> Draining` transition in `serve_with_ingress`.
+    close_admission: AtomicBool,
+    shutdown_request_tx: tokio::sync::watch::Sender<Option<ShutdownReason>>,
+    shutdown_request_rx: tokio::sync::watch::Receiver<Option<ShutdownReason>>,
+    /// Background listeners (e.g. Runner QUIC) observe this without closing HTTP
+    /// admission. Operator-driven shutdown uses this before the HTTP drain phase.
+    background_services_stop_tx: tokio::sync::watch::Sender<Option<ShutdownReason>>,
+    background_services_stop_rx: tokio::sync::watch::Receiver<Option<ShutdownReason>>,
 }
 
 impl Default for ShutdownCoordinator {
     fn default() -> Self {
+        let (shutdown_request_tx, shutdown_request_rx) = tokio::sync::watch::channel(None);
+        let (background_services_stop_tx, background_services_stop_rx) =
+            tokio::sync::watch::channel(None);
         Self {
             state: AtomicU8::new(ShutdownState::Running as u8),
+            close_admission: AtomicBool::new(false),
+            shutdown_request_tx,
+            shutdown_request_rx,
+            background_services_stop_tx,
+            background_services_stop_rx,
         }
     }
 }
@@ -72,6 +98,34 @@ impl ShutdownCoordinator {
 
     fn is_running(&self) -> bool {
         self.state.load(Ordering::Acquire) == ShutdownState::Running as u8
+            && !self.close_admission.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn shutdown_request_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<ShutdownReason>> {
+        self.shutdown_request_rx.clone()
+    }
+
+    pub(crate) fn background_services_stop_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<ShutdownReason>> {
+        self.background_services_stop_rx.clone()
+    }
+
+    /// Notify background listeners without closing HTTP admission. Idempotent
+    /// sends are safe; the last reason wins.
+    pub(crate) fn notify_background_services_stop(&self, reason: ShutdownReason) {
+        let _ = self.background_services_stop_tx.send(Some(reason));
+    }
+
+    /// Programmatic shutdown (e.g. workflow-session persistence fatal). Closes
+    /// admission immediately while leaving lifecycle state `Running` until HTTP
+    /// ingress observes the authoritative drain transition.
+    pub(crate) fn request_shutdown(&self, reason: ShutdownReason) {
+        self.close_admission.store(true, Ordering::Release);
+        let _ = self.shutdown_request_tx.send(Some(reason));
+        self.notify_background_services_stop(reason);
     }
 
     fn mark_stopped(&self) {
@@ -165,6 +219,22 @@ impl TerminationSignals {
     }
 }
 
+async fn recv_coordinator_shutdown(
+    rx: &mut tokio::sync::watch::Receiver<Option<ShutdownReason>>,
+) -> ShutdownReason {
+    loop {
+        if rx.changed().await.is_err() {
+            tracing::warn!(
+                "shutdown coordinator request channel closed; treating as workflow persistence failure"
+            );
+            return ShutdownReason::PersistenceFailure;
+        }
+        if let Some(reason) = rx.borrow_and_update().clone() {
+            return reason;
+        }
+    }
+}
+
 pub(crate) async fn serve_until_termination<A, S>(
     server: Server<A>,
     service: S,
@@ -179,22 +249,29 @@ where
     S: Into<Service> + Send,
 {
     let mut signals = TerminationSignals::new()?;
+    let mut coordinator_shutdown = coordinator.shutdown_request_receiver();
+    let pre_coordinator_reason = coordinator_shutdown.borrow().clone();
     let parent_eof = if stop_on_stdin_eof {
         Some(parent_eof_signal()?)
     } else {
         None
     };
     let signal = async move {
+        if let Some(reason) = pre_coordinator_reason {
+            return reason;
+        }
         if let Some(parent_eof) = parent_eof {
             tokio::select! {
                 reason = signals.recv() => reason,
                 _ = parent_eof => ShutdownReason::ParentEof,
                 _ = service_stop => ShutdownReason::ServiceStop,
+                reason = recv_coordinator_shutdown(&mut coordinator_shutdown) => reason,
             }
         } else {
             tokio::select! {
                 reason = signals.recv() => reason,
                 _ = service_stop => ShutdownReason::ServiceStop,
+                reason = recv_coordinator_shutdown(&mut coordinator_shutdown) => reason,
             }
         }
     };
@@ -285,6 +362,7 @@ where
         tokio::select! {
             result = &mut serve => {
                 let _ = stop.send(true);
+                coordinator.notify_background_services_stop(ShutdownReason::ServiceStop);
                 if !ingress_finished {
                     let _ = tokio::time::timeout(Duration::from_secs(15), &mut ingress).await;
                 }
@@ -296,6 +374,7 @@ where
         }
     };
 
+    coordinator.notify_background_services_stop(reason);
     let _ = stop.send(true);
     let mut http_result = None;
     if !ingress_finished {
@@ -372,6 +451,12 @@ where
             shutdown_state = "stopped",
             "Server graceful shutdown completed"
         );
+    }
+    if reason == ShutdownReason::PersistenceFailure {
+        return match result {
+            Ok(()) => Err(persistence_failure_exit_error()),
+            Err(error) => Err(error),
+        };
     }
     result
 }

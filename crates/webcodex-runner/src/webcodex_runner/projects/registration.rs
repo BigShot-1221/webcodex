@@ -18,6 +18,113 @@ use crate::webcodex_runner::output::{ok_cmd, CommandResult};
 
 const AUTO_PROJECT_HASH_PREFIX_LENGTHS: &[usize] = &[8, 12, 16, 24, 32, 48, 64];
 
+pub(crate) fn mint_registration_incarnation() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+pub(crate) fn valid_registration_incarnation(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok()
+}
+
+pub(super) fn append_registration_incarnation_to_toml(
+    content: &str,
+    incarnation: &str,
+) -> Result<String, String> {
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("failed to parse project toml for migration: {error}"))?;
+    if doc.contains_key("registration_incarnation") {
+        return Err("registration_incarnation already present".to_string());
+    }
+    doc.insert(
+        "registration_incarnation",
+        toml_edit::Item::Value(toml_edit::Value::from(incarnation)),
+    );
+    Ok(doc.to_string())
+}
+
+fn project_registry_config_is_upgradeable(path: &Path) -> Result<(), &'static str> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "project_registry_unavailable")?;
+    if metadata.file_type().is_symlink() {
+        return Err("project_registry_symlink");
+    }
+    Ok(())
+}
+
+pub(super) fn write_registry_record_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "project config has no parent".to_string())?;
+    let original_permissions = if path.exists() {
+        Some(
+            std::fs::metadata(path)
+                .map_err(|error| format!("failed to read project config metadata: {error}"))?
+                .permissions(),
+        )
+    } else {
+        None
+    };
+    let id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project");
+    let temp = unique_registry_temp(parent, id, "toml.tmp");
+    let result = (|| {
+        let mut file = std::fs::File::create(&temp)
+            .map_err(|error| format!("failed to create migration temp file: {error}"))?;
+        if let Some(permissions) = original_permissions {
+            std::fs::set_permissions(&temp, permissions).map_err(|error| {
+                format!("failed to preserve project config permissions: {error}")
+            })?;
+        }
+        file.write_all(content.as_bytes())
+            .map_err(|error| format!("failed to write migration temp file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("failed to sync migration temp file: {error}"))?;
+        project_registry_config_is_upgradeable(path).map_err(|code| code.to_string())?;
+        std::fs::rename(&temp, path)
+            .map_err(|error| format!("failed to atomically replace project config: {error}"))?;
+        sync_parent_dir(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Load one Runner registry record, persisting a legacy missing
+/// `registration_incarnation` exactly once before returning.
+pub(crate) fn load_runner_project_registry_record(
+    path: &Path,
+) -> Result<RunnerProjectFile, String> {
+    project_registry_config_is_upgradeable(path).map_err(|code| code.to_string())?;
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("failed to read project config: {error}"))?;
+    let project = parse_runner_project_toml(&content)?;
+    if project.registration_incarnation.is_some() {
+        return Ok(project);
+    }
+    let _registry_guard = project_registry_write_lock()
+        .lock()
+        .map_err(|_| "project registry lock unavailable".to_string())?;
+    project_registry_config_is_upgradeable(path).map_err(|code| code.to_string())?;
+    let refreshed =
+        std::fs::read_to_string(path).map_err(|error| format!("failed to read project config: {error}"))?;
+    let refreshed_project = parse_runner_project_toml(&refreshed)?;
+    if let Some(existing) = refreshed_project.registration_incarnation.as_deref() {
+        if valid_registration_incarnation(existing) {
+            return Ok(refreshed_project);
+        }
+        return Err("registration_incarnation is invalid".to_string());
+    }
+    let incarnation = mint_registration_incarnation();
+    let migrated = append_registration_incarnation_to_toml(&refreshed, &incarnation)?;
+    write_registry_record_atomic(path, &migrated)?;
+    let mut upgraded = refreshed_project;
+    upgraded.registration_incarnation = Some(incarnation);
+    Ok(upgraded)
+}
+
 /// Windows-only raw/canonical namespace fence. Local disks plus UNC and
 /// verbatim-UNC shares may proceed; device namespaces and generic verbatim
 /// namespaces fail closed with a stable error before filesystem access.
@@ -111,8 +218,13 @@ pub(super) fn build_project_toml_with_registration_source(
     description: &Option<String>,
     allow_patch: bool,
 ) -> String {
+    let registration_incarnation = mint_registration_incarnation();
     let mut toml = String::new();
     toml.push_str(&format!("id = {}\n", toml_basic_string(id)));
+    toml.push_str(&format!(
+        "registration_incarnation = {}\n",
+        toml_basic_string(&registration_incarnation)
+    ));
     toml.push_str(&format!("name = {}\n", toml_basic_string(name)));
     toml.push_str(&format!("path = {}\n", toml_basic_string(path)));
     if let Some(registration_source) = registration_source {
@@ -349,9 +461,8 @@ pub(super) fn load_project_files_for_path_resolution(
 
     let mut projects = Vec::with_capacity(files.len());
     for file in files {
-        let content = std::fs::read_to_string(&file).map_err(|_| "project_registry_unavailable")?;
         let project =
-            parse_runner_project_toml(&content).map_err(|_| "project_registry_unavailable")?;
+            load_runner_project_registry_record(&file).map_err(|_| "project_registry_unavailable")?;
         projects.push(project);
     }
     Ok(projects)
@@ -513,6 +624,7 @@ fn path_resolution_success(
         "path": canonical_path.to_string_lossy(),
         "kind": project_wire_kind(project),
         "registration_source": effective_registration_source(project).as_str(),
+        "registration_incarnation": project.registration_incarnation,
         "description": project.description,
         "allow_patch": project.allow_patch,
         "disabled": project.disabled,
@@ -781,4 +893,78 @@ pub(crate) fn handle_resolve_or_register_project_operation(
             Some(&write_result.config_path),
         ),
     )
+}
+
+#[cfg(test)]
+mod registry_record_migration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_migration_builds_from_refreshed_registry_bytes_under_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo");
+        std::fs::create_dir(&project_dir).unwrap();
+        let config_path = tmp.path().join("legacy.toml");
+        let amended = format!(
+            "id = \"legacy\"\nname = \"Legacy\"\npath = {:?}\nallow_patch = true\n\n[hooks]\nprecommit = [\"cargo test\"]\n",
+            project_dir.to_string_lossy()
+        );
+        std::fs::write(&config_path, &amended).unwrap();
+
+        let loaded = load_runner_project_registry_record(&config_path).unwrap();
+        assert!(valid_registration_incarnation(
+            loaded.registration_incarnation.as_deref().expect("incarnation")
+        ));
+
+        let migrated = std::fs::read_to_string(&config_path).unwrap();
+        assert!(migrated.contains("registration_incarnation"));
+        assert!(
+            migrated.contains("[hooks]"),
+            "migration must reflect registry bytes observed under the write lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_registry_record_atomic_fails_closed_when_metadata_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sealed.toml");
+        std::fs::write(&path, "id = \"sealed\"\npath = \"/tmp/sealed\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        let result = write_registry_record_atomic(&path, "id = \"sealed\"\npath = \"/tmp/x\"\n");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("failed to read project config metadata")
+        );
+
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_registry_replace_rejects_symlink_configs() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("repo");
+        let real_config = tmp.path().join("real");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir(&real_config).unwrap();
+        let legacy = format!(
+            "id = \"legacy\"\npath = {:?}\n",
+            project_dir.to_string_lossy()
+        );
+        std::fs::write(real_config.join("legacy.toml"), &legacy).unwrap();
+        symlink(real_config.join("legacy.toml"), tmp.path().join("legacy.toml")).unwrap();
+
+        let err = load_runner_project_registry_record(&tmp.path().join("legacy.toml")).unwrap_err();
+        assert_eq!(err, "project_registry_symlink");
+    }
 }

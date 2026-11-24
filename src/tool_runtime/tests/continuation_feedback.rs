@@ -527,16 +527,19 @@ async fn validation_summary_surfaces_validation_delta_without_shell_or_new_event
     // Create a real session scoped to the registered project, then record
     // prior + current validation evidence directly in the ledger (no shell,
     // no agent request).
-    let session = runtime
-        .sessions
-        .start_session_with_options(sessions::SessionCreateOptions::new(
-            Some(project.clone()),
-            Some("validation delta".to_string()),
-            SessionMode::Normal,
-            SessionGuards::default(),
-        ))
-        .unwrap()
-        .session_id;
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("validation delta"),
+    )
+    .await
+    .session_id;
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&auth))
+        .await
+        .expect("registered project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved);
     // Use a Normal-mode instruction so the attempt boundary is task_instruction.
     add_instruction_for(
         &runtime,
@@ -544,6 +547,7 @@ async fn validation_summary_surfaces_validation_delta_without_shell_or_new_event
         "fix tests",
         SessionMode::Normal,
         &project,
+        project_identity,
     );
     // Prior comparable run: 2 passed, 0 failed.
     record_validation_event_for(
@@ -638,17 +642,22 @@ async fn finish_coding_task_continuation_matches_handoff_attempt_without_rerunni
     let project =
         register_runner_project_at_path(&runtime, "finish-agent", "demo", dir.path()).await;
     let auth = auth_context(None, true);
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("finish continuation".to_string()),
-    );
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("finish continuation"))
+            .await;
     let session_id = session.session_id.clone();
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&auth))
+        .await
+        .expect("registered project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved);
     add_instruction_for(
         &runtime,
         &session_id,
         "instruction A",
         SessionMode::Normal,
         &project,
+        project_identity,
     );
     record_write_for(&runtime, &session_id, &project, &["src/lib.rs"]);
     record_validation_event_for(
@@ -830,6 +839,7 @@ fn add_instruction(runtime: &ToolRuntime, session_id: &str, instruction: &str, m
         .sessions
         .ensure_coding_session(sessions::CodingSessionRequest {
             project: "test-project".to_string(),
+            project_identity: None,
             authority_fingerprint: sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
                 .to_string(),
             resume_session_id: Some(session_id.to_string()),
@@ -932,11 +942,13 @@ fn add_instruction_for(
     instruction: &str,
     mode: SessionMode,
     project: &str,
+    project_identity: Option<webcodex_workflow_session::SessionProjectIdentity>,
 ) {
     runtime
         .sessions
         .ensure_coding_session(sessions::CodingSessionRequest {
             project: project.to_string(),
+            project_identity,
             authority_fingerprint: sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
                 .to_string(),
             resume_session_id: Some(session_id.to_string()),

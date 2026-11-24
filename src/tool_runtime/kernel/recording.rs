@@ -331,6 +331,19 @@ impl PreparedInvocation {
             // recording Session. Public arguments can never populate this field.
             *trusted_recording_session_id = context.session_id.map(str::to_string);
         }
+        if let Some(session_id) = context.session_id {
+            if session_event.is_none() {
+                let mut result =
+                    session_context::session_persistence_unavailable_result(Some(session_id));
+                result.output["dispatch_certainty"] = Value::String("not_started".to_string());
+                crate::tool_runtime::dispatch::decorate_structured_execution_prestart_denial(
+                    &request.tool_name,
+                    &mut result,
+                    "persistence_unavailable",
+                );
+                return Err(ToolCallOutcome::rejected_result(result));
+            }
+        }
 
         Ok(Self {
             call,

@@ -11,11 +11,14 @@ use serde_json::{json, Value};
 use super::permissions::{
     add_permission_to_result, permission_execution_denied_result, PermissionDecision,
 };
-use super::session_context::{session_guard_denied_result, session_lifecycle_denied_result};
+use super::session_context::{
+    session_guard_denied_result, session_lifecycle_denied_result,
+    session_persistence_unavailable_result,
+};
 use super::sessions::{
     SessionPathHint, SessionToolContract, SessionTransport, ToolCallRecorderMetadata, ToolCallStart,
 };
-use super::{ToolResult, ToolRuntime};
+use super::{RecoveryKind, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 
 /// Shared Browser/Computer terminal diagnostics. Missing state keeps the
@@ -571,10 +574,12 @@ impl ToolRuntime {
                 business_project.as_deref(),
                 policy.risk,
             );
-            if let Some(start) = session_start.as_mut() {
+            let permission_recorded = if let Some(start) = session_start.as_mut() {
                 self.sessions
-                    .record_permission_decision(start, decision.clone());
-            }
+                    .record_permission_decision(start, decision.clone())
+            } else {
+                true
+            };
             if decision.status == "denied" || decision.status == "pending" {
                 let mut result = permission_execution_denied_result(&decision);
                 add_permission_to_result(&mut result, &decision);
@@ -588,10 +593,49 @@ impl ToolRuntime {
                 );
                 return Err(SpecializedGovernanceDenial::Tool(result));
             }
+            if session_start.is_some() && !permission_recorded {
+                let mut result = ToolResult::err_with_output(
+                    format!(
+                        "{external_tool_name} was not dispatched: session permission evidence could not be persisted"
+                    ),
+                    json!({
+                        "error_kind": "session_persistence_unavailable",
+                        "failure_kind": "persistence_unavailable",
+                        "dispatch_certainty": "not_started",
+                        "state_changed": false,
+                        "reobserve_required": true,
+                    }),
+                )
+                .with_recovery(RecoveryKind::NoAction);
+                if let Some(session_id) = recording_session_id {
+                    result.output["session_id"] = Value::String(session_id.to_string());
+                }
+                add_permission_to_result(&mut result, &decision);
+                let terminal = json!({
+                    "specialized": policy.audit_projection(),
+                    "dispatch_certainty": "not_started",
+                    "success": false,
+                    "failure_kind": "persistence_unavailable",
+                });
+                self.sessions.record_tool_call_finished(
+                    session_start,
+                    false,
+                    &terminal,
+                    result.error.as_deref(),
+                    Some("session_persistence_unavailable"),
+                );
+                return Err(SpecializedGovernanceDenial::Tool(result));
+            }
             Some(decision)
         } else {
             None
         };
+
+        if recording_session_id.is_some() && session_start.is_none() {
+            let mut result = session_persistence_unavailable_result(recording_session_id);
+            result.output["dispatch_certainty"] = Value::String("not_started".to_string());
+            return Err(SpecializedGovernanceDenial::Tool(result));
+        }
 
         Ok(SpecializedInvocationPermit {
             policy,

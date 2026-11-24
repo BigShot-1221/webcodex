@@ -1602,9 +1602,8 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
         register_runner_project_at_path(&runtime, "coding-finish-compact", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("compact finish".to_string()));
+    let session = start_registered_project_session(&runtime, &project, &auth, Some("compact finish"))
+        .await;
     let session_id = session.session_id.clone();
 
     let task = tokio::spawn({
@@ -1741,9 +1740,8 @@ async fn finish_coding_task_summary_only_omits_diff_generation_even_when_request
     )
     .await;
     let auth = auth_context(None, true);
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("compact no diff".to_string()));
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("compact no diff")).await;
     let session_id = session.session_id.clone();
 
     let task = tokio::spawn({
@@ -1807,9 +1805,13 @@ async fn finish_coding_task_summary_only_uses_review_evidence_without_projecting
     let project =
         register_runner_project_at_path(&runtime, "coding-finish-docs", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("docs-only finish".to_string()));
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("docs-only finish"),
+    )
+    .await;
     let session_id = session.session_id.clone();
 
     record_coding_task_tool_event(
@@ -1904,9 +1906,8 @@ async fn finish_coding_task_summary_only_treats_dirty_workspace_as_advisory() {
     let project =
         register_runner_project_at_path(&runtime, "coding-finish-dirty", "demo", tmp.path()).await;
     let auth = auth_context(None, true);
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("dirty finish".to_string()));
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("dirty finish")).await;
     let session_id = session.session_id.clone();
 
     let task = tokio::spawn({
@@ -1960,10 +1961,13 @@ async fn finish_coding_task_does_not_resolve_a_different_validation_identity() {
         register_runner_project_at_path(&runtime, "coding-finish-resolved", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("resolved validation finish".to_string()),
-    );
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("resolved validation finish"),
+    )
+    .await;
     let session_id = session.session_id.clone();
 
     record_coding_task_tool_event(
@@ -3784,9 +3788,8 @@ async fn finish_summary_fixture(client_id: &'static str) -> FinishSummaryFixture
     let project =
         register_runner_project_at_path_with_auth(&runtime, client_id, "demo", tmp.path(), &auth)
             .await;
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some(client_id.to_string()));
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some(client_id)).await;
     FinishSummaryFixture {
         _tmp: tmp,
         runtime,

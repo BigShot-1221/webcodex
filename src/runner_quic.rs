@@ -23,13 +23,15 @@ use crate::runner_protocol::{
 };
 #[cfg(test)]
 use crate::runner_protocol::{write_quic_register_frame, QuicRegisterFrame};
+use crate::server_shutdown::ShutdownReason;
 use crate::Database;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::JoinSet;
 
 /// The rustls crypto provider used for the QUIC transport. The dependency tree
 /// pulls *both* `aws-lc-rs` and `ring`, so rustls cannot auto-select a
@@ -48,6 +50,12 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 const ERROR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// Maximum number of peer frames to discard on an error path before closing.
 const ERROR_DRAIN_MAX_FRAMES: usize = 4;
+/// After the QUIC endpoint closes, wait this long for active connection tasks
+/// (each still runs shared session bounded teardown) before aborting stragglers.
+pub(crate) const QUIC_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound for awaiting the QUIC listener task in the Server main routine.
+pub(crate) const QUIC_LISTENER_JOIN_TIMEOUT: Duration =
+    Duration::from_secs(15 + 5);
 
 /// Load a PEM cert chain from `path` into DER certificates.
 fn load_certs(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -108,6 +116,7 @@ pub(crate) async fn run_runner_quic_listener(
     registry: Arc<RunnerRegistry>,
     quic_cfg: QuicServerConfig,
     quic_status: Option<Arc<std::sync::Mutex<QuicRuntimeStatus>>>,
+    mut background_shutdown: watch::Receiver<Option<ShutdownReason>>,
 ) -> Result<(), String> {
     if let Err(e) = quic_cfg.validate() {
         if let Some(status) = quic_status.as_ref() {
@@ -168,38 +177,137 @@ pub(crate) async fn run_runner_quic_listener(
         listen,
         quic_cfg.alpn
     );
-    serve_quic_endpoint(endpoint, &quic_cfg.alpn, config, db, registry).await;
+    serve_quic_endpoint(
+        endpoint,
+        &quic_cfg.alpn,
+        config,
+        db,
+        registry,
+        &mut background_shutdown,
+    )
+    .await;
     Ok(())
 }
 
-/// Accept loop shared by the production listener and tests. Runs until the
-/// endpoint is closed. Each connection is handled in its own task so a slow or
-/// misbehaving Runner cannot block acceptance of others.
+/// Accept loop shared by the production listener and tests. Runs until shutdown
+/// is observed or the endpoint is closed. Connection tasks are tracked in a
+/// [`JoinSet`] so shutdown can close the endpoint, drain with a deadline, and
+/// join or abort stragglers.
 async fn serve_quic_endpoint(
     endpoint: quinn::Endpoint,
     alpn: &str,
     config: Arc<Config>,
     db: Option<Arc<Database>>,
     registry: Arc<RunnerRegistry>,
+    shutdown: &mut watch::Receiver<Option<ShutdownReason>>,
 ) {
-    while let Some(incoming) = endpoint.accept().await {
-        let config = config.clone();
-        let db = db.clone();
-        let registry = registry.clone();
-        let alpn = alpn.to_string();
-        tokio::spawn(async move {
-            match incoming.await {
-                Ok(conn) => {
-                    handle_quic_connection(conn, &alpn, config, db, registry).await;
+    let mut connections = JoinSet::new();
+    let alpn_owned = alpn.to_string();
+
+    if shutdown.borrow().is_some() {
+        tracing::info!(
+            shutdown_signal = shutdown.borrow().as_ref().map(|r| r.as_str()),
+            "Runner QUIC listener not accepting; background shutdown already requested"
+        );
+    } else {
+        loop {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || shutdown.borrow().is_some() {
+                        break;
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        "QUIC Runner connection handshake failed; check UDP reachability, certificate trust/SAN, and ALPN"
-                    );
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = joined {
+                        if error.is_panic() {
+                            tracing::error!("Runner QUIC connection task panicked");
+                        }
+                    }
+                }
+                incoming = endpoint.accept() => {
+                    match incoming {
+                        Some(incoming) => {
+                            let config = config.clone();
+                            let db = db.clone();
+                            let registry = registry.clone();
+                            let alpn = alpn_owned.clone();
+                            connections.spawn(async move {
+                                match incoming.await {
+                                    Ok(conn) => {
+                                        handle_quic_connection(conn, &alpn, config, db, registry)
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "QUIC Runner connection handshake failed; check UDP reachability, certificate trust/SAN, and ALPN"
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                        None => break,
+                    }
                 }
             }
-        });
+        }
+    }
+
+    let stop_reason = shutdown.borrow().clone();
+    if let Some(reason) = stop_reason {
+        tracing::info!(
+            shutdown_signal = reason.as_str(),
+            active_connections = connections.len(),
+            "Closing Runner QUIC endpoint"
+        );
+    }
+    endpoint.close(quinn::VarInt::from_u32(0), b"server shutting down");
+    drain_quic_connection_tasks(&mut connections, stop_reason).await;
+}
+
+async fn drain_quic_connection_tasks(
+    connections: &mut JoinSet<()>,
+    reason: Option<ShutdownReason>,
+) {
+    if connections.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let mut deadline = tokio::time::sleep(QUIC_CONNECTION_DRAIN_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                tracing::warn!(
+                    shutdown_signal = reason.as_ref().map(ShutdownReason::as_str),
+                    active_connections = connections.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    drain_deadline_seconds = QUIC_CONNECTION_DRAIN_TIMEOUT.as_secs(),
+                    "Runner QUIC connection drain deadline elapsed; aborting remaining connections"
+                );
+                connections.abort_all();
+                break;
+            }
+            Some(joined) = connections.join_next() => {
+                if let Err(error) = joined {
+                    if error.is_panic() {
+                        tracing::error!("Runner QUIC connection task panicked during shutdown");
+                    }
+                }
+                if connections.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+    while let Some(joined) = connections.join_next().await {
+        if let Err(error) = joined {
+            if error.is_panic() {
+                tracing::error!("Runner QUIC connection task panicked after abort");
+            }
+        }
     }
 }
 
@@ -265,7 +373,7 @@ async fn handle_quic_connection(
 
     // 2. Authenticate the agent token exactly like the HTTP/WebSocket paths.
     //    The token is dropped immediately after auth so it is never logged.
-    let auth = authenticate_bearer(&config, db.as_ref(), auth_token.as_deref()).await;
+    let auth = authenticate_bearer(config.clone(), db.clone(), auth_token.as_deref()).await;
     drop(auth_token);
     let auth = match auth {
         Some(ctx) => ctx,
@@ -617,8 +725,10 @@ mod tests {
     ) -> std::net::SocketAddr {
         let server_crypto = server_crypto(cert_der, key_der);
         let (endpoint, addr) = bind_server(server_crypto);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(None);
         tokio::spawn(async move {
-            serve_quic_endpoint(endpoint, TEST_ALPN, config, None, registry).await;
+            serve_quic_endpoint(endpoint, TEST_ALPN, config, None, registry, &mut shutdown_rx)
+                .await;
         });
         addr
     }
@@ -796,8 +906,17 @@ mod tests {
         // Spawn the accept loop.
         let serve_registry = registry.clone();
         let serve_config = config.clone();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(None);
         tokio::spawn(async move {
-            serve_quic_endpoint(endpoint, TEST_ALPN, serve_config, None, serve_registry).await;
+            serve_quic_endpoint(
+                endpoint,
+                TEST_ALPN,
+                serve_config,
+                None,
+                serve_registry,
+                &mut shutdown_rx,
+            )
+            .await;
         });
 
         // Client: connect, open bi stream, register.
@@ -1431,8 +1550,17 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let serve_registry = registry.clone();
         let serve_config = config.clone();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(None);
         tokio::spawn(async move {
-            serve_quic_endpoint(endpoint, TEST_ALPN, serve_config, None, serve_registry).await;
+            serve_quic_endpoint(
+                endpoint,
+                TEST_ALPN,
+                serve_config,
+                None,
+                serve_registry,
+                &mut shutdown_rx,
+            )
+            .await;
         });
 
         let client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -1486,8 +1614,17 @@ mod tests {
         let registry = Arc::new(RunnerRegistry::default());
         let serve_registry = registry.clone();
         let serve_config = config.clone();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(None);
         tokio::spawn(async move {
-            serve_quic_endpoint(endpoint, TEST_ALPN, serve_config, None, serve_registry).await;
+            serve_quic_endpoint(
+                endpoint,
+                TEST_ALPN,
+                serve_config,
+                None,
+                serve_registry,
+                &mut shutdown_rx,
+            )
+            .await;
         });
 
         let client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();

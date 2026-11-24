@@ -5,6 +5,8 @@ use super::project::{
     attach_permission, attach_project_resolution, invalid_project_source, resolve_project_source,
     ManagedWorktreeRequest,
 };
+use crate::tool_runtime::session_context::session_persistence_uncertain_result;
+
 use super::projection::{
     append_workspace_warnings, owning_runner_available, project_coding_agent_providers,
     project_work_on_project_output_inner, recommended_flow_payload,
@@ -229,6 +231,27 @@ impl ToolRuntime {
                 return attach_project_resolution(err.into_tool_result(), &project_resolution)
             }
         };
+        let project_identity = match Self::session_project_identity_failure_from_resolved(&resolved) {
+            Ok(identity) => identity,
+            Err(crate::tool_runtime::project_resolution::SessionProjectIdentityUnavailable::RootFingerprint) => {
+                return attach_project_resolution(
+                    crate::tool_runtime::session_context::project_root_fingerprint_unavailable_result(
+                        startup.tool_name,
+                    ),
+                    &project_resolution,
+                );
+            }
+            Err(
+                crate::tool_runtime::project_resolution::SessionProjectIdentityUnavailable::RegistrationIncarnation,
+            ) => {
+                return attach_project_resolution(
+                    crate::tool_runtime::session_context::project_registration_incarnation_unavailable_result(
+                        startup.tool_name,
+                    ),
+                    &project_resolution,
+                );
+            }
+        };
         project_resolution.resolved_project = resolved.resolved_id.clone();
         if let Some(session_id) = resume_session_id.as_deref() {
             if resume_session_project
@@ -419,6 +442,7 @@ impl ToolRuntime {
         let session_outcome = match self.sessions.ensure_coding_session_with_git_baseline(
             sessions::CodingSessionRequest {
                 project: resolved.resolved_id.clone(),
+                project_identity: Some(project_identity),
                 authority_fingerprint,
                 resume_session_id: resume_session_id.clone(),
                 instruction: title.clone(),
@@ -927,6 +951,18 @@ fn coding_session_start_error(
                 }),
             )
         }
+        sessions::CodingSessionError::ResumeProjectIdentityMismatch { session_id } => {
+            ToolResult::err_with_output(
+                "session_project_identity_changed",
+                json!({
+                    "error_kind": "session_project_identity_changed",
+                    "failure_kind": "session_project_identity_changed",
+                    "session_id": session_id,
+                    "resume_requested": true,
+                    "state_changed": false,
+                }),
+            )
+        }
         sessions::CodingSessionError::ResumeAuthorityMismatch { session_id } => {
             ToolResult::err_with_output(
                 "session_authority_denied",
@@ -969,6 +1005,19 @@ fn coding_session_start_error(
                     "state_changed": false,
                 }),
             )
+        }
+        sessions::CodingSessionError::PersistenceUnavailable => ToolResult::err_with_output(
+            "session_persistence_unavailable",
+            json!({
+                "error_kind": "session_persistence_unavailable",
+                "failure_kind": "persistence_unavailable",
+                "state_changed": false,
+                "reobserve_required": true,
+            }),
+        )
+        .with_recovery(RecoveryKind::NoAction),
+        sessions::CodingSessionError::PersistenceUncertain { session_id } => {
+            session_persistence_uncertain_result(Some(session_id.as_str()))
         }
     }
 }

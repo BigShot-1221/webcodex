@@ -1,9 +1,15 @@
 //! Runtime handlers for explicit Workflow Session tool calls.
 
+use super::project_resolution::SessionProjectIdentityUnavailable;
 use super::session_context::{
-    absent_workflow_session_result, session_authority_denied_result,
-    session_lifecycle_denied_result, session_message_error_result, session_project_mismatch_result,
-    workflow_session_authority_fingerprint, SessionProjectMismatch,
+    absent_workflow_session_result, project_registration_incarnation_unavailable_result,
+    project_root_fingerprint_unavailable_result, session_authority_denied_result,
+    session_close_persistence_uncertain_result, session_lifecycle_denied_result,
+    session_message_error_result, session_persistence_uncertain_result,
+    session_persistence_unavailable_result,
+    session_project_identity_changed_result,
+    session_project_mismatch_result, workflow_session_authority_fingerprint,
+    SessionProjectMismatch,
 };
 use super::tool_inputs::SessionMode;
 use super::{sessions, RecoveryKind, ToolCall, ToolResult, ToolRuntime};
@@ -321,6 +327,18 @@ impl ToolRuntime {
             },
             None => None,
         };
+        let project_identity = match resolved.as_ref() {
+            Some(resolved) => match Self::session_project_identity_failure_from_resolved(resolved) {
+                Ok(identity) => Some(identity),
+                Err(SessionProjectIdentityUnavailable::RootFingerprint) => {
+                    return project_root_fingerprint_unavailable_result("start_session");
+                }
+                Err(SessionProjectIdentityUnavailable::RegistrationIncarnation) => {
+                    return project_registration_incarnation_unavailable_result("start_session");
+                }
+            },
+            None => None,
+        };
         // Best-effort load of project-local instruction files (AGENTS.md,
         // CLAUDE.md, ...). Any read failure is swallowed and never fails
         // start_session. `null` when no project was provided.
@@ -368,13 +386,14 @@ impl ToolRuntime {
                 },
             ),
         )
+        .with_project_identity(project_identity)
         .with_owner_authority_fingerprint(Some(owner_authority_fingerprint))
         .with_project_instructions(project_instructions.clone())
         .with_execution_context(execution_context.unwrap_or_default());
         let summary = match self.sessions.start_session_with_options(options) {
             Ok(summary) => summary,
             Err(error) => {
-                return invalid_execution_context_result(error);
+                return map_start_session_error(error);
             }
         };
         let session_ref = self.session_reference_for_id(&summary.session_id, auth);
@@ -481,6 +500,12 @@ impl ToolRuntime {
             Err(sessions::SessionExecutionContextUpdateError::InvalidExecutionContext(error)) => {
                 invalid_execution_context_result(error)
             }
+            Err(sessions::SessionExecutionContextUpdateError::PersistenceUnavailable) => {
+                session_persistence_unavailable_result(Some(&session_id))
+            }
+            Err(sessions::SessionExecutionContextUpdateError::PersistenceUncertain) => {
+                session_persistence_uncertain_result(Some(&session_id))
+            }
         }
     }
 
@@ -527,6 +552,9 @@ impl ToolRuntime {
                 // cannot escape cleanup by reserving after the initial scan.
                 let persistent_shells_closed =
                     self.close_persistent_shells_for_session(&session_id).await;
+                if self.sessions.await_persistence_barrier().await.is_err() {
+                    return session_close_persistence_uncertain_result(&session_id);
+                }
                 ToolResult::ok(json!({
                     "success": true,
                     "session_id": outcome.summary.session_id,
@@ -538,6 +566,12 @@ impl ToolRuntime {
             }
             Err(sessions::SessionCloseError::UnknownSession) => {
                 absent_workflow_session_result(&self.sessions, &session_id, auth)
+            }
+            Err(sessions::SessionCloseError::PersistenceUnavailable) => {
+                session_persistence_unavailable_result(Some(&session_id))
+            }
+            Err(sessions::SessionCloseError::PersistenceUncertain) => {
+                session_close_persistence_uncertain_result(&session_id)
             }
         }
     }
@@ -557,18 +591,38 @@ impl ToolRuntime {
                 auth,
             ));
         };
-        if let Some(project) = project {
-            // Project authorization and immutable creation-time Session authority
-            // are independent checks. Local/dev has no credential project check,
-            // but still has the same canonical authority fence as every caller.
-            let resolved = if let Some(auth) = auth {
-                let resolved = match self
-                    .resolve_project_input_for_auth(&project, Some(auth))
-                    .await
-                {
-                    Ok(resolved) => resolved,
-                    Err(err) => return Err(err.into_tool_result()),
-                };
+        let stored_identity = self
+            .sessions
+            .session_project_identity(session_id)
+            .flatten();
+        let allow_retired_access = matches!(tool_name, "read_session_summary" | "close_session");
+        let caller_fingerprint = workflow_session_authority_fingerprint(auth)
+            .map_err(|_| session_authority_denied_result(session_id, tool_name))?;
+        #[cfg(test)]
+        let synthetic_test_fixture = owner_authority_fingerprint
+            == sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT;
+        #[cfg(not(test))]
+        let synthetic_test_fixture = false;
+        if !synthetic_test_fixture && owner_authority_fingerprint != caller_fingerprint {
+            return Err(session_authority_denied_result(session_id, tool_name));
+        }
+
+        let Some(project) = project else {
+            #[cfg(test)]
+            if synthetic_test_fixture {
+                return Ok(None);
+            }
+            if auth.is_some_and(AuthContext::is_open_anonymous) {
+                return Err(session_authority_denied_result(session_id, tool_name));
+            }
+            return Ok(None);
+        };
+
+        let resolution = self
+            .resolve_project_input_for_auth(&project, auth)
+            .await;
+        match resolution {
+            Ok(resolved) => {
                 if resolved.resolved_id != project {
                     return Err(session_project_mismatch_result(
                         session_id,
@@ -579,38 +633,34 @@ impl ToolRuntime {
                         },
                     ));
                 }
-                Some(resolved)
-            } else {
-                None
-            };
-            let caller_fingerprint = workflow_session_authority_fingerprint(auth)
-                .map_err(|_| session_authority_denied_result(session_id, tool_name))?;
-            #[cfg(test)]
-            let synthetic_test_fixture = owner_authority_fingerprint
-                == sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT;
-            #[cfg(not(test))]
-            let synthetic_test_fixture = false;
-            if !synthetic_test_fixture && owner_authority_fingerprint != caller_fingerprint {
-                return Err(session_authority_denied_result(session_id, tool_name));
+                let current_identity =
+                    match Self::session_project_identity_failure_from_resolved(&resolved) {
+                    Ok(identity) => Some(identity),
+                    Err(_) => None,
+                };
+                let identity_ok = matches!(
+                    (stored_identity.as_ref(), current_identity.as_ref()),
+                    (
+                        Some(stored),
+                        Some(current),
+                    ) if stored.is_strong_identity()
+                        && current.is_strong_identity()
+                        && stored == current
+                );
+                if !identity_ok {
+                    return Err(session_project_identity_changed_result(session_id, tool_name));
+                }
+                Ok(Some(resolved))
             }
-            return Ok(resolved);
+            Err(err) if allow_retired_access => {
+                if self.verify_retired_session_project(&project, auth).await.is_ok() {
+                    Ok(None)
+                } else {
+                    Err(err.into_tool_result())
+                }
+            }
+            Err(err) => Err(err.into_tool_result()),
         }
-
-        #[cfg(test)]
-        if owner_authority_fingerprint == sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
-        {
-            return Ok(None);
-        }
-
-        if auth.is_some_and(AuthContext::is_open_anonymous) {
-            return Err(session_authority_denied_result(session_id, tool_name));
-        }
-        let caller_fingerprint = workflow_session_authority_fingerprint(auth)
-            .map_err(|_| session_authority_denied_result(session_id, tool_name))?;
-        if owner_authority_fingerprint != caller_fingerprint {
-            return Err(session_authority_denied_result(session_id, tool_name));
-        }
-        Ok(None)
     }
 
     fn trusted_collaboration_author_session(
@@ -684,18 +734,22 @@ impl ToolRuntime {
             }
             None => None,
         };
-        match self.sessions.post_message_with_ack_and_delivery(
-            sessions::PostSessionMessageInput {
-                session_id: session_id.clone(),
-                kind,
-                message,
-                tags,
-                reply_to,
-                priority,
-            },
-            requires_ack,
-            delivery,
-        ) {
+        match self
+            .sessions
+            .post_message_with_ack_and_delivery(
+                sessions::PostSessionMessageInput {
+                    session_id: session_id.clone(),
+                    kind,
+                    message,
+                    tags,
+                    reply_to,
+                    priority,
+                },
+                requires_ack,
+                delivery,
+            )
+            .await
+        {
             Ok(outcome) => ToolResult::ok(json!({
                 "success": true,
                 "session_id": session_id,
@@ -755,7 +809,11 @@ impl ToolRuntime {
         {
             return result;
         }
-        match self.sessions.get_assignment(&session_id, &message_id) {
+        match self
+            .sessions
+            .get_assignment(&session_id, &message_id)
+            .await
+        {
             Ok(snapshot) => ToolResult::ok(json!({
                 "success": true,
                 "session_id": session_id,
@@ -911,7 +969,9 @@ impl ToolRuntime {
                 completion_id: completion_id.clone(),
                 author_session_id,
                 expected_assignment_fence,
-            }) {
+            })
+            .await
+        {
             Ok(outcome) => ToolResult::ok(json!({
                 "success": true,
                 "session_id": session_id,
@@ -1043,4 +1103,20 @@ fn invalid_execution_context_result(error: String) -> ToolResult {
             "state_changed": false,
         }),
     )
+}
+
+fn map_start_session_error(error: String) -> ToolResult {
+    if error == sessions::SessionStore::SESSION_PERSISTENCE_UNAVAILABLE {
+        return session_persistence_unavailable_result(None);
+    }
+    let uncertain_prefix = format!("{}:", sessions::SessionStore::SESSION_PERSISTENCE_UNCERTAIN);
+    if let Some(session_id) = error.strip_prefix(&uncertain_prefix) {
+        if !session_id.is_empty() {
+            return session_persistence_uncertain_result(Some(session_id));
+        }
+    }
+    if error == sessions::SessionStore::SESSION_PERSISTENCE_UNCERTAIN {
+        return session_persistence_uncertain_result(None);
+    }
+    invalid_execution_context_result(error)
 }

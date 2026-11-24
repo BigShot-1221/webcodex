@@ -122,7 +122,7 @@ impl Database {
         };
         let timeout: i64 = connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0))?;
         let timeout = u64::try_from(timeout)?;
-        let connection = HistoryConnectionGuard {
+        let mut connection = HistoryConnectionGuard {
             connection,
             old_busy_timeout: Some(Duration::from_millis(timeout)),
         };

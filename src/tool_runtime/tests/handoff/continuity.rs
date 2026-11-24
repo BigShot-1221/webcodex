@@ -70,16 +70,26 @@ async fn handoff_reread_recovers_corrected_task_without_reusing_validation_or_re
     let project =
         register_runner_project_at_path_with_auth(&runtime, client, "demo", root.path(), &auth)
             .await;
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("Implement the original request".into()),
-    );
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("Implement the original request"),
+    )
+    .await;
     let sid = session.session_id;
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&auth))
+        .await
+        .expect("registered project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved)
+        .expect("registered project must expose registration incarnation");
     let instruction = |text: &str| {
         runtime
             .sessions
             .ensure_coding_session(sessions::CodingSessionRequest {
                 project: project.clone(),
+                project_identity: Some(project_identity.clone()),
                 authority_fingerprint: sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
                     .to_string(),
                 resume_session_id: Some(sid.clone()),
@@ -263,7 +273,8 @@ async fn handoff_diagnostic_external_race_omits_completion_verdict_but_retains_v
     let runtime = test_runtime().with_communication_database(db.clone());
     let client = "handoff-diagnostic-external-race";
     let project = register_runner_project_at_path(&runtime, client, "demo", root.path()).await;
-    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let auth = auth_context(None, true);
+    let session = start_registered_project_session(&runtime, &project, &auth, None).await;
     let sid = session.session_id;
     record_handoff_tool_event(
         &runtime,

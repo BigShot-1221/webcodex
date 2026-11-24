@@ -94,13 +94,19 @@ fn commit_file(root: &Path, path: &str, content: &str) {
     git(root, &["commit", "-q", "-m", "fixture"]);
 }
 
-fn start_coding_session_with_baseline(
+async fn start_coding_session_with_baseline(
     runtime: &ToolRuntime,
     auth: &crate::auth::AuthContext,
     project: &str,
     baseline: String,
     instruction: &str,
 ) -> crate::tool_runtime::SessionSummary {
+    let resolved = runtime
+        .resolve_project_input_for_auth(project, Some(auth))
+        .await
+        .expect("registered project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved)
+        .expect("registered project must expose registration incarnation");
     let authority_fingerprint =
         crate::tool_runtime::workflow_session_authority_fingerprint(Some(auth)).unwrap();
     runtime
@@ -108,6 +114,7 @@ fn start_coding_session_with_baseline(
         .ensure_coding_session_with_git_baseline(
             CodingSessionRequest {
                 project: project.to_string(),
+                project_identity: Some(project_identity),
                 authority_fingerprint,
                 resume_session_id: None,
                 instruction: Some(instruction.to_string()),
@@ -381,9 +388,14 @@ async fn e2b_fixture(
         },
     )
     .await;
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("E2b integration".to_string()));
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("E2b integration"),
+    )
+    .await;
     (root, runtime, project, session.session_id)
 }
 
@@ -811,9 +823,9 @@ async fn e2b_same_project_mutation_fence_serializes_independent_hosts() {
         seed_read_revision(&runtime, &project, "src/example.rs", &"a".repeat(64)).await;
     let second_revision =
         seed_read_revision(&runtime, &project, "src/other.rs", &"b".repeat(64)).await;
-    let second_session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("second E2b host".to_string()));
+    let auth = bootstrap_auth_context();
+    let second_session =
+        start_registered_project_session(&runtime, &project, &auth, Some("second E2b host")).await;
     let first_host = Arc::new(CanonicalOrchestrationHost::new(
         runtime.clone(),
         Some(&bootstrap_auth_context()),
@@ -933,9 +945,14 @@ async fn e2b_mutation_fence_is_project_scoped_not_process_global() {
         },
     )
     .await;
-    let session_two = runtime
-        .sessions
-        .start_session(Some(project_two.clone()), Some("P2 E2b host".to_string()));
+    let auth = bootstrap_auth_context();
+    let session_two = start_registered_project_session(
+        &runtime,
+        &project_two,
+        &auth,
+        Some("P2 E2b host"),
+    )
+    .await;
     let project_two_revision =
         seed_read_revision(&runtime, &project_two, "src/example.rs", &"c".repeat(64)).await;
     let project_one_guard = runtime
@@ -1042,10 +1059,10 @@ async fn e2a_validation_does_not_acquire_project_mutation_fence() {
         },
     )
     .await;
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("E2a fence isolation".to_string()),
-    );
+    let auth = bootstrap_auth_context();
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("E2a fence isolation"))
+            .await;
     let project_guard = runtime
         .orchestration_mutation_fences
         .hold_project_for_test(&project)
@@ -1142,7 +1159,8 @@ async fn e2b_nested_edit_drives_real_final_changes_baseline_to_full_final_worksp
         &project,
         baseline,
         "E2b Final Changes integration",
-    );
+    )
+    .await;
 
     // This non-Code-Mode workspace change proves Final Changes freezes the
     // complete baseline→final workspace, not merely the nested edit provenance.
@@ -1269,7 +1287,8 @@ async fn e2b_outer_only_noop_and_prestart_failure_do_not_create_final_changes_el
         &project,
         baseline.clone(),
         "outer-only E2b",
-    );
+    )
+    .await;
     let read = spawn_e2b_call(
         &runtime,
         &project,
@@ -1295,7 +1314,8 @@ async fn e2b_outer_only_noop_and_prestart_failure_do_not_create_final_changes_el
         &project,
         baseline.clone(),
         "no-op E2b",
-    );
+    )
+    .await;
     let noop_task = spawn_e2b_call(
         &runtime,
         &project,
@@ -1324,7 +1344,8 @@ async fn e2b_outer_only_noop_and_prestart_failure_do_not_create_final_changes_el
         &project,
         baseline,
         "prestart failure E2b",
-    );
+    )
+    .await;
     let prestart_result = spawn_e2b_call(
         &runtime,
         &project,
@@ -1412,11 +1433,15 @@ async fn direct_edit_project_files_does_not_acquire_experimental_orchestration_f
 async fn e1_and_e2a_remain_unable_to_dispatch_apply_text_edits_after_e2b() {
     let (_root, runtime, project, _session_id) =
         e2b_fixture("e2b-stage-isolation", "before\n").await;
+    let auth = bootstrap_auth_context();
     for tool_name in ["execute_code_mode", "execute_effectful_code_mode"] {
-        let session = runtime.sessions.start_session(
-            Some(project.clone()),
-            Some(format!("isolation {tool_name}")),
-        );
+        let session = start_registered_project_session(
+            &runtime,
+            &project,
+            &auth,
+            Some(&format!("isolation {tool_name}")),
+        )
+        .await;
         let result = runtime
             .dispatch_with_auth(
                 match tool_name {
@@ -1588,10 +1613,11 @@ async fn e2b_child_permission_denial_is_canonical_and_non_effectful() {
     let project =
         register_runner_project_at_path(&runtime, "e2b-child-permission", "demo", root.path())
             .await;
-    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(&runtime, &project, &auth, None).await;
     let host = CanonicalOrchestrationHost::new(
         runtime.clone(),
-        Some(&bootstrap_auth_context()),
+        Some(&auth),
         project,
         session.session_id.clone(),
         ToolTransport::Mcp,
@@ -1635,7 +1661,8 @@ async fn e2b_runner_capability_failure_never_claims_mutation() {
         },
     )
     .await;
-    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(&runtime, &project, &auth, None).await;
     let source = r#"
         const before=await tools.read_files({items:[{path:"example.rs"}]});
         const revision=before.output.items[0].output.read_revision;

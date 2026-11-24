@@ -9,6 +9,8 @@ fn persistent_fixture(window: Duration) -> (tempfile::TempDir, SessionStore) {
         path: temporary.path().join("sessions.json"),
         restored_sessions: 0,
         last_persist_error: None,
+        database: None,
+        durable_db_path: None,
     });
     store.writer = LedgerWriterGuard::spawn_with_window(
         store.inner.clone(),
@@ -172,10 +174,10 @@ fn failed_durable_write_is_reported_and_later_mutation_can_recover() {
         .unwrap()
         .path = blocker.join("sessions.json");
     let id = store.start_session(None, None).session_id;
-    assert!(store.persist_after_mutation_durable().is_err());
+    assert!(store.persist_after_mutation_durable_blocking().is_err());
     assert!(store.status().last_persist_error.is_some());
     std::fs::remove_file(&blocker).unwrap();
-    assert!(store.persist_after_mutation_durable().is_ok());
+    assert!(store.persist_after_mutation_durable_blocking().is_ok());
     assert!(store.status().last_persist_error.is_none());
     let restored = SessionStore::with_persistence(blocker.join("sessions.json"), 1, 20);
     assert!(restored.contains_session(&id));
@@ -205,7 +207,7 @@ fn multiple_flush_waiters_and_new_dirty_generations_all_complete() {
         let done = done.clone();
         joins.push(std::thread::spawn(move || {
             let id = worker.start_session(None, None).session_id;
-            worker.persist_after_mutation_durable().unwrap();
+            worker.persist_after_mutation_durable_blocking().unwrap();
             done.send(id).unwrap();
         }));
     }

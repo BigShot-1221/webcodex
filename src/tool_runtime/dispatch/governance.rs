@@ -441,6 +441,19 @@ impl ToolRuntime {
                 return result;
             }
         }
+        if let Some(session_id) = session_id.as_deref() {
+            if session_start.is_none() {
+                let mut result =
+                    session_context::session_persistence_unavailable_result(Some(session_id));
+                result.output["dispatch_certainty"] = Value::String("not_started".to_string());
+                decorate_structured_execution_prestart_denial(
+                    call.tool_name(),
+                    &mut result,
+                    "persistence_unavailable",
+                );
+                return result;
+            }
+        }
         let activity_context =
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
         let validation_assertion_name = recorder_metadata.expectation.assertion_name.as_deref();

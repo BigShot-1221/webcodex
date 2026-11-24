@@ -72,6 +72,7 @@ pub use model::{
     SessionDiscoveryPage, SessionDiscussionCounts, SessionDiscussionSummary, SessionEvent,
     SessionExecutionContext, SessionExecutionContextUpdateError, SessionGuardDenial, SessionGuards,
     SessionLifecycle, SessionLifecycleDenial, SessionMessage, SessionMessageDelivery,
+    SessionProjectIdentity,
     SessionMessageDeliveryOutcome, SessionMessageDeliveryReplay, SessionMessageError,
     SessionMessageKind, SessionMessageObservationError, SessionMessagePriority,
     SessionMessageStatus, SessionRetentionTombstone, SessionSummary, SessionTransport,

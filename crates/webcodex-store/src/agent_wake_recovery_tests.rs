@@ -309,7 +309,8 @@ fn explicit_server_takeover_recovers_once_after_new_owner_acquires_state() {
     );
     let successor_guard = ServerInstanceGuard::acquire(&successor).unwrap();
 
-    let unrelated = Database::open(&temp.path().join("unrelated-takeover.db")).unwrap();
+    let unrelated_temp = tempfile::tempdir().unwrap();
+    let unrelated = Database::open(&unrelated_temp.path().join("unrelated-takeover.db")).unwrap();
     let unrelated_guard = ServerInstanceGuard::acquire(&unrelated).unwrap();
     assert_eq!(
         successor

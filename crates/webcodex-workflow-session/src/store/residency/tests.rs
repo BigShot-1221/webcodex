@@ -215,7 +215,7 @@ fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
         delivery_key: "same-send".into(),
     };
     let first = store
-        .post_message_with_ack_and_delivery(message(&id), true, Some(delivery.clone()))
+        .post_message_with_ack_and_delivery_for_test(message(&id), true, Some(delivery.clone()))
         .unwrap();
     churn(&store);
     let ack = store.observe_message_acks(&id, &[first.message.message_id.clone()]);
@@ -223,7 +223,7 @@ fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
     churn(&store);
     assert!(
         store
-            .post_message_with_ack_and_delivery(message(&id), true, Some(delivery.clone()))
+            .post_message_with_ack_and_delivery_for_test(message(&id), true, Some(delivery.clone()))
             .unwrap()
             .replayed
     );
@@ -242,7 +242,7 @@ fn active_residency_restart_restores_cold_and_keyed_replay_ack_survive() {
         "restore/query cannot rewrite the ledger"
     );
     let replay = reopened
-        .post_message_with_ack_and_delivery(message(&id), true, Some(delivery))
+        .post_message_with_ack_and_delivery_for_test(message(&id), true, Some(delivery))
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.message.message_id, first.message.message_id);
@@ -325,11 +325,11 @@ fn active_residency_assignment_fences_and_exact_completion_replay_survive_churn(
     let mut input = message(&id);
     input.kind = SessionMessageKind::Todo;
     let todo = store.post_message(input).unwrap();
-    let assignment = store.get_assignment(&id, &todo.message_id).unwrap();
+    let assignment = store.get_assignment_for_test(&id, &todo.message_id).unwrap();
     churn(&store);
     assert_eq!(
         store
-            .get_assignment(&id, &todo.message_id)
+            .get_assignment_for_test(&id, &todo.message_id)
             .unwrap()
             .assignment_fence,
         assignment.assignment_fence
@@ -344,10 +344,10 @@ fn active_residency_assignment_fences_and_exact_completion_replay_survive_churn(
         author_session_id: None,
         expected_assignment_fence: assignment.assignment_fence,
     };
-    let first = store.complete_message(completion.clone()).unwrap();
+    let first = store.complete_message_for_test(completion.clone()).unwrap();
     assert!(!first.replayed);
     churn(&store);
-    let replay = store.complete_message(completion).unwrap();
+    let replay = store.complete_message_for_test(completion).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.answer.message_id, first.answer.message_id);
     assert_eq!(

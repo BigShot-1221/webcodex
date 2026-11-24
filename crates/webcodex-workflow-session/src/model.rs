@@ -7,6 +7,7 @@ use std::time::Instant;
 use webcodex_core::project_instructions::{
     ProjectInstructionsSnapshot, ProjectInstructionsSummarySnapshot,
 };
+use webcodex_core::runner_protocol::PROJECT_ROOT_FINGERPRINT_PREFIX;
 use webcodex_core::workflow_session_contract::PermissionDecision;
 pub use webcodex_core::workflow_session_contract::{
     SessionExecutionContext, SessionMessageKind, SessionMessagePriority, SessionMessageStatus,
@@ -127,6 +128,10 @@ pub struct SessionCloseOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCloseError {
     UnknownSession,
+    /// Workflow Session persistence is in a terminal failure state; new mutations are rejected.
+    PersistenceUnavailable,
+    /// In-memory session close was applied but durable persistence could not be confirmed.
+    PersistenceUncertain,
 }
 
 /// Lifecycle-based tool denial (orthogonal to mode/guards).
@@ -135,10 +140,72 @@ pub struct SessionLifecycleDenial {
     pub lifecycle: SessionLifecycle,
 }
 
+/// Domain-separated Project registration identity bound at Workflow Session
+/// creation. It is descriptive durable authority metadata and never re-derived
+/// from today's Runner inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProjectIdentity {
+    /// Runner-observed canonical root fingerprint captured at Session creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_fingerprint: Option<String>,
+    /// Legacy compatibility field; may round-trip old rows, but is never minted
+    /// for new identity or used for authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_path: Option<String>,
+    pub registration_incarnation: String,
+}
+
+impl SessionProjectIdentity {
+    pub const MAX_REGISTRATION_INCARNATION_LEN: usize = 36;
+
+    pub fn valid_root_fingerprint(value: &str) -> bool {
+        value
+            .strip_prefix(PROJECT_ROOT_FINGERPRINT_PREFIX)
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    }
+
+    pub fn valid_registration_incarnation(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= Self::MAX_REGISTRATION_INCARNATION_LEN
+            && uuid::Uuid::parse_str(value).is_ok()
+    }
+
+    /// True when both durable identity fields are present and canonical. Legacy
+    /// path-only rows deserialize but remain unauthorized for live retargeting.
+    pub fn is_strong_identity(&self) -> bool {
+        self.root_fingerprint
+            .as_deref()
+            .is_some_and(Self::valid_root_fingerprint)
+            && Self::valid_registration_incarnation(self.registration_incarnation.trim())
+    }
+
+    pub fn from_runner_inventory(
+        root_fingerprint: Option<String>,
+        _registered_path: String,
+        registration_incarnation: String,
+    ) -> Option<Self> {
+        let registration_incarnation = registration_incarnation.trim().to_string();
+        if !Self::valid_registration_incarnation(&registration_incarnation) {
+            return None;
+        }
+        let root_fingerprint = root_fingerprint
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .filter(|value| Self::valid_root_fingerprint(value))?;
+        Some(Self {
+            root_fingerprint: Some(root_fingerprint),
+            registered_path: None,
+            registration_incarnation,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
     pub session_id: String,
     pub project: Option<String>,
+    pub project_identity: Option<SessionProjectIdentity>,
     /// Domain-separated SHA-256 of the canonical creation-time authority group.
     /// The historical field name is retained only in persistence; in-memory
     /// mutable/queryable Sessions always carry a canonical fingerprint and never
@@ -219,6 +286,7 @@ pub enum StoredSession {
 pub struct ColdSessionRecord {
     pub session_id: String,
     pub project: Option<String>,
+    pub project_identity: Option<SessionProjectIdentity>,
     pub owner_authority_fingerprint: String,
     pub mode: SessionMode,
     pub guards: SessionGuards,
@@ -256,6 +324,13 @@ impl StoredSession {
         match self {
             Self::Hot(record) => record.project.as_deref(),
             Self::Cold(record) => record.project.as_deref(),
+        }
+    }
+
+    pub fn project_identity(&self) -> Option<&SessionProjectIdentity> {
+        match self {
+            Self::Hot(record) => record.project_identity.as_ref(),
+            Self::Cold(record) => record.project_identity.as_ref(),
         }
     }
 
@@ -327,6 +402,7 @@ pub struct SessionDiscoveryPage {
 #[derive(Debug, Clone)]
 pub struct SessionCreateOptions {
     pub project: Option<String>,
+    pub project_identity: Option<SessionProjectIdentity>,
     pub owner_authority_fingerprint: Option<String>,
     pub title: Option<String>,
     pub mode: SessionMode,
@@ -344,6 +420,7 @@ impl SessionCreateOptions {
     ) -> Self {
         Self {
             project,
+            project_identity: None,
             owner_authority_fingerprint: None,
             title,
             mode,
@@ -351,6 +428,11 @@ impl SessionCreateOptions {
             project_instructions: None,
             execution_context: SessionExecutionContext::default(),
         }
+    }
+
+    pub fn with_project_identity(mut self, project_identity: Option<SessionProjectIdentity>) -> Self {
+        self.project_identity = project_identity;
+        self
     }
 
     pub fn with_project_instructions(
@@ -383,6 +465,7 @@ impl SessionCreateOptions {
 #[derive(Debug, Clone)]
 pub struct CodingSessionRequest {
     pub project: String,
+    pub project_identity: Option<SessionProjectIdentity>,
     /// Canonical creation-time authority fence for every caller, including the
     /// canonical local/dev authority group.
     pub authority_fingerprint: String,
@@ -437,12 +520,21 @@ pub enum CodingSessionError {
         session_project: Option<String>,
         request_project: String,
     },
+    ResumeProjectIdentityMismatch {
+        session_id: String,
+    },
     ResumeAuthorityMismatch {
         session_id: String,
     },
     WriteScopeRequired,
     InvalidExecutionContext(String),
     CommitFailed,
+    /// Workflow Session persistence is in a terminal failure state; new mutations are rejected.
+    PersistenceUnavailable,
+    /// In-memory coding bootstrap was applied but durable persistence could not be confirmed.
+    PersistenceUncertain {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +550,10 @@ pub enum SessionExecutionContextUpdateError {
     SessionNotActive { lifecycle: SessionLifecycle },
     SessionHasNoProject,
     InvalidExecutionContext(String),
+    /// Workflow Session persistence is in a terminal failure state; new mutations are rejected.
+    PersistenceUnavailable,
+    /// In-memory execution-context update was applied but durable persistence could not be confirmed.
+    PersistenceUncertain,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -538,11 +634,13 @@ impl PersistedSessionSnapshot {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedSessionRecord {
     pub session_id: String,
     pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_identity: Option<SessionProjectIdentity>,
     /// Historical field name retained on disk, but v2 requires the canonical
     /// domain-separated authority-group fingerprint on every persisted row.
     pub owner_authority_fingerprint: String,
@@ -734,7 +832,7 @@ pub struct ToolEffectEventEvidence {
     pub execution_state: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionEvent {
     pub event_id: String,
@@ -1147,6 +1245,8 @@ pub enum SessionMessageError {
         current: SessionAssignmentCurrentState,
     },
     PersistenceUncertain,
+    /// Mutation rejected because durable persistence entered a terminal failure state.
+    PersistenceUnavailable,
     /// Message-board mutation denied because the workflow session is closed.
     /// Query tools remain available.
     SessionClosed {
@@ -1203,6 +1303,10 @@ pub struct SessionSummary {
     /// model-facing summary returns at most `MAX_SUMMARY_LIMIT` events.
     #[serde(default)]
     pub retention_truncated: bool,
+    /// Internal recovery-safety fact: retained durable history has an unclosed or
+    /// ambiguous mutating tool-call pairing. Never model-facing state.
+    #[serde(skip_serializing, default)]
+    pub retained_unclosed_mutating_tool_call: bool,
     /// 0-based sequence of the first event still present in the durable ledger.
     #[serde(default)]
     pub ledger_first_retained_sequence: usize,

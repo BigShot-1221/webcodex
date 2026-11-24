@@ -77,7 +77,9 @@ use crate::webcodex_runner::transport::registration::*;
 
 use crate::webcodex_runner::config::validate_shell_config;
 use crate::webcodex_runner::job_manager::job_manager_tests::{shell_job_request, ws_sink};
-use crate::webcodex_runner::projects::{project_root_fingerprint, RunnerProjectFile};
+use crate::webcodex_runner::projects::{
+    project_root_fingerprint, valid_registration_incarnation, RunnerProjectFile,
+};
 use crate::webcodex_runner::run_shell_with_profiles;
 use crate::webcodex_runner::{
     handle_prepare_managed_worktree, handle_project_lifecycle_op, handle_project_op,
@@ -243,6 +245,8 @@ mod project_durability;
 mod project_policy;
 #[path = "main_tests/project_registration.rs"]
 mod project_registration;
+#[path = "main_tests/project_registration_incarnation.rs"]
+mod project_registration_incarnation;
 #[path = "main_tests/registration.rs"]
 mod registration;
 #[path = "main_tests/runner_config.rs"]
@@ -1244,6 +1248,7 @@ fn register_managed_source_project(registry: &Path, source: &Path) {
         name: Some("Source".to_string()),
         kind: Some("repo".to_string()),
         registration_source: None,
+        registration_incarnation: None,
         description: None,
         disabled: false,
         hooks: HashMap::new(),

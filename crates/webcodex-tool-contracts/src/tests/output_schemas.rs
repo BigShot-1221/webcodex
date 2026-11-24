@@ -2363,6 +2363,10 @@ fn key_tool_output_schemas_include_expected_fields() {
         );
     }
     assert!(!has_output_field("get_runtime_status", "agents"));
+    assert!(
+        has_output_field("get_runtime_status", "shared_database_wal"),
+        "get_runtime_status missing shared_database_wal"
+    );
     for field in ["runners", "summary", "count"] {
         assert!(has_output_field("list_runners", field));
     }
@@ -4369,6 +4373,45 @@ fn job_metadata_schema_accepts_runtime_structured_execution_values() {
     accept(project_build);
     accept(run_skill_resource);
     accept(python);
+}
+
+#[test]
+fn get_runtime_status_shared_database_wal_schema_matches_observation_shape() {
+    let schema = output_schema_for_tool("get_runtime_status");
+    let wal = &schema["properties"]["output"]["properties"]["shared_database_wal"];
+    assert_eq!(wal["additionalProperties"], false);
+    assert_eq!(
+        wal["properties"]["status"]["enum"],
+        json!(["available", "no_wal", "busy", "unavailable"])
+    );
+    assert_eq!(wal["required"], json!(["status"]));
+    for valid in [
+        json!({"status": "available"}),
+        json!({"status": "available", "wal_bytes": 128, "log_frames": 4, "checkpointed_frames": 2, "uncheckpointed_frames": 2, "checkpoint_busy": false}),
+        json!({"status": "no_wal", "wal_bytes": 0}),
+        json!({"status": "busy", "wal_bytes": 0}),
+        json!({"status": "busy", "wal_bytes": 16, "checkpoint_busy": true, "log_frames": 1, "checkpointed_frames": 0, "uncheckpointed_frames": 1}),
+        json!({"status": "unavailable", "error_kind": "connection_open"}),
+        json!({"status": "unavailable", "wal_bytes": 0, "error_kind": "query_failed"}),
+    ] {
+        test_support::validate_schema_instance(&valid, wal)
+            .unwrap_or_else(|error| panic!("valid observation rejected: {valid}: {error}"));
+    }
+    for invalid in [
+        json!({}),
+        json!({"status": "unknown"}),
+        json!({"status": "available", "wal_bytes": -1}),
+        json!({"status": "available", "log_frames": -1}),
+        json!({"status": "available", "checkpointed_frames": -1}),
+        json!({"status": "available", "uncheckpointed_frames": -1}),
+        json!({"status": "available", "nested": {"leak": true}}),
+        json!({"status": "available", "wal_bytes": 0, "error_kind": null}),
+    ] {
+        assert!(
+            test_support::validate_schema_instance(&invalid, wal).is_err(),
+            "invalid observation must be rejected: {invalid}"
+        );
+    }
 }
 
 #[test]

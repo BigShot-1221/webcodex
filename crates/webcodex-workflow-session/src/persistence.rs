@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -16,11 +16,13 @@ use super::events::{
 };
 use super::model::{
     ColdSessionRecord, PersistedRetentionTombstoneRow, PersistedSessionLedger,
-    PersistedSessionRecord, SessionEvent, SessionGuards, SessionMessage, SessionRecord,
-    SessionRetentionTombstone, StoredSession, DEFAULT_MAX_MESSAGES_PER_SESSION, EVENT_ID_PREFIX,
-    MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS, MAX_MATERIALIZED_VALIDATION_JOB_IDS,
-    MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS, SESSION_LEDGER_VERSION,
+    PersistedSessionRecord, SessionEvent, SessionGuards, SessionMessage, SessionMessageKind,
+    SessionMessageStatus, SessionRecord, SessionRetentionTombstone, StoredSession,
+    DEFAULT_MAX_MESSAGES_PER_SESSION, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS,
+    MAX_INPUT_ARRAY_ITEMS, MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_CHARS,
+    MAX_MESSAGE_RESOLUTION_CHARS, SESSION_LEDGER_VERSION,
 };
+use self::database::SessionDatabase;
 use super::query::{is_valid_completion_id, validate_message_tags};
 use super::util::{
     bound_chars, bound_event_error_summary, bound_summary_string, redact_and_bound_instruction,
@@ -28,6 +30,8 @@ use super::util::{
 use webcodex_core::project_instructions::ProjectInstructionsSummarySnapshot;
 use webcodex_core::workflow_session_contract::is_safe_job_id;
 
+pub(crate) mod database;
+mod legacy_import;
 mod resident;
 mod stream;
 
@@ -78,6 +82,7 @@ impl PersistedSessionRecord {
         Self {
             session_id: record.session_id.clone(),
             project: record.project.clone(),
+            project_identity: record.project_identity.clone(),
             owner_authority_fingerprint: record.owner_authority_fingerprint.clone(),
             title: record.title.clone(),
             mode: record.mode,
@@ -120,6 +125,7 @@ impl PersistedSessionRecord {
     pub fn still_matches_record(&self, record: &SessionRecord) -> bool {
         self.session_id == record.session_id
             && self.project == record.project
+            && self.project_identity == record.project_identity
             && self.owner_authority_fingerprint == record.owner_authority_fingerprint
             && self.title == record.title
             && self.mode == record.mode
@@ -379,6 +385,7 @@ impl PersistedSessionRecord {
         Some(SessionRecord {
             session_id,
             project,
+            project_identity: self.project_identity.clone(),
             owner_authority_fingerprint,
             title: self.title.map(|value| bound_summary_string(value.trim())),
             mode: self.mode,
@@ -477,6 +484,7 @@ pub fn cold_session_from_persisted(
     Ok(ColdSessionRecord {
         session_id: persisted.session_id.clone(),
         project: persisted.project.clone(),
+        project_identity: persisted.project_identity.clone(),
         owner_authority_fingerprint,
         mode: persisted.mode,
         guards: persisted.guards,
@@ -500,6 +508,7 @@ pub fn materialize_cold_session(
     let persisted = serde_json::from_str::<PersistedSessionRecord>(record.raw.get()).ok()?;
     if persisted.session_id != record.session_id
         || persisted.project != record.project
+        || persisted.project_identity != record.project_identity
         || persisted.owner_authority_fingerprint != record.owner_authority_fingerprint
         || persisted.lifecycle != record.lifecycle
         || persisted.mode != record.mode
@@ -644,7 +653,11 @@ pub fn load_persisted_ledger(
         .collect::<HashSet<_>>();
     let (tombstones, tombstone_ids, next_expiry_ordinal, expiry_ordinal_exhausted) =
         accept_restored_tombstones(tombstone_rows, &live_ids);
-    records.sort_by_key(StoredSession::updated_at);
+    records.sort_by(|left, right| {
+        left.updated_at()
+            .cmp(&right.updated_at())
+            .then_with(|| left.session_id().cmp(right.session_id()))
+    });
     let mut sessions = HashMap::new();
     let mut lru = VecDeque::new();
     let (mut hot, mut cold, mut cold_bytes) = (0usize, 0usize, 0usize);
@@ -672,6 +685,126 @@ pub fn load_persisted_ledger(
         expiry_ordinal_exhausted,
         last_persist_error: None,
     }
+}
+
+/// SQLite startup restore bundle for Stage E production: rehydrates the Store from durable
+/// session rows and seeds Writer/global revision allocation on process start.
+pub(crate) struct RestoredSessionDatabase {
+    pub database: Arc<SessionDatabase>,
+    pub ledger: RestoredSessionLedger,
+    /// Last durable `workflow_session_state.revision` per live Session id.
+    pub committed_revisions: HashMap<String, u64>,
+    /// Committed message-observation watermark per live Session (`previous_message_revision` at restore).
+    pub committed_message_revisions: HashMap<String, u64>,
+    /// `max(committed_revisions)` after restore. Zero only when inventory is empty.
+    /// Seeds global next dirty-revision allocation (production restore must not restart from zero).
+    pub durable_revision_high_water: u64,
+}
+
+fn cold_from_sanitized_persisted(
+    persisted: &PersistedSessionRecord,
+) -> Result<ColdSessionRecord, serde_json::Error> {
+    let mut cold = cold_session_from_persisted(persisted, None)?;
+    if persisted.lifecycle.allows_mutation() {
+        cold.unfenced_completion_ids = unfenced_completion_ids_from_persisted(persisted);
+    }
+    Ok(cold)
+}
+
+fn unfenced_completion_ids_from_persisted(persisted: &PersistedSessionRecord) -> Vec<String> {
+    let fenced: HashSet<_> = persisted
+        .completion_assignment_fence_fingerprints
+        .keys()
+        .cloned()
+        .collect();
+    persisted
+        .messages
+        .iter()
+        .filter(|message| {
+            message.kind == SessionMessageKind::Todo
+                && message.status == SessionMessageStatus::Resolved
+                && message.completion_id.is_some()
+                && message.resolved_by_message_id.is_some()
+                && !fenced.contains(&message.message_id)
+        })
+        .map(|message| message.message_id.clone())
+        .collect()
+}
+
+/// Fail-closed SQLite restore: open shared DB, optional one-time legacy import, bounded
+/// load + single sanitize boundary per Session, Cold RAM payloads, tombstone parity.
+///
+/// Does not mutate the JSON ledger. Returns `Err` on any open/import/inventory/load/
+/// conversion/tombstone error without publishing a partial ledger.
+pub(crate) fn restore_session_database(
+    db_path: &Path,
+    legacy_ledger_path: &Path,
+    max_events_per_session: usize,
+) -> io::Result<RestoredSessionDatabase> {
+    let started = std::time::Instant::now();
+    let database = Arc::new(SessionDatabase::open(db_path)?);
+    database.import_legacy(legacy_ledger_path)?;
+    let locators = database.inventory()?;
+    let tombstone_rows = database.tombstones()?;
+    let mut sessions = HashMap::new();
+    let mut lru = VecDeque::new();
+    let mut committed_revisions = HashMap::new();
+    let mut committed_message_revisions = HashMap::new();
+    let mut durable_revision_high_water = 0_u64;
+    let (mut cold_count, mut cold_bytes) = (0usize, 0usize);
+    for locator in &locators {
+        let persisted = database.load(locator, max_events_per_session)?;
+        let cold_record = cold_from_sanitized_persisted(&persisted).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "SQLite restore failed to admit Cold Session {}: {err}",
+                    persisted.session_id
+                ),
+            )
+        })?;
+        committed_revisions.insert(persisted.session_id.clone(), locator.revision);
+        committed_message_revisions.insert(
+            persisted.session_id.clone(),
+            locator.previous_message_revision,
+        );
+        durable_revision_high_water = durable_revision_high_water.max(locator.revision);
+        cold_bytes += cold_record.raw.get().len();
+        cold_count += 1;
+        let session_id = persisted.session_id.clone();
+        lru.push_back(session_id.clone());
+        sessions.insert(session_id, StoredSession::Cold(cold_record));
+    }
+    let live_ids = sessions.keys().cloned().collect::<HashSet<_>>();
+    let (tombstones, tombstone_ids, next_expiry_ordinal, expiry_ordinal_exhausted) =
+        accept_restored_tombstones(tombstone_rows, &live_ids);
+    tracing::debug!(
+        target: "webcodex::session_cost",
+        phase = "restore",
+        source = "sqlite",
+        session_count = sessions.len(),
+        hot_sessions = 0,
+        cold_sessions = cold_count,
+        cold_raw_bytes = cold_bytes,
+        durable_revision_high_water,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "session database restore"
+    );
+    Ok(RestoredSessionDatabase {
+        database,
+        ledger: RestoredSessionLedger {
+            sessions,
+            lru,
+            tombstones,
+            tombstone_ids,
+            next_expiry_ordinal,
+            expiry_ordinal_exhausted,
+            last_persist_error: None,
+        },
+        committed_revisions,
+        committed_message_revisions,
+        durable_revision_high_water,
+    })
 }
 
 pub(super) fn is_lower_hex_sha256(value: &str) -> bool {

@@ -28,13 +28,14 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
     canonical_tool_call_finished_events, closeout_work_projection, current_attempt_event_view,
     exploration_tool_kind, normalize_observed_project_path, ExplorationToolKind,
     SessionDiscussionSummary, SessionEvent, SessionMessage, SessionSummary,
 };
+use crate::task_context::RECONCILE_ACTION;
 
 /// Maximum number of characters returned from the previous instruction.
 const MAX_INSTRUCTION_EXCERPT_CHARS: usize = 500;
@@ -49,6 +50,98 @@ const MAX_FAILURE_IDENTITIES: usize = 20;
 const MAX_SUGGESTED_ACTIONS: usize = 8;
 pub const EXPLORATION_CONTINUITY_ACTION: &str =
     "continue from the recent exploration workset before repeating broad discovery";
+
+const MUTATING_HISTORY_INCOMPLETE_ACTION: &str =
+    "inspect whether durable Session history is missing before resuming mutating work";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CallIdentity<'a> {
+    session_id: &'a str,
+    project: Option<&'a str>,
+    tool_name: &'a str,
+    call_id: &'a str,
+    logical_invocation_id: Option<&'a str>,
+    logical_invocation_role: Option<&'a str>,
+}
+
+fn retained_scope_project(event: &SessionEvent) -> Option<&str> {
+    event
+        .resolved_project
+        .as_deref()
+        .or(event.project.as_deref())
+}
+
+fn mutating_tool_call_identity<'a>(
+    event: &'a SessionEvent,
+    session_id: &'a str,
+) -> Option<CallIdentity<'a>> {
+    let call_id = event.call_id.as_deref()?;
+    if call_id.is_empty() {
+        return None;
+    }
+    Some(CallIdentity {
+        session_id,
+        project: retained_scope_project(event),
+        tool_name: &event.tool_name,
+        call_id,
+        logical_invocation_id: event.logical_invocation_id.as_deref(),
+        logical_invocation_role: event.logical_invocation_role.as_deref(),
+    })
+}
+
+fn mutating_start_like(event: &SessionEvent) -> bool {
+    event.write_like || event.shell_like
+}
+
+/// Fail closed when retained durable history has ambiguous or unclosed mutating
+/// tool-call pairing. Only `write_like` / `shell_like` starts participate; read-like
+/// calls are ignored even when unclosed. Finish pairing uses exact call identity and
+/// does not rely on finish metadata flags, which may differ from the paired start.
+pub(crate) fn retained_history_has_unclosed_mutating_tool_calls<'a>(
+    events: impl DoubleEndedIterator<Item = &'a SessionEvent>,
+    session_id: &'a str,
+) -> bool {
+    let mut pending_finishes: HashMap<CallIdentity<'_>, usize> = HashMap::new();
+
+    for event in events.rev() {
+        if event.session_id != session_id {
+            continue;
+        }
+        match event.kind.as_str() {
+            "tool_call_finished" => {
+                let Some(identity) = mutating_tool_call_identity(event, session_id) else {
+                    continue;
+                };
+                *pending_finishes.entry(identity).or_insert(0) += 1;
+            }
+            "tool_call_started" => {
+                if !mutating_start_like(event) {
+                    continue;
+                }
+                let Some(call_id) = event.call_id.as_deref().filter(|id| !id.is_empty()) else {
+                    return true;
+                };
+                let identity = CallIdentity {
+                    session_id,
+                    project: retained_scope_project(event),
+                    tool_name: &event.tool_name,
+                    call_id,
+                    logical_invocation_id: event.logical_invocation_id.as_deref(),
+                    logical_invocation_role: event.logical_invocation_role.as_deref(),
+                };
+                match pending_finishes.get(&identity).copied().unwrap_or(0) {
+                    1 => {
+                        pending_finishes.insert(identity, 0);
+                    }
+                    _ => return true,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
 
 /// Root continuation feedback projection returned to the model.
 #[derive(Debug, Clone, Serialize)]
@@ -666,6 +759,7 @@ fn build_attempt_summary(
 
     // --- outcome ---
     let (outcome_status, reason_codes) = build_attempt_outcome(
+        session_summary,
         &meaningful,
         actionable_failed_tool_calls,
         unresolved_failures,
@@ -684,6 +778,24 @@ fn build_attempt_summary(
         suggest_exploration_continuity,
         workspace_conflicts,
     );
+
+    if session_summary.retained_unclosed_mutating_tool_call {
+        suggested_next_actions.clear();
+        suggested_next_actions.push(RECONCILE_ACTION.to_string());
+        if session_summary.events_truncated || session_summary.retention_truncated {
+            push_unique(
+                &mut suggested_next_actions,
+                MUTATING_HISTORY_INCOMPLETE_ACTION,
+            );
+        }
+        suggested_next_actions.truncate(MAX_SUGGESTED_ACTIONS);
+    } else if session_summary.events_truncated || session_summary.retention_truncated {
+        insert_unique_front(
+            &mut suggested_next_actions,
+            MUTATING_HISTORY_INCOMPLETE_ACTION,
+        );
+        suggested_next_actions.truncate(MAX_SUGGESTED_ACTIONS);
+    }
 
     let task_context = crate::task_context::task_context_value(
         session_summary,
@@ -1050,6 +1162,7 @@ fn build_attempt_guidance(discussion: &SessionDiscussionSummary) -> AttemptGuida
 }
 
 fn build_attempt_outcome(
+    session_summary: &SessionSummary,
     meaningful: &[&SessionEvent],
     actionable_failed_tool_calls: usize,
     unresolved_failures: usize,
@@ -1082,13 +1195,20 @@ fn build_attempt_outcome(
     if matches!(validation.status.as_str(), "unproven" | "inconclusive") {
         push_unique(&mut reasons, "validation_inconclusive");
     }
-    let status = if reasons.is_empty() {
+    let mut status = if reasons.is_empty() {
         "in_progress".to_string()
     } else if unresolved_failures > 0 || jobs.recovering_count > 0 {
         "blocked".to_string()
     } else {
         "in_progress".to_string()
     };
+    if session_summary.events_truncated || session_summary.retention_truncated {
+        push_unique(&mut reasons, "mutating_call_history_incomplete");
+    }
+    if session_summary.retained_unclosed_mutating_tool_call {
+        push_unique(&mut reasons, "unconfirmed_tool_execution");
+        status = "blocked".to_string();
+    }
     (status, reasons)
 }
 
@@ -1886,6 +2006,11 @@ fn push_unique(values: &mut Vec<String>, value: &str) {
     if !values.iter().any(|existing| existing == value) {
         values.push(value.to_string());
     }
+}
+
+fn insert_unique_front(values: &mut Vec<String>, value: &str) {
+    values.retain(|existing| existing != value);
+    values.insert(0, value.to_string());
 }
 
 fn to_value<T: Serialize>(value: T) -> Value {

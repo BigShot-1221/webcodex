@@ -561,9 +561,13 @@ async fn window_affinity_attention_is_strict_and_explicit_recorder_keeps_precede
         register_runner_project_at_path(&runtime, "attention-strict", "demo", root.path()).await;
     let auth = auth_context(None, true);
     let window_id = "attention-strict-window";
-    let affinity = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("affinity target".to_string()));
+    let affinity = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("affinity target"),
+    )
+    .await;
     let affinity_message = runtime
         .sessions
         .post_message_with_ack(
@@ -667,9 +671,8 @@ async fn window_affinity_attention_is_strict_and_explicit_recorder_keeps_precede
         .is_none());
 
     let closed_window = "attention-strict-closed";
-    let closed = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("closed affinity".to_string()));
+    let closed =
+        start_registered_project_session(&runtime, &project, &auth, Some("closed affinity")).await;
     record_window_activity_fixture(
         &window_db,
         &auth,
@@ -702,9 +705,13 @@ async fn window_affinity_attention_is_strict_and_explicit_recorder_keeps_precede
         .get("session_attention")
         .is_none());
 
-    let recorder = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("explicit recorder".to_string()));
+    let recorder = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("explicit recorder"),
+    )
+    .await;
     let recorder_message = runtime
         .sessions
         .post_message_with_ack(

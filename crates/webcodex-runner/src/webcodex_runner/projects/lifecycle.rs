@@ -151,11 +151,7 @@ pub(crate) fn handle_project_lifecycle_operation(
         }
         return project_error_cmd(start, "project_not_found");
     }
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(v) => v,
-        Err(_) => return project_error_cmd(start, "operation_failed"),
-    };
-    let mut project = match parse_runner_project_toml(&content) {
+    let mut project = match super::registration::load_runner_project_registry_record(&config_path) {
         Ok(v) => v,
         Err(_) => return project_error_cmd(start, "operation_failed"),
     };
@@ -171,6 +167,7 @@ pub(crate) fn handle_project_lifecycle_operation(
                 "disabled": project.disabled, "path": project.path,
                 "name": project.name, "kind": project.kind,
                 "registration_source": effective_registration_source(&project).as_str(),
+                "registration_incarnation": project.registration_incarnation,
                 "description": project.description,
                 "allow_patch": project.allow_patch,
                 "root_fingerprint": canonicalize_existing(Path::new(&project.path)).ok()
@@ -236,6 +233,7 @@ pub(crate) fn handle_project_lifecycle_operation(
             "disabled": project.disabled, "path": project.path,
             "name": project.name, "kind": project.kind,
             "registration_source": effective_registration_source(&project).as_str(),
+            "registration_incarnation": project.registration_incarnation,
             "description": project.description,
             "allow_patch": project.allow_patch,
             "root_fingerprint": canonicalize_existing(Path::new(&project.path)).ok()
@@ -257,8 +255,9 @@ fn matching_existing_project(
     if !config_path.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&config_path).map_err(|_| "operation_failed")?;
-    let project = parse_runner_project_toml(&content).map_err(|_| "operation_failed")?;
+    let project =
+        super::registration::load_runner_project_registry_record(&config_path)
+            .map_err(|_| "operation_failed")?;
     let matches = project.id == id
         && paths_equal(Path::new(&project.path), Path::new(path))
         && project.name.as_deref() == Some(name)
@@ -308,6 +307,7 @@ fn recovered_project_result(
         "id": runtime_id, "agent_project_id": project.id, "client_id": client_id,
         "name": project.name, "path": project.path, "kind": project.kind,
         "registration_source": effective_registration_source(project).as_str(),
+        "registration_incarnation": project.registration_incarnation,
         "description": project.description,
         "created_directory": false, "created_config": false, "overwritten": false,
         "allow_patch": project.allow_patch, "template": template,
@@ -436,6 +436,7 @@ pub(crate) fn handle_project_operation(
     let runtime_id = format!("agent:{}:{}", client_id, id);
 
     let toml_content = build_project_toml(&id, &name, &path, &description, allow_patch);
+    let parsed_register_toml = parse_runner_project_toml(&toml_content).expect("generated project TOML must parse");
     let template = json
         .get("template")
         .and_then(|v| v.as_str())
@@ -526,7 +527,8 @@ pub(crate) fn handle_project_operation(
             "overwritten": write_result.overwritten,
             "allow_patch": allow_patch,
             "registration_source": EXPLICIT_REGISTRATION_SOURCE,
-            "revision": project_revision(&parse_runner_project_toml(&toml_content).expect("generated project TOML must parse")),
+            "registration_incarnation": parsed_register_toml.registration_incarnation,
+            "revision": project_revision(&parsed_register_toml),
             "root_fingerprint": project_root_fingerprint(&canonical),
             "operation": "register", "outcome": "registered", "changed": true, "recovered": false,
         });
@@ -704,6 +706,8 @@ pub(crate) fn handle_project_operation(
         }
     }
 
+    let parsed_create_toml =
+        parse_runner_project_toml(&toml_content).expect("generated project TOML must parse");
     // Write project TOML.
     let write_result =
         match write_project_toml_atomic(project_registry_dir, &id, &toml_content, overwrite) {
@@ -730,8 +734,9 @@ pub(crate) fn handle_project_operation(
         "overwritten": write_result.overwritten,
         "allow_patch": allow_patch,
         "registration_source": EXPLICIT_REGISTRATION_SOURCE,
+        "registration_incarnation": parsed_create_toml.registration_incarnation,
         "template": template,
-        "revision": project_revision(&parse_runner_project_toml(&toml_content).expect("generated project TOML must parse")),
+        "revision": project_revision(&parsed_create_toml),
         "root_fingerprint": path_buf.canonicalize().ok().filter(|path| path.is_dir()).as_deref().map(project_root_fingerprint),
         "git_initialized": git_initialized,
         "operation": "create", "outcome": "created", "changed": true, "recovered": false,

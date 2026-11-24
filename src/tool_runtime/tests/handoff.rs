@@ -212,9 +212,9 @@ async fn session_handoff_summary_includes_recent_failed_tools() {
     )
     .await;
     let project = agent_test_project_id("handoff-fail");
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("failed calls".to_string()));
+    let auth = auth_context(None, true);
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("failed calls")).await;
     let sid = session.session_id.clone();
 
     // Dispatch an invalid canonical read_files request so the public tool call
@@ -229,7 +229,7 @@ async fn session_handoff_summary_includes_recent_failed_tools() {
                 with_line_numbers: None,
                 max_result_bytes: None,
             },
-            Some(&auth_context(None, true)),
+            Some(&auth),
         )
         .await;
     assert!(!read_result.success, "read_files should have failed");
@@ -275,10 +275,13 @@ async fn expected_stop_job_failures_are_classified_without_permission_noise() {
     .await;
     let session_project = "agent:expected-stop:alpha".to_string();
     let request_project = "agent:expected-stop:beta".to_string();
-    let session = runtime.sessions.start_session(
-        Some(session_project),
-        Some("expected stop failures".to_string()),
-    );
+    let session = start_registered_project_session(
+        &runtime,
+        &session_project,
+        &auth,
+        Some("expected stop failures"),
+    )
+    .await;
     let sid = session.session_id.clone();
 
     let wrong_project = call_recorded_tool(
@@ -643,9 +646,13 @@ async fn expectation_mismatch_and_unexpected_success_are_visible() {
     .await;
     let project = "agent:expect-mismatch:demo".to_string();
 
-    let mismatch_session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("mismatch".to_string()));
+    let mismatch_session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("mismatch"),
+    )
+    .await;
     let mismatch_sid = mismatch_session.session_id.clone();
     let mismatch = call_recorded_tool(
         &runtime,
@@ -1288,15 +1295,26 @@ async fn closeout_boundary_gap_keeps_historical_validation_visible_without_curre
     let runtime = test_runtime();
     let project =
         register_runner_project_at_path(&runtime, "boundary-history", "demo", tmp.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("historical validation without attempt boundary".to_string()),
-    );
+    let auth = auth_context(None, true);
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("historical validation without attempt boundary"),
+    )
+    .await;
     let sid = session.session_id.clone();
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&auth))
+        .await
+        .expect("registered project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved)
+        .expect("registered project must expose registration incarnation");
     runtime
         .sessions
         .ensure_coding_session(crate::tool_runtime::sessions::CodingSessionRequest {
             project: project.clone(),
+            project_identity: Some(project_identity),
             authority_fingerprint:
                 crate::tool_runtime::sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
                     .to_string(),
@@ -1773,12 +1791,20 @@ async fn generic_call_runtime_tool_recording_session_preserves_failure_expectati
     let project =
         register_runner_project_at_path(&runtime, "generic-recording", "demo", tmp.path()).await;
     let auth = bootstrap_auth_context();
-    let business_session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("business session".to_string()));
-    let tracking_session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("tracking session".to_string()));
+    let business_session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("business session"),
+    )
+    .await;
+    let tracking_session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("tracking session"),
+    )
+    .await;
     let business_sid = business_session.session_id.clone();
     let tracking_sid = tracking_session.session_id.clone();
 

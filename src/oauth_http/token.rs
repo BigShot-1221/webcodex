@@ -84,7 +84,8 @@ pub(crate) async fn oauth_token(
         depot,
         form.client_id.as_deref(),
         form.client_secret.as_deref(),
-    )?;
+    )
+    .await?;
     let now = chrono::Utc::now().timestamp();
     let body = if grant_type == "authorization_code" {
         handle_authorization_code_grant(&config, &db, &client, &form, now)?

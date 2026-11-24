@@ -13,22 +13,26 @@ use webcodex_core::coding_agent::{
     CodingAgentResponsePayload, CodingAgentRunSnapshot, CodingAgentRunState,
 };
 
-fn seed(runtime: &ToolRuntime, project: Option<&str>, auth: &AuthContext) -> String {
-    let id = runtime
-        .sessions
-        .start_session_with_options(
-            SessionCreateOptions::new(
-                project.map(str::to_string),
-                Some("recovery source".into()),
-                SessionMode::Normal,
-                Default::default(),
+async fn seed(runtime: &ToolRuntime, project: Option<&str>, auth: &AuthContext) -> String {
+    let summary = if let Some(project) = project {
+        start_registered_project_session(runtime, project, auth, Some("recovery source")).await
+    } else {
+        runtime
+            .sessions
+            .start_session_with_options(
+                SessionCreateOptions::new(
+                    None,
+                    Some("recovery source".into()),
+                    SessionMode::Normal,
+                    Default::default(),
+                )
+                .with_owner_authority_fingerprint(Some(
+                    workflow_session_authority_fingerprint(Some(auth)).unwrap(),
+                )),
             )
-            .with_owner_authority_fingerprint(Some(
-                workflow_session_authority_fingerprint(Some(auth)).unwrap(),
-            )),
-        )
-        .unwrap()
-        .session_id;
+            .unwrap()
+    };
+    let id = summary.session_id;
     note(
         runtime,
         &id,
@@ -72,7 +76,7 @@ async fn coding_agent_context_recovers_exact_closed_history_without_resuming_or_
     ));
     let project = register_runner_project_at_path(&runtime, "context", "demo", root.path()).await;
     let auth = bootstrap_auth_context();
-    let id = seed(&runtime, Some(&project), &auth);
+    let id = seed(&runtime, Some(&project), &auth).await;
     runtime.sessions.close_session(&id).unwrap();
     let listed = runtime
         .dispatch_with_auth(
@@ -132,12 +136,13 @@ async fn coding_agent_context_rejects_foreign_owner_wrong_project_missing_scope_
     let project = register_runner_project_at_path(&runtime, "context", "demo", root.path()).await;
     let other = register_runner_project_at_path(&runtime, "other", "demo", root.path()).await;
     let auth = bootstrap_auth_context();
-    let id = seed(&runtime, Some(&project), &auth);
+    let id = seed(&runtime, Some(&project), &auth).await;
     let foreign = seed(
         &runtime,
         Some(&project),
         &shared_key_auth_context("different-owner"),
-    );
+    )
+    .await;
     for (source, target) in [(&foreign, &project), (&id, &other)] {
         let error = runtime
             .coding_agent_context_instruction(target, source, "Review", Some(&auth))
@@ -149,7 +154,7 @@ async fn coding_agent_context_rejects_foreign_owner_wrong_project_missing_scope_
             .to_string()
             .contains("existing database schema"));
     }
-    let unscoped = seed(&runtime, None, &auth);
+    let unscoped = seed(&runtime, None, &auth).await;
     let error = runtime
         .coding_agent_context_instruction(&project, &unscoped, "Review", Some(&auth))
         .await
@@ -200,7 +205,7 @@ async fn coding_agent_context_is_frozen_in_dispatched_intent_and_changed_retry_c
     )
     .await;
     let auth = bootstrap_auth_context();
-    let id = seed(&runtime, Some(&project), &auth);
+    let id = seed(&runtime, Some(&project), &auth).await;
     let call = || ToolCall::CodingAgentStart {
         project: project.clone(),
         provider_id: "review".into(),
@@ -310,12 +315,12 @@ async fn coding_agent_context_expired_selectors_stop_before_dispatch() {
     )
     .await;
     let auth = bootstrap_auth_context();
-    let expired = seed(&runtime, Some(&project), &auth);
+    let expired = seed(&runtime, Some(&project), &auth).await;
     let session_ref = runtime
         .session_reference_for_id(&expired, Some(&auth))
         .expect("live session issues a ref");
     runtime.sessions.close_session(&expired).unwrap();
-    let retained = seed(&runtime, Some(&project), &auth);
+    let retained = seed(&runtime, Some(&project), &auth).await;
     runtime.sessions.close_session(&retained).unwrap();
     assert!(runtime
         .sessions

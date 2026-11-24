@@ -29,7 +29,8 @@ pub(crate) async fn oauth_revoke(
         depot,
         form.client_id.as_deref(),
         form.client_secret.as_deref(),
-    )?;
+    )
+    .await?;
     let client_id = form.client_id.as_deref().expect("authenticated client_id");
 
     // --- Revoke ---

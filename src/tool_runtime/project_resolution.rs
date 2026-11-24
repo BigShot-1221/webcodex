@@ -3,6 +3,7 @@ use crate::auth::AuthContext;
 use crate::projects::ProjectConfig;
 use crate::runner_protocol::{RunnerProjectLineage, RunnerProjectSummary, RunnerView};
 use serde_json::{json, Value};
+use webcodex_workflow_session::SessionProjectIdentity;
 
 const MODEL_PROJECT_REFERENCE_PREFIX: &str = "~p";
 
@@ -15,6 +16,7 @@ pub(crate) struct ProjectResolverCandidate {
     pub(crate) path: String,
     pub(crate) allow_patch: bool,
     pub(crate) root_fingerprint: Option<String>,
+    pub(crate) registration_incarnation: Option<String>,
     pub(crate) lineage: Option<RunnerProjectLineage>,
     pub(crate) connected: bool,
     pub(crate) status: String,
@@ -65,9 +67,29 @@ pub(crate) struct ResolvedProject {
     /// produced this resolution. It is descriptive only and never authorizes
     /// access by itself.
     pub(crate) root_fingerprint: Option<String>,
+    pub(crate) registration_incarnation: Option<String>,
     /// Descriptive Runner-owned lineage only. It never changes execution cwd,
     /// ProjectConfig, Session authority, Plugin placement, or tool permission.
     pub(crate) knowledge_association: Option<RunnerProjectLineage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiredSessionProjectDenial {
+    MalformedProjectId,
+    RunnerUnavailable,
+    InventoryIncomplete,
+    ProjectStillRegistered,
+}
+
+impl RetiredSessionProjectDenial {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MalformedProjectId => "invalid_project_id",
+            Self::RunnerUnavailable => "runner_unavailable",
+            Self::InventoryIncomplete => "inventory_incomplete",
+            Self::ProjectStillRegistered => "project_still_registered",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +188,12 @@ impl From<ProjectResolverError> for String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionProjectIdentityUnavailable {
+    RootFingerprint,
+    RegistrationIncarnation,
+}
+
 pub(crate) fn runner_project_runtime_id(client_id: &str, project_id: &str) -> String {
     format!("agent:{}:{}", client_id, project_id)
 }
@@ -252,6 +280,7 @@ impl ToolRuntime {
             path: project.path.clone(),
             allow_patch: project.allow_patch,
             root_fingerprint: project.root_fingerprint.clone(),
+            registration_incarnation: project.registration_incarnation.clone(),
             lineage: project.lineage.clone(),
             connected: client.connected,
             status: client.status.clone(),
@@ -276,8 +305,80 @@ impl ToolRuntime {
             resolved_id: candidate.id.clone(),
             config: Self::project_config_from_candidate(candidate),
             root_fingerprint: candidate.root_fingerprint.clone(),
+            registration_incarnation: candidate.registration_incarnation.clone(),
             knowledge_association: candidate.lineage.clone(),
         }
+    }
+
+    pub(crate) fn session_project_identity_failure_from_resolved(
+        resolved: &ResolvedProject,
+    ) -> Result<SessionProjectIdentity, SessionProjectIdentityUnavailable> {
+        let root_fingerprint = resolved.root_fingerprint.as_deref();
+        if !root_fingerprint.is_some_and(SessionProjectIdentity::valid_root_fingerprint) {
+            return Err(SessionProjectIdentityUnavailable::RootFingerprint);
+        }
+        let registration_incarnation = resolved.registration_incarnation.as_deref();
+        if !registration_incarnation
+            .is_some_and(SessionProjectIdentity::valid_registration_incarnation)
+        {
+            return Err(SessionProjectIdentityUnavailable::RegistrationIncarnation);
+        }
+        SessionProjectIdentity::from_runner_inventory(
+            resolved.root_fingerprint.clone(),
+            String::new(),
+            resolved.registration_incarnation.clone().expect("checked above"),
+        )
+        .ok_or(SessionProjectIdentityUnavailable::RootFingerprint)
+    }
+
+    pub(crate) fn session_project_identity_from_resolved(
+        resolved: &ResolvedProject,
+    ) -> Option<SessionProjectIdentity> {
+        Self::session_project_identity_failure_from_resolved(resolved).ok()
+    }
+
+    fn runtime_id_parts(runtime_id: &str) -> Option<(&str, &str)> {
+        let rest = runtime_id.strip_prefix("agent:")?;
+        rest.split_once(':')
+            .filter(|(client, project)| !client.is_empty() && !project.is_empty())
+    }
+
+    /// Prove a formerly bound runtime Project id is absent from the current
+    /// authoritative Runner inventory snapshot.
+    pub(crate) async fn verify_retired_session_project(
+        &self,
+        runtime_project_id: &str,
+        auth: Option<&AuthContext>,
+    ) -> Result<(), RetiredSessionProjectDenial> {
+        let Some((client_id, agent_project_id)) = Self::runtime_id_parts(runtime_project_id) else {
+            return Err(RetiredSessionProjectDenial::MalformedProjectId);
+        };
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        let Some(runner) = self
+            .runner_registry
+            .get_runner_view_for_auth(client_id, access.as_ref())
+            .await
+        else {
+            return Err(RetiredSessionProjectDenial::RunnerUnavailable);
+        };
+        if !runner.connected || runner.status != "online" {
+            return Err(RetiredSessionProjectDenial::RunnerUnavailable);
+        }
+        if runner
+            .project_inventory
+            .as_ref()
+            .is_none_or(|status| status.sync_state != "complete")
+        {
+            return Err(RetiredSessionProjectDenial::InventoryIncomplete);
+        }
+        if runner
+            .projects
+            .iter()
+            .any(|project| project.id == agent_project_id)
+        {
+            return Err(RetiredSessionProjectDenial::ProjectStillRegistered);
+        }
+        Ok(())
     }
 
     fn sort_resolver_candidates(candidates: &mut [ProjectResolverCandidate]) {

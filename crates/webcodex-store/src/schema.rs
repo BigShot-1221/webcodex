@@ -1,6 +1,6 @@
 use super::Database;
 use anyhow::Context;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 
 impl Database {
@@ -934,6 +934,179 @@ fn validate_supported_domain_schemas(conn: &Connection) -> anyhow::Result<()> {
             anyhow::bail!("unsupported pre-v0.4.6 {table} schema; upgrade through v0.4.6 first");
         }
     }
+    Ok(())
+}
+
+// `schema_version = 1` mirrors `WORKFLOW_SESSION_STORAGE_SCHEMA_VERSION` in
+// `webcodex-workflow-session` (`persistence/database.rs`); update both together.
+const WORKFLOW_SESSION_BACKUP_SCHEMA_VERSION: u32 = 1;
+
+const WORKFLOW_SESSION_BACKUP_TABLES: &[(&str, &[&str])] = &[
+    (
+        "workflow_session_storage",
+        &["id", "schema_version", "legacy_imported"],
+    ),
+    (
+        "workflow_session_state",
+        &[
+            "session_id",
+            "project",
+            "owner_authority_fingerprint",
+            "created_at",
+            "updated_at",
+            "revision",
+            "previous_message_revision",
+            "message_observation_revision",
+            "events_observed",
+            "state_json",
+        ],
+    ),
+    (
+        "workflow_session_events",
+        &["session_id", "ordinal", "event_id", "event_json"],
+    ),
+    (
+        "workflow_session_messages",
+        &[
+            "session_id",
+            "message_id",
+            "observation_revision",
+            "message_json",
+        ],
+    ),
+    (
+        "workflow_session_message_delivery_replays",
+        &[
+            "session_id",
+            "scope_key",
+            "payload_fingerprint",
+            "message_id",
+        ],
+    ),
+    (
+        "workflow_session_retention_tombstones",
+        &[
+            "session_id",
+            "owner_authority_fingerprint",
+            "incarnation_fingerprint",
+            "expiry_ordinal",
+        ],
+    ),
+];
+
+fn workflow_session_backup_table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn validate_workflow_session_backup_domain(conn: &Connection) -> anyhow::Result<()> {
+    let table_count = WORKFLOW_SESSION_BACKUP_TABLES.len();
+    let mut present = 0usize;
+    for &(table, _) in WORKFLOW_SESSION_BACKUP_TABLES {
+        if workflow_session_backup_table_exists(conn, table)? {
+            present += 1;
+        }
+    }
+
+    match present {
+        0 => return Ok(()),
+        n if n == table_count => {}
+        n => anyhow::bail!(
+            "shared database backup has partial Workflow Session schema ({n} of {table_count} required tables present)"
+        ),
+    }
+
+    for &(table, required_columns) in WORKFLOW_SESSION_BACKUP_TABLES {
+        let columns = table_columns(conn, table)?;
+        if columns.is_empty() {
+            anyhow::bail!(
+                "shared database backup missing Workflow Session table `{table}`"
+            );
+        }
+        for required in required_columns {
+            if !columns.iter().any(|column| column.as_str() == *required) {
+                anyhow::bail!(
+                    "shared database backup Workflow Session table `{table}` missing required column `{required}`"
+                );
+            }
+        }
+    }
+
+    let marker_version: Option<u32> = conn
+        .query_row(
+            "SELECT schema_version FROM workflow_session_storage WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("read workflow_session_storage schema marker")?;
+    match marker_version {
+        Some(version) if version == WORKFLOW_SESSION_BACKUP_SCHEMA_VERSION => {}
+        Some(version) => anyhow::bail!(
+            "workflow_session_storage schema version {version} is not supported (expected {})",
+            WORKFLOW_SESSION_BACKUP_SCHEMA_VERSION
+        ),
+        None => anyhow::bail!(
+            "shared database backup missing workflow_session_storage marker row id=1"
+        ),
+    }
+
+    Ok(())
+}
+
+// Mirrors `wc_agent_wake_attempts` in `agent_wake.rs` (`ensure_agent_wake_schema`).
+// No additive migration path exists for this table today; backup validation
+// expects the full initial DDL column set when the Wake domain is present.
+const AGENT_WAKE_ATTEMPTS_BACKUP_REQUIRED_COLUMNS: &[&str] = &[
+    "attempt_id",
+    "wake_id",
+    "endpoint_id",
+    "controller_generation",
+    "adapter_kind",
+    "state",
+    "claim_fence_hash",
+    "consume_token_hash",
+    "claimed_at_unix_ms",
+    "claim_lease_expires_at_unix_ms",
+    "prepared_at_unix_ms",
+    "delivered_at_unix_ms",
+    "delivery_unknown_at_unix_ms",
+    "revoked_at_unix_ms",
+    "consumed_at_unix_ms",
+];
+
+/// Backup-only column probe for `wc_agent_wake_attempts` after
+/// [`Database::validate_agent_wake_schema`] (co-presence + wake source columns).
+/// Entirely absent Wake tables are accepted; partial co-presence remains rejected upstream.
+fn validate_agent_wake_attempts_backup_schema(conn: &Connection) -> anyhow::Result<()> {
+    const TABLE: &str = "wc_agent_wake_attempts";
+    let columns = table_columns(conn, TABLE)?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    for required in AGENT_WAKE_ATTEMPTS_BACKUP_REQUIRED_COLUMNS {
+        if !columns.iter().any(|column| column.as_str() == *required) {
+            anyhow::bail!(
+                "shared database backup Agent Wake table `{TABLE}` missing required column `{required}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read-only validation for a shared Store database backup (no migration or writes).
+pub(crate) fn validate_shared_database_backup_schema(conn: &Connection) -> anyhow::Result<()> {
+    validate_supported_domain_schemas(conn)?;
+    Database::validate_agent_wake_schema(conn)?;
+    validate_agent_wake_attempts_backup_schema(conn)?;
+    validate_workflow_session_backup_domain(conn)?;
     Ok(())
 }
 

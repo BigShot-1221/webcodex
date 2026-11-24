@@ -152,7 +152,7 @@ pub(super) fn required_token_parameter<'a>(
 
 /// Call only after endpoint-specific parameters have been checked: a missing
 /// grant/token must retain priority over client authentication and DB access.
-pub(super) fn authenticate_token_client(
+pub(super) async fn authenticate_token_client(
     depot: &Depot,
     client_id: Option<&str>,
     client_secret: Option<&str>,
@@ -163,20 +163,28 @@ pub(super) fn authenticate_token_client(
         .ok_or_else(|| OAuthTokenError::invalid_client("missing client_secret"))?;
     let db = crate::auth::get_db(depot)
         .ok_or_else(|| OAuthTokenError::server_error("DB not available"))?;
-    let secret_ok = crate::auth::verify_oauth_client_secret(&db, client_id, client_secret)
-        .map_err(|_| OAuthTokenError::server_error("internal error"))?;
-    if !secret_ok {
-        return Err(OAuthTokenError::invalid_client(
-            "client authentication failed",
-        ));
-    }
+    let client_id_owned = client_id.to_string();
+    let client_secret_owned = client_secret.to_string();
+    let db_blocking = Arc::clone(&db);
     // Recheck liveness after secret verification, retaining the existing
     // invalid_client response if this second lookup fails or sees revocation.
-    let client = db
-        .get_oauth_client_by_client_id(client_id)
-        .ok()
-        .flatten()
-        .ok_or_else(|| OAuthTokenError::invalid_client("client authentication failed"))?;
+    let client = tokio::task::spawn_blocking(move || {
+        let secret_ok =
+            crate::auth::verify_oauth_client_secret(&db_blocking, &client_id_owned, &client_secret_owned)
+                .map_err(|_| OAuthTokenError::server_error("internal error"))?;
+        if !secret_ok {
+            return Err(OAuthTokenError::invalid_client(
+                "client authentication failed",
+            ));
+        }
+        db_blocking
+            .get_oauth_client_by_client_id(&client_id_owned)
+            .ok()
+            .flatten()
+            .ok_or_else(|| OAuthTokenError::invalid_client("client authentication failed"))
+    })
+    .await
+    .map_err(|_| OAuthTokenError::server_error("internal error"))??;
     Ok((db, client))
 }
 

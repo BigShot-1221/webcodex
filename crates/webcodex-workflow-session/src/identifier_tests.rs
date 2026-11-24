@@ -86,7 +86,7 @@ fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
     let session = store.start_session(Some("demo".into()), None);
     let note = post(&store, &session.session_id, SessionMessageKind::Note);
     let replacement = store
-        .replace_message(ReplaceSessionMessageInput {
+        .replace_message_for_test(ReplaceSessionMessageInput {
             session_id: session.session_id.clone(),
             message_id: note.message_id.clone(),
             message: "replacement".into(),
@@ -95,11 +95,11 @@ fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
         .replacement;
     let todo = post(&store, &session.session_id, SessionMessageKind::Todo);
     let fence = store
-        .get_assignment(&session.session_id, &todo.message_id)
+        .get_assignment_for_test(&session.session_id, &todo.message_id)
         .unwrap()
         .assignment_fence;
     let answer = store
-        .complete_message(CompleteSessionMessageInput {
+        .complete_message_for_test(CompleteSessionMessageInput {
             session_id: session.session_id.clone(),
             message_id: todo.message_id.clone(),
             answer: "done".into(),
@@ -169,6 +169,7 @@ fn legacy_ledger_restores_all_links_and_resumes_with_compact_messages() {
     let resumed = restored
         .ensure_coding_session(CodingSessionRequest {
             project: "demo".into(),
+            project_identity: None,
             authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.into(),
             resume_session_id: Some(legacy_session.clone()),
             instruction: Some("continue".into()),

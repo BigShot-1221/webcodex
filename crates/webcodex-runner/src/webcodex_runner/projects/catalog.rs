@@ -12,6 +12,7 @@ use webcodex_process::{GracefulTermination, ManagedChild};
 
 use super::super::config::{project_registry_dir, validate_shell_profile_name, RunnerConfig};
 use super::super::shell::canonicalize_existing;
+use super::registration::load_runner_project_registry_record;
 use super::{RunnerProjectCache, RunnerProjectFile, RunnerProjectShellContext};
 use webcodex_core::runner_protocol::{
     RunnerProjectLineage, RunnerProjectSummary, PROJECT_ROOT_FINGERPRINT_PREFIX,
@@ -85,6 +86,12 @@ pub(crate) fn parse_runner_project_toml(content: &str) -> Result<RunnerProjectFi
     project.name = trim_optional(project.name);
     project.kind = trim_optional(project.kind);
     project.registration_source = trim_optional(project.registration_source);
+    project.registration_incarnation = trim_optional(project.registration_incarnation);
+    if let Some(registration_incarnation) = project.registration_incarnation.as_deref() {
+        if !super::registration::valid_registration_incarnation(registration_incarnation) {
+            return Err("registration_incarnation is invalid".to_string());
+        }
+    }
     project.description = trim_optional(project.description);
     project.managed_source = trim_optional(project.managed_source);
     project.managed_source_project_id = trim_optional(project.managed_source_project_id);
@@ -591,6 +598,7 @@ fn runner_project_summary_with_shutdown(
         allow_patch: project.allow_patch,
         kind: project_wire_kind(project),
         registration_source: Some(registration_source.as_str().to_string()),
+        registration_incarnation: project.registration_incarnation.clone(),
         description: project.description.clone(),
         hooks,
         disabled: project.disabled,
@@ -661,18 +669,7 @@ fn load_runner_project_summaries_from_dir_with_shutdown(
         if shutdown.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
             break;
         }
-        let content = match std::fs::read_to_string(&file) {
-            Ok(content) => content,
-            Err(e) => {
-                eprintln!(
-                    "webcodex-runner project warning: failed to read {}: {}",
-                    file.display(),
-                    e
-                );
-                continue;
-            }
-        };
-        let project = match parse_runner_project_toml(&content) {
+        let project = match load_runner_project_registry_record(&file) {
             Ok(project) => project,
             Err(e) => {
                 eprintln!(

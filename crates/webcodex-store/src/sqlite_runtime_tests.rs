@@ -70,3 +70,59 @@ fn concurrent_wal_checkpoint_and_writer_preserve_all_committed_rows() {
         "ok"
     );
 }
+
+#[test]
+fn shared_database_wal_observation_reports_uncheckpointed_frames_without_noop_checkpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("noop-observe.db");
+    let db = Database::open(&path).unwrap();
+    {
+        let mut conn = db.conn_for_tests();
+        conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            "CREATE TABLE wal_noop_probe(id INTEGER PRIMARY KEY);
+             INSERT INTO wal_noop_probe VALUES (1), (2), (3);",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let first = db.shared_database_wal_observation();
+    assert_eq!(first.status, "available");
+    assert_eq!(first.checkpoint_busy, Some(false));
+    assert!(first.error_kind.is_none());
+    assert!(first.log_frames.is_some());
+    assert!(first.checkpointed_frames.is_some());
+    let uncheckpointed = first
+        .uncheckpointed_frames
+        .expect("NOOP exposes frame metrics when available");
+    assert!(
+        uncheckpointed > 0,
+        "expected uncheckpointed WAL frames after disabled autocheckpoint: {first:?}"
+    );
+    assert!(first.wal_bytes.unwrap_or(0) > 0);
+
+    let second = db.shared_database_wal_observation();
+    assert_eq!(second.status, "available");
+    assert_eq!(second.checkpointed_frames, first.checkpointed_frames);
+    assert_eq!(second.uncheckpointed_frames, first.uncheckpointed_frames);
+    assert_eq!(second.checkpoint_busy, Some(false));
+}
+
+#[test]
+fn shared_database_wal_observation_busy_when_diagnostic_mutex_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::open(&tmp.path().join("diag-mutex.db")).unwrap();
+    let _ = db.shared_database_wal_observation();
+    let diagnostic = db
+        .wal_diagnostic_connection
+        .get()
+        .expect("lazy diagnostic connection initialized by first observation");
+    let _guard = diagnostic.lock().unwrap();
+    let observation = db.shared_database_wal_observation();
+    assert_eq!(observation.status, "busy");
+    assert!(observation.checkpoint_busy.is_none());
+    assert!(observation.error_kind.is_none());
+}

@@ -43,7 +43,7 @@ use registration::sync_parent_dir;
 #[cfg(test)]
 pub(crate) use registration::{
     fail_next_project_parent_sync_after_rename, fail_next_project_publish_before_rename,
-    validate_project_path_policy,
+    valid_registration_incarnation, validate_project_path_policy,
 };
 
 static PROJECT_REGISTRY_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -106,6 +106,8 @@ pub(crate) struct RunnerProjectFile {
     pub(crate) kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) registration_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) registration_incarnation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
     #[serde(default)]
@@ -294,6 +296,7 @@ mod durability_tests {
             name: None,
             kind: None,
             registration_source: None,
+            registration_incarnation: None,
             description: None,
             disabled: false,
             hooks: HashMap::new(),

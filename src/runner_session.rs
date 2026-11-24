@@ -25,7 +25,34 @@ use crate::runner_protocol::{RunnerEnvelope, RunnerPollRequest, RunnerRegisterRe
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Notify};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
+
+/// Aborts a spawned task when this guard is dropped, unless [`Self::disarm`]
+/// cleared the handle. Covers parent session cancellation (e.g. QUIC endpoint
+/// JoinSet `abort_all`) where dropping a [`JoinHandle`] would detach the child.
+struct TaskAbortOnDrop {
+    abort: Option<AbortHandle>,
+}
+
+impl TaskAbortOnDrop {
+    fn new<T>(task: &JoinHandle<T>) -> Self {
+        Self {
+            abort: Some(task.abort_handle()),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.abort = None;
+    }
+}
+
+impl Drop for TaskAbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            abort.abort();
+        }
+    }
+}
 
 /// Channel capacity for outgoing envelopes (requests + pongs). Provides
 /// backpressure if the Runner reads slowly. Shared by both transports.
@@ -255,6 +282,8 @@ async fn run_runner_session_with_pump(
 
     let mut pump_task = pump_task;
     let mut writer_task = writer_task;
+    let mut pump_abort_guard = TaskAbortOnDrop::new(&pump_task);
+    let mut writer_abort_guard = TaskAbortOnDrop::new(&writer_task);
     let mut pump_observed = false;
     let mut writer_observed = false;
 
@@ -390,6 +419,14 @@ async fn run_runner_session_with_pump(
             }
         }
     }
+
+    // Intentional teardown finished: disarm so guard drop does not re-abort after
+    // joins (abort on a completed task is already a no-op, but disarm keeps the
+    // contract obvious). Forced parent cancellation drops these guards earlier
+    // without disarm, aborting pump/writer immediately.
+    pump_abort_guard.disarm();
+    writer_abort_guard.disarm();
+
     registry
         .reconcile_disconnect_for_connection(client_id, runner_instance_id, connection_id)
         .await;

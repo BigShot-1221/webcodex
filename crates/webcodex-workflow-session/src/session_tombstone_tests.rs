@@ -25,6 +25,7 @@ fn close_new(store: &SessionStore, title: &str) -> String {
 fn coding_request(resume: Option<String>, owner: &str) -> CodingSessionRequest {
     CodingSessionRequest {
         project: "agent:test:retention".to_string(),
+        project_identity: None,
         authority_fingerprint: owner.to_string(),
         resume_session_id: resume,
         instruction: None,

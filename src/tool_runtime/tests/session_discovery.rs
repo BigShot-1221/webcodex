@@ -1,5 +1,6 @@
 use super::support::*;
 use crate::auth::scopes::{SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ};
+use crate::tool_runtime::project_resolution::ToolRuntime;
 use crate::tool_runtime::session_context::workflow_session_authority_fingerprint;
 use crate::tool_runtime::sessions::SessionCreateOptions;
 use crate::tool_runtime::{registered_tool_specs, ToolCall, ToolRuntime};
@@ -15,12 +16,18 @@ fn discovery_call(project: &str, offset: usize, limit: usize) -> ToolCall {
     }
 }
 
-fn seed(
+async fn seed(
     runtime: &ToolRuntime,
     project: &str,
     auth: &crate::auth::AuthContext,
     title: &str,
 ) -> String {
+    let resolved = runtime
+        .resolve_project_input_for_auth(project, Some(auth))
+        .await
+        .expect("seed project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved)
+        .expect("seed project must expose registration incarnation");
     runtime
         .sessions
         .start_session_with_options(
@@ -30,6 +37,7 @@ fn seed(
                 SessionMode::Normal,
                 Default::default(),
             )
+            .with_project_identity(Some(project_identity))
             .with_owner_authority_fingerprint(Some(
                 workflow_session_authority_fingerprint(Some(auth)).unwrap(),
             )),
@@ -45,7 +53,7 @@ async fn session_discovery_requires_project_visibility_and_scopes() {
     let project =
         register_runner_project_at_path(&runtime, "discovery-owner", "demo", root.path()).await;
     let bootstrap = auth_context(None, true);
-    seed(&runtime, &project, &bootstrap, "private title");
+    seed(&runtime, &project, &bootstrap, "private title").await;
     let mut unprivileged = auth_context(Some("outsider"), false);
     unprivileged.scopes = vec![
         SCOPE_RUNTIME_READ.to_string(),
@@ -83,10 +91,10 @@ async fn session_discovery_returns_exact_refs_and_does_not_resume() {
     let auth = auth_context(None, true);
     let foreign = auth_context(Some("foreign"), false);
     for _ in 0..22 {
-        seed(&runtime, &project, &foreign, "FOREIGN TITLE");
+        seed(&runtime, &project, &foreign, "FOREIGN TITLE").await;
     }
-    let active = seed(&runtime, &project, &auth, "existing work");
-    let closed = seed(&runtime, &project, &auth, "finished work");
+    let active = seed(&runtime, &project, &auth, "existing work").await;
+    let closed = seed(&runtime, &project, &auth, "finished work").await;
     runtime.sessions.close_session(&closed).unwrap();
     let count_before = runtime.sessions.status().retained_sessions;
     let first = runtime
@@ -141,7 +149,7 @@ async fn session_discovery_returns_exact_refs_and_does_not_resume() {
         .await;
     assert_eq!(historical.output["sessions"][0]["session_id"], closed);
     for _ in 0..25 {
-        seed(&runtime, &project, &auth, &"界".repeat(1000));
+        seed(&runtime, &project, &auth, &"界".repeat(1000)).await;
     }
     let capped = runtime
         .dispatch_with_auth(discovery_call(&project, 0, usize::MAX), Some(&auth))

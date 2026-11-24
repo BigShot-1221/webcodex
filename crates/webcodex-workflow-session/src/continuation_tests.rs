@@ -6,11 +6,15 @@ use crate::{
     SessionMessagePriority, SessionPathHint, SessionStore, SessionToolContract, SessionTransport,
     ToolCallRecorderMetadata, TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT,
 };
+use crate::continuation::retained_history_has_unclosed_mutating_tool_calls;
+use crate::task_context::RECONCILE_ACTION;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use webcodex_core::workflow_session_contract::SessionMode;
 
 const PROJECT: &str = "test-project";
+const MUTATING_HISTORY_INCOMPLETE_ACTION: &str =
+    "inspect whether durable Session history is missing before resuming mutating work";
 
 fn store(max_events: usize) -> SessionStore {
     SessionStore::new(16, max_events)
@@ -26,6 +30,7 @@ fn add_instruction(store: &SessionStore, session_id: &str, instruction: &str) {
     store
         .ensure_coding_session(CodingSessionRequest {
             project: PROJECT.to_string(),
+            project_identity: None,
             authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
             resume_session_id: Some(session_id.to_string()),
             instruction: Some(instruction.to_string()),
@@ -967,4 +972,297 @@ fn fresh_session_reports_not_applicable() {
     let f = feedback_for(&store, &session);
     assert_eq!(f["status"], "not_applicable");
     assert_eq!(f["reason_code"], "empty_session");
+}
+
+#[test]
+fn unclosed_mutating_tool_call_blocks_continuation() {
+    let store = store(200);
+    let session = create_session(&store, "unclosed mutating");
+    add_instruction(&store, &session, "write");
+    let mut metadata = ToolCallRecorderMetadata::default();
+    metadata.assign_logical_invocation();
+    store.record_tool_call_started_with_metadata(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/lib.rs"]}),
+        Some(PROJECT.to_string()),
+        metadata,
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let summary = store.summary(&session, Some(200)).unwrap();
+    assert!(summary.retained_unclosed_mutating_tool_call);
+    let feedback = feedback_for(&store, &session);
+    assert_eq!(feedback["attempt"]["outcome"]["status"], "blocked");
+    assert!(feedback["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|code| code == "unconfirmed_tool_execution"));
+    let stall = &feedback["attempt"]["task_context"]["stall"];
+    assert_eq!(stall["status"], "reconcile_required");
+    assert_eq!(stall["reason_code"], "unconfirmed_tool_execution");
+    assert_eq!(stall["recommendation"], RECONCILE_ACTION);
+    assert_eq!(feedback["attempt"]["suggested_next_actions"][0], RECONCILE_ACTION);
+}
+
+#[test]
+fn unclosed_read_like_tool_call_does_not_block_resume() {
+    let store = store(200);
+    let session = create_session(&store, "unclosed read");
+    add_instruction(&store, &session, "read");
+    store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "read_files",
+        &json!({"project": PROJECT, "items": [{"path": "src/lib.rs"}]}),
+        synthetic_contract(true, false, SessionPathHint::None),
+    );
+    let summary = store.summary(&session, Some(200)).unwrap();
+    assert!(!summary.retained_unclosed_mutating_tool_call);
+    let feedback = feedback_for(&store, &session);
+    assert_ne!(feedback["attempt"]["outcome"]["status"], "blocked");
+}
+
+#[test]
+fn paired_mutating_tool_calls_do_not_set_unclosed_flag() {
+    let store = store(200);
+    let session = create_session(&store, "paired write");
+    add_instruction(&store, &session, "write");
+    record_write(&store, &session, &["src/lib.rs"]);
+    let summary = store.summary(&session, Some(200)).unwrap();
+    assert!(!summary.retained_unclosed_mutating_tool_call);
+    let start = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_started")
+        .unwrap();
+    let mut finish = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished")
+        .unwrap()
+        .clone();
+    finish.write_like = false;
+    finish.shell_like = false;
+    let events = vec![start.clone(), finish];
+    assert!(!retained_history_has_unclosed_mutating_tool_calls(
+        events.iter(),
+        &session,
+    ));
+}
+
+#[test]
+fn restored_session_with_unclosed_mutating_call_stays_restored_and_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger_path = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger_path, 10, 200);
+    let session = create_session(&store, "restore unclosed");
+    let mut metadata = ToolCallRecorderMetadata::default();
+    metadata.assign_logical_invocation();
+    store.record_tool_call_started_with_metadata(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/lib.rs"]}),
+        Some(PROJECT.to_string()),
+        metadata,
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.flush_persistence();
+    drop(store);
+
+    let restored = SessionStore::with_persistence(&ledger_path, 10, 200);
+    assert_eq!(restored.status().restored_sessions, 1);
+    let summary = restored.summary(&session, None).expect("session restored");
+    assert!(summary.retained_unclosed_mutating_tool_call);
+    let feedback = feedback_for(&restored, &session);
+    assert_eq!(feedback["attempt"]["outcome"]["status"], "blocked");
+}
+
+#[test]
+fn unclosed_mutating_before_summary_tail_still_blocks_resume() {
+    let store = store(200);
+    let session = create_session(&store, "unclosed head");
+    let mut metadata = ToolCallRecorderMetadata::default();
+    metadata.assign_logical_invocation();
+    store.record_tool_call_started_with_metadata(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/unclosed.rs"]}),
+        Some(PROJECT.to_string()),
+        metadata,
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    for index in 0..40 {
+        record_write(&store, &session, &[&format!("src/tail_{index:02}.rs")]);
+    }
+    let summary = store.summary(&session, Some(5)).unwrap();
+    assert!(summary.events_truncated);
+    assert!(summary.retained_unclosed_mutating_tool_call);
+    assert_eq!(feedback_for(&store, &session)["attempt"]["outcome"]["status"], "blocked");
+}
+
+#[test]
+fn two_mutating_starts_cannot_share_one_finish() {
+    let store = store(200);
+    let session = create_session(&store, "one finish");
+    add_instruction(&store, &session, "write");
+    record_write(&store, &session, &["src/a.rs"]);
+    let summary = store.summary(&session, Some(200)).unwrap();
+    let start = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_started")
+        .unwrap();
+    let finish = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished")
+        .unwrap();
+    let events = vec![start.clone(), start.clone(), finish.clone()];
+    assert!(retained_history_has_unclosed_mutating_tool_calls(
+        events.iter(),
+        &session,
+    ));
+}
+
+#[test]
+fn finish_before_start_cannot_prove_mutating_call_closed() {
+    let store = store(200);
+    let session = create_session(&store, "finish order");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/order.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    let summary = store.summary(&session, Some(200)).unwrap();
+    let start = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_started")
+        .unwrap();
+    let finish = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished")
+        .unwrap();
+    let events = vec![finish.clone(), start.clone()];
+    assert!(retained_history_has_unclosed_mutating_tool_calls(
+        events.iter(),
+        &session,
+    ));
+}
+
+#[test]
+fn duplicate_finish_without_mutating_start_does_not_block_history_scan() {
+    let store = store(200);
+    let session = create_session(&store, "read dup finish");
+    add_instruction(&store, &session, "read");
+    record_write(&store, &session, &["src/lib.rs"]);
+    let summary = store.summary(&session, Some(200)).unwrap();
+    let mut start = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_started")
+        .unwrap()
+        .clone();
+    start.write_like = false;
+    start.shell_like = false;
+    let finish = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished")
+        .unwrap()
+        .clone();
+    let events = vec![start, finish.clone(), finish];
+    assert!(!retained_history_has_unclosed_mutating_tool_calls(
+        events.iter(),
+        &session,
+    ));
+}
+
+#[test]
+fn mutating_start_with_empty_call_id_fails_closed() {
+    let store = store(200);
+    let session = create_session(&store, "empty call id");
+    add_instruction(&store, &session, "write");
+    record_write(&store, &session, &["src/lib.rs"]);
+    let summary = store.summary(&session, Some(200)).unwrap();
+    let mut start = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_started" && event.write_like)
+        .unwrap()
+        .clone();
+    start.call_id = Some(String::new());
+    let events = vec![start];
+    assert!(retained_history_has_unclosed_mutating_tool_calls(
+        events.iter(),
+        &session,
+    ));
+}
+
+#[test]
+fn retention_truncated_without_unclosed_adds_history_incomplete_not_blocked() {
+    let store = store(5);
+    let session = create_session(&store, "ledger cap");
+    add_instruction(&store, &session, "write many");
+    for index in 0..3 {
+        record_write(&store, &session, &[&format!("src/{index}.rs")]);
+    }
+    let summary = store.summary(&session, Some(200)).unwrap();
+    assert!(summary.retention_truncated);
+    assert!(!summary.retained_unclosed_mutating_tool_call);
+    let feedback = feedback_for(&store, &session);
+    assert_ne!(feedback["attempt"]["outcome"]["status"], "blocked");
+    let reasons = feedback["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap();
+    assert!(reasons.iter().any(|code| code == "mutating_call_history_incomplete"));
+    assert!(!reasons.iter().any(|code| code == "unconfirmed_tool_execution"));
+    assert!(feedback["attempt"]["suggested_next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == MUTATING_HISTORY_INCOMPLETE_ACTION));
+}
+
+#[test]
+fn unclosed_mutating_outcome_keeps_other_reason_codes() {
+    let store = store(200);
+    let session = create_session(&store, "unclosed plus guidance");
+    add_instruction(&store, &session, "write");
+    store
+        .post_message(PostSessionMessageInput {
+            session_id: session.clone(),
+            kind: SessionMessageKind::Guidance,
+            message: "pause".to_string(),
+            tags: Vec::new(),
+            reply_to: None,
+            priority: SessionMessagePriority::Normal,
+        })
+        .unwrap();
+    let mut metadata = ToolCallRecorderMetadata::default();
+    metadata.assign_logical_invocation();
+    store.record_tool_call_started_with_metadata(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/open.rs"]}),
+        Some(PROJECT.to_string()),
+        metadata,
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let reasons = feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(reasons.iter().any(|code| code == "unconfirmed_tool_execution"));
+    assert!(reasons.iter().any(|code| code == "open_guidance"));
+    assert!(reasons.iter().any(|code| code == "validation_not_run"));
 }

@@ -387,13 +387,15 @@ async fn dashboard(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 
 #[cfg(test)]
 mod tests {
+    mod project_paths;
+
     use super::*;
     use crate::auth::scopes::SCOPE_ADMIN;
     use salvo::test::{ResponseExt, TestClient};
     use salvo::Service;
 
-    fn service(auth: Option<AuthContext>) -> Service {
-        let (_tmp, db) = crate::test_support::test_db();
+    fn service(auth: Option<AuthContext>) -> (tempfile::TempDir, Service) {
+        let (tmp, db) = crate::test_support::test_db();
         let runtime = Arc::new(ToolRuntime::new(
             Arc::new(crate::RunnerRegistry::default()),
             Arc::new(crate::tool_runtime::RuntimeInfo::default()),
@@ -404,16 +406,17 @@ mod tests {
         if let Some(auth) = auth {
             router = router.hoop(affix_state::inject(auth));
         }
-        Service::new(router.push(routes()))
+        (tmp, Service::new(router.push(routes())))
     }
 
     async fn call(auth: Option<AuthContext>) -> (StatusCode, Value) {
+        let (_tmp, service) = service(auth);
         let mut response = TestClient::post("http://127.0.0.1/admin/dashboard")
             .add_header("host", "127.0.0.1", true)
             .add_header("origin", "http://127.0.0.1", true)
             .add_header("content-type", "application/json", true)
             .body("{}")
-            .send(&service(auth))
+            .send(&service)
             .await;
         let status = response.status_code.unwrap();
         let body = response.take_json::<Value>().await.unwrap();
@@ -669,6 +672,7 @@ mod tests {
         body: &str,
         origin: bool,
     ) -> (StatusCode, Value) {
+        let (_tmp, service) = service(auth);
         let mut request = TestClient::post("http://127.0.0.1/admin/projects/register")
             .add_header("host", "127.0.0.1", true)
             .add_header("content-type", "application/json", true)
@@ -682,7 +686,7 @@ mod tests {
             },
             true,
         );
-        let mut response = request.send(&service(auth)).await;
+        let mut response = request.send(&service).await;
         let status = response.status_code.unwrap();
         let body = response.take_json::<Value>().await.unwrap();
         (status, body)

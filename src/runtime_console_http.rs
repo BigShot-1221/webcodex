@@ -840,6 +840,7 @@ enum RuntimeConsoleError {
     NotFound,
     Conflict,
     PersistenceUncertain,
+    PersistenceUnavailable,
     Internal,
     Request { status: u16, message: &'static str },
 }
@@ -850,7 +851,9 @@ impl RuntimeConsoleError {
             Self::Invalid => StatusCode::BAD_REQUEST,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict => StatusCode::CONFLICT,
-            Self::PersistenceUncertain => StatusCode::SERVICE_UNAVAILABLE,
+            Self::PersistenceUncertain | Self::PersistenceUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Request { status, .. } => {
                 StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST)
@@ -866,6 +869,9 @@ impl RuntimeConsoleError {
             Self::PersistenceUncertain => {
                 "Outcome may have happened; refresh retained messages before retrying"
             }
+            Self::PersistenceUnavailable => {
+                "Session persistence is temporarily unavailable; retry after recovery"
+            }
             Self::Internal => "Runtime Console unavailable",
             Self::Request { message, .. } => message,
         }
@@ -878,6 +884,17 @@ impl Scribe for RuntimeConsoleError {
     fn render(self, res: &mut Response) {
         let status = self.status();
         res.status_code(status);
+        if matches!(self, Self::PersistenceUnavailable) {
+            res.render(Json(serde_json::json!({
+                "status": status.as_u16(),
+                "error": self.message(),
+                "error_kind": "session_persistence_unavailable",
+                "failure_kind": "persistence_unavailable",
+                "state_changed": false,
+                "reobserve_required": true,
+            })));
+            return;
+        }
         res.render(crate::json_error(status, self.message()));
     }
 }
@@ -1039,6 +1056,9 @@ fn session_message_mutation_error(
         | SessionMessageError::SessionClosed { .. } => RuntimeConsoleError::Conflict,
         SessionMessageError::DeliveryPersistenceUncertain
         | SessionMessageError::PersistenceUncertain => RuntimeConsoleError::PersistenceUncertain,
+        SessionMessageError::PersistenceUnavailable => {
+            RuntimeConsoleError::PersistenceUnavailable
+        }
         SessionMessageError::InvalidAssignmentFence | SessionMessageError::InvalidInput(_) => {
             RuntimeConsoleError::Invalid
         }
@@ -2217,6 +2237,7 @@ async fn session_withdraw_message_for_auth(
     let outcome = runtime
         .sessions
         .withdraw_message(&input.session_id, &input.message_id)
+        .await
         .map_err(session_message_mutation_error)?;
     let value =
         serde_json::to_value(&outcome.message).map_err(|_| RuntimeConsoleError::Internal)?;
@@ -2251,6 +2272,7 @@ async fn session_replace_message_for_auth(
             message_id: input.message_id,
             message: input.message,
         })
+        .await
         .map_err(session_message_mutation_error)?;
     let original_value =
         serde_json::to_value(&outcome.original).map_err(|_| RuntimeConsoleError::Internal)?;

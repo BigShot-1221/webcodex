@@ -42,7 +42,8 @@ async fn fixture(client: &str) -> (tempfile::TempDir, ToolRuntime, String, Strin
         },
     )
     .await;
-    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let auth = bootstrap_auth_context();
+    let session = start_registered_project_session(&runtime, &project, &auth, None).await;
     (root, runtime, project, session.session_id)
 }
 

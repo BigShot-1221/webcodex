@@ -82,8 +82,8 @@ async fn read_files_canonical_session_cache_keeps_each_invocation_recorded() {
     let runtime = ToolRuntime::new_for_tests();
     let client = "read-cache-canonical";
     let project = register_runner_project_at_path(&runtime, client, "demo", root.path()).await;
-    let session = runtime.sessions.start_session(Some(project.clone()), None);
     let auth = auth_context(None, true);
+    let session = start_registered_project_session(&runtime, &project, &auth, None).await;
     for expected_end in [2, 1] {
         let read = runtime.dispatch_with_auth(
             ToolCall::ReadFiles {
@@ -1129,11 +1129,10 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-sparse-single";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("sparse read".to_string()));
-    let session_id = session.session_id.clone();
     let auth = auth_context(None, true);
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("sparse read")).await;
+    let session_id = session.session_id.clone();
     let content = "one\ntwo";
 
     let task = tokio::spawn({
@@ -1227,12 +1226,15 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-partial-visible";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("read continuation session".to_string()),
-    );
-    let session_id = session.session_id.clone();
     let auth = auth_context(None, true);
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("read continuation session"),
+    )
+    .await;
+    let session_id = session.session_id.clone();
     let content = "one\ntwo\nthree";
 
     let task = tokio::spawn({
@@ -1714,12 +1716,15 @@ async fn read_files_partial_item_has_one_invocation_follow_up() {
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "read-batch-item-continuation";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("batch read continuation session".to_string()),
-    );
-    let session_id = session.session_id.clone();
     let auth = auth_context(None, true);
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("batch read continuation session"),
+    )
+    .await;
+    let session_id = session.session_id.clone();
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -2110,9 +2115,9 @@ async fn read_files_records_one_outer_session_event_and_keeps_metadata_outer_onl
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-session";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("batch read".to_string()));
+    let auth = auth_context(None, true);
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("batch read")).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
@@ -2175,11 +2180,10 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-direct-final-cap";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("direct final cap".to_string()));
-    seed_recovery_events(&runtime, &session.session_id, &project, 20);
     let auth = auth_context(None, true);
+    let session =
+        start_registered_project_session(&runtime, &project, &auth, Some("direct final cap")).await;
+    seed_recovery_events(&runtime, &session.session_id, &project, 20);
 
     let task = tokio::spawn({
         let runtime = runtime.clone();
@@ -2241,10 +2245,13 @@ async fn ordinary_read_delivers_terminal_attention_without_host_continuation_sup
     let client_id = "read-passive-terminal";
     super::jobs::register_job_agent_for_auth(&runtime, client_id, "repo", &auth).await;
     let project = format!("agent:{client_id}:repo");
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("same-turn passive job attention".to_string()),
-    );
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("same-turn passive job attention"),
+    )
+    .await;
     let window = ClientWindow::for_test("read-passive-window");
 
     let job_id = super::jobs::start_agent_runtime_job_in_session(
@@ -2401,10 +2408,14 @@ async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-outer-sparse";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime
-        .sessions
-        .start_session(Some(project.clone()), Some("outer sparse read".to_string()));
     let auth = auth_context(None, true);
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("outer sparse read"),
+    )
+    .await;
     let arguments = json!({
         "project": project,
         "items": [{"path": "a.rs"}]
@@ -2474,15 +2485,21 @@ async fn read_files_outer_recorder_observes_canonical_batch_before_primary_proje
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-canonical-before-projection";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let recording_session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("canonical batch evidence".to_string()),
-    );
-    let business_session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("inner business read".to_string()),
-    );
     let auth = auth_context(None, true);
+    let recording_session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("canonical batch evidence"),
+    )
+    .await;
+    let business_session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("inner business read"),
+    )
+    .await;
     let arguments = json!({
         "project": project,
         "items": [{"path": "a.rs"}, {"path": "b.rs"}],
@@ -2562,10 +2579,14 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-overlay-bound";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("bounded recovery overlays".to_string()),
-    );
+    let auth = auth_context(None, true);
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("bounded recovery overlays"),
+    )
+    .await;
     seed_recovery_events(&runtime, &session.session_id, &project, 50);
     seed_large_changed_path_events(&runtime, &session.session_id, &project, 50);
     for kind in [
@@ -2594,10 +2615,17 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
     // Seed an explicit retained attempt boundary after the deliberately large
     // historical overlay. Current validation evidence must not infer a complete
     // attempt from a truncated Session tail.
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&auth))
+        .await
+        .expect("registered project must resolve");
+    let project_identity = ToolRuntime::session_project_identity_from_resolved(&resolved)
+        .expect("registered project must expose registration incarnation");
     runtime
         .sessions
         .ensure_coding_session(crate::tool_runtime::sessions::CodingSessionRequest {
             project: project.clone(),
+            project_identity: Some(project_identity),
             authority_fingerprint:
                 crate::tool_runtime::sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
                     .to_string(),
@@ -2655,7 +2683,6 @@ async fn read_files_ignores_context_ack_and_preserves_bounded_attention() {
         None,
     );
 
-    let auth = auth_context(None, true);
     let arguments = json!({
         "project": project,
         "items": [{"path": "a.rs"}]
@@ -2731,12 +2758,15 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
     let runtime = ToolRuntime::new_for_tests();
     let client_id = "batch-final-cap";
     let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let session = runtime.sessions.start_session(
-        Some(project.clone()),
-        Some("final response cap".to_string()),
-    );
-    seed_recovery_events(&runtime, &session.session_id, &project, 20);
     let auth = auth_context(None, true);
+    let session = start_registered_project_session(
+        &runtime,
+        &project,
+        &auth,
+        Some("final response cap"),
+    )
+    .await;
+    seed_recovery_events(&runtime, &session.session_id, &project, 20);
     let arguments = json!({
         "project": project,
         "items": [

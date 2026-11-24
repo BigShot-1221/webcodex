@@ -83,27 +83,13 @@ fn tool_names(runtime: &ToolRuntime, session_id: &str) -> Vec<String> {
         .collect()
 }
 
-fn start_authorized_project_session(
+async fn start_authorized_project_session(
     runtime: &ToolRuntime,
     project: &str,
     title: Option<&str>,
     auth: &AuthContext,
 ) -> sessions::SessionSummary {
-    let fingerprint =
-        super::super::session_context::workflow_session_authority_fingerprint(Some(auth))
-            .expect("test authority must have a stable identity");
-    runtime
-        .sessions
-        .start_session_with_options(
-            sessions::SessionCreateOptions::new(
-                Some(project.to_string()),
-                title.map(str::to_string),
-                super::super::SessionMode::Normal,
-                sessions::SessionGuards::default(),
-            )
-            .with_owner_authority_fingerprint(Some(fingerprint)),
-        )
-        .unwrap()
+    start_registered_project_session(runtime, project, auth, title).await
 }
 
 fn start_authorized_unscoped_session(
@@ -555,19 +541,22 @@ async fn observe_session_messages_collaboration_recorder_target_scope_fences() {
         "agent:workstation:my-repo",
         Some("observation coordinator"),
         &auth,
-    );
+    )
+    .await;
     let same_project_worker = start_authorized_project_session(
         &runtime,
         "agent:workstation:my-repo",
         Some("same-project worker"),
         &auth,
-    );
+    )
+    .await;
     let other_project_worker = start_authorized_project_session(
         &runtime,
         "agent:workstation:other-repo",
         Some("other-project worker"),
         &auth,
-    );
+    )
+    .await;
 
     let allowed = call_with_recorder(
         &runtime,
@@ -817,9 +806,15 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
     register_agent(&runtime, client_id, None, RunnerCapabilities::default()).await;
     let project = agent_test_project_id(client_id);
     let auth = auth_context(None, true);
-    let coordinator =
-        start_authorized_project_session(&runtime, &project, Some("coordinator C"), &auth);
-    let worker = start_authorized_project_session(&runtime, &project, Some("worker W"), &auth);
+    let coordinator = start_authorized_project_session(
+        &runtime,
+        &project,
+        Some("coordinator C"),
+        &auth,
+    )
+    .await;
+    let worker =
+        start_authorized_project_session(&runtime, &project, Some("worker W"), &auth).await;
     assert_ne!(coordinator.session_id, worker.session_id);
 
     let coordinator_window = ClientWindow::for_test("collaboration-coordinator-window");
@@ -885,6 +880,7 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
     let assignment_fence = runtime
         .sessions
         .get_assignment(&coordinator.session_id, &todo_id)
+        .await
         .unwrap()
         .assignment_fence;
     let forged_author_error = super::super::ToolCall::from_tool_name(
@@ -1063,7 +1059,8 @@ async fn collaboration_completion_without_recording_session_has_null_author_even
     register_agent(&runtime, client_id, None, RunnerCapabilities::default()).await;
     let project = agent_test_project_id(client_id);
     let auth = auth_context(None, true);
-    let coordinator = start_authorized_project_session(&runtime, &project, None, &auth);
+    let coordinator =
+        start_authorized_project_session(&runtime, &project, None, &auth).await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -1079,6 +1076,7 @@ async fn collaboration_completion_without_recording_session_has_null_author_even
     let assignment_fence = runtime
         .sessions
         .get_assignment(&coordinator.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     let window = ClientWindow::for_test("no-recorder-author-window");
@@ -1109,9 +1107,14 @@ async fn collaboration_explicit_recording_session_is_completion_author() {
     let project = agent_test_project_id(client_id);
     let auth = auth_context(None, true);
     let coordinator =
-        start_authorized_project_session(&runtime, &project, Some("coordinator"), &auth);
-    let worker_recording =
-        start_authorized_project_session(&runtime, &project, Some("worker W1"), &auth);
+        start_authorized_project_session(&runtime, &project, Some("coordinator"), &auth).await;
+    let worker_recording = start_authorized_project_session(
+        &runtime,
+        &project,
+        Some("worker W1"),
+        &auth,
+    )
+    .await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -1126,6 +1129,7 @@ async fn collaboration_explicit_recording_session_is_completion_author() {
     let assignment_fence = runtime
         .sessions
         .get_assignment(&coordinator.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     let window = ClientWindow::for_test("recorder-vs-current-window");
@@ -1176,13 +1180,15 @@ async fn collaboration_cross_project_recorder_fails_closed_before_completion() {
     let runtime = runtime_with_resolver_projects().await;
     let auth = auth_context(None, true);
     let coordinator =
-        start_authorized_project_session(&runtime, "agent:workstation:my-repo", Some("C"), &auth);
+        start_authorized_project_session(&runtime, "agent:workstation:my-repo", Some("C"), &auth)
+            .await;
     let worker = start_authorized_project_session(
         &runtime,
         "agent:workstation:other-repo",
         Some("W"),
         &auth,
-    );
+    )
+    .await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -1197,6 +1203,7 @@ async fn collaboration_cross_project_recorder_fails_closed_before_completion() {
     let assignment_fence = runtime
         .sessions
         .get_assignment(&coordinator.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     let window = ClientWindow::for_test("cross-project-worker");
@@ -1444,7 +1451,8 @@ async fn collaboration_mixed_project_scope_fails_closed_in_both_directions() {
         "agent:workstation:my-repo",
         Some("scoped coordinator"),
         &auth,
-    );
+    )
+    .await;
     let unscoped_worker = call_with_recorder(
         &runtime,
         "start_session",
@@ -1473,6 +1481,7 @@ async fn collaboration_mixed_project_scope_fails_closed_in_both_directions() {
     let scoped_assignment_fence = runtime
         .sessions
         .get_assignment(&scoped_coordinator.session_id, &scoped_todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     for (tool_name, arguments) in [
@@ -1541,7 +1550,8 @@ async fn collaboration_mixed_project_scope_fails_closed_in_both_directions() {
         "agent:workstation:my-repo",
         Some("scoped worker"),
         &auth,
-    );
+    )
+    .await;
     let unscoped_todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -1556,6 +1566,7 @@ async fn collaboration_mixed_project_scope_fails_closed_in_both_directions() {
     let unscoped_assignment_fence = runtime
         .sessions
         .get_assignment(&unscoped_coordinator_id, &unscoped_todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
     for (tool_name, arguments) in [
@@ -1676,6 +1687,7 @@ async fn project_scoped_session_authority_rejects_recycled_project_identity() {
     let assignment_fence = runtime
         .sessions
         .get_assignment(&session_id, &todo_id)
+        .await
         .unwrap()
         .assignment_fence;
     runtime.sessions.flush_persistence();
@@ -1862,6 +1874,7 @@ async fn projectless_session_owner_authority_blocks_known_ids_from_foreign_princ
     let assignment_fence = runtime
         .sessions
         .get_assignment(&session_id, &todo_id)
+        .await
         .unwrap()
         .assignment_fence;
 
@@ -2081,7 +2094,8 @@ async fn collaboration_foreign_owner_cannot_read_or_complete_known_session_and_t
     )
     .await;
     let project = "agent:alice-host:private".to_string();
-    let coordinator = start_authorized_project_session(&runtime, &project, None, &alice);
+    let coordinator =
+        start_authorized_project_session(&runtime, &project, None, &alice).await;
     let todo = runtime
         .sessions
         .post_message(PostSessionMessageInput {
@@ -2096,6 +2110,7 @@ async fn collaboration_foreign_owner_cannot_read_or_complete_known_session_and_t
     let assignment_fence = runtime
         .sessions
         .get_assignment(&coordinator.session_id, &todo.message_id)
+        .await
         .unwrap()
         .assignment_fence;
 

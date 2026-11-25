@@ -876,7 +876,7 @@ session/prompt successfully dispatched
 recover a durable ACP session, but it does not by itself prove whether an
 in-flight prompt completed, partially acted, or never ran.
 
-### Protected terminal retention (personal fork)
+### Hot inventory and durable replay evidence (personal fork)
 
 The 128-record Runner inventory is a hot recovery/control bound, not an
 instruction to erase uncertain execution history. A protected terminal record
@@ -886,14 +886,41 @@ receipt for its exact Run identity and owning Runner. The negotiated
 `coding_agent_archive_lookup` capability and per-identity acknowledgements are
 internal protocol fields; they are not caller-supplied permission or retry
 policy. A missing acknowledgement, conflicting identity, or failed durable
-write retains the protected record. Ordinary definitive-terminal retention is
-unchanged. The archive contains recovery metadata, not event transcripts.
+write retains the protected record. On upgraded peers, ordinary completed and
+definitely cancelled records become eligible for hot archival after 15 minutes;
+definite failures after 24 hours. Capacity pressure may archive earlier only
+with a durable exact receipt. Durable ordinary replay evidence is retained for
+at least 24 hours after terminal, independently of hot retention. Cold physical
+retirement is deliberately disabled until persistent expiry and downgrade
+safety are established. Legacy and uncertain records are not deleted by age.
+The archive contains recovery metadata, not event transcripts.
 
-Server receipts are stored under the runtime state directory in
-`private/coding-agent-archive-routes-v1`; the Runner archive is the sibling
+Ordinary callers may use `wc-acp-v2:<unix-seconds>:<32-lowercase-hex-nonce>`
+keys: new execution admission expires 24 hours after issuance, and malformed,
+future or expired versioned keys are rejected without dispatch. The original
+principal-plus-key Run ID and AgentTask fixed-key semantics are unchanged.
+Versioned execution requires the negotiated `coding_agent_replay_expiry`
+capability. A single Server maintenance owner runs every 15 minutes, rotates
+through eligible online Runners, and processes at most 64 identities per round
+within a cooperative two-second work budget (not a hard transport or disk-I/O
+deadline). Internal `coding_agent_retention_maintenance` capability gates this
+operation; maintenance never launches an ACP provider.
+
+MCP request waits share the effective Host budget; the request deadline is
+not the ACP Run execution deadline. A lost response is reconciled against the
+same identity rather than automatically cancelling or redispatching the Run.
+For stage timings, use the `webcodex::acp_timing` debug target (bounded Run ID,
+stage, elapsed time and outcome fields, not prompts or event payloads).
+
+Server admission claims and receipts are stored under the runtime state directory
+in `private/coding-agent-archive-routes-v1`. Existing schema-1 receipt slots are
+readable; new schema-2 immutable admission claims occupy the primary slot,
+and an exact terminal routing receipt is published separately as a sidecar.
+The Runner archive is the sibling
 of its namespaced hot Run directory, with extension `archive-v1`. Keep the
 Runner hot directory (including `archive-required-v1`), archive directory,
-and Server receipts together when backing up or moving runtime state. A
+and the complete Server claim/receipt directory together when backing up or
+moving runtime state. A
 SQLite database backup alone does not include these files; database-only
 restore must leave these independent runtime-state files in place. Do not
 restore an older receipt set over newer Runner archives or remove the marker

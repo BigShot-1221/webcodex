@@ -56,7 +56,8 @@ async fn maintain_runner(
         archive_acknowledged_runs: acknowledgements,
         work_budget_ms,
     });
-    let (request_id, receiver) = runtime.runner_registry.enqueue_coding_agent(
+    let (request_id, receiver) = runtime.runner_registry.enqueue_coding_agent_until(
+        Some(tokio::time::Instant::from_std(deadline)),
         &client.client_id, &client.runner_instance_id, &provider.provider_id,
         &provider.provider_instance_id, request, None,
         "auth_server_acp_retention".to_string(),

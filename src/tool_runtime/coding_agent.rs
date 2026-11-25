@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant as RequestInstant;
 use uuid::Uuid;
 use webcodex_core::coding_agent::retention::{
-    hot_inventory_expired, hot_retention_deadline, is_ordinary_terminal, parse_replay_key,
+    hot_inventory_expired, is_ordinary_terminal, parse_replay_key,
     CodingAgentReplayWindow, ReplayWindowError, ORDINARY_REPLAY_RETENTION_SECS,
     SUCCESS_HOT_RETENTION_SECS,
 };
@@ -80,174 +80,70 @@ pub(crate) struct ServerRunBinding {
 
 #[derive(Debug, Default)]
 struct ServerRunRetentionIndex {
-  by_client_receipt: HashMap<String, BTreeMap<(i64, String), String>>,
-  terminal_cap: BTreeMap<(i64, String), String>,
-  meta: HashMap<String, ServerRunRetentionMeta>,
+    terminal_cap: BTreeMap<(i64, String), String>,
+    terminal_order: HashMap<String, i64>,
 }
 
-#[derive(Debug, Clone)]
-struct ServerRunRetentionMeta {
-    client_id: String,
-    updated_at: i64,
-    hot_deadline: Option<i64>,
-    evictable: bool,
-    route_confirmed: bool,
-    uses_v2: bool,
+fn pending_terminal_lifecycle_evidence(binding: &ServerRunBinding) -> bool {
+    binding.recording_session_id.is_some() && binding.recorded_lifecycle_mask & 4 == 0
 }
 
 impl ServerRunRetentionIndex {
-  fn remove_run(&mut self, run_id: &str) {
-      let Some(old) = self.meta.remove(run_id) else {
-          return;
-      };
-      self.terminal_cap
-          .remove(&(old.updated_at, run_id.to_string()));
-      if let Some(deadline) = old.hot_deadline {
-          if let Some(client) = self.by_client_receipt.get_mut(&old.client_id) {
-              client.remove(&(deadline, run_id.to_string()));
-              if client.is_empty() {
-                  self.by_client_receipt.remove(&old.client_id);
-              }
-          }
-      }
-  }
+    fn remove_run(&mut self, run_id: &str) {
+        if let Some(updated_at) = self.terminal_order.remove(run_id) {
+            self.terminal_cap.remove(&(updated_at, run_id.to_string()));
+        }
+    }
 
-  fn note_binding(&mut self, binding: &ServerRunBinding) {
-      self.remove_run(&binding.snapshot.run_id);
-      let evictable = is_ordinary_terminal(&binding.snapshot);
-      let hot_deadline = if binding.retention_uses_v2 {
-          if binding.retention_route_confirmed && evictable {
-              hot_retention_deadline(&binding.snapshot)
-          } else if !binding.retention_route_confirmed && binding.snapshot.state.terminal() {
-              Some(i64::MIN)
-          } else {
-              None
-          }
-      } else if evictable {
-          Some(
-              binding
-                  .snapshot
-                  .updated_at
-                  .saturating_add(SERVER_TERMINAL_RETENTION_SECS),
-          )
-      } else {
-          None
-      };
-      let meta = ServerRunRetentionMeta {
-          client_id: binding.client_id.clone(),
-          updated_at: binding.snapshot.updated_at,
-          hot_deadline,
-          evictable,
-          route_confirmed: binding.retention_route_confirmed,
-          uses_v2: binding.retention_uses_v2,
-      };
-      if binding.snapshot.state.terminal() && evictable
-          && (!binding.retention_uses_v2 || binding.retention_route_confirmed) {
-          self.terminal_cap.insert(
-              (binding.snapshot.updated_at, binding.snapshot.run_id.clone()),
-              binding.snapshot.run_id.clone(),
-          );
-      }
-      if let Some(deadline) = hot_deadline {
-          self.by_client_receipt
-              .entry(binding.client_id.clone())
-              .or_default()
-              .insert((deadline, binding.snapshot.run_id.clone()), binding.snapshot.run_id.clone());
-      }
-      self.meta.insert(binding.snapshot.run_id.clone(), meta);
-  }
+    fn note_binding(&mut self, binding: &ServerRunBinding) {
+        let run_id = &binding.snapshot.run_id;
+        self.remove_run(run_id);
+        if is_ordinary_terminal(&binding.snapshot)
+            && (!binding.retention_uses_v2 || binding.retention_route_confirmed)
+            && !pending_terminal_lifecycle_evidence(binding)
+        {
+            let updated_at = binding.snapshot.updated_at;
+            self.terminal_cap.insert((updated_at, run_id.clone()), run_id.clone());
+            self.terminal_order.insert(run_id.clone(), updated_at);
+        }
+    }
 
-  fn enforce_terminal_cap(&mut self) -> Vec<String> {
-      let mut removed = Vec::new();
-      while self.terminal_cap.len() > SERVER_MAX_TERMINAL_RUNS {
-          let Some((_, run_id)) = self.terminal_cap.pop_first() else {
-              break;
-          };
-          self.remove_run(&run_id);
-          removed.push(run_id);
-      }
-      removed
-  }
+    fn enforce_terminal_cap(&mut self) -> Vec<String> {
+        let mut removed = Vec::new();
+        while self.terminal_cap.len() > SERVER_MAX_TERMINAL_RUNS {
+            let Some((_, run_id)) = self.terminal_cap.pop_first() else {
+                break;
+            };
+            self.remove_run(&run_id);
+            removed.push(run_id);
+        }
+        removed
+    }
 
-  fn prune_expired_for_run(
-      &mut self,
-      runs: &mut HashMap<String, ServerRunBinding>,
-      run_id: &str,
-      now: i64,
-  ) {
-      let Some(meta) = self.meta.get(run_id).cloned() else {
-          return;
-      };
-      let Some(binding) = runs.get(run_id) else {
-          self.remove_run(run_id);
-          return;
-      };
-      let snapshot = &binding.snapshot;
-      if !snapshot.state.terminal() {
-          return;
-      }
-      let should_remove = if meta.uses_v2 {
-          meta.route_confirmed
-              && meta.evictable
-              && hot_inventory_expired(snapshot, now)
-      } else {
-          meta.evictable
-              && snapshot
-                  .updated_at
-                  .saturating_add(SERVER_TERMINAL_RETENTION_SECS)
-                  <= now
-      };
-      if should_remove {
-          runs.remove(run_id);
-          self.remove_run(run_id);
-      }
-  }
-
-  fn receipt_candidates(
-      &self,
-      client_id: &str,
-      now: i64,
-      budget: usize,
-  ) -> Vec<String> {
-      let Some(order) = self.by_client_receipt.get(client_id) else {
-          return Vec::new();
-      };
-      let mut out = Vec::new();
-      for ((deadline, _), run_id) in order.iter() {
-          if out.len() >= budget {
-              break;
-          }
-          let Some(meta) = self.meta.get(run_id) else {
-              continue;
-          };
-          if meta.uses_v2 && meta.route_confirmed && (*deadline > now || !meta.evictable) {
-              continue;
-          }
-          if !meta.uses_v2 && meta.evictable && *deadline > now {
-              continue;
-          }
-          out.push(run_id.clone());
-      }
-      out
-  }
-
-  fn client_pressure(&self, client_id: &str, now: i64) -> bool {
-      self.by_client_receipt
-          .get(client_id)
-          .is_some_and(|order| {
-              order
-                  .iter()
-                  .any(|((deadline, _), run_id)| {
-                      self.meta.get(run_id).is_some_and(|meta| {
-                          (meta.uses_v2 && !meta.route_confirmed)
-                              || (meta.evictable
-                                  && ((*deadline <= now && meta.uses_v2 && meta.route_confirmed)
-                                      || (!meta.uses_v2
-                                          && *deadline <= now)))
-                      })
-                  })
-          })
-  }
+    fn prune_expired_for_run(
+        &mut self,
+        runs: &mut HashMap<String, ServerRunBinding>,
+        run_id: &str,
+        now: i64,
+    ) {
+        let Some(binding) = runs.get(run_id) else {
+            self.remove_run(run_id);
+            return;
+        };
+        let snapshot = &binding.snapshot;
+        if !is_ordinary_terminal(snapshot) || pending_terminal_lifecycle_evidence(binding) {
+            return;
+        }
+        let should_remove = if binding.retention_uses_v2 {
+            binding.retention_route_confirmed && hot_inventory_expired(snapshot, now)
+        } else {
+            snapshot.updated_at.saturating_add(SERVER_TERMINAL_RETENTION_SECS) <= now
+        };
+        if should_remove {
+            runs.remove(run_id);
+            self.remove_run(run_id);
+        }
+    }
 }
 
 pub(crate) struct CodingAgentServerState {
@@ -411,6 +307,7 @@ fn merge_server_run_binding_locked(
         CodingAgentObservationMerge::Stale | CodingAgentObservationMerge::ExactReplay => {
             if existing.recording_session_id.is_none() {
                 existing.recording_session_id = incoming.recording_session_id.take();
+                index.note_binding(existing);
             }
             Ok(existing.clone())
         }
@@ -579,10 +476,12 @@ impl CodingAgentServerState {
         let Some(recording_session_id) = recording_session_id else {
             return;
         };
+        let mut index = self.retention_index.lock().await;
         let mut runs = self.runs.lock().await;
         if let Some(binding) = runs.get_mut(run_id) {
             if binding.recording_session_id.is_none() {
                 binding.recording_session_id = Some(recording_session_id);
+                index.note_binding(binding);
             }
         }
     }
@@ -591,6 +490,7 @@ impl CodingAgentServerState {
         &self,
         run_id: &str,
     ) -> Option<(String, CodingAgentRunSnapshot, &'static str)> {
+        let mut index = self.retention_index.lock().await;
         let mut runs = self.runs.lock().await;
         let binding = runs.get_mut(run_id)?;
         let session_id = binding.recording_session_id.clone()?;
@@ -608,7 +508,12 @@ impl CodingAgentServerState {
             return None;
         }
         binding.recorded_lifecycle_mask |= bit;
-        Some((session_id, binding.snapshot.clone(), kind))
+        let evidence = (session_id, binding.snapshot.clone(), kind);
+        index.note_binding(binding);
+        for evicted in index.enforce_terminal_cap() {
+            runs.remove(&evicted);
+        }
+        Some(evidence)
     }
 
     async fn get(&self, run_id: &str) -> Option<ServerRunBinding> {

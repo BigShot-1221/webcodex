@@ -1,6 +1,6 @@
 # WebCodex ACP 生命周期、轻量归档与超时优化任务书
 
-> 建立：2026-11-25。状态：第一、二批已提交（静态交付、未运行验收）；第三批 commit `8d0aec95a6480d3d7eeb0faaefd3b1ca8c924e19`（准入与索引，已提交）；第四批 commit `5ae8033c15dc5b8f5f676f59a8b9e2b1f1a95147`（有界热维护，冷退休按安全门槛保留）；第五批 commit `757e842c93bf25e2e58e266218066f785fa3d657`（请求预算）；第六批静态交付待独立提交；第七批待复查。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
+> 建立：2026-11-25。状态：第一、二批已提交（静态交付、未运行验收）；第三批 commit `8d0aec95a6480d3d7eeb0faaefd3b1ca8c924e19`（准入与索引，已提交）；第四批 commit `5ae8033c15dc5b8f5f676f59a8b9e2b1f1a95147`（有界热维护，冷退休按安全门槛保留）；第五批 commit `757e842c93bf25e2e58e266218066f785fa3d657`（请求预算）；第六批 commit `070b61f754931b7ae0341de126ef580ea2d8a509`（阶段诊断）；第七批静态复查与修订完成。七批静态交付，不代表冷记录最终物理退休或运行验收已完成。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
 
 ## 1. 范围、事实来源及目标
 
@@ -76,7 +76,7 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 | 4 独立自动清理 | 按已确认保留策略实现生命周期所有者、分批维护、增量游标、压力有界回收、取消/关闭排空、失败诊断 | 15 分钟调度、64 条/2 秒协作预算、公平游标、capability 门控内部维护 RPC、关停停止派发并等待在途轮次；冷 replay 退休与水位推进仍 fail-closed；静态完成、运行验收待授权 |
 | 5 超时管理 | 复用 McpHostRuntimePolicy，贯穿剩余 request deadline，区分准入/ACP setup/Run 执行/观察/取消；检查各 adapter 与 Host 返回余量，保留 idempotent recovery | 单次观察等待不超过有效请求预算；无事件正常返回，外层 timeout 不自动取消 Run 或新 key 重派；准确区分 not_started/started/outcome_unknown；静态实施完成，运行验收待授权 |
 | 6 诊断与恢复 | 增加必要阶段/耗时与结构化错误：准入、库存/回执、写入、spawn、initialize、session/new、prompt、首事件、terminal、Server 回传。安全有界采集错误类别；不直接持久化原始 stderr/Prompt/凭据；诊断与普通结果分离 | 能定位责任层而非笼统超时；无输出不等于失败；证据可关联同一 Run；不引入逐事件同步 I/O 或无限日志；阶段诊断源码已静态交付，运行测量待授权 |
-| 7 全链路复查与上游兼容 | 复查 Server/Runner/MCP/REST/CLI/Desktop/Workflow Session、协议、权限、取消、关停、Windows 文件与迁移路径；检查扩展边界、废弃代码/文档与具名消费者 | 静态审查完成、未验证项明确；获得独立授权后再做定向测试、基线复测、故障注入、编译/打包；待开始 |
+| 7 全链路复查与上游兼容 | 复查 Server/Runner/MCP/REST/CLI/Desktop/Workflow Session、协议、权限、取消、关停、Windows 文件与迁移路径；检查扩展边界、废弃代码/文档与具名消费者 | 静态复查与修订完成；冷退休、真实慢磁盘/混合版本/并发及运行验收仍未完成，需安全契约及独立运行授权 |
 
 依赖：1 → 2 → 3 → 4 → 5 → 6 → 7；已稳定契约且互不冲突的只读诊断可并行。第 1 批先定义测量/诊断契约，不等到第 6 批才收集可比较证据；需实际运行测量时遵守独立授权。不得同时修改共享状态或重叠文件。
 
@@ -183,4 +183,12 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 - 独立 debug target `webcodex::acp_timing` 以 Run ID、layer、固定 stage、单调 elapsed_ms 和有界 outcome 分类关联。Runner 记录准入锁 wait/hold、live/durable lookup、压力/receipt 数量、耐久 claim、worker/provider spawn、setup/initialize/session_new/config、prompt barrier/write、首个可归一化事件/权限/终态响应、worker lifetime、终态提交及其 durable/状态/固定错误码；恢复扫描记录实际 hot entry_count。scope_exit 只表明离开阶段，不自动解释失败。
 - Server 记录 prepare/reconcile/receipt/claim/enqueue 以及 start/observe/permission/cancel/diagnose/归档响应等待；区分 response_received、runner_error_response、channel_closed、request_deadline；有界 receipt page 记录扫描候选/确认计数。保留已有 AcpFailure 分类、权限与 durable 状态语义。首事件只记录一次，不记录 payload/路径/Prompt/凭据，不新增同步磁盘写入或永久事件库存。
 - 静态复查计时器生命周期、原函数调用与 move/borrow、响应 helper 返回类型及日志字段来源；未运行实际诊断、测试、编译或性能测量。第七批统一核查实际源码与兼容边界。
+
+### 2026-11-25 第七批静态复查与交付
+
+- GPT / WebCodex 原生复查和编辑，基线 `070b61f754931b7ae0341de126ef580ea2d8a509`；复用已核实官方 main `70315e49a19d9e6a445008c8e043644ad62b54eb` 及任务书 blob 锚点，未同步远端。
+- 检查共享 replay/retention 契约、能力默认值/注册与内部 typed 请求、Registry 精确 owner 与期限栅栏、Runner 准入账本/原子归档/恢复及 Server 私有 claim 与回执路径；旧格式保留，Windows 私有路径/拒绝 reparse/原子发布复用现有约束。普通 Start 不遍历冷历史；正常候选协调有界。保留 ACP 执行权威，保留 AgentTask `agent-task-coding-run:v1:<attempt_id>`、canonical ToolCall dispatch、Workflow Session 生命周期事件契约。未在 CLI/Desktop 引入新用户参数或第二套执行器，未运行各 adapter。
+- 实际修正 `src/tool_runtime/coding_agent.rs`：删除第四批改用注册库存分页后无消费者的 `by_client_receipt` 和候选/pressure 方法，Server 仅索引允许容量淘汰的普通终态；期限淘汰及容量淘汰均排除尚待提取 terminal lifecycle evidence 的 binding，attach/merge/take 更新同一索引、统一 index→runs 锁序。沿用现有 recorder 的一次提取/尝试语义，不声称 Workflow Session 持久化成功已得到额外确认。受保护/未获回执缓存仍保守驻留，不能承诺全部 Server 缓存有硬上限。
+- `src/tool_runtime/coding_agent_retention_maintenance.rs` 复用第五批 deadline-aware enqueue，防止等待 Registry 锁后派发过期维护；保留单 owner 关停 join 和在途耐久操作语义。`docs/agent/acp-coding-agent-run.md` 更新冷热保留、版本 key、能力协商、claim/sidecar 备份、请求超时和诊断说明，明确没有最终冷退休。
+- 七批交付为源码与静态复查，本轮没有运行测试、cargo check、编译、benchmark、安装、实际用户数据维护或远程 Git。历史任务记录保留在本文件，不再当作当前源码状态。仍需后续建立可证明的双端持久过期水位和降级拒绝契约，方可安全实现普通冷记录最终物理退休；异常/legacy/固定 key 无证据不删。未验证编译、断电/时钟回拨/磁盘故障、混合版本与并发实际运行、启动及内存/磁盘性能。后续运行验收须独立授权。
 

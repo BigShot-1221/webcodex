@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant as RequestInstant;
 use uuid::Uuid;
 use webcodex_core::coding_agent::retention::{
     hot_inventory_expired, hot_retention_deadline, is_ordinary_terminal, parse_replay_key,
@@ -273,6 +274,7 @@ pub(crate) struct CodingAgentPreparedStart {
     config: BTreeMap<String, CodingAgentConfigValue>,
     timeout_secs: u64,
     replay_window: Option<CodingAgentReplayWindow>,
+    request_deadline: RequestInstant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +304,16 @@ impl CodingAgentStartFailure {
             self.recovery,
             Some(&self.run_id),
         )
+    }
+}
+
+fn coding_agent_budget_failure(run_id: &str) -> CodingAgentStartFailure {
+    CodingAgentStartFailure {
+        kind: "coding_agent_request_budget_exhausted".into(),
+        message: "Request wait budget exhausted; reconcile the same Run without redispatching under a new key".into(),
+        certainty: CodingAgentStartCertainty::OutcomeUnknown,
+        recovery: RecoveryKind::Reconcile,
+        run_id: run_id.to_string(),
     }
 }
 
@@ -702,6 +714,17 @@ impl ToolRuntime {
         Ok(self)
     }
 
+    // Request-local ingress clock, never a Run execution deadline.
+    fn coding_agent_request_deadline(&self, ceiling: u64, observe: bool) -> RequestInstant {
+        match self.mcp_request_started_at {
+            Some(start) => {
+                let cap = if observe { self.mcp_host_policy.continuation_wait_secs } else { self.mcp_host_policy.max_sync_wait_secs };
+                start + Duration::from_secs(ceiling.min(cap))
+            }
+            None => RequestInstant::now() + Duration::from_secs(ceiling),
+        }
+    }
+
     pub(crate) async fn coding_agent_start(
         &self,
         project: String,
@@ -730,17 +753,17 @@ impl ToolRuntime {
             Err(error) => return error,
         };
         if let Some(source) = context_session_id {
-            prepared.instruction = match self
+            prepared.instruction = match tokio::time::timeout_at(prepared.request_deadline, self
                 .coding_agent_context_instruction(
                     &prepared.runtime_project_id,
                     &source,
                     &prepared.instruction,
                     auth,
-                )
-                .await
+                )).await
             {
-                Ok(instruction) => instruction,
-                Err(mut error) => {
+                Ok(Ok(instruction)) => instruction,
+                Err(_) => return coding_agent_budget_failure(&prepared.run_id).into_tool_result(),
+                Ok(Err(mut error)) => {
                     error.output["execution_state"] = json!("not_started");
                     error.output["run_id"] = json!(prepared.run_id);
                     return error;
@@ -777,6 +800,7 @@ impl ToolRuntime {
         timeout_secs: Option<u64>,
         auth: Option<&AuthContext>,
     ) -> Result<CodingAgentPreparedStart, ToolResult> {
+        let request_deadline = self.coding_agent_request_deadline(START_RESPONSE_WAIT_SECS, false);
         if let Err(error) = validate_start_input(
             &provider_id,
             &idempotency_key,
@@ -809,21 +833,17 @@ impl ToolRuntime {
             window.check_at(Utc::now().timestamp())
                 .map_err(|error| replay_start_failure(&run_id, error).into_tool_result())?;
         }
-        let resolved = self
-            .resolve_project_input_for_auth(&project, auth)
-            .await
+        let resolved = tokio::time::timeout_at(request_deadline, self.resolve_project_input_for_auth(&project, auth))
+            .await.map_err(|_| coding_agent_budget_failure(&run_id).into_tool_result())?
             .map_err(|error| error.into_tool_result())?;
         if !resolved.config.allow_patch {
             return Err(coding_agent_project_not_writable_result(&run_id));
         }
         let client_id = resolved.config.client_id.as_str();
-        let client = match self
-            .runner_registry
-            .get_runner_semantic_view_for_auth(
+        let client = match tokio::time::timeout_at(request_deadline, self.runner_registry.get_runner_semantic_view_for_auth(
                 client_id,
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
-            )
-            .await
+            )).await.map_err(|_| coding_agent_budget_failure(&run_id).into_tool_result())?
         {
             Some(client) if client.view.connected => client,
             _ => {
@@ -905,6 +925,7 @@ impl ToolRuntime {
             config,
             timeout_secs,
             replay_window,
+            request_deadline,
         })
     }
 
@@ -914,8 +935,9 @@ impl ToolRuntime {
         recording_session_id: Option<String>,
         auth: Option<&AuthContext>,
     ) -> CodingAgentTypedStartOutcome {
+        let deadline = prepared.request_deadline;
         let existing = match self
-            .reconcile_run_with_claim(&prepared.run_id, &prepared.authority_fingerprint, auth, true)
+            .reconcile_run_with_claim(&prepared.run_id, &prepared.authority_fingerprint, auth, true, deadline)
             .await
         {
             Ok(existing) => existing,
@@ -951,9 +973,13 @@ impl ToolRuntime {
             return CodingAgentTypedStartOutcome::Run(existing.snapshot);
         }
 
-        let archive_acknowledged_runs = self
-            .archive_acknowledgements_for_start(&prepared.client, auth, prepared.replay_window)
-            .await;
+        let archive_acknowledged_runs = match tokio::time::timeout_at(deadline, self.archive_acknowledgements_for_start(&prepared.client, auth, deadline)).await {
+            Ok(value) => value,
+            Err(_) => return CodingAgentTypedStartOutcome::Failure(coding_agent_budget_failure(&prepared.run_id)),
+        };
+        if RequestInstant::now() >= deadline {
+            return CodingAgentTypedStartOutcome::Failure(coding_agent_budget_failure(&prepared.run_id));
+        }
         if let Some(window) = prepared.replay_window {
             if let Err(error) = window.check_at(Utc::now().timestamp()) {
                 return CodingAgentTypedStartOutcome::Failure(replay_start_failure(&prepared.run_id, error));
@@ -962,10 +988,13 @@ impl ToolRuntime {
         // This immutable owner/intent fence must be durable before transport
         // dispatch. It closes the gap between Runner admission and inventory
         // registration, including Server restart and cross-Runner retries.
-        if let Err(message) = self.coding_agent_runs
-            .reserve_admission(AdmissionClaim::from_prepared(&prepared), prepared.client.capabilities.coding_agent_replay_expiry)
-            .await
-        {
+        let claim_result = tokio::time::timeout_at(deadline, self.coding_agent_runs
+            .reserve_admission(AdmissionClaim::from_prepared(&prepared), prepared.client.capabilities.coding_agent_replay_expiry)).await;
+        let claim_result = match claim_result {
+            Ok(result) => result,
+            Err(_) => return CodingAgentTypedStartOutcome::Failure(coding_agent_budget_failure(&prepared.run_id)),
+        };
+        if let Err(message) = claim_result {
             return CodingAgentTypedStartOutcome::Failure(CodingAgentStartFailure {
                 kind: "coding_agent_admission_claim_conflict".to_string(),
                 message,
@@ -995,7 +1024,8 @@ impl ToolRuntime {
         });
         let (request_id, receiver) = match self
             .runner_registry
-            .enqueue_coding_agent(
+            .enqueue_coding_agent_until(
+                Some(deadline),
                 &prepared.client.client_id,
                 &prepared.client.runner_instance_id,
                 &prepared.provider_id,
@@ -1011,14 +1041,14 @@ impl ToolRuntime {
                 return CodingAgentTypedStartOutcome::Failure(CodingAgentStartFailure {
                     kind: "coding_agent_dispatch_rejected".to_string(),
                     message: error,
-                    certainty: CodingAgentStartCertainty::NotStarted,
-                    recovery: RecoveryKind::Reobserve,
+                    certainty: CodingAgentStartCertainty::OutcomeUnknown,
+                    recovery: RecoveryKind::Reconcile,
                     run_id: prepared.run_id,
                 })
             }
         };
         let response =
-            match tokio::time::timeout(Duration::from_secs(START_RESPONSE_WAIT_SECS), receiver)
+            match tokio::time::timeout_at(deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1030,6 +1060,7 @@ impl ToolRuntime {
                             &prepared.authority_fingerprint,
                             recording_session_id,
                             auth,
+                            deadline,
                         )
                         .await;
                 }
@@ -1100,6 +1131,7 @@ impl ToolRuntime {
         run_id: &str,
         auth: Option<&AuthContext>,
     ) -> Result<Option<CodingAgentRunSnapshot>, ToolResult> {
+        let deadline = self.coding_agent_request_deadline(CONTROL_RESPONSE_WAIT_SECS, true);
         let principal = stable_principal(auth).map_err(|error| {
             coding_agent_error(
                 "coding_agent_identity_unavailable",
@@ -1111,7 +1143,7 @@ impl ToolRuntime {
         })?;
         let authority = authority_fingerprint(&principal);
         let binding = self
-            .reconcile_run(run_id, &authority, auth)
+            .reconcile_run(run_id, &authority, auth, deadline)
             .await
             .map_err(|error| {
                 coding_agent_error(
@@ -1134,6 +1166,7 @@ impl ToolRuntime {
         wait_secs: Option<u64>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let deadline = self.coding_agent_request_deadline(CONTROL_RESPONSE_WAIT_SECS, true);
         let wait_secs = wait_secs
             .unwrap_or(0)
             .min(CODING_AGENT_OBSERVE_WAIT_MAX_SECS);
@@ -1149,7 +1182,7 @@ impl ToolRuntime {
                 )
             }
         };
-        let binding = match self.reconcile_run(&run_id, &authority, auth).await {
+        let binding = match self.reconcile_run(&run_id, &authority, auth, deadline).await {
             Ok(Some(binding)) => binding,
             Ok(None) => {
                 return coding_agent_error(
@@ -1223,6 +1256,7 @@ impl ToolRuntime {
                 token_reset,
             ));
         }
+        let wait_secs = wait_secs.min(deadline.saturating_duration_since(RequestInstant::now()).as_secs().saturating_sub(1));
         let operation = CodingAgentRequest::Observe(CodingAgentObserveRequest {
             run_id: run_id.clone(),
             after_sequence,
@@ -1231,7 +1265,8 @@ impl ToolRuntime {
         });
         let (request_id, receiver) = match self
             .runner_registry
-            .enqueue_coding_agent(
+            .enqueue_coding_agent_until(
+                Some(deadline),
                 &binding.client_id,
                 &binding.runner_instance_id,
                 &binding.provider_id,
@@ -1268,7 +1303,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout(Duration::from_secs(CONTROL_RESPONSE_WAIT_SECS), receiver)
+            match tokio::time::timeout_at(deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1382,6 +1417,7 @@ impl ToolRuntime {
         option_id: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let deadline = self.coding_agent_request_deadline(CONTROL_RESPONSE_WAIT_SECS, false);
         let authority = match stable_principal(auth) {
             Ok(principal) => authority_fingerprint(&principal),
             Err(error) => {
@@ -1394,7 +1430,7 @@ impl ToolRuntime {
                 )
             }
         };
-        let binding = match self.reconcile_run(&run_id, &authority, auth).await {
+        let binding = match self.reconcile_run(&run_id, &authority, auth, deadline).await {
             Ok(Some(binding)) => binding,
             Ok(None) => {
                 return coding_agent_error(
@@ -1432,7 +1468,8 @@ impl ToolRuntime {
             });
         let (request_id, receiver) = match self
             .runner_registry
-            .enqueue_coding_agent(
+            .enqueue_coding_agent_until(
+                Some(deadline),
                 &binding.client_id,
                 &binding.runner_instance_id,
                 &binding.provider_id,
@@ -1455,7 +1492,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout(Duration::from_secs(CONTROL_RESPONSE_WAIT_SECS), receiver)
+            match tokio::time::timeout_at(deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1514,6 +1551,7 @@ impl ToolRuntime {
         run_id: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let deadline = self.coding_agent_request_deadline(START_RESPONSE_WAIT_SECS, false);
         let authority = match stable_principal(auth) {
             Ok(principal) => authority_fingerprint(&principal),
             Err(error) => {
@@ -1526,7 +1564,7 @@ impl ToolRuntime {
                 )
             }
         };
-        let binding = match self.reconcile_run(&run_id, &authority, auth).await {
+        let binding = match self.reconcile_run(&run_id, &authority, auth, deadline).await {
             Ok(Some(binding)) => binding,
             Ok(None) => {
                 return coding_agent_error(
@@ -1556,7 +1594,8 @@ impl ToolRuntime {
         });
         let (request_id, receiver) = match self
             .runner_registry
-            .enqueue_coding_agent(
+            .enqueue_coding_agent_until(
+                Some(deadline),
                 &binding.client_id,
                 &binding.runner_instance_id,
                 &binding.provider_id,
@@ -1579,7 +1618,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout(Duration::from_secs(START_RESPONSE_WAIT_SECS), receiver)
+            match tokio::time::timeout_at(deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1664,6 +1703,7 @@ impl ToolRuntime {
         include_live_acp: bool,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        let deadline = self.coding_agent_request_deadline(DIAGNOSE_RESPONSE_WAIT_SECS, false);
         if let Err(error) = webcodex_core::coding_agent::validate_provider_id(&provider_id) {
             return coding_agent_error(
                 "invalid_coding_agent_diagnose",
@@ -1715,24 +1755,23 @@ impl ToolRuntime {
                 );
             }
         }
-        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error.into_tool_result(),
+        let resolved = match tokio::time::timeout_at(deadline, self.resolve_project_input_for_auth(&project, auth)).await {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(error)) => return error.into_tool_result(),
+            Err(_) => return coding_agent_error("coding_agent_request_budget_exhausted", "Diagnose request budget exhausted before dispatch", "not_started", RecoveryKind::Reobserve, None),
         };
         // Presence-only diagnosis does not require Project write authority.
         // include_live_acp=true reuses start_coding_agent scope admission
         // (including project:write for OAuth) and the per-Project permission
         // check below; it does not mutate the Project.
         let client_id = resolved.config.client_id.as_str();
-        let client = match self
-            .runner_registry
-            .get_runner_semantic_view_for_auth(
+        let client = match tokio::time::timeout_at(deadline, self.runner_registry.get_runner_semantic_view_for_auth(
                 client_id,
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
-            )
-            .await
+            )).await
         {
-            Some(client) if client.view.connected => client,
+            Ok(Some(client)) if client.view.connected => client,
+            Err(_) => return coding_agent_error("coding_agent_request_budget_exhausted", "Diagnose request budget exhausted before dispatch", "not_started", RecoveryKind::Reobserve, None),
             _ => {
                 return coding_agent_error(
                     "coding_agent_runner_unavailable",
@@ -1810,6 +1849,7 @@ impl ToolRuntime {
                 &authority,
                 include_live_acp,
                 auth,
+                deadline,
             )
             .await;
         if let Some(decision) = permission_decision.as_ref() {
@@ -1830,6 +1870,7 @@ impl ToolRuntime {
         authority: &str,
         include_live_acp: bool,
         auth: Option<&AuthContext>,
+        deadline: RequestInstant,
     ) -> ToolResult {
         let operation = CodingAgentRequest::Diagnose(CodingAgentDiagnoseRequest {
             run_id: run_id.to_string(),
@@ -1839,9 +1880,10 @@ impl ToolRuntime {
             provider_instance_id: provider_instance_id.to_string(),
             include_live_acp,
         });
-        let (_, receiver) = match self
+        let (request_id, receiver) = match self
             .runner_registry
-            .enqueue_coding_agent(
+            .enqueue_coding_agent_until(
+                Some(deadline),
                 &client.client_id,
                 &client.runner_instance_id,
                 provider_id,
@@ -1864,11 +1906,14 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout(Duration::from_secs(DIAGNOSE_RESPONSE_WAIT_SECS), receiver)
+            match tokio::time::timeout_at(deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) | Err(_) => return diagnose_response_lost(include_live_acp, run_id),
+                Ok(Err(_)) | Err(_) => {
+                    let _ = self.runner_registry.cancel_request_dispatch_state(&request_id).await;
+                    return diagnose_response_lost(include_live_acp, run_id);
+                }
             };
         diagnose_result_from_response(
             response,
@@ -1887,12 +1932,18 @@ impl ToolRuntime {
         authority: &str,
         recording_session_id: Option<String>,
         auth: Option<&AuthContext>,
+        deadline: RequestInstant,
     ) -> CodingAgentTypedStartOutcome {
         let dispatched = self
             .runner_registry
             .cancel_request_dispatch_state(request_id)
             .await;
-        match self.reconcile_run(run_id, authority, auth).await {
+        let reconciled = if RequestInstant::now() < deadline {
+            self.reconcile_run_with_claim(run_id, authority, auth, true, deadline).await
+        } else {
+            Ok(self.coding_agent_runs.get(run_id).await.filter(|binding| binding.authority_fingerprint == authority))
+        };
+        match reconciled {
             Ok(Some(binding)) => {
                 self.coding_agent_runs
                     .attach_recorder(run_id, recording_session_id)
@@ -1914,9 +1965,9 @@ impl ToolRuntime {
         match dispatched {
             Some(false) => CodingAgentTypedStartOutcome::Failure(CodingAgentStartFailure {
                 kind: "coding_agent_start_timeout".to_string(),
-                message: "Run admission timed out before Runner dispatch".to_string(),
-                certainty: CodingAgentStartCertainty::NotStarted,
-                recovery: RecoveryKind::RetrySame,
+                message: "This request was removed before dispatch; an earlier same-key Run may still exist. Reconcile the same Run.".to_string(),
+                certainty: CodingAgentStartCertainty::OutcomeUnknown,
+                recovery: RecoveryKind::Reconcile,
                 run_id: run_id.to_string(),
             }),
             Some(true) | None => CodingAgentTypedStartOutcome::Failure(CodingAgentStartFailure {
@@ -1961,7 +2012,7 @@ impl ToolRuntime {
         &self,
         client: &crate::runner_protocol::RunnerView,
         auth: Option<&AuthContext>,
-        _replay_window: Option<CodingAgentReplayWindow>,
+        deadline: RequestInstant,
     ) -> Option<Vec<String>> {
         if !client.capabilities.coding_agent_archive_lookup {
             return None;
@@ -1976,16 +2027,8 @@ impl ToolRuntime {
         }
         // Legacy archive-aware Runners retain the historical receipt path.
         // For a new Runner this is exclusively a capacity-pressure path.
-        self.archive_acknowledgements_bounded(client, auth).await
-    }
-
-    async fn archive_acknowledgements_bounded(
-        &self,
-        client: &crate::runner_protocol::RunnerView,
-        auth: Option<&AuthContext>,
-    ) -> Option<Vec<String>> {
         self.archive_acknowledgements_bounded_until(
-            client, auth, std::time::Instant::now() + Duration::from_secs(2), false,
+            client, auth, (std::time::Instant::now() + Duration::from_secs(2)).min(deadline.into_std()), false,
         ).await
     }
 
@@ -2080,12 +2123,11 @@ impl ToolRuntime {
         &self,
         route: &ArchiveRoute,
         auth: Option<&AuthContext>,
+        deadline: RequestInstant,
     ) -> Result<(crate::runner_protocol::RunnerView, CodingAgentRunSnapshot), String> {
         let access = crate::runner_http::runner_access_from_auth(auth);
-        let client = self
-            .runner_registry
-            .get_runner_view_for_auth(&route.client_id, access.as_ref())
-            .await
+        let client = tokio::time::timeout_at(deadline, self.runner_registry.get_runner_view_for_auth(&route.client_id, access.as_ref())).await
+            .map_err(|_| "ACP archive owner lookup wait budget exhausted".to_string())?
             .ok_or_else(|| {
                 "ACP archive owner is unavailable; the Run must not be redispatched".to_string()
             })?;
@@ -2099,7 +2141,8 @@ impl ToolRuntime {
             .ok_or_else(|| "ACP archive owner has no current provider fence".to_string())?;
         let (request_id, receiver) = self
             .runner_registry
-            .enqueue_coding_agent(
+            .enqueue_coding_agent_until(
+                Some(deadline),
                 &client.client_id,
                 &client.runner_instance_id,
                 &provider.provider_id,
@@ -2115,7 +2158,7 @@ impl ToolRuntime {
             )
             .await?;
         let response =
-            match tokio::time::timeout(Duration::from_secs(CONTROL_RESPONSE_WAIT_SECS), receiver)
+            match tokio::time::timeout_at(deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -2136,10 +2179,8 @@ impl ToolRuntime {
         if !run.state.terminal() || !route.matches(&client.client_id, &run) {
             return Err("ACP archive receipt and retained Run identity disagree".into());
         }
-        let current = self
-            .runner_registry
-            .get_runner_view_for_auth(&route.client_id, access.as_ref())
-            .await
+        let current = tokio::time::timeout_at(deadline, self.runner_registry.get_runner_view_for_auth(&route.client_id, access.as_ref())).await
+            .map_err(|_| "ACP archive owner lookup wait budget exhausted".to_string())?
             .ok_or_else(|| "ACP archive owner became unavailable".to_string())?;
         if current.runner_instance_id != client.runner_instance_id {
             return Err("ACP archive owner changed during observation".into());
@@ -2152,8 +2193,9 @@ impl ToolRuntime {
         run_id: &str,
         authority: &str,
         auth: Option<&AuthContext>,
+        deadline: RequestInstant,
     ) -> Result<Option<ServerRunBinding>, String> {
-        self.reconcile_run_with_claim(run_id, authority, auth, false).await
+        self.reconcile_run_with_claim(run_id, authority, auth, false, deadline).await
     }
 
     async fn reconcile_run_with_claim(
@@ -2162,8 +2204,13 @@ impl ToolRuntime {
         authority: &str,
         auth: Option<&AuthContext>,
         allow_pending_admission: bool,
+        deadline: RequestInstant,
     ) -> Result<Option<ServerRunBinding>, String> {
-        let existing = self.coding_agent_runs.get(run_id).await;
+        if RequestInstant::now() >= deadline {
+            return Err("CodingAgentRun request wait budget exhausted; reconcile the same Run".into());
+        }
+        let existing = tokio::time::timeout_at(deadline, self.coding_agent_runs.get(run_id)).await
+            .map_err(|_| "CodingAgentRun cache lookup wait budget exhausted".to_string())?;
         if let Some(binding) = existing {
             if binding.authority_fingerprint != authority {
                 return Ok(None);
@@ -2171,14 +2218,11 @@ impl ToolRuntime {
             // Once the Server has a binding, only the exact bound client may
             // refresh it. Another visible Runner advertising the same run_id is
             // not evidence about this Run and must not force a false retarget/lost.
-            if let Some((client, run)) = self
-                .runner_registry
-                .coding_agent_run_for_runner_for_auth(
+            if let Some((client, run)) = tokio::time::timeout_at(deadline, self.runner_registry.coding_agent_run_for_runner_for_auth(
                     crate::runner_http::runner_access_from_auth(auth).as_ref(),
                     &binding.client_id,
                     run_id,
-                )
-                .await
+                )).await.map_err(|_| "CodingAgentRun Runner lookup wait budget exhausted".to_string())?
             {
                 if run.authority_fingerprint != authority {
                     return Ok(None);
@@ -2211,13 +2255,10 @@ impl ToolRuntime {
             // replacement instance, however, is a positive fence crossing. If that
             // replacement does not advertise the durable Run, the old prompt may have
             // executed and P1 must close it `lost` rather than retrying blindly.
-            if let Some(current) = self
-                .runner_registry
-                .get_runner_view_for_auth(
+            if let Some(current) = tokio::time::timeout_at(deadline, self.runner_registry.get_runner_view_for_auth(
                     &binding.client_id,
                     crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                )
-                .await
+                )).await.map_err(|_| "CodingAgentRun Runner lookup wait budget exhausted".to_string())?
             {
                 let instance_replaced = current.runner_instance_id != binding.runner_instance_id;
                 let provider_replaced = !instance_replaced
@@ -2245,12 +2286,11 @@ impl ToolRuntime {
         // protected Run has an immutable Server receipt before it leaves the
         // Runner inventory. An offline owner blocks only its exact Run id.
         let access = crate::runner_http::runner_access_from_auth(auth);
-        let hot = self
-            .runner_registry
-            .coding_agent_run_for_auth_checked(access.as_ref(), run_id)
-            .await?;
+        let hot = tokio::time::timeout_at(deadline, self.runner_registry.coding_agent_run_for_auth_checked(access.as_ref(), run_id)).await
+            .map_err(|_| "CodingAgentRun inventory lookup wait budget exhausted".to_string())??;
         // Receipt publication precedes hot removal; sample it after the hot view.
-        let (claim, route) = self.coding_agent_runs.route_lookup(run_id).await?;
+        let (claim, route) = tokio::time::timeout_at(deadline, self.coding_agent_runs.route_lookup(run_id)).await
+            .map_err(|_| "CodingAgentRun route lookup wait budget exhausted".to_string())??;
         if let Some(claim) = &claim {
             if claim.authority_fingerprint != authority {
                 return Ok(None);
@@ -2274,7 +2314,7 @@ impl ToolRuntime {
                 if route.authority_fingerprint != authority {
                     return Err("ACP archive receipt authority conflict".into());
                 }
-                Some(self.observe_archived_run(&route, auth).await?)
+                Some(self.observe_archived_run(&route, auth, deadline).await?)
             }
             (None, hot) => hot,
         };

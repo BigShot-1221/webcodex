@@ -2257,6 +2257,20 @@ impl RunnerRegistry {
         auth: Option<&crate::RunnerAccess>,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<CodingAgentResponse>), String> {
+        self.enqueue_coding_agent_until(None, client_id, expected_runner_instance_id, expected_provider_id, expected_provider_instance_id, operation, auth, requested_by).await
+    }
+
+    pub async fn enqueue_coding_agent_until(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        client_id: &str,
+        expected_runner_instance_id: &str,
+        expected_provider_id: &str,
+        expected_provider_instance_id: &str,
+        operation: CodingAgentRequest,
+        auth: Option<&crate::RunnerAccess>,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<CodingAgentResponse>), String> {
         let retention_maintenance = matches!(&operation, CodingAgentRequest::RetentionMaintenance(_));
         if retention_maintenance && (auth.is_some() || requested_by != "auth_server_acp_retention") {
             return Err("ACP retention maintenance is internal only".into());
@@ -2281,7 +2295,14 @@ impl RunnerRegistry {
             requested_by,
             RunnerOperation::CodingAgent(operation),
         )?;
-        let mut inner = self.inner.lock().await;
+        let mut inner = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.inner.lock()).await
+                .map_err(|_| "CodingAgentRun dispatch wait budget exhausted".to_string())?,
+            None => self.inner.lock().await,
+        };
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err("CodingAgentRun dispatch wait budget exhausted".into());
+        }
         let runner = inner
             .runners
             .get(client_id)
@@ -2315,6 +2336,9 @@ impl RunnerRegistry {
         }
         if now_ts().saturating_sub(runner.last_seen) > super::RUNNER_ONLINE_WINDOW_SECS {
             return Err("exact Runner is offline; CodingAgentRun was not dispatched".to_string());
+        }
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err("CodingAgentRun dispatch wait budget exhausted".into());
         }
         enqueue_pending_request_locked(
             self.telemetry.as_ref(),

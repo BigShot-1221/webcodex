@@ -583,6 +583,7 @@ pub(super) fn app_public_origin(runtime: &ToolRuntime) -> Option<String> {
 
 #[handler]
 pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let mcp_request_started_at = tokio::time::Instant::now();
     let mut guard = ToolRequestLifecycle::new("mcp", new_trace_id(), "-", "POST /mcp", None);
     guard.received();
 
@@ -774,15 +775,15 @@ pub async fn mcp_post(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     // stores, execution ownership and the deployment snapshot remain unchanged.
     let runtime = if policy == runtime.mcp_host_policy
         && policy_selection.profile_source == runtime.mcp_host_profile_source
+        && request.method != "tools/call"
     {
         runtime
     } else {
-        Arc::new(
-            runtime
-                .as_ref()
-                .clone()
-                .with_request_mcp_host_policy(policy_selection),
-        )
+        let mut view = runtime.as_ref().clone().with_request_mcp_host_policy(policy_selection);
+        if request.method == "tools/call" {
+            view.mcp_request_started_at = Some(mcp_request_started_at);
+        }
+        Arc::new(view)
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let window = match crate::client_window::mcp_window(

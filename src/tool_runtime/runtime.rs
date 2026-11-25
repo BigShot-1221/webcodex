@@ -115,6 +115,7 @@ pub struct ToolRuntime {
     /// clones may narrow or switch this preference without changing authority or
     /// execution lifetime.
     pub(crate) mcp_host_policy: crate::mcp_host::McpHostRuntimePolicy,
+    pub(crate) mcp_request_started_at: Option<tokio::time::Instant>,
     /// Request-local diagnostic provenance; never shared mutable Host preference.
     pub(crate) mcp_host_profile_source: crate::mcp_host::McpHostPolicySource,
     /// Immutable deployment snapshot reported by runtime diagnostics. Request-local
@@ -237,6 +238,7 @@ impl ToolRuntime {
             coding_agent_runs: Arc::new(super::coding_agent::CodingAgentServerState::default()),
             runtime_info,
             mcp_host_policy: crate::mcp_host::McpHostRuntimePolicy::default(),
+            mcp_request_started_at: None,
             mcp_host_profile_source: crate::mcp_host::McpHostPolicySource::Deployment,
             deployment_mcp_host_policy: crate::mcp_host::McpHostRuntimePolicy::default(),
             model_workflow_policy: crate::model_workflow::ModelWorkflowPolicy::default(),

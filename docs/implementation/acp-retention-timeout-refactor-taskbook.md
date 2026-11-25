@@ -1,6 +1,6 @@
 # WebCodex ACP 生命周期、轻量归档与超时优化任务书
 
-> 建立：2026-11-25。状态：第一批架构设计静态完成；第二至七批待实施。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
+> 建立：2026-11-25。状态：第一批已提交；第二批源码静态完成（未提交、未运行验收）；第三至七批待实施。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
 
 ## 1. 范围、事实来源及目标
 
@@ -60,7 +60,7 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 ### 4.1 第一批确定的实施契约
 
 - 冷热区分是存储/缓存生命周期而非改变 Run 事实。已成功/确定取消的热驻留以 terminal 时间为基准 15 分钟；确定失败 24 小时；普通防重耐久证据不少于终态后 24 小时，不因热容量不足提前删除。冷存储沿用现有最小 DurableRunRecord/精确分片路径；保留事件观察/终态投影所需字段，不新增第二套历史。OutcomeUnknown/Lost/持久化不确定不参与普通终态回收。归档前持久路由回执必须精确匹配身份，Server/Runner 配套恢复；归档缺失与错误区分。
-- D3 新版普通 Start 键采用显式版本、不可变签发时间、唯一随机部分（建议 `wc-acp-v2:<unix-seconds>:<uuid>`）；普通有效期以签发后 24 小时为技术窗口，终态防重保留期限独立计算，不提前于 D1。拒绝 malformed、未来签发及已过期的新派发；过期请求只能观察/核对原 Run，不能以新 key 自动重试。保留原 principal+完整 key 的确定性 Run ID 算法，避免重新解释既有键时改变 Run 身份。旧 v1 记录无可验证时间，不能推断过期或批量清除；AgentTask `agent-task-coding-run:v1:<attempt_id>` 的精确 binding/claim 是具名内部消费者，保持原 Run ID 与 Attempt fence，不套用普通调用有效期。
+- D3 新版普通 Start 键采用显式版本、不可变签发时间、唯一随机部分（`wc-acp-v2:<unix-seconds>:<32 位小写十六进制随机 nonce>`）；普通有效期以签发后 24 小时为技术窗口，终态防重保留期限独立计算，不提前于 D1。拒绝 malformed、未来签发及已过期的新派发；过期请求只能观察/核对原 Run，不能以新 key 自动重试。保留原 principal+完整 key 的确定性 Run ID 算法，避免重新解释既有键时改变 Run 身份。旧 v1 记录无可验证时间，不能推断过期或批量清除；AgentTask `agent-task-coding-run:v1:<attempt_id>` 的精确 binding/claim 是具名内部消费者，保持原 Run ID 与 Attempt fence，不套用普通调用有效期。
 - 新 Server/Runner 通过明确 capability 与 typed start 契约协商版本、有效期；旧 Runner 不得接收无法执行过期拒绝的新版启动，旧记录可精确观察。过期校验覆盖服务端准备/实际派发及 Runner 准入，不允许因等待跨过有效期后再启动。退回无 expiry 支持的程序不能无条件复用已清理状态；只有在持久化防重/过期水位（防止重启和时钟回拨复活已删键）及双方兼容/降级边界得到证实后，才允许实际退休相应新版证据。旧协议无法识别安全标记的降级须保留兼容防重证据或禁止使用当前状态，明确备份/回滚条件。若不能证明安全，暂保留记录而不是按时间删。禁止以客户端自报时间绕过身份绑定。
 - Server 路由索引与 Runner 权威库存分别由各自拥有者维护，普通 Start 无批量归档 RPC/回执 I/O；通过独立维护或有界压力协调传输必要回执，不额外启动第二个执行器。保留 capability 协商、精确 owner/provider fence、归档 marker 与原子耐久屏障。冷记录查询按 Run ID，不载入全量历史；活跃计数、热记录计数、耐久写入失败的预约在同一准入契约内协调，重启仅恢复必要热索引，历史目录通过有界游标维护。
 - 请求预算复用 McpHostRuntimePolicy（请求选择不扩大部署上限），以单次单调 deadline 的剩余量裁剪 admission/setup/Server transport/observe 等请求等待，不将 Host deadline 当作 Run deadline；外层等待丢失返回原 Run 的确定性及观察入口，不自动取消或重派。保留官方执行/取消机制及总 Run timeout。独立 REST/CLI 消费者继续走 canonical ToolRuntime，不能假设每个 adapter 已经传递预算。
@@ -71,7 +71,7 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 | 批次 | 工作及交付 | 验收与状态 |
 | --- | --- | --- |
 | 1 官方兼容性与架构边界 | 核对最新双方源码、当前实现和消费者；列出归档/回执/重放/恢复不变量、启动链路和预算传递；定义分阶段观测指标、拟议模块边界及 D1-D5 决策，建立可比较基线 | 记录双方版本、证据与差异、已确认 D1-D5；架构契约已写入 4.1，静态完成（设计交付，无源码改动） |
-| 2 轻量化归档 | 在已确认契约内精简字段与存储职责，精确查询、冷热隔离，兼容旧格式和配套回执；清理重复实现 | 现有 Run 不误重派；归档查询与身份/权限/错误确定性一致；迁移/降级失败保留证据；待开始 |
+| 2 轻量化归档 | 在已确认契约内精简字段与存储职责，精确查询、冷热隔离，兼容旧格式和配套回执；清理重复实现 | 共享 replay/冷热契约与 v2 准入已实现；静态复查完成、无运行验收（见 §8 第二批记录） |
 | 3 准入与索引优化 | 定向重构 Server 启动前批量归档确认、Runner admission 及 capacity scan；增量索引、精确查找，缩小锁范围；保留原子预约/耐久声明/并发 fencing | 正常 start 全量扫描 0、无逐历史记录 RPC/持久化；并发同 key 仅一份执行，不超容量，索引可恢复；待开始 |
 | 4 独立自动清理 | 按已确认保留策略实现生命周期所有者、分批维护、增量游标、压力有界回收、取消/关闭排空、失败诊断 | 运行中及未核对不确定 Run 不误删；故障/崩溃/部分清理可恢复；不阻塞普通准入；维护任务有界、无重复线程；待开始 |
 | 5 超时管理 | 复用 McpHostRuntimePolicy，贯穿剩余 request deadline，区分准入/ACP setup/Run 执行/观察/取消；检查各 adapter 与 Host 返回余量，保留 idempotent recovery | 单次观察等待不超过有效请求预算；无事件正常返回，外层 timeout 不自动取消 Run 或新 key 重派；准确区分 not_started/started/outcome_unknown；待开始 |
@@ -111,5 +111,31 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 - 已追加核对 `src/tool_runtime/agent_task.rs` 156/904-1007（固定 Attempt replay key 与 durable binding claim）、`src/tool_runtime/dispatch/execution.rs`（canonical dispatch）、`src/tool_runtime/coding_agent_archive.rs`（私有不可变回执与原子发布）、`crates/webcodex-core/src/coding_agent.rs` 330/638（Start wire 与 Run ID 校验）、`crates/webcodex-runner-registry/src/runners.rs` 1620-1690（跨 Runner 精确查找与归档库存）、`docs/compatibility-policy.md`（已发布 v0.4.6 baseline、能力协商）。相关 src、src/tool_runtime、crates、Runner 及 coding_agent 路径下 AGENTS.md 定向读取均返回 not_found。CLI/Desktop 搜索 idempotency_key 未见直接字符串消费者，不等于全链路复查完成。
 - 第一批交付为设计与任务书；第二批按 4.1 开始共享 replay/冷热存储契约，第三批移除启动热路径全扫、第四批独立维护，第五批预算、第六批诊断、第七批审查。完整 adapter 路径、持久过期水位/降级安全及具体实现仍需后续逐批核实。尚无源码修改、测试、构建、真实数据维护或 ACP Agent 执行。
 
-第一批静态验收：设计契约与用户 D1-D5、已核实本地及官方 blob 一致；无代码修改或运行验证。提交范围仅本任务书，第二批开始共享协议及冷热归档源码改造。昨日融合进度及尚未完成的安装/迁移验收仍见 [融合记录](upstream-main-fusion-progress-2026-11-24.md)；不得将其历史快照当作本轮当前源码。
+第一批静态验收：设计契约与用户 D1-D5、已核实本地及官方 blob 一致；无代码修改或运行验证。仅提交本任务书，commit `4cde161e29d7c828b8a31e45b45c6cf5431b0653`，提交后 HEAD 已核实；其他工作区文件保持原状。
+
+### 第二批执行入口
+
+- Cursor ACP Run `wc_agent_run_4hzaX_tXKSCIk8pK4LcRC-teAqwvtCXKvNIuhepgZpU`，派发后进入 running/started，随后两次精确观察均为 lost/outcome_unknown，错误 `coding_agent_permission_invalid`，终态时间 1795575097；不重派。Runner run.rs:460-483 权限解析错误先 terminate_run_io 再 mark_lost，清理函数忽略部分退出错误，因此另行做了 Windows 进程只读核对：未见 Cursor/ACP 进程，项目运行 Job 列表为空，工作区未发现该 Run 的源码修改。GPT 原生工具接续，不绕过 ACP 权限或修改运行配置。使用 Runner 默认模型配置，未传 config；实际模型未独立确认。本批仅共享重放协议/冷热归档，GPT 负责独立审查、任务书、commit；ACP 不得提交、不触及其他任务修改、不进行测试、构建及真实数据操作。恢复时精确观察该 Run，不另行派发。昨日融合进度及尚未完成的安装/迁移验收仍见 [融合记录](upstream-main-fusion-progress-2026-11-24.md)；不得将其历史快照当作本轮当前源码。
+
+### 2026-11-25 第二批静态交付（未提交、未运行验收）
+
+- 执行器：GPT / WebCodex 原生编辑及 Cursor CLI。ACP permission_invalid 后已核实原 Run 终态及进程退出，未重派。CLI Job `wc_job_dH86WRCqjuwG2YRf` completed、exit 0；显式 `--model composer-2.5`，未启用 Fast，实际模型未独立核实。GPT 复查实际源码并修正归档安全问题。基线为第一批 commit `4cde161e29d7c828b8a31e45b45c6cf5431b0653`。未运行测试、构建、打包或真实数据维护。
+- 实际修改范围（仅此任务，未触及 Workflow Session、`artifacts/`、安装包及其他并行工作）：
+  - `crates/webcodex-core/src/coding_agent_retention.rs`（新增/扩展）：D1 常量、`CodingAgentReplayWindow`、`parse_replay_key`（`wc-acp-v2:`）、`is_ordinary_terminal`、`hot_retention_deadline` / `ordinary_replay_deadline`、`hot_inventory_expired` / `durable_replay_expired`；年龄只表示保留下限，不构成删除授权。
+  - `crates/webcodex-core/src/coding_agent.rs`：`Snapshot`/`Start` 可选 `replay_window`、校验与 merge/archive fingerprint 绑定；`#[path]` 挂载 retention。
+  - `crates/webcodex-core/src/runner_protocol.rs`：`CodingAgentReplayExpiry` 能力（`v2_baseline = false`，旧 Runner 默认 false）。
+  - `crates/webcodex-runner/src/webcodex_runner/transport/registration.rs`：ACP 注册时协商 `coding_agent_replay_expiry`。
+  - `crates/webcodex-runner-registry/src/runners.rs`：同实例能力降级拒绝（含 replay expiry）。
+  - `crates/webcodex-runner/src/webcodex_runner/coding_agent/store.rs`：`DurableRunRecord.replay_window` 兼容读；与 D1 回放下限注释对齐。
+  - `crates/webcodex-runner/src/webcodex_runner/coding_agent/lifecycle.rs`：热清理按 `hot_inventory_expired`（终态时间 + D1），且仅在精确 Server 耐久路由回执与 live/durable 一致时原子归档；所有容量回收均须回执，归档失败保留热记录。不按年龄删除 legacy 或 v2 防重证据。inventory 不再触发清理。
+  - `crates/webcodex-runner/src/webcodex_runner/coding_agent.rs`：准入双重 replay 校验、耐久回放栅栏、`replay_window` 身份冲突检测。
+  - `src/tool_runtime/coding_agent.rs`：`prepare`/`dispatch` 解析 v2 key、能力门控、Server 热注册按 D1 修剪；既有内联测试 fixture 时间基准调整。
+  - 构造点/静态 fixture：`runner_operation.rs`、`agent_task.rs`、若干 `tests/*.rs`、`protocol.rs` 等仅补 `replay_window: None`（AgentTask attempt key 未改）。
+- 调用链（新执行准入）：`idempotency_key` → `parse_replay_key` / `check_at`（Server prepare + dispatch + Runner admission）→ `CodingAgentStartRequest.replay_window` → 耐久 `DurableRunRecord` / `CodingAgentRunSnapshot`；过期 v2 仅 `coding_agent_replay_key_expired` + reconcile 观察，不重派。
+- 冷热边界：热库存（Server `prune_server_runs_locked`、Runner `cleanup_expired`）用 `hot_retention_deadline`；普通耐久防重下限用 `ordinary_replay_deadline`；普通热到期及容量压力须先持久化精确 Server 路由回执，再原子移出热目录；新版 Server 缓存回收也检查回执，旧 Runner 沿用旧 TTL。GPT 修复 CLI 草稿中普通记录可无回执归档以及 legacy 只按年龄删除的缺陷。当前所有防重证据均保留，第四批建立持久过期水位和降级安全后才可实现新版退休；旧记录无可验证过期时间继续保护。
+- 安全边界保持：Lost/OutcomeUnknown/`coding_agent_terminal_persistence_uncertain` 非 ordinary；归档前 exact Server receipt / `archive_identity_fingerprint`（含可选 replay window）未改语义；旧 wire 无 `replay_window` 视为 legacy；畸形 `wc-acp-v*` 失败闭合；旧 Runner 无 `CodingAgentReplayExpiry` 不得执行带窗口的新 start。
+- 静态复查：核对 Server prepare/dispatch/reconcile、Runner admission/terminal/durable lookup、capability 与 receipt fingerprint；`durable_record_from_snapshot` / `validate_durable_record` 保留 `schema_version` 与 serde default。工具说明及既有测试断言同步新契约，未执行测试。AgentTask 固定键继续兼容；原有 Workflow Session 修改不属于本批。
+- 已知后续边界：新 Runner + 旧 Server 仅能取得旧协议受保护记录回执，普通热容量满时保守拒绝；旧 Runner 不享有新版 24h 防重保证。须配套升级。恢复时超出正常热容量的历史溢出记录缺回执仍会失败闭合，第三批须解决恢复索引及有界回执协调，不提前删除旧记录。
+- 未验证项（需后续独立授权）：编译/测试、双版本 Runner 降级实况、持久过期水位与 clock 回拨、第四批维护游标与 v2 实际清理、启动路径全扫移除（第三批）、请求预算贯穿（第五批）、全链路 adapter（第七批）。
+- 第三批入口：`archive_acknowledgements` 启动前批量路径与 Runner `list_records_for_retention` 准入锁内扫描的索引化/零全扫重构；在第二批 replay/冷热契约稳定前提下进行。
 

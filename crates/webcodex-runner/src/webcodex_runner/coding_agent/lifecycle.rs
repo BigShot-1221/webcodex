@@ -1,30 +1,14 @@
 //! Cancellation, restart recovery, and durable-before-live terminal transitions.
 
 use super::protocol::bounded_text;
-use super::store::{
-    durable_record_from_snapshot, DurableDispatchPhase, DurableRunRecord, STORE_RETENTION_SECS,
-};
+use super::store::{durable_record_from_snapshot, DurableDispatchPhase, DurableRunRecord};
 use super::*;
+use webcodex_core::coding_agent::retention::{
+    hot_inventory_expired, is_ordinary_terminal,
+};
 
 pub(super) fn coding_agent_run_retention_evictable(snapshot: &CodingAgentRunSnapshot) -> bool {
-    if !snapshot.state.terminal() {
-        return false;
-    }
-    if snapshot.state == CodingAgentRunState::Lost {
-        return false;
-    }
-    if snapshot.execution_state == CodingAgentExecutionState::OutcomeUnknown {
-        return false;
-    }
-    if snapshot
-        .terminal
-        .as_ref()
-        .and_then(|terminal| terminal.error_code.as_deref())
-        == Some(CODING_AGENT_TERMINAL_PERSISTENCE_UNCERTAIN)
-    {
-        return false;
-    }
-    true
+    is_ordinary_terminal(snapshot)
 }
 
 pub(super) fn select_bounded_inventory_runs(
@@ -54,6 +38,7 @@ fn durable_live_retention_aligned(
         && record.provider_id == snapshot.provider_id
         && record.provider_instance_id == snapshot.provider_instance_id
         && record.created_at == snapshot.created_at
+        && record.replay_window == snapshot.replay_window
         && snapshot.state == record.state
         && snapshot.execution_state == record.execution_state
         && snapshot.updated_at == record.updated_at
@@ -77,10 +62,9 @@ fn oldest_evictable_durable_run_id<'a>(
         .filter(|record| record.dispatch_phase == DurableDispatchPhase::Terminal)
         .filter(|record| {
             let snapshot = record.snapshot(0);
-            coding_agent_run_retention_evictable(&snapshot)
-                || archive_acknowledgements.contains(
-                    &webcodex_core::coding_agent::archive_identity_fingerprint(&snapshot),
-                )
+            archive_acknowledgements.contains(
+                &webcodex_core::coding_agent::archive_identity_fingerprint(&snapshot),
+            )
         })
         .min_by(|left, right| {
             // Prefer normal terminal eviction. Protected terminal records may
@@ -207,22 +191,25 @@ impl CodingAgentManager {
         Ok(())
     }
 
-    pub(super) fn cleanup_expired(&self) {
-        let cutoff = now().saturating_sub(STORE_RETENTION_SECS);
+    pub(super) fn cleanup_expired(&self, archive_acknowledgements: &[String]) {
+        let timestamp = now();
         let expired = {
             let map = self.runs.lock().unwrap();
             map.iter()
                 .filter(|(_, entry)| {
                     let snapshot = entry.snapshot();
-                    coding_agent_run_retention_evictable(&snapshot) && snapshot.updated_at < cutoff
+                    hot_inventory_expired(&snapshot, timestamp)
+                        && archive_acknowledgements.contains(
+                            &webcodex_core::coding_agent::archive_identity_fingerprint(&snapshot),
+                        )
                 })
                 .map(|(run_id, _)| run_id.clone())
                 .collect::<Vec<_>>()
         };
-        self.cleanup_expired_stale_candidates(cutoff, expired);
+        self.cleanup_expired_stale_candidates(timestamp, expired, archive_acknowledgements);
     }
 
-    fn cleanup_expired_stale_candidates(&self, cutoff: i64, stale_candidate_run_ids: Vec<String>) {
+    fn cleanup_expired_stale_candidates(&self, timestamp: i64, stale_candidate_run_ids: Vec<String>, archive_acknowledgements: &[String]) {
         for run_id in stale_candidate_run_ids {
             let entry = {
                 let map = self.runs.lock().unwrap();
@@ -233,47 +220,40 @@ impl CodingAgentManager {
             };
             let _terminal_transition = entry.terminal_transition.lock().unwrap();
             let snapshot = entry.snapshot();
-            if !coding_agent_run_retention_evictable(&snapshot) || snapshot.updated_at >= cutoff {
+            if !hot_inventory_expired(&snapshot, timestamp)
+                || !archive_acknowledgements.contains(
+                    &webcodex_core::coding_agent::archive_identity_fingerprint(&snapshot),
+                )
+            {
                 continue;
             }
             let durable = match self.store.read(&run_id) {
                 Ok(Some(record)) => record,
-                Ok(None) => {
-                    self.runs.lock().unwrap().remove(&run_id);
-                    continue;
-                }
-                Err(_) => continue,
+                Ok(None) | Err(_) => continue,
             };
             if !durable_live_retention_aligned(&durable, &snapshot) {
                 continue;
             }
-            match self.store.remove_checked(&run_id) {
-                Ok(()) => {
-                    self.runs.lock().unwrap().remove(&run_id);
-                }
-                Err(error) => {
-                    tracing::error!(
-                        run_id = %run_id,
-                        error = %error,
-                        "ACP expired Run durable removal failed; retaining in-memory Run"
-                    );
-                }
+            match self.store.archive_terminal(&durable) {
+                Ok(()) => { self.runs.lock().unwrap().remove(&run_id); }
+                Err(error) => tracing::error!(run_id = %run_id, error = %error,
+                    "ACP terminal archival failed; retaining in-memory Run"),
             }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn cleanup_expired_for_test(&self) {
-        self.cleanup_expired();
+        self.cleanup_expired(&[]);
     }
 
     #[cfg(test)]
     pub(crate) fn cleanup_expired_stale_candidates_for_test(
         &self,
         stale_candidate_run_ids: Vec<String>,
+        archive_acknowledgements: &[String],
     ) {
-        let cutoff = now().saturating_sub(STORE_RETENTION_SECS);
-        self.cleanup_expired_stale_candidates(cutoff, stale_candidate_run_ids);
+        self.cleanup_expired_stale_candidates(now(), stale_candidate_run_ids, archive_acknowledgements);
     }
 
     pub(super) fn enforce_durable_capacity_for_admission(
@@ -290,7 +270,7 @@ impl CodingAgentManager {
                 .unwrap()
                 .values()
                 .map(|entry| entry.snapshot())
-                .filter(|run| run.state.terminal() && !coding_agent_run_retention_evictable(run))
+                .filter(|run| run.state.terminal())
                 .collect::<Vec<_>>();
             for run in candidates {
                 if let Some(record) = self.store.read_archived(&run.run_id)? {
@@ -316,7 +296,13 @@ impl CodingAgentManager {
         &self,
         protected_run_id: Option<&str>,
     ) -> Result<(), String> {
-        self.enforce_durable_capacity_for_admission(protected_run_id, &[])
+        // Synthetic durable receipts for the existing isolated capacity fixtures.
+        let acknowledgements = self.store.list_records_for_retention()?.records
+            .iter()
+            .filter(|record| record.dispatch_phase == DurableDispatchPhase::Terminal)
+            .map(|record| webcodex_core::coding_agent::archive_identity_fingerprint(&record.snapshot(0)))
+            .collect::<Vec<_>>();
+        self.enforce_durable_capacity_for_admission(protected_run_id, &acknowledgements)
     }
 
     fn enforce_durable_capacity_before_scan(&self) -> Result<(), String> {
@@ -384,11 +370,9 @@ impl CodingAgentManager {
     }
 
     fn retire_durable_terminal(&self, record: &DurableRunRecord) -> Result<(), String> {
-        if coding_agent_run_retention_evictable(&record.snapshot(0)) {
-            self.store.remove_checked(&record.run_id)
-        } else {
-            self.store.archive_terminal(record)
-        }
+        // The caller has already checked the immutable Server receipt. Hot
+        // expiry or capacity pressure does not authorize replay-fence deletion.
+        self.store.archive_terminal(record)
     }
 
     pub(super) fn setup_failure(

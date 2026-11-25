@@ -458,6 +458,12 @@ impl RunnerRegistry {
             inner.runners.get(&client_id),
             &runner_instance_id,
             &runner_features,
+            RunnerFeature::CodingAgentReplayExpiry,
+        )?;
+        reject_same_instance_feature_downgrade(
+            inner.runners.get(&client_id),
+            &runner_instance_id,
+            &runner_features,
             RunnerFeature::StructuredCargoTestExecutionPolicy,
         )?;
         reject_same_instance_feature_downgrade(

@@ -9,6 +9,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[path = "coding_agent_retention.rs"]
+pub mod retention;
+
 pub const CODING_AGENT_MAX_PROVIDERS: usize = 8;
 pub const CODING_AGENT_MAX_PROVIDER_ID_BYTES: usize = 64;
 pub const CODING_AGENT_MAX_PROVIDER_NAME_BYTES: usize = 128;
@@ -272,6 +275,9 @@ pub struct CodingAgentRunSnapshot {
     pub state: CodingAgentRunState,
     pub execution_state: CodingAgentExecutionState,
     pub observation_revision: u64,
+    /// Immutable v2 admission window; absent for existing legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_window: Option<retention::CodingAgentReplayWindow>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -339,6 +345,9 @@ pub struct CodingAgentStartRequest {
     #[serde(default)]
     pub config: BTreeMap<String, CodingAgentConfigValue>,
     pub timeout_secs: u64,
+    /// Present only on negotiated v2 starts. Omission retains the old wire shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_window: Option<retention::CodingAgentReplayWindow>,
     /// Immutable Run identities whose exact owning Runner is durably indexed
     /// by the Server. None means no durable routing support; Some(empty)
     /// advertises support but authorizes no archival.
@@ -664,6 +673,9 @@ pub fn validate_request(request: &CodingAgentRequest) -> Result<(), String> {
         CodingAgentRequest::Start(request) => {
             validate_intent_fingerprint(&request.intent_fingerprint)?;
             validate_authority_fingerprint(&request.authority_fingerprint)?;
+            if let Some(window) = request.replay_window {
+                window.expires_at().map_err(|_| "invalid ACP replay window".to_string())?;
+            }
             let acknowledged = request
                 .archive_acknowledged_runs
                 .as_deref()
@@ -870,6 +882,11 @@ pub fn validate_response_for_request(
         return Err("CodingAgentRun response run_id does not match request".to_string());
     }
     validate_coding_agent_run_snapshot(run)?;
+    if let CodingAgentRequest::Start(start) = request {
+        if start.replay_window.is_some() && start.replay_window != run.replay_window {
+            return Err("CodingAgentRun response replay window does not match request".to_string());
+        }
+    }
     Ok(())
 }
 
@@ -1063,6 +1080,9 @@ pub fn validate_coding_agent_run_snapshot(run: &CodingAgentRunSnapshot) -> Resul
     validate_authority_fingerprint(&run.authority_fingerprint)?;
     validate_provider_id(&run.provider_id)?;
     validate_provider_instance_id(&run.provider_instance_id)?;
+    if let Some(window) = run.replay_window {
+        window.expires_at().map_err(|_| "invalid ACP Run replay window".to_string())?;
+    }
     if run.runtime_project_id.trim().is_empty()
         || run.runtime_project_id.len() > CODING_AGENT_MAX_PROJECT_ID_BYTES
     {
@@ -1256,6 +1276,12 @@ pub fn archive_identity_fingerprint(run: &CodingAgentRunSnapshot) -> String {
         hash.update(value.as_bytes());
     }
     hash.update(run.created_at.to_be_bytes());
+    // Legacy v1 receipt fingerprints are unchanged. Bind the optional window
+    // only when it was actually admitted and durably recorded.
+    if let Some(window) = run.replay_window {
+        hash.update(b"replay-window-v2\0");
+        hash.update(window.issued_at.to_be_bytes());
+    }
     format!("{:x}", hash.finalize())
 }
 
@@ -1304,6 +1330,7 @@ fn validate_coding_agent_run_identity_transition(
         || stored.provider_id != incoming.provider_id
         || stored.provider_instance_id != incoming.provider_instance_id
         || stored.created_at != incoming.created_at
+        || stored.replay_window != incoming.replay_window
     {
         return Err("CodingAgentRun observation identity changed across revisions".to_string());
     }
@@ -1476,6 +1503,7 @@ mod tests {
             instruction: "inspect the repository".to_string(),
             config: BTreeMap::new(),
             timeout_secs: 60,
+            replay_window: None,
             archive_acknowledged_runs: None,
         })
     }
@@ -1584,6 +1612,7 @@ mod tests {
             state: CodingAgentRunState::Running,
             execution_state: CodingAgentExecutionState::Started,
             observation_revision: 1,
+            replay_window: None,
             created_at: 1,
             updated_at: 1,
             terminal: None,
@@ -1632,6 +1661,7 @@ mod tests {
             state,
             execution_state,
             observation_revision: 1,
+            replay_window: None,
             created_at: 1,
             updated_at: 1,
             terminal: stop_reason.or(error_code).map(|_| CodingAgentTerminal {
@@ -2242,6 +2272,7 @@ mod tests {
             instruction: "inspect the repository".to_string(),
             config: BTreeMap::new(),
             timeout_secs: 60,
+            replay_window: None,
             archive_acknowledged_runs: None,
         });
         validate_request(&request).unwrap();

@@ -87,6 +87,7 @@ fn durable_store_replaces_existing_state_cross_platform() {
         state: CodingAgentRunState::Starting,
         execution_state: CodingAgentExecutionState::NotStarted,
         dispatch_phase: DurableDispatchPhase::BeforePromptBarrier,
+        replay_window: None,
         created_at: timestamp,
         updated_at: timestamp,
         terminal: None,
@@ -131,6 +132,7 @@ fn pre_barrier_restart_is_not_started_and_child_tree_is_reaped() {
             state: CodingAgentRunState::Starting,
             execution_state: CodingAgentExecutionState::NotStarted,
             dispatch_phase: DurableDispatchPhase::BeforePromptBarrier,
+            replay_window: None,
             created_at: timestamp,
             updated_at: timestamp,
             terminal: None,
@@ -248,7 +250,7 @@ fn retention_evictable_skips_active_and_uncertain_terminals() {
 }
 
 #[test]
-fn cleanup_expired_retains_terminal_within_twenty_four_hours() {
+fn cleanup_expired_archives_acknowledged_expired_hot_terminal() {
     let temp = TempDir::new().unwrap();
     let store = DurableRunStore::new(temp.path().join("store"));
     let cfg = AcpConfig {
@@ -258,7 +260,7 @@ fn cleanup_expired_retains_terminal_within_twenty_four_hours() {
         agents: Vec::new(),
     };
     let manager = CodingAgentManager::with_store(&cfg, store.root.clone()).unwrap();
-    let recent = terminal_snapshot("wc_agent_run_recent_terminal", now() - (16 * 60));
+    let recent = terminal_snapshot("wc_agent_run_recent_terminal", now() - (10 * 60));
     manager.runs.lock().unwrap().insert(
         recent.run_id.clone(),
         Arc::new(RunEntry::new(recent.clone())),
@@ -274,6 +276,12 @@ fn cleanup_expired_retains_terminal_within_twenty_four_hours() {
     );
     store.write(&durable_terminal_record(&expired)).unwrap();
     manager.inventory();
+    assert!(manager.runs.lock().unwrap().contains_key(&expired.run_id));
+    manager.cleanup_expired(&[
+        webcodex_core::coding_agent::archive_identity_fingerprint(&recent),
+        webcodex_core::coding_agent::archive_identity_fingerprint(&expired),
+    ]);
+    assert!(store.read_archived(&expired.run_id).unwrap().is_some());
     assert!(manager
         .runs
         .lock()
@@ -396,7 +404,7 @@ fn enforce_durable_capacity_evicts_oldest_terminal_before_new_claim() {
         store.list_records_for_retention().unwrap().entry_count,
         CODING_AGENT_MAX_INVENTORY_RUNS - 1
     );
-    assert!(!store.read("wc_agent_run_capacity_000").unwrap().is_some());
+    assert!(store.read_archived("wc_agent_run_capacity_000").unwrap().is_some());
     assert!(store.read("wc_agent_run_capacity_127").unwrap().is_some());
 }
 
@@ -626,6 +634,7 @@ fn cleanup_expired_rechecks_evictable_before_removal_under_terminal_transition()
 
     assert!(test_coding_agent_run_retention_evictable(&completed) && completed.updated_at < cutoff);
     let stale_candidates = vec![run.to_string()];
+    let receipt = webcodex_core::coding_agent::archive_identity_fingerprint(&completed);
 
     let _guard = entry.terminal_transition.lock().unwrap();
     let mut lost = completed;
@@ -650,7 +659,7 @@ fn cleanup_expired_rechecks_evictable_before_removal_under_terminal_transition()
     );
     drop(_guard);
 
-    manager.cleanup_expired_stale_candidates_for_test(stale_candidates);
+    manager.cleanup_expired_stale_candidates_for_test(stale_candidates, &[receipt]);
 
     assert!(manager.runs.lock().unwrap().contains_key(run));
     assert!(store.read(run).unwrap().is_some());
@@ -664,7 +673,7 @@ fn durable_store_remove_checked_not_found_is_success() {
 }
 
 #[test]
-fn enforce_durable_capacity_fails_closed_when_durable_removal_fails() {
+fn enforce_durable_capacity_fails_closed_without_durable_receipts() {
     let temp = TempDir::new().unwrap();
     let store = DurableRunStore::new(temp.path().join("store"));
     let cfg = AcpConfig {
@@ -684,14 +693,10 @@ fn enforce_durable_capacity_fails_closed_when_durable_removal_fails() {
             .unwrap()
             .insert(run_id.clone(), Arc::new(RunEntry::new(snapshot)));
     }
-    store.fail_next_removes(1);
     let error = manager
-        .enforce_durable_capacity_for_admission_for_test(Some("wc_agent_run_new_admission"))
+        .enforce_durable_capacity_for_admission(Some("wc_agent_run_new_admission"), &[])
         .unwrap_err();
-    assert!(
-        error.contains("failed to remove ACP Run state dir")
-            || error.contains("injected ACP durable run removal failure")
-    );
+    assert!(error.contains("without durable Server archive acknowledgement"));
     assert_eq!(
         store.list_records_for_retention().unwrap().entry_count,
         CODING_AGENT_MAX_INVENTORY_RUNS
@@ -700,7 +705,7 @@ fn enforce_durable_capacity_fails_closed_when_durable_removal_fails() {
 }
 
 #[test]
-fn cleanup_expired_retains_run_when_durable_removal_fails() {
+fn cleanup_expired_retains_run_without_durable_receipt() {
     let temp = TempDir::new().unwrap();
     let store = DurableRunStore::new(temp.path().join("store"));
     let cfg = AcpConfig {
@@ -719,7 +724,6 @@ fn cleanup_expired_retains_run_when_durable_removal_fails() {
         .unwrap()
         .insert(run.to_string(), Arc::new(RunEntry::new(completed.clone())));
     store.write(&durable_terminal_record(&completed)).unwrap();
-    store.fail_next_removes(1);
     manager.cleanup_expired_for_test();
     assert!(manager.runs.lock().unwrap().contains_key(run));
     assert!(store.read(run).unwrap().is_some());
@@ -736,6 +740,7 @@ fn terminal_snapshot(run_id: &str, updated_at: i64) -> CodingAgentRunSnapshot {
         state: CodingAgentRunState::Completed,
         execution_state: CodingAgentExecutionState::Completed,
         observation_revision: 0,
+        replay_window: None,
         created_at: updated_at,
         updated_at,
         terminal: Some(CodingAgentTerminal {
@@ -760,6 +765,7 @@ fn active_snapshot(run_id: &str, updated_at: i64) -> CodingAgentRunSnapshot {
         state: CodingAgentRunState::Running,
         execution_state: CodingAgentExecutionState::OutcomeUnknown,
         observation_revision: 0,
+        replay_window: None,
         created_at: updated_at,
         updated_at,
         terminal: None,
@@ -780,6 +786,7 @@ fn durable_terminal_record(snapshot: &CodingAgentRunSnapshot) -> DurableRunRecor
         state: snapshot.state.clone(),
         execution_state: snapshot.execution_state,
         dispatch_phase: DurableDispatchPhase::Terminal,
+        replay_window: snapshot.replay_window,
         created_at: snapshot.created_at,
         updated_at: snapshot.updated_at,
         terminal: snapshot.terminal.clone(),
@@ -798,6 +805,7 @@ fn durable_active_record(snapshot: &CodingAgentRunSnapshot) -> DurableRunRecord 
         state: snapshot.state.clone(),
         execution_state: snapshot.execution_state,
         dispatch_phase: DurableDispatchPhase::BeforePromptBarrier,
+        replay_window: snapshot.replay_window,
         created_at: snapshot.created_at,
         updated_at: snapshot.updated_at,
         terminal: None,

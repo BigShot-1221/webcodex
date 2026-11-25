@@ -411,6 +411,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // silently enabled by generated legacy agent config.
             coding_agent_runs: false,
             coding_agent_archive_lookup: false,
+            coding_agent_replay_expiry: false,
             // Native Tool Plugins are likewise advertised only by a Runner
             // binary that implements the typed local Plugin lifecycle.
             native_tool_plugins: false,

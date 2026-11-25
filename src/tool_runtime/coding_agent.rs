@@ -15,6 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+use webcodex_core::coding_agent::retention::{
+    hot_inventory_expired, is_ordinary_terminal, parse_replay_key, CodingAgentReplayWindow,
+    ReplayWindowError, ORDINARY_REPLAY_RETENTION_SECS, SUCCESS_HOT_RETENTION_SECS,
+};
 use webcodex_core::coding_agent::{
     merge_coding_agent_run_snapshot, validate_coding_agent_run_snapshot, CodingAgentCancelRequest,
     CodingAgentConfigPolicyProjection, CodingAgentConfigValue, CodingAgentDiagnoseRequest,
@@ -48,8 +52,8 @@ const PUBLIC_TOKEN_SEQUENCE_BYTES: usize = 8;
 const PUBLIC_TOKEN_TAG_BYTES: usize = 16;
 const PUBLIC_TOKEN_PAYLOAD_BYTES: usize =
     PUBLIC_TOKEN_EPOCH_BYTES + PUBLIC_TOKEN_SEQUENCE_BYTES + PUBLIC_TOKEN_TAG_BYTES;
-/// Must match `STORE_RETENTION_SECS` in the Runner durable store.
-const SERVER_TERMINAL_RETENTION_SECS: i64 = 24 * 60 * 60;
+/// Legacy ordinary-replay floor for fixtures; hot eviction uses D1 terminal deadlines.
+const SERVER_TERMINAL_RETENTION_SECS: i64 = ORDINARY_REPLAY_RETENTION_SECS;
 const SERVER_MAX_TERMINAL_RUNS: usize = CODING_AGENT_MAX_INVENTORY_RUNS;
 const OBSERVATION_MAC_KEY_DIR: &str = "private";
 const OBSERVATION_MAC_KEY_FILE: &str = "coding-agent-observation-mac-key-v2";
@@ -65,6 +69,8 @@ pub(crate) struct ServerRunBinding {
     provider_instance_id: String,
     recording_session_id: Option<String>,
     recorded_lifecycle_mask: u8,
+    retention_uses_v2: bool,
+    retention_route_confirmed: bool,
     snapshot: CodingAgentRunSnapshot,
 }
 
@@ -88,6 +94,7 @@ pub(crate) struct CodingAgentPreparedStart {
     instruction: String,
     config: BTreeMap<String, CodingAgentConfigValue>,
     timeout_secs: u64,
+    replay_window: Option<CodingAgentReplayWindow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +127,17 @@ impl CodingAgentStartFailure {
     }
 }
 
+fn replay_start_failure(run_id: &str, error: ReplayWindowError) -> CodingAgentStartFailure {
+    let expired = matches!(error, ReplayWindowError::Expired);
+    CodingAgentStartFailure {
+        kind: if expired { "coding_agent_replay_key_expired" } else { "coding_agent_replay_key_invalid" }.to_string(),
+        message: if expired { "ACP replay key expired; observe or reconcile the original Run, never redispatch it" } else { "Invalid ACP replay key version, timestamp or nonce" }.to_string(),
+        certainty: if expired { CodingAgentStartCertainty::OutcomeUnknown } else { CodingAgentStartCertainty::NotStarted },
+        recovery: if expired { RecoveryKind::Reconcile } else { RecoveryKind::FixInput },
+        run_id: run_id.to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum CodingAgentTypedStartOutcome {
     Run(CodingAgentRunSnapshot),
@@ -127,43 +145,30 @@ pub(crate) enum CodingAgentTypedStartOutcome {
 }
 
 fn coding_agent_run_retention_evictable(snapshot: &CodingAgentRunSnapshot) -> bool {
-    if !snapshot.state.terminal() {
-        return false;
-    }
-    if snapshot.state == CodingAgentRunState::Lost {
-        return false;
-    }
-    if snapshot.execution_state == CodingAgentExecutionState::OutcomeUnknown {
-        return false;
-    }
-    if snapshot
-        .terminal
-        .as_ref()
-        .and_then(|terminal| terminal.error_code.as_deref())
-        == Some("coding_agent_terminal_persistence_uncertain")
-    {
-        return false;
-    }
-    true
+    is_ordinary_terminal(snapshot)
 }
 
 fn prune_server_runs_locked(runs: &mut HashMap<String, ServerRunBinding>, now: i64) {
-    let cutoff = now.saturating_sub(SERVER_TERMINAL_RETENTION_SECS);
     runs.retain(|_, binding| {
         let snapshot = &binding.snapshot;
         if !snapshot.state.terminal() {
             return true;
         }
-        if !coding_agent_run_retention_evictable(snapshot) {
+        if !is_ordinary_terminal(snapshot) {
             return true;
         }
-        snapshot.updated_at >= cutoff
+        if binding.retention_uses_v2 {
+            return !binding.retention_route_confirmed || !hot_inventory_expired(snapshot, now);
+        }
+        // Do not shorten the historical cache window for a legacy Runner.
+        snapshot.updated_at.saturating_add(SERVER_TERMINAL_RETENTION_SECS) > now
     });
     let mut terminals = runs
         .iter()
         .filter(|(_, binding)| {
             binding.snapshot.state.terminal()
-                && coding_agent_run_retention_evictable(&binding.snapshot)
+                && is_ordinary_terminal(&binding.snapshot)
+                && (!binding.retention_uses_v2 || binding.retention_route_confirmed)
         })
         .map(|(run_id, binding)| (run_id.clone(), binding.snapshot.updated_at))
         .collect::<Vec<_>>();
@@ -187,6 +192,7 @@ fn run_matches_binding_identity(binding: &ServerRunBinding, run: &CodingAgentRun
         && run.provider_id == binding.provider_id
         && run.provider_instance_id == binding.provider_instance_id
         && run.created_at == binding.snapshot.created_at
+        && run.replay_window == binding.snapshot.replay_window
 }
 
 fn merge_server_run_binding_locked(
@@ -217,6 +223,7 @@ fn merge_server_run_binding_locked(
                 .clone()
                 .or(incoming.recording_session_id);
             incoming.recorded_lifecycle_mask = existing.recorded_lifecycle_mask;
+            incoming.retention_route_confirmed |= existing.retention_route_confirmed;
             *existing = incoming;
             Ok(existing.clone())
         }
@@ -279,6 +286,8 @@ impl CodingAgentServerState {
             provider_instance_id: run.provider_instance_id.clone(),
             recording_session_id,
             recorded_lifecycle_mask: 0,
+            retention_uses_v2: client.capabilities.coding_agent_replay_expiry,
+            retention_route_confirmed: false,
             snapshot: run,
         };
         let mut runs = self.runs.lock().await;
@@ -579,6 +588,12 @@ impl ToolRuntime {
         })?;
         let authority_fingerprint = authority_fingerprint(&principal);
         let run_id = deterministic_run_id(&principal, &idempotency_key);
+        let replay_window = parse_replay_key(&idempotency_key)
+            .map_err(|error| replay_start_failure(&run_id, error).into_tool_result())?;
+        if let Some(window) = replay_window {
+            window.check_at(Utc::now().timestamp())
+                .map_err(|error| replay_start_failure(&run_id, error).into_tool_result())?;
+        }
         let resolved = self
             .resolve_project_input_for_auth(&project, auth)
             .await
@@ -612,6 +627,15 @@ impl ToolRuntime {
                 "exact Project Runner does not advertise CodingAgentRun",
                 "not_started",
                 RecoveryKind::Reobserve,
+                Some(&run_id),
+            ));
+        }
+        if replay_window.is_some() && !client.supports(RunnerFeature::CodingAgentReplayExpiry) {
+            return Err(coding_agent_error(
+                "coding_agent_replay_expiry_unsupported",
+                "Exact Runner does not support versioned ACP replay expiry; upgrade or observe the original Run",
+                "outcome_unknown",
+                RecoveryKind::Reconcile,
                 Some(&run_id),
             ));
         }
@@ -665,6 +689,7 @@ impl ToolRuntime {
             instruction,
             config,
             timeout_secs,
+            replay_window,
         })
     }
 
@@ -712,6 +737,11 @@ impl ToolRuntime {
         }
 
         let archive_acknowledged_runs = self.archive_acknowledgements(&prepared.client, auth).await;
+        if let Some(window) = prepared.replay_window {
+            if let Err(error) = window.check_at(Utc::now().timestamp()) {
+                return CodingAgentTypedStartOutcome::Failure(replay_start_failure(&prepared.run_id, error));
+            }
+        }
         let operation = CodingAgentRequest::Start(CodingAgentStartRequest {
             run_id: prepared.run_id.clone(),
             intent_fingerprint: prepared.intent_fingerprint.clone(),
@@ -723,6 +753,7 @@ impl ToolRuntime {
             instruction: prepared.instruction.clone(),
             config: prepared.config.clone(),
             timeout_secs: prepared.timeout_secs,
+            replay_window: prepared.replay_window,
             archive_acknowledged_runs,
         });
         let (request_id, receiver) = match self
@@ -1698,7 +1729,7 @@ impl ToolRuntime {
         let bindings = self.coding_agent_runs.runs.lock().await;
         for run in inventory
             .into_iter()
-            .filter(|run| run.state.terminal() && !coding_agent_run_retention_evictable(run))
+            .filter(|run| run.state.terminal() && (client.capabilities.coding_agent_replay_expiry || !coding_agent_run_retention_evictable(run)))
         {
             let Ok(route) = ArchiveRoute::from_snapshot(&client.client_id, &run) else {
                 continue;
@@ -1713,7 +1744,7 @@ impl ToolRuntime {
         drop(bindings);
         // Filesystem durability must not block the async runtime. Failed or
         // conflicting receipts are never acknowledged; the Runner retains them.
-        tokio::task::spawn_blocking(move || {
+        let acknowledged = tokio::task::spawn_blocking(move || {
             receipts.into_iter().filter_map(|route| {
                 match routes.persist(&route) {
                     Ok(()) => Some(route.identity),
@@ -1722,8 +1753,15 @@ impl ToolRuntime {
                         None
                     }
                 }
-            }).collect()
-        }).await.ok()
+            }).collect::<Vec<_>>()
+        }).await.ok()?;
+        let mut bindings = self.coding_agent_runs.runs.lock().await;
+        for binding in bindings.values_mut().filter(|binding| binding.client_id == client.client_id) {
+            if binding.snapshot.state.terminal() && acknowledged.contains(&webcodex_core::coding_agent::archive_identity_fingerprint(&binding.snapshot)) {
+                binding.retention_route_confirmed = true;
+            }
+        }
+        Some(acknowledged)
     }
 
     async fn archive_route(&self, run_id: &str) -> Result<Option<ArchiveRoute>, String> {
@@ -2786,6 +2824,8 @@ mod tests {
             provider_instance_id: "provider".to_string(),
             recording_session_id: None,
             recorded_lifecycle_mask: 0,
+            retention_uses_v2: true,
+            retention_route_confirmed: true,
             snapshot: CodingAgentRunSnapshot {
                 run_id,
                 intent_fingerprint: "fingerprint".to_string(),
@@ -2800,6 +2840,7 @@ mod tests {
                     CodingAgentExecutionState::Started
                 },
                 observation_revision: 0,
+                replay_window: None,
                 created_at: updated_at,
                 updated_at,
                 terminal,
@@ -2946,7 +2987,7 @@ mod tests {
             test_server_binding(
                 "wc_agent_run_expired".to_string(),
                 CodingAgentRunState::Completed,
-                now - SERVER_TERMINAL_RETENTION_SECS - 1,
+                now - SUCCESS_HOT_RETENTION_SECS - 1,
             ),
         );
         for index in 0..SERVER_MAX_TERMINAL_RUNS + 2 {
@@ -2976,7 +3017,7 @@ mod tests {
             test_server_binding(
                 "wc_agent_run_midretention".to_string(),
                 CodingAgentRunState::Completed,
-                now - (16 * 60),
+                now - (10 * 60),
             ),
         );
         prune_server_runs_locked(&mut runs, now);
@@ -2984,7 +3025,16 @@ mod tests {
         runs.get_mut("wc_agent_run_midretention")
             .unwrap()
             .snapshot
-            .updated_at = now - SERVER_TERMINAL_RETENTION_SECS - 1;
+            .updated_at = now - SUCCESS_HOT_RETENTION_SECS - 1;
+        if let Some(terminal) = runs
+            .get_mut("wc_agent_run_midretention")
+            .unwrap()
+            .snapshot
+            .terminal
+            .as_mut()
+        {
+            terminal.completed_at = now - SUCCESS_HOT_RETENTION_SECS - 1;
+        }
         prune_server_runs_locked(&mut runs, now);
         assert!(!runs.contains_key("wc_agent_run_midretention"));
     }

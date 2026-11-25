@@ -851,6 +851,7 @@ async fn coding_run_attempt_ref_executes_then_reconciles_from_reopened_db_and_fr
         state: CodingAgentRunState::Running,
         execution_state: CodingAgentExecutionState::Started,
         observation_revision: 1,
+        replay_window: start.replay_window,
         created_at: run_now,
         updated_at: run_now,
         terminal: None,

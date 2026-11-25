@@ -13,8 +13,9 @@ const STORE_MAX_RUN_DIR_SCAN: usize = CODING_AGENT_MAX_INVENTORY_RUNS + 1;
 // on historical uncertain identities. Each record is size-bounded; lookup
 // never scans the archive. Storage failures, not an arbitrary count of
 // uncertain identities, are the admission boundary.
-/// Must match `SERVER_TERMINAL_RETENTION_SECS` in `src/tool_runtime/coding_agent.rs`.
-pub(super) const STORE_RETENTION_SECS: i64 = 24 * 60 * 60;
+/// Legacy fixture anchor for ordinary replay floor; hot eviction uses D1 deadlines.
+pub(super) const STORE_RETENTION_SECS: i64 =
+    webcodex_core::coding_agent::retention::ORDINARY_REPLAY_RETENTION_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +38,8 @@ pub(super) struct DurableRunRecord {
     pub(super) state: CodingAgentRunState,
     pub(super) execution_state: CodingAgentExecutionState,
     pub(super) dispatch_phase: DurableDispatchPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) replay_window: Option<webcodex_core::coding_agent::retention::CodingAgentReplayWindow>,
     pub(super) created_at: i64,
     pub(super) updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +58,7 @@ impl DurableRunRecord {
             state: self.state.clone(),
             execution_state: self.execution_state,
             observation_revision,
+            replay_window: self.replay_window,
             created_at: self.created_at,
             updated_at: self.updated_at,
             terminal: self.terminal.clone(),
@@ -714,6 +718,7 @@ pub(super) fn durable_record_from_snapshot(
         state: snapshot.state.clone(),
         execution_state: snapshot.execution_state,
         dispatch_phase: phase,
+        replay_window: snapshot.replay_window,
         created_at: snapshot.created_at,
         updated_at: snapshot.updated_at,
         terminal: snapshot.terminal.clone(),

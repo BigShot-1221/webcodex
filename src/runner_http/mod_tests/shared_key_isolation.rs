@@ -313,6 +313,7 @@ async fn managed_user_coding_agent_inventory_does_not_cross_owner() {
                             execution_state:
                                 webcodex_core::coding_agent::CodingAgentExecutionState::Started,
                             observation_revision: 1,
+                            replay_window: None,
                             created_at: 1,
                             updated_at: 1,
                             terminal: None,

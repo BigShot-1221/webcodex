@@ -126,6 +126,7 @@ async fn workbench_runner_submission_is_durable_and_same_key_replay_never_starts
         state: CodingAgentRunState::Running,
         execution_state: CodingAgentExecutionState::Started,
         observation_revision: 1,
+        replay_window: start.replay_window,
         created_at: now,
         updated_at: now,
         terminal: None,

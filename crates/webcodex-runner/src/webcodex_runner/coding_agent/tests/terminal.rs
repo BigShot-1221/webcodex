@@ -319,6 +319,7 @@ fn concurrent_pre_prompt_terminal_transitions_commit_one_terminal_truth() {
         state: CodingAgentRunState::Starting,
         execution_state: CodingAgentExecutionState::NotStarted,
         dispatch_phase: DurableDispatchPhase::BeforePromptBarrier,
+        replay_window: None,
         created_at: timestamp,
         updated_at: timestamp,
         terminal: None,

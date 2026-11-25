@@ -233,6 +233,7 @@ fn start_request(
         instruction: "inspect".to_string(),
         config,
         timeout_secs: 10,
+        replay_window: None,
         archive_acknowledged_runs: None,
     })
 }
@@ -379,6 +380,7 @@ fn start_request_for_provider(
         instruction: "inspect".to_string(),
         config,
         timeout_secs: 10,
+        replay_window: None,
         archive_acknowledged_runs: None,
     })
 }
@@ -531,6 +533,7 @@ fn seed_terminal_test_run(
         state,
         execution_state,
         dispatch_phase: phase,
+        replay_window: None,
         created_at: timestamp,
         updated_at: timestamp,
         terminal: None,

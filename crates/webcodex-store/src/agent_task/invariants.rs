@@ -71,6 +71,7 @@ fn canonical_coding_run_snapshot(
         state,
         execution_state,
         observation_revision,
+        replay_window: None,
         // AgentTask persists the authoritative semantic observation fields but not
         // Runner wall-clock snapshot metadata. Neutralize those non-persisted fields
         // so durable replay/conflict classification compares exactly what is stored.

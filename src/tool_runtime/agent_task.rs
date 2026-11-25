@@ -104,6 +104,7 @@ mod observation_tests {
             state: CodingAgentRunState::Running,
             execution_state: CodingAgentExecutionState::Started,
             observation_revision: u64::MAX,
+            replay_window: None,
             created_at: 1,
             updated_at: 1,
             terminal: None,

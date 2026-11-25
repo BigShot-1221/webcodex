@@ -300,6 +300,7 @@ async fn coding_agent_run_lookup_is_exact_when_bound_and_ambiguous_when_unbound(
                             execution_state:
                                 webcodex_core::coding_agent::CodingAgentExecutionState::Started,
                             observation_revision: 1,
+                            replay_window: None,
                             created_at: 1,
                             updated_at: 1,
                             terminal: None,
@@ -369,6 +370,7 @@ async fn coding_agent_registration_rejects_semantically_contradictory_snapshot()
         state: webcodex_core::coding_agent::CodingAgentRunState::Running,
         execution_state: webcodex_core::coding_agent::CodingAgentExecutionState::Started,
         observation_revision: 1,
+        replay_window: None,
         created_at: 1,
         updated_at: 1,
         terminal: None,

@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 #[cfg(all(test, unix))]
 use webcodex_core::coding_agent::CodingAgentCancelRequest;
+use webcodex_core::coding_agent::retention::ReplayWindowError;
 use webcodex_core::coding_agent::{
     validate_coding_agent_run_snapshot, validate_request, CodingAgentConfigValue,
     CodingAgentDispatchState, CodingAgentEvent, CodingAgentEventKind, CodingAgentExecutionState,
@@ -467,7 +468,6 @@ impl CodingAgentManager {
     }
 
     pub(crate) fn inventory(&self) -> CodingAgentRunInventory {
-        self.cleanup_expired();
         let runs = self
             .runs
             .lock()
@@ -761,13 +761,15 @@ impl CodingAgentManager {
                 barrier.wait();
             }
         }
-        self.cleanup_expired();
         if let Some(existing) = self.runs.lock().unwrap().get(&request.run_id).cloned() {
             let snapshot = existing.snapshot();
             if snapshot.intent_fingerprint != request.intent_fingerprint
                 || snapshot.authority_fingerprint != request.authority_fingerprint
                 || snapshot.runtime_project_id != request.runtime_project_id
                 || snapshot.provider_id != request.provider_id
+                || (snapshot.replay_window.is_some()
+                    && request.replay_window.is_some()
+                    && snapshot.replay_window != request.replay_window)
             {
                 return response_error(
                     CodingAgentDispatchState::NotStarted,
@@ -790,6 +792,9 @@ impl CodingAgentManager {
                     || snapshot.authority_fingerprint != request.authority_fingerprint
                     || snapshot.runtime_project_id != request.runtime_project_id
                     || snapshot.provider_id != request.provider_id
+                    || (snapshot.replay_window.is_some()
+                        && request.replay_window.is_some()
+                        && snapshot.replay_window != request.replay_window)
                 {
                     return response_error(
                         CodingAgentDispatchState::NotStarted,
@@ -813,6 +818,29 @@ impl CodingAgentManager {
                     "reconcile",
                 );
             }
+        }
+        let replay_admission_error = |timestamp| {
+            request.replay_window.and_then(|window| window.check_at(timestamp).err()).map(|error| {
+                match error {
+                    ReplayWindowError::Expired => response_error(
+                        CodingAgentDispatchState::OutcomeUnknown,
+                        "coding_agent_replay_key_expired",
+                        "Versioned ACP key has expired; observe the original Run, do not redispatch",
+                        "replay_expired",
+                        "reconcile",
+                    ),
+                    ReplayWindowError::Invalid | ReplayWindowError::Future => response_error(
+                        CodingAgentDispatchState::NotStarted,
+                        "coding_agent_replay_key_invalid",
+                        "Versioned ACP key timestamp is invalid or in the future",
+                        "invalid_input",
+                        "fix_input",
+                    ),
+                }
+            })
+        };
+        if let Some(error) = replay_admission_error(now()) {
+            return error;
         }
         match self.store.archive_required() {
             Ok(true) if request.archive_acknowledged_runs.is_none() => {
@@ -895,6 +923,7 @@ impl CodingAgentManager {
                 );
             }
         };
+        self.cleanup_expired(request.archive_acknowledged_runs.as_deref().unwrap_or_default());
         if let Err(error) = self.enforce_durable_capacity_for_admission(
             Some(&request.run_id),
             request
@@ -912,6 +941,9 @@ impl CodingAgentManager {
         }
 
         let timestamp = now();
+        if let Some(error) = replay_admission_error(timestamp) {
+            return error;
+        }
         let record = DurableRunRecord {
             schema_version: STORE_SCHEMA_VERSION,
             run_id: request.run_id.clone(),
@@ -923,6 +955,7 @@ impl CodingAgentManager {
             state: CodingAgentRunState::Starting,
             execution_state: CodingAgentExecutionState::NotStarted,
             dispatch_phase: DurableDispatchPhase::BeforePromptBarrier,
+            replay_window: request.replay_window,
             created_at: timestamp,
             updated_at: timestamp,
             terminal: None,

@@ -1082,7 +1082,7 @@ impl RunnerRegistry {
             !request_ids.contains(request_id) && !job_ids.contains(job_id)
         });
         for client_id in &expired {
-            clear_coding_agent_run_owners_locked(&mut inner, client_id);
+            clear_coding_agent_run_owners_locked(inner, client_id);
             inner.runners.remove(client_id);
             inner.queues_by_runner.remove(client_id);
             inner.notifiers.remove(client_id);

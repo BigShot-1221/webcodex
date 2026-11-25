@@ -1,6 +1,6 @@
 # WebCodex ACP 生命周期、轻量归档与超时优化任务书
 
-> 建立：2026-11-25。状态：第一批已提交；第二批源码静态完成（未提交、未运行验收）；第三至七批待实施。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
+> 建立：2026-11-25。状态：第一、二批已提交（静态交付、未运行验收）；第三批准入与索引源码完成静态复查，待本批独立提交；第四至七批待实施。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
 
 ## 1. 范围、事实来源及目标
 
@@ -72,7 +72,7 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 | --- | --- | --- |
 | 1 官方兼容性与架构边界 | 核对最新双方源码、当前实现和消费者；列出归档/回执/重放/恢复不变量、启动链路和预算传递；定义分阶段观测指标、拟议模块边界及 D1-D5 决策，建立可比较基线 | 记录双方版本、证据与差异、已确认 D1-D5；架构契约已写入 4.1，静态完成（设计交付，无源码改动） |
 | 2 轻量化归档 | 在已确认契约内精简字段与存储职责，精确查询、冷热隔离，兼容旧格式和配套回执；清理重复实现 | 共享 replay/冷热契约与 v2 准入已实现；静态复查完成、无运行验收（见 §8 第二批记录） |
-| 3 准入与索引优化 | 定向重构 Server 启动前批量归档确认、Runner admission 及 capacity scan；增量索引、精确查找，缩小锁范围；保留原子预约/耐久声明/并发 fencing | 正常 start 全量扫描 0、无逐历史记录 RPC/持久化；并发同 key 仅一份执行，不超容量，索引可恢复；待开始 |
+| 3 准入与索引优化 | 定向重构 Server 启动前批量归档确认、Runner admission 及 capacity scan；增量索引、精确查找，缩小锁范围；保留原子预约/耐久声明/并发 fencing | 正常 start 全量扫描 0、无逐历史记录 RPC/持久化；新派发同 key 的耐久归属 fence、增量索引、压力反馈/分页及恢复路径已静态复查；运行验收待授权 |
 | 4 独立自动清理 | 按已确认保留策略实现生命周期所有者、分批维护、增量游标、压力有界回收、取消/关闭排空、失败诊断 | 运行中及未核对不确定 Run 不误删；故障/崩溃/部分清理可恢复；不阻塞普通准入；维护任务有界、无重复线程；待开始 |
 | 5 超时管理 | 复用 McpHostRuntimePolicy，贯穿剩余 request deadline，区分准入/ACP setup/Run 执行/观察/取消；检查各 adapter 与 Host 返回余量，保留 idempotent recovery | 单次观察等待不超过有效请求预算；无事件正常返回，外层 timeout 不自动取消 Run 或新 key 重派；准确区分 not_started/started/outcome_unknown；待开始 |
 | 6 诊断与恢复 | 增加必要阶段/耗时与结构化错误：准入、库存/回执、写入、spawn、initialize、session/new、prompt、首事件、terminal、Server 回传。安全有界采集错误类别；不直接持久化原始 stderr/Prompt/凭据；诊断与普通结果分离 | 能定位责任层而非笼统超时；无输出不等于失败；证据可关联同一 Run；不引入逐事件同步 I/O 或无限日志；待开始 |
@@ -117,7 +117,7 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 
 - Cursor ACP Run `wc_agent_run_4hzaX_tXKSCIk8pK4LcRC-teAqwvtCXKvNIuhepgZpU`，派发后进入 running/started，随后两次精确观察均为 lost/outcome_unknown，错误 `coding_agent_permission_invalid`，终态时间 1795575097；不重派。Runner run.rs:460-483 权限解析错误先 terminate_run_io 再 mark_lost，清理函数忽略部分退出错误，因此另行做了 Windows 进程只读核对：未见 Cursor/ACP 进程，项目运行 Job 列表为空，工作区未发现该 Run 的源码修改。GPT 原生工具接续，不绕过 ACP 权限或修改运行配置。使用 Runner 默认模型配置，未传 config；实际模型未独立确认。本批仅共享重放协议/冷热归档，GPT 负责独立审查、任务书、commit；ACP 不得提交、不触及其他任务修改、不进行测试、构建及真实数据操作。恢复时精确观察该 Run，不另行派发。昨日融合进度及尚未完成的安装/迁移验收仍见 [融合记录](upstream-main-fusion-progress-2026-11-24.md)；不得将其历史快照当作本轮当前源码。
 
-### 2026-11-25 第二批静态交付（未提交、未运行验收）
+### 2026-11-25 第二批静态交付（已提交、未运行验收）
 
 - 执行器：GPT / WebCodex 原生编辑及 Cursor CLI。ACP permission_invalid 后已核实原 Run 终态及进程退出，未重派。CLI Job `wc_job_dH86WRCqjuwG2YRf` completed、exit 0；显式 `--model composer-2.5`，未启用 Fast，实际模型未独立核实。GPT 复查实际源码并修正归档安全问题。基线为第一批 commit `4cde161e29d7c828b8a31e45b45c6cf5431b0653`。未运行测试、构建、打包或真实数据维护。
 - 实际修改范围（仅此任务，未触及 Workflow Session、`artifacts/`、安装包及其他并行工作）：
@@ -138,4 +138,25 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 - 已知后续边界：新 Runner + 旧 Server 仅能取得旧协议受保护记录回执，普通热容量满时保守拒绝；旧 Runner 不享有新版 24h 防重保证。须配套升级。恢复时超出正常热容量的历史溢出记录缺回执仍会失败闭合，第三批须解决恢复索引及有界回执协调，不提前删除旧记录。
 - 未验证项（需后续独立授权）：编译/测试、双版本 Runner 降级实况、持久过期水位与 clock 回拨、第四批维护游标与 v2 实际清理、启动路径全扫移除（第三批）、请求预算贯穿（第五批）、全链路 adapter（第七批）。
 - 第三批入口：`archive_acknowledgements` 启动前批量路径与 Runner `list_records_for_retention` 准入锁内扫描的索引化/零全扫重构；在第二批 replay/冷热契约稳定前提下进行。
+- 第二批实际提交 `d289cd36d1f757cc4e209f8dc2a592dfca6e7d80`，接续时已核实 HEAD、提交历史及关键源码；第一批提交 `4cde161e29d7c828b8a31e45b45c6cf5431b0653` 为其直接父提交。
+
+### 2026-11-25 第三批接续（初次草稿，历史记录）
+
+- 原 Session `wc_sess_jmM4OshWcAaA-47q` 已恢复，分支 `integration/upstream-main-2026-11-24`；基线 HEAD `d289cd36d1f757cc4e209f8dc2a592dfca6e7d80`。四个 Workflow Session 文件及十个未跟踪项保留，暂存区为空。旧 ACP Run 精确观察仍为 lost/outcome_unknown、permission_invalid；旧 CLI Job completed/exit 0；Windows 只读进程核对未见 Cursor/ACP 进程，不重派旧 Run。当前运行构建 `c81376cadfb9cb884517adcb2f60c090de10f941` dirty，与源码不一致。
+- GPT/WebCodex 重新确认 Runner admission 热路径仍扫描 live 状态、按库存反复读取所有 hot durable records，Server start 仍批量获取归档候选并持久化回执；recover 先执行无回执容量回收导致 MAX+1 溢出失败；初始写入失败调用不检查结果的 remove。保留旧协议、防重与权威状态，采用增量准入账本、精确查询、有界协调。第四批独立维护依赖第三批稳定接口。
+- Cursor CLI Job `wc_job_4N1gjnf5vJ60afUc` 已完成、exit 0；显式 `--model composer-2.5`、`--trust`，未启用 Fast，实际模型未独立核实。草稿涉及 Runner index/lifecycle/store/manager、现有 recovery fixture、Server coding_agent。GPT 独立复查发现未满足验收：索引 Mutex Clone/借用、重复移除计数、初始声明失败占位、终态失败计数、常规 Start 残余全扫、Server 持久回执确认及 registry 精确索引。已通过 WebCodex 原生编辑修正前三个 index.rs 静态问题。定向修复 CLI Job `wc_job_yYN4yqGPRpBbal8s` 已完成、exit 0，模型参数同前，实际模型未独立核实。GPT 继续复查并直接修正恢复 listing 部分移动、Server merge 所有权/借用及可见性、索引跨 Runner 冲突语义、回执耐久确认、活跃计数、热索引重复遍历等问题。两个新 CLI Job 均已明确终态，不得重复启动。第三批仍未完成或提交。
+- 本次核实官方 main `70315e49a19d9e6a445008c8e043644ad62b54eb`，Server coding_agent/lifecycle 两个已读 blob 与任务书原锚点一致。第五批只读准备核实 32/65 秒等待与 MCP Host policy 未贯通；未实施后续批次。
+- 当前实际源码草稿：Runner `coding_agent/index.rs`（新增）、`coding_agent.rs`、`lifecycle.rs`、`store.rs`、`tests/recovery.rs`；Server `src/tool_runtime/coding_agent.rs`；Registry `runners.rs`、`state.rs`。Runner 活跃 ID 集合、保守 claim 占位、精确回执指纹索引及热期限索引；恢复单次 listing 并原地更新记录；准入压力最多64个回执候选和2秒协作检查，依靠原有精确幂等 archive_terminal 协调部分 rename；新 Runner 普通 Start 不再触发历史批量回执，压力时基于精确注册库存，旧 Runner 保留兼容路径；Registry run_id→client_id/库存位置，保留可见范围内多 owner 冲突拒绝。Server 已确认回执才允许 v2 缓存淘汰；未确认回执需实际 persist 同步，不能仅据 read 确认。以上仅静态局部实现，未完成端到端验收。
+- 剩余验收阻塞：Server `dispatch_prepared_coding_agent_start` 在 `reconcile_run` 与 `enqueue_coding_agent` 间仍无跨 Runner 的同 Run ID 耐久声明；原 Registry `CodingAgentDispatchFence` 仅绑定 request_id/实例/provider，不足以覆盖同 key 并发及响应丢失/重启后跨 Runner 的重新派发。应在第三批继续封闭此竞态，复用现有私有路由存储、明确原子声明/精确 owner/确认未启动与不确定结果的处理，不得盲目重派或改变 AgentTask 固定 key 语义。另需完整复查所有索引调用点、压力回执重复同步及候选公平性、实际 MAX+1 与部分失败恢复、旧 fixture 断言对应真实路径；尚未证实编译正确或全部满足验收。第四批必须先证明 Server/Runner 双端降级栅栏及持久时间水位，未证明可安全退休的记录保留。
+- 工作区未暂存、未新建 commit；HEAD 仍为第二批基线。已保留四个原 Workflow Session 修改文件及十个无关未跟踪项。不执行测试、cargo check、编译、benchmark、构建、远程 Git 或实际用户数据清理。接续时先确认两个 CLI Job 终态、读当前草稿及 Git 状态，不重复前两批或上述已落地修改。
+
+### 第三批最终静态交付（本次续接）
+
+- 精确恢复原 Workflow Session，两个 CLI Job 已终态；GPT 通过 WebCodex 原生定向修改与复查，未再次派发 Agent。基线 HEAD 仍为 d289cd36d1f757cc4e209f8dc2a592dfca6e7d80。保留四个无关 Workflow Session 文件及十个无关未跟踪项。
+- `src/tool_runtime/coding_agent_archive.rs`：在既有私有分片路由主槽增加 schema 2 不可变 admission claim，绑定 Run ID、principal、intent、Project、Runner/provider 实例及可选 replay window；旧 schema 1 仍精确读取。主槽先耐久原子发布、再 dispatch；旧归档感知 Server 不能将未知 schema 解释为不存在。终态回执独立不可变 sidecar，必须精确匹配权威 Run snapshot 与 claim；不记录 Prompt/配置内容/日志。采用现有私有目录权限、大小约束、同步及不替换发布机制，Windows 拒绝 reparse 文件。未引入独立数据库。
+- `src/tool_runtime/coding_agent.rs`：真实 Server 启动注入持久状态；在 reconcile → reserve_admission → 最终有效期检查 → enqueue 顺序内完成耐久栅栏。未观察到已声明 Run 不能当作未启动，原 Runner/Provider 精确实例才能安全重放；旧 Runner 无 replay-expiry 能力时不允许对不可观测的已声明 Run 再派发。明确安全兼容取舍：旧格式仍可观察；老程序不能执行新版 Run 归属声明。内存声明仅供既有进程内 fixture。AgentTask 固定键、principal+key Run ID 和原 Attempt 契约保持；旧版本此前未声明且未上报的 Run 不能凭缺失记录证明未执行，配套升级/恢复边界继续保护。
+- Registry `state.rs/runners.rs`：精确 Run owner/位置索引，注册与清除原子更新，可见范围内多 owner 冲突拒绝；同 Runner 实例的容量压力反馈及滚动 receipt page（最多 64 条），修复 tombstone/注册迟滞导致的压力漏报，不改旧 wire schema。Server 只在压力或 legacy 兼容路径取页，收到明确容量拒绝后记录压力，成功清除；回执实际 sync 后才确认，不盲目重派。
+- Runner `coding_agent.rs/index.rs/lifecycle.rs/store.rs`：先查已有 live/durable，活跃 ID、热库存占位/终态/receipt/期限增量更新；恢复 MAX+1 有界索引，不依赖无回执预清理；初始持久化失败且清理失败保留占位、返回 reconcile，不盲目释放；原子归档在 exact identity/terminal transition 栅栏后更新账本。常规准入没有全热历史扫描和逐历史回执写入。既有 fixture 同步索引，原断言保留；Server retention fixture 使用实际增量索引逻辑，不运行测试。
+- 静态证据：已复查 dispatch、reconcile、receipt、Registry 注册/精准查询、Runner recover/admission、terminal durable-before-live、archive_terminal、占位清理失败与压力候选。Git diff --check 无 whitespace error（存在 Windows LF/CRLF 提示）。本批仅静态交付，不声称编译或并发/磁盘/降级运行验证已完成。旧 Runner 缺新版耐久语义的不可观测 claim 保守拒绝；新 claim/receipt 的后续普通过期退休必须遵循第四批 D1-D5、安全水位与降级栅栏，尚无实际数据删除。
+- 第四批入口：建立独立生命周期维护、稳定有界游标与回执传递，证明安全退休策略；无安全证据的 legacy/uncertain 及不可判定 claim 保留。
 

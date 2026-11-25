@@ -16,8 +16,9 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use webcodex_core::coding_agent::retention::{
-    hot_inventory_expired, is_ordinary_terminal, parse_replay_key, CodingAgentReplayWindow,
-    ReplayWindowError, ORDINARY_REPLAY_RETENTION_SECS, SUCCESS_HOT_RETENTION_SECS,
+    hot_inventory_expired, hot_retention_deadline, is_ordinary_terminal, parse_replay_key,
+    CodingAgentReplayWindow, ReplayWindowError, ORDINARY_REPLAY_RETENTION_SECS,
+    SUCCESS_HOT_RETENTION_SECS,
 };
 use webcodex_core::coding_agent::{
     merge_coding_agent_run_snapshot, validate_coding_agent_run_snapshot, CodingAgentCancelRequest,
@@ -36,7 +37,7 @@ use webcodex_core::coding_agent::{
 
 #[path = "coding_agent_archive.rs"]
 mod archive;
-use archive::{ArchiveRoute, ArchiveRoutes};
+use archive::{AdmissionClaim, ArchiveRoute, ArchiveRoutes};
 
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 256;
 const START_RESPONSE_WAIT_SECS: u64 = 32;
@@ -55,6 +56,8 @@ const PUBLIC_TOKEN_PAYLOAD_BYTES: usize =
 /// Legacy ordinary-replay floor for fixtures; hot eviction uses D1 terminal deadlines.
 const SERVER_TERMINAL_RETENTION_SECS: i64 = ORDINARY_REPLAY_RETENTION_SECS;
 const SERVER_MAX_TERMINAL_RUNS: usize = CODING_AGENT_MAX_INVENTORY_RUNS;
+/// Bounds per-Start archive receipt coordination (batch-four owns scheduled maintenance).
+const ADMISSION_ARCHIVE_RECEIPT_BUDGET: usize = 64;
 const OBSERVATION_MAC_KEY_DIR: &str = "private";
 const OBSERVATION_MAC_KEY_FILE: &str = "coding-agent-observation-mac-key-v2";
 const OBSERVATION_MAC_KEY_BYTES: usize = 32;
@@ -74,11 +77,186 @@ pub(crate) struct ServerRunBinding {
     snapshot: CodingAgentRunSnapshot,
 }
 
+#[derive(Debug, Default)]
+struct ServerRunRetentionIndex {
+  by_client_receipt: HashMap<String, BTreeMap<(i64, String), String>>,
+  terminal_cap: BTreeMap<(i64, String), String>,
+  meta: HashMap<String, ServerRunRetentionMeta>,
+}
+
+#[derive(Debug, Clone)]
+struct ServerRunRetentionMeta {
+    client_id: String,
+    updated_at: i64,
+    hot_deadline: Option<i64>,
+    evictable: bool,
+    route_confirmed: bool,
+    uses_v2: bool,
+}
+
+impl ServerRunRetentionIndex {
+  fn remove_run(&mut self, run_id: &str) {
+      let Some(old) = self.meta.remove(run_id) else {
+          return;
+      };
+      self.terminal_cap
+          .remove(&(old.updated_at, run_id.to_string()));
+      if let Some(deadline) = old.hot_deadline {
+          if let Some(client) = self.by_client_receipt.get_mut(&old.client_id) {
+              client.remove(&(deadline, run_id.to_string()));
+              if client.is_empty() {
+                  self.by_client_receipt.remove(&old.client_id);
+              }
+          }
+      }
+  }
+
+  fn note_binding(&mut self, binding: &ServerRunBinding) {
+      self.remove_run(&binding.snapshot.run_id);
+      let evictable = is_ordinary_terminal(&binding.snapshot);
+      let hot_deadline = if binding.retention_uses_v2 {
+          if binding.retention_route_confirmed && evictable {
+              hot_retention_deadline(&binding.snapshot)
+          } else if !binding.retention_route_confirmed && binding.snapshot.state.terminal() {
+              Some(i64::MIN)
+          } else {
+              None
+          }
+      } else if evictable {
+          Some(
+              binding
+                  .snapshot
+                  .updated_at
+                  .saturating_add(SERVER_TERMINAL_RETENTION_SECS),
+          )
+      } else {
+          None
+      };
+      let meta = ServerRunRetentionMeta {
+          client_id: binding.client_id.clone(),
+          updated_at: binding.snapshot.updated_at,
+          hot_deadline,
+          evictable,
+          route_confirmed: binding.retention_route_confirmed,
+          uses_v2: binding.retention_uses_v2,
+      };
+      if binding.snapshot.state.terminal() && evictable
+          && (!binding.retention_uses_v2 || binding.retention_route_confirmed) {
+          self.terminal_cap.insert(
+              (binding.snapshot.updated_at, binding.snapshot.run_id.clone()),
+              binding.snapshot.run_id.clone(),
+          );
+      }
+      if let Some(deadline) = hot_deadline {
+          self.by_client_receipt
+              .entry(binding.client_id.clone())
+              .or_default()
+              .insert((deadline, binding.snapshot.run_id.clone()), binding.snapshot.run_id.clone());
+      }
+      self.meta.insert(binding.snapshot.run_id.clone(), meta);
+  }
+
+  fn enforce_terminal_cap(&mut self) -> Vec<String> {
+      let mut removed = Vec::new();
+      while self.terminal_cap.len() > SERVER_MAX_TERMINAL_RUNS {
+          let Some((_, run_id)) = self.terminal_cap.pop_first() else {
+              break;
+          };
+          self.remove_run(&run_id);
+          removed.push(run_id);
+      }
+      removed
+  }
+
+  fn prune_expired_for_run(
+      &mut self,
+      runs: &mut HashMap<String, ServerRunBinding>,
+      run_id: &str,
+      now: i64,
+  ) {
+      let Some(meta) = self.meta.get(run_id).cloned() else {
+          return;
+      };
+      let Some(binding) = runs.get(run_id) else {
+          self.remove_run(run_id);
+          return;
+      };
+      let snapshot = &binding.snapshot;
+      if !snapshot.state.terminal() {
+          return;
+      }
+      let should_remove = if meta.uses_v2 {
+          meta.route_confirmed
+              && meta.evictable
+              && hot_inventory_expired(snapshot, now)
+      } else {
+          meta.evictable
+              && snapshot
+                  .updated_at
+                  .saturating_add(SERVER_TERMINAL_RETENTION_SECS)
+                  <= now
+      };
+      if should_remove {
+          runs.remove(run_id);
+          self.remove_run(run_id);
+      }
+  }
+
+  fn receipt_candidates(
+      &self,
+      client_id: &str,
+      now: i64,
+      budget: usize,
+  ) -> Vec<String> {
+      let Some(order) = self.by_client_receipt.get(client_id) else {
+          return Vec::new();
+      };
+      let mut out = Vec::new();
+      for ((deadline, _), run_id) in order.iter() {
+          if out.len() >= budget {
+              break;
+          }
+          let Some(meta) = self.meta.get(run_id) else {
+              continue;
+          };
+          if meta.uses_v2 && meta.route_confirmed && (*deadline > now || !meta.evictable) {
+              continue;
+          }
+          if !meta.uses_v2 && meta.evictable && *deadline > now {
+              continue;
+          }
+          out.push(run_id.clone());
+      }
+      out
+  }
+
+  fn client_pressure(&self, client_id: &str, now: i64) -> bool {
+      self.by_client_receipt
+          .get(client_id)
+          .is_some_and(|order| {
+              order
+                  .iter()
+                  .any(|((deadline, _), run_id)| {
+                      self.meta.get(run_id).is_some_and(|meta| {
+                          (meta.uses_v2 && !meta.route_confirmed)
+                              || (meta.evictable
+                                  && ((*deadline <= now && meta.uses_v2 && meta.route_confirmed)
+                                      || (!meta.uses_v2
+                                          && *deadline <= now)))
+                      })
+                  })
+          })
+  }
+}
+
 pub(crate) struct CodingAgentServerState {
     epoch: [u8; PUBLIC_TOKEN_EPOCH_BYTES],
     observation_mac_key: [u8; OBSERVATION_MAC_KEY_BYTES],
     runs: Mutex<HashMap<String, ServerRunBinding>>,
+    retention_index: Mutex<ServerRunRetentionIndex>,
     archive_routes: Option<ArchiveRoutes>,
+    #[cfg(test)]
+    volatile_admission_claims: Mutex<HashMap<String, AdmissionClaim>>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,39 +326,18 @@ fn coding_agent_run_retention_evictable(snapshot: &CodingAgentRunSnapshot) -> bo
     is_ordinary_terminal(snapshot)
 }
 
+#[cfg(test)]
 fn prune_server_runs_locked(runs: &mut HashMap<String, ServerRunBinding>, now: i64) {
-    runs.retain(|_, binding| {
-        let snapshot = &binding.snapshot;
-        if !snapshot.state.terminal() {
-            return true;
-        }
-        if !is_ordinary_terminal(snapshot) {
-            return true;
-        }
-        if binding.retention_uses_v2 {
-            return !binding.retention_route_confirmed || !hot_inventory_expired(snapshot, now);
-        }
-        // Do not shorten the historical cache window for a legacy Runner.
-        snapshot.updated_at.saturating_add(SERVER_TERMINAL_RETENTION_SECS) > now
-    });
-    let mut terminals = runs
-        .iter()
-        .filter(|(_, binding)| {
-            binding.snapshot.state.terminal()
-                && is_ordinary_terminal(&binding.snapshot)
-                && (!binding.retention_uses_v2 || binding.retention_route_confirmed)
-        })
-        .map(|(run_id, binding)| (run_id.clone(), binding.snapshot.updated_at))
-        .collect::<Vec<_>>();
-    if terminals.len() <= SERVER_MAX_TERMINAL_RUNS {
-        return;
+    let mut index = ServerRunRetentionIndex::default();
+    for binding in runs.values() {
+        index.note_binding(binding);
     }
-    terminals.sort_by(|(left_id, left_at), (right_id, right_at)| {
-        left_at.cmp(right_at).then_with(|| left_id.cmp(right_id))
-    });
-    let remove_count = terminals.len().saturating_sub(SERVER_MAX_TERMINAL_RUNS);
-    for (run_id, _) in terminals.into_iter().take(remove_count) {
-        runs.remove(&run_id);
+    let run_ids = runs.keys().cloned().collect::<Vec<_>>();
+    for run_id in run_ids {
+        index.prune_expired_for_run(runs, &run_id, now);
+    }
+    for evicted in index.enforce_terminal_cap() {
+        runs.remove(&evicted);
     }
 }
 
@@ -197,12 +354,17 @@ fn run_matches_binding_identity(binding: &ServerRunBinding, run: &CodingAgentRun
 
 fn merge_server_run_binding_locked(
     runs: &mut HashMap<String, ServerRunBinding>,
+    index: &mut ServerRunRetentionIndex,
     mut incoming: ServerRunBinding,
 ) -> Result<ServerRunBinding, String> {
     let run_id = incoming.snapshot.run_id.clone();
     let Some(existing) = runs.get_mut(&run_id) else {
         validate_coding_agent_run_snapshot(&incoming.snapshot)?;
+        index.note_binding(&incoming);
         runs.insert(run_id, incoming.clone());
+        for evicted in index.enforce_terminal_cap() {
+            runs.remove(&evicted);
+        }
         return Ok(incoming);
     };
 
@@ -225,7 +387,12 @@ fn merge_server_run_binding_locked(
             incoming.recorded_lifecycle_mask = existing.recorded_lifecycle_mask;
             incoming.retention_route_confirmed |= existing.retention_route_confirmed;
             *existing = incoming;
-            Ok(existing.clone())
+            let merged = existing.clone();
+            index.note_binding(&merged);
+            for evicted in index.enforce_terminal_cap() {
+                runs.remove(&evicted);
+            }
+            Ok(merged)
         }
     }
 }
@@ -253,7 +420,10 @@ impl CodingAgentServerState {
             epoch: webcodex_core::compact::random_bytes(),
             observation_mac_key,
             runs: Mutex::new(HashMap::new()),
+            retention_index: Mutex::new(ServerRunRetentionIndex::default()),
             archive_routes: None,
+            #[cfg(test)]
+            volatile_admission_claims: Mutex::new(HashMap::new()),
         }
     }
 
@@ -262,6 +432,46 @@ impl CodingAgentServerState {
             Self::with_observation_mac_key(load_or_create_observation_mac_key(state_dir)?);
         state.archive_routes = Some(ArchiveRoutes::new(&state_dir.join(OBSERVATION_MAC_KEY_DIR)));
         Ok(state)
+    }
+
+    async fn reserve_admission(&self, claim: AdmissionClaim, allow_exact_retry: bool) -> Result<(), String> {
+        if let Some(routes) = self.archive_routes.clone() {
+            return tokio::task::spawn_blocking(move || routes.claim(&claim, allow_exact_retry))
+                .await
+                .map_err(|_| "ACP durable admission worker failed".to_string())?;
+        }
+        // Nonpersistent state is only supported by in-process fixtures.
+        #[cfg(test)]
+        {
+            let mut claims = self.volatile_admission_claims.lock().await;
+            if let Some(existing) = claims.get(&claim.run_id) {
+                return if allow_exact_retry && existing == &claim { Ok(()) } else {
+                    Err("ACP Run is already bound to a different admission".into())
+                };
+            }
+            claims.insert(claim.run_id.clone(), claim);
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        Err("ACP durable admission storage is unavailable".into())
+    }
+
+    async fn route_lookup(
+        &self,
+        run_id: &str,
+    ) -> Result<(Option<AdmissionClaim>, Option<ArchiveRoute>), String> {
+        if let Some(routes) = self.archive_routes.clone() {
+            let run_id = run_id.to_owned();
+            return tokio::task::spawn_blocking(move || routes.lookup(&run_id))
+                .await
+                .map_err(|_| "ACP durable route lookup failed".to_string())?;
+        }
+        #[cfg(test)]
+        {
+            return Ok((self.volatile_admission_claims.lock().await.get(run_id).cloned(), None));
+        }
+        #[cfg(not(test))]
+        Ok((None, None))
     }
 
     fn observation_token(&self, run_id: &str, sequence: u64) -> String {
@@ -290,9 +500,12 @@ impl CodingAgentServerState {
             retention_route_confirmed: false,
             snapshot: run,
         };
+        let mut index = self.retention_index.lock().await;
         let mut runs = self.runs.lock().await;
-        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
-        merge_server_run_binding_locked(&mut runs, incoming)
+        let now = Utc::now().timestamp();
+        let binding = merge_server_run_binding_locked(&mut runs, &mut index, incoming)?;
+        index.prune_expired_for_run(&mut runs, &binding.snapshot.run_id, now);
+        Ok(binding)
     }
 
     async fn mark_lost(
@@ -300,8 +513,10 @@ impl CodingAgentServerState {
         run_id: &str,
         code: &str,
     ) -> Result<Option<ServerRunBinding>, String> {
+        let mut index = self.retention_index.lock().await;
         let mut runs = self.runs.lock().await;
-        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
+        let now = Utc::now().timestamp();
+        index.prune_expired_for_run(&mut runs, run_id, now);
         let Some(current) = runs.get(run_id).cloned() else {
             return Ok(None);
         };
@@ -310,7 +525,7 @@ impl CodingAgentServerState {
         }
         let mut lost = current.clone();
         mark_server_binding_lost(&mut lost, code)?;
-        merge_server_run_binding_locked(&mut runs, lost).map(Some)
+        merge_server_run_binding_locked(&mut runs, &mut index, lost).map(Some)
     }
 
     async fn merge_bound_snapshot(
@@ -320,9 +535,9 @@ impl CodingAgentServerState {
     ) -> Result<ServerRunBinding, String> {
         let mut incoming = binding.clone();
         incoming.snapshot = run;
+        let mut index = self.retention_index.lock().await;
         let mut runs = self.runs.lock().await;
-        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
-        merge_server_run_binding_locked(&mut runs, incoming)
+        merge_server_run_binding_locked(&mut runs, &mut index, incoming)
     }
 
     async fn attach_recorder(&self, run_id: &str, recording_session_id: Option<String>) {
@@ -330,7 +545,6 @@ impl CodingAgentServerState {
             return;
         };
         let mut runs = self.runs.lock().await;
-        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
         if let Some(binding) = runs.get_mut(run_id) {
             if binding.recording_session_id.is_none() {
                 binding.recording_session_id = Some(recording_session_id);
@@ -343,7 +557,6 @@ impl CodingAgentServerState {
         run_id: &str,
     ) -> Option<(String, CodingAgentRunSnapshot, &'static str)> {
         let mut runs = self.runs.lock().await;
-        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
         let binding = runs.get_mut(run_id)?;
         let session_id = binding.recording_session_id.clone()?;
         let (bit, kind) = match binding.snapshot.state {
@@ -364,8 +577,10 @@ impl CodingAgentServerState {
     }
 
     async fn get(&self, run_id: &str) -> Option<ServerRunBinding> {
+        let mut index = self.retention_index.lock().await;
         let mut runs = self.runs.lock().await;
-        prune_server_runs_locked(&mut runs, Utc::now().timestamp());
+        let now = Utc::now().timestamp();
+        index.prune_expired_for_run(&mut runs, run_id, now);
         runs.get(run_id).cloned()
     }
 }
@@ -700,7 +915,7 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> CodingAgentTypedStartOutcome {
         let existing = match self
-            .reconcile_run(&prepared.run_id, &prepared.authority_fingerprint, auth)
+            .reconcile_run_with_claim(&prepared.run_id, &prepared.authority_fingerprint, auth, true)
             .await
         {
             Ok(existing) => existing,
@@ -736,7 +951,29 @@ impl ToolRuntime {
             return CodingAgentTypedStartOutcome::Run(existing.snapshot);
         }
 
-        let archive_acknowledged_runs = self.archive_acknowledgements(&prepared.client, auth).await;
+        let archive_acknowledged_runs = self
+            .archive_acknowledgements_for_start(&prepared.client, auth, prepared.replay_window)
+            .await;
+        if let Some(window) = prepared.replay_window {
+            if let Err(error) = window.check_at(Utc::now().timestamp()) {
+                return CodingAgentTypedStartOutcome::Failure(replay_start_failure(&prepared.run_id, error));
+            }
+        }
+        // This immutable owner/intent fence must be durable before transport
+        // dispatch. It closes the gap between Runner admission and inventory
+        // registration, including Server restart and cross-Runner retries.
+        if let Err(message) = self.coding_agent_runs
+            .reserve_admission(AdmissionClaim::from_prepared(&prepared), prepared.client.capabilities.coding_agent_replay_expiry)
+            .await
+        {
+            return CodingAgentTypedStartOutcome::Failure(CodingAgentStartFailure {
+                kind: "coding_agent_admission_claim_conflict".to_string(),
+                message,
+                certainty: CodingAgentStartCertainty::OutcomeUnknown,
+                recovery: RecoveryKind::Reconcile,
+                run_id: prepared.run_id,
+            });
+        }
         if let Some(window) = prepared.replay_window {
             if let Err(error) = window.check_at(Utc::now().timestamp()) {
                 return CodingAgentTypedStartOutcome::Failure(replay_start_failure(&prepared.run_id, error));
@@ -799,7 +1036,9 @@ impl ToolRuntime {
             };
         match response.payload {
             Some(CodingAgentResponsePayload::Start { run }) => {
-                if run.authority_fingerprint != prepared.authority_fingerprint
+                if run.run_id != prepared.run_id
+                    || run.replay_window != prepared.replay_window
+                    || run.authority_fingerprint != prepared.authority_fingerprint
                     || run.intent_fingerprint != prepared.intent_fingerprint
                     || run.runtime_project_id != prepared.runtime_project_id
                     || run.provider_id != prepared.provider_id
@@ -829,14 +1068,30 @@ impl ToolRuntime {
                         })
                     }
                 };
+                self.runner_registry.note_coding_agent_retention_pressure(
+                    crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                    &prepared.client.client_id,
+                    &prepared.client.runner_instance_id,
+                    false,
+                ).await;
                 self.record_coding_agent_lifecycle_if_needed(&prepared.run_id)
                     .await;
                 CodingAgentTypedStartOutcome::Run(binding.snapshot)
             }
-            _ => CodingAgentTypedStartOutcome::Failure(coding_agent_start_failure_from_response(
-                response,
-                &prepared.run_id,
-            )),
+            _ => {
+                let failure = coding_agent_start_failure_from_response(response, &prepared.run_id);
+                if failure.certainty == CodingAgentStartCertainty::NotStarted
+                    && failure.kind == "coding_agent_retention_capacity_exhausted"
+                {
+                    self.runner_registry.note_coding_agent_retention_pressure(
+                        crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                        &prepared.client.client_id,
+                        &prepared.client.runner_instance_id,
+                        true,
+                    ).await;
+                }
+                CodingAgentTypedStartOutcome::Failure(failure)
+            }
         }
     }
 
@@ -1699,79 +1954,101 @@ impl ToolRuntime {
         );
     }
 
-    /// Archive acknowledgement is an internal durable identity handoff, not a
-    /// grant to execute or inspect other Projects. Only the exact selected
-    /// registration's bounded inventory can contribute candidate receipts.
-    async fn archive_acknowledgements(
+    /// Pressure uses the exact registered inventory count, not historical bindings.
+    /// The registration may lag an admission; the Runner remains authoritative
+    /// and may reject until a subsequent registration provides current evidence.
+    async fn archive_acknowledgements_for_start(
+        &self,
+        client: &crate::runner_protocol::RunnerView,
+        auth: Option<&AuthContext>,
+        _replay_window: Option<CodingAgentReplayWindow>,
+    ) -> Option<Vec<String>> {
+        if !client.capabilities.coding_agent_archive_lookup {
+            return None;
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        if client.capabilities.coding_agent_replay_expiry
+            && !self.runner_registry.coding_agent_inventory_at_capacity_for_runner(
+                access.as_ref(), &client.client_id, &client.runner_instance_id,
+            ).await
+        {
+            return Some(Vec::new());
+        }
+        // Legacy archive-aware Runners retain the historical receipt path.
+        // For a new Runner this is exclusively a capacity-pressure path.
+        self.archive_acknowledgements_bounded(client, auth).await
+    }
+
+    async fn archive_acknowledgements_bounded(
         &self,
         client: &crate::runner_protocol::RunnerView,
         auth: Option<&AuthContext>,
     ) -> Option<Vec<String>> {
-        let Some(routes) = self.coding_agent_runs.archive_routes.clone() else {
-            return None;
-        };
-        if !client.capabilities.coding_agent_archive_lookup {
-            return None;
-        }
-        let inventory = match self
-            .runner_registry
-            .coding_agent_archive_inventory_for_runner(
-                crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                &client.client_id,
-                &client.runner_instance_id,
-            )
-            .await
-        {
-            Ok(inventory) => inventory,
-            Err(_) => return None,
-        };
+        let routes = self.coding_agent_runs.archive_routes.clone()?;
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        let inventory = self.runner_registry.coding_agent_archive_inventory_for_runner(
+            access.as_ref(), &client.client_id, &client.runner_instance_id,
+            ADMISSION_ARCHIVE_RECEIPT_BUDGET,
+        ).await.ok()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut receipts = Vec::new();
-        let bindings = self.coding_agent_runs.runs.lock().await;
-        for run in inventory
-            .into_iter()
-            .filter(|run| run.state.terminal() && (client.capabilities.coding_agent_replay_expiry || !coding_agent_run_retention_evictable(run)))
         {
-            let Ok(route) = ArchiveRoute::from_snapshot(&client.client_id, &run) else {
-                continue;
-            };
-            if let Some(binding) = bindings.get(&run.run_id) {
-                if !route.matches(&binding.client_id, &binding.snapshot) {
+            let bindings = self.coding_agent_runs.runs.lock().await;
+            for run in inventory.into_iter().filter(|run| {
+                run.state.terminal() && (client.capabilities.coding_agent_replay_expiry
+                    || !coding_agent_run_retention_evictable(run))
+            }).take(ADMISSION_ARCHIVE_RECEIPT_BUDGET) {
+                if std::time::Instant::now() >= deadline { break; }
+                let Ok(route) = ArchiveRoute::from_snapshot(&client.client_id, &run) else {
                     continue;
-                }
-            }
-            receipts.push(route);
-        }
-        drop(bindings);
-        // Filesystem durability must not block the async runtime. Failed or
-        // conflicting receipts are never acknowledged; the Runner retains them.
-        let acknowledged = tokio::task::spawn_blocking(move || {
-            receipts.into_iter().filter_map(|route| {
-                match routes.persist(&route) {
-                    Ok(()) => Some(route.identity),
-                    Err(error) => {
-                        tracing::warn!(run_id = %route.run_id, %error, "ACP archive receipt not acknowledged");
-                        None
+                };
+                let confirmed = match bindings.get(&run.run_id) {
+                    Some(binding) if route.matches(&binding.client_id, &binding.snapshot) => {
+                        binding.retention_route_confirmed
                     }
-                }
-            }).collect::<Vec<_>>()
-        }).await.ok()?;
-        let mut bindings = self.coding_agent_runs.runs.lock().await;
-        for binding in bindings.values_mut().filter(|binding| binding.client_id == client.client_id) {
-            if binding.snapshot.state.terminal() && acknowledged.contains(&webcodex_core::coding_agent::archive_identity_fingerprint(&binding.snapshot)) {
-                binding.retention_route_confirmed = true;
+                    Some(_) => continue,
+                    None => false,
+                };
+                receipts.push((route, run, confirmed));
             }
         }
-        Some(acknowledged)
-    }
-
-    async fn archive_route(&self, run_id: &str) -> Result<Option<ArchiveRoute>, String> {
-        let Some(routes) = self.coding_agent_runs.archive_routes.clone() else {
-            return Ok(None);
-        };
-        let run_id = run_id.to_owned();
-        tokio::task::spawn_blocking(move || routes.read(&run_id))
-            .await
-            .map_err(|_| "ACP archive receipt lookup failed".to_string())?
+        let confirmed_routes = tokio::task::spawn_blocking(move || {
+            let mut acknowledged = Vec::new();
+            for (route, run, confirmed) in receipts {
+                if std::time::Instant::now() >= deadline { break; }
+                let result = if confirmed {
+                    match routes.read(&route.run_id) {
+                        Ok(Some(existing)) if existing == route => Ok(()),
+                        Ok(None) => routes.persist(&route, &run),
+                        Ok(Some(_)) => Err("ACP archive routing identity conflict".to_string()),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    // A read alone is not proof that publication was synced.
+                    routes.persist(&route, &run)
+                };
+                match result {
+                    Ok(()) => acknowledged.push(route),
+                    Err(error) => tracing::warn!(run_id = %route.run_id, %error,
+                        "ACP archive receipt not acknowledged"),
+                }
+            }
+            acknowledged
+        }).await.ok()?;
+        let mut index = self.coding_agent_runs.retention_index.lock().await;
+        let mut bindings = self.coding_agent_runs.runs.lock().await;
+        for route in &confirmed_routes {
+            if let Some(binding) = bindings.get_mut(&route.run_id) {
+                if route.matches(&binding.client_id, &binding.snapshot) {
+                    binding.retention_route_confirmed = true;
+                    index.note_binding(binding);
+                }
+            }
+        }
+        for evicted in index.enforce_terminal_cap() {
+            bindings.remove(&evicted);
+        }
+        Some(confirmed_routes.into_iter().map(|route| route.identity).collect())
     }
 
     async fn observe_archived_run(
@@ -1850,6 +2127,16 @@ impl ToolRuntime {
         run_id: &str,
         authority: &str,
         auth: Option<&AuthContext>,
+    ) -> Result<Option<ServerRunBinding>, String> {
+        self.reconcile_run_with_claim(run_id, authority, auth, false).await
+    }
+
+    async fn reconcile_run_with_claim(
+        &self,
+        run_id: &str,
+        authority: &str,
+        auth: Option<&AuthContext>,
+        allow_pending_admission: bool,
     ) -> Result<Option<ServerRunBinding>, String> {
         let existing = self.coding_agent_runs.get(run_id).await;
         if let Some(binding) = existing {
@@ -1938,7 +2225,17 @@ impl ToolRuntime {
             .coding_agent_run_for_auth_checked(access.as_ref(), run_id)
             .await?;
         // Receipt publication precedes hot removal; sample it after the hot view.
-        let route = self.archive_route(run_id).await?;
+        let (claim, route) = self.coding_agent_runs.route_lookup(run_id).await?;
+        if let Some(claim) = &claim {
+            if claim.authority_fingerprint != authority {
+                return Ok(None);
+            }
+            if let Some((client, run)) = &hot {
+                if !claim.matches_snapshot(&client.client_id, run) {
+                    return Err("ACP registered Run conflicts with durable admission claim".into());
+                }
+            }
+        }
         let found = match (route, hot) {
             (Some(route), Some((client, run))) => {
                 if route.authority_fingerprint != authority
@@ -1957,8 +2254,14 @@ impl ToolRuntime {
             (None, hot) => hot,
         };
         let Some((client, run)) = found else {
+            if claim.is_some() && !allow_pending_admission {
+                return Err("ACP admission was durably reserved, but its Run is not yet observable; reconcile the original Run".into());
+            }
             return Ok(None);
         };
+        if claim.as_ref().is_some_and(|claim| !claim.matches_snapshot(&client.client_id, &run)) {
+            return Err("ACP retained Run conflicts with durable admission claim".into());
+        }
         if run.authority_fingerprint != authority {
             return Ok(None);
         }
@@ -2862,13 +3165,13 @@ mod tests {
         let route = ArchiveRoute::from_snapshot("test", &run).unwrap();
         let routes = ArchiveRoutes::new(temp.path());
         assert!(routes.read(&run.run_id).unwrap().is_none());
-        routes.persist(&route).unwrap();
-        routes.persist(&route).unwrap();
+        routes.persist(&route, &run).unwrap();
+        routes.persist(&route, &run).unwrap();
         let reopened = ArchiveRoutes::new(temp.path());
         assert_eq!(reopened.read(&run.run_id).unwrap().as_ref(), Some(&route));
         let mut conflict = route.clone();
         conflict.identity = "0".repeat(64);
-        assert!(reopened.persist(&conflict).is_err());
+        assert!(reopened.persist(&conflict, &run).is_err());
         assert_eq!(reopened.read(&run.run_id).unwrap().as_ref(), Some(&route));
         assert!(!route.matches("different_runner", &run));
     }

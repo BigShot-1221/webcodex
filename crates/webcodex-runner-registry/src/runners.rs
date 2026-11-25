@@ -38,6 +38,29 @@ use webcodex_core::runner_protocol::{
 
 use webcodex_core::runner_operation::valid_computer_control_epoch;
 
+fn clear_coding_agent_run_owners_locked(inner: &mut RunnerRegistryInner, client_id: &str) {
+    let run_ids = inner.runners.get(client_id).map(|runner| runner.coding_agent_inventory.runs.iter().map(|run| run.run_id.clone()).collect::<Vec<_>>()).unwrap_or_default();
+    for run_id in run_ids {
+        if let Some(owners) = inner.coding_agent_run_owners.get_mut(&run_id) {
+            owners.remove(client_id);
+            if owners.is_empty() {
+                inner.coding_agent_run_owners.remove(&run_id);
+            }
+        }
+    }
+}
+
+fn index_coding_agent_run_owners_locked(
+    inner: &mut RunnerRegistryInner,
+    client_id: &str,
+    inventory: &CodingAgentRunInventory,
+) {
+    clear_coding_agent_run_owners_locked(inner, client_id);
+    for (position, run) in inventory.runs.iter().enumerate() {
+        inner.coding_agent_run_owners.entry(run.run_id.clone()).or_default().insert(client_id.to_string(), position);
+    }
+}
+
 fn validate_coding_agent_registration(
     client_id: &str,
     capability: bool,
@@ -348,6 +371,8 @@ impl RunnerRegistry {
             job_capacity_generation,
             coding_agent_providers: coding_agent_providers.clone(),
             coding_agent_inventory,
+            coding_agent_retention_pressure: false,
+            coding_agent_receipt_cursor: 0,
             projected_structured_terminal_suppressions: VecDeque::new(),
         };
         match (
@@ -571,6 +596,8 @@ impl RunnerRegistry {
         if let Some(existing) = inner.runners.get(&client_id) {
             if existing.runner_instance_id == runner_instance_id {
                 record.registered_at = existing.registered_at;
+                record.coding_agent_retention_pressure = existing.coding_agent_retention_pressure;
+                record.coding_agent_receipt_cursor = existing.coding_agent_receipt_cursor;
                 record.projected_structured_terminal_suppressions =
                     existing.projected_structured_terminal_suppressions.clone();
                 record.prune_projected_structured_terminal_suppressions(now);
@@ -596,6 +623,7 @@ impl RunnerRegistry {
         // connection lease, and notifier are committed under this same lock so
         // the registry never exposes a half-registered long-lived session.
         inner.notifiers.remove(&client_id);
+        index_coding_agent_run_owners_locked(&mut inner, &client_id, &record.coding_agent_inventory);
         inner.runners.insert(client_id.clone(), record);
         if let Some(streaming) = streaming {
             inner.notifiers.insert(
@@ -1048,6 +1076,7 @@ impl RunnerRegistry {
             !request_ids.contains(request_id) && !job_ids.contains(job_id)
         });
         for client_id in &expired {
+            clear_coding_agent_run_owners_locked(&mut inner, client_id);
             inner.runners.remove(client_id);
             inner.queues_by_runner.remove(client_id);
             inner.notifiers.remove(client_id);
@@ -1593,6 +1622,7 @@ impl RunnerRegistry {
     ) -> Option<(RunnerView, CodingAgentRunSnapshot)> {
         let mut inner = self.inner.lock().await;
         self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let position = *inner.coding_agent_run_owners.get(run_id)?.get(client_id)?;
         let runner = inner.runners.get(client_id)?;
         if !runner_visible_to_access(auth, runner) {
             return None;
@@ -1600,11 +1630,49 @@ impl RunnerRegistry {
         let run = runner
             .coding_agent_inventory
             .runs
-            .iter()
-            .find(|run| run.run_id == run_id)
+            .get(position)
+            .filter(|run| run.run_id == run_id)
             .cloned()?;
         let view = Self::runner_view_locked(&inner, client_id)?;
         Some((view, run))
+    }
+
+    pub async fn coding_agent_inventory_at_capacity_for_runner(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        client_id: &str,
+        expected_instance_id: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let Some(runner) = inner.runners.get(client_id) else {
+            return false;
+        };
+        if runner.runner_instance_id != expected_instance_id {
+            return false;
+        }
+        if !runner_visible_to_access(auth, runner) {
+            return false;
+        }
+        runner.coding_agent_retention_pressure
+            || runner.coding_agent_inventory.runs.len() >= CODING_AGENT_MAX_INVENTORY_RUNS
+    }
+
+    pub async fn note_coding_agent_retention_pressure(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        client_id: &str,
+        expected_instance_id: &str,
+        pressured: bool,
+    ) {
+        let mut inner = self.inner.lock().await;
+        if let Some(runner) = inner.runners.get_mut(client_id) {
+            if runner.runner_instance_id == expected_instance_id
+                && runner_visible_to_access(auth, runner)
+            {
+                runner.coding_agent_retention_pressure = pressured;
+            }
+        }
     }
 
     pub async fn coding_agent_run_for_auth(
@@ -1628,33 +1696,16 @@ impl RunnerRegistry {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
         self.prune_expired_shared_key_runners_locked(&mut inner, now);
-        let mut ids = inner.runners.keys().cloned().collect::<Vec<_>>();
-        ids.sort();
+        let Some(owners) = inner.coding_agent_run_owners.get(run_id) else {
+            return Ok(None);
+        };
         let mut matched = None;
-        for client_id in ids {
-            let Some(runner) = inner.runners.get(&client_id) else {
-                continue;
-            };
-            if !runner_visible_to_access(auth, runner) {
-                continue;
-            }
-            let Some(run) = runner
-                .coding_agent_inventory
-                .runs
-                .iter()
-                .find(|run| run.run_id == run_id)
-                .cloned()
-            else {
-                continue;
-            };
-            if matched.is_some() {
-                // A Server restart has no process-local binding to disambiguate
-                // duplicate run ids. Fail closed instead of choosing a Runner by
-                // registry iteration order and silently retargeting provenance.
-                return Err("ACP Run identity is present on multiple Runners".to_string());
-            }
-            let view = Self::runner_view_locked(&inner, &client_id)
-                .ok_or_else(|| "ACP Run owner could not be observed".to_string())?;
+        for (client_id, position) in owners {
+            let runner = inner.runners.get(client_id).ok_or_else(|| "ACP Run owner index is stale; reconcile registration".to_string())?;
+            if !runner_visible_to_access(auth, runner) { continue; }
+            if matched.is_some() { return Err("ACP Run identity is present on multiple Runners".to_string()); }
+            let run = runner.coding_agent_inventory.runs.get(*position).filter(|run| run.run_id == run_id).cloned().ok_or_else(|| "ACP Run owner index is stale; reconcile registration".to_string())?;
+            let view = Self::runner_view_locked(&inner, client_id).ok_or_else(|| "ACP Run owner could not be observed".to_string())?;
             matched = Some((view, run));
         }
         Ok(matched)
@@ -1668,12 +1719,13 @@ impl RunnerRegistry {
         auth: Option<&crate::RunnerAccess>,
         client_id: &str,
         expected_instance_id: &str,
+        limit: usize,
     ) -> Result<Vec<CodingAgentRunSnapshot>, String> {
         let mut inner = self.inner.lock().await;
         self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
         let runner = inner
             .runners
-            .get(client_id)
+            .get_mut(client_id)
             .ok_or_else(|| "exact ACP Runner is unavailable".to_string())?;
         assert_runner_access(auth, runner)?;
         if runner.runner_instance_id != expected_instance_id
@@ -1683,7 +1735,18 @@ impl RunnerRegistry {
         {
             return Err("ACP archive inventory registration changed".to_string());
         }
-        Ok(runner.coding_agent_inventory.runs.clone())
+        let inventory = &runner.coding_agent_inventory.runs;
+        if inventory.is_empty() {
+            runner.coding_agent_receipt_cursor = 0;
+            return Ok(Vec::new());
+        }
+        let start = runner.coding_agent_receipt_cursor % inventory.len();
+        let count = limit.min(64).min(inventory.len());
+        let page = (0..count)
+            .map(|offset| inventory[(start + offset) % inventory.len()].clone())
+            .collect();
+        runner.coding_agent_receipt_cursor = (start + count) % inventory.len();
+        Ok(page)
     }
 
     pub async fn assert_runner_access(

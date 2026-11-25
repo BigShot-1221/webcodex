@@ -115,6 +115,9 @@ pub(super) struct RunnerRecord {
     /// Authoritative active/recent-terminal CodingAgentRun inventory from this
     /// Runner. Bodies/events are deliberately absent from this durable projection.
     pub(super) coding_agent_inventory: CodingAgentRunInventory,
+    // Exact-instance pressure feedback and bounded receipt-page cursor. Not wire state.
+    pub(super) coding_agent_retention_pressure: bool,
+    pub(super) coding_agent_receipt_cursor: usize,
     /// Same-Server evidence that a hidden structured terminal Job was already
     /// projected into its initiating tool result and deliberately discarded.
     /// This stays process-local and is preserved only across registrations by
@@ -532,6 +535,8 @@ pub(super) struct RunnerRegistryInner {
     /// from reclaiming the same runner lease after the replacement later
     /// becomes stale.
     pub(super) retired_instances: HashMap<String, VecDeque<String>>,
+    /// Exact cross-Runner CodingAgentRun routing: `run_id -> owning client_id`.
+    pub(super) coding_agent_run_owners: HashMap<String, HashMap<String, usize>>,
     /// Runtime project ids temporarily fenced while unregister validates and
     /// removes the Runner registry entry. Job enqueue checks this set while
     /// holding the same registry mutex, closing the check/start TOCTOU window.

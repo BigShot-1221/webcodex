@@ -73,6 +73,86 @@ impl ArchiveRoute {
     }
 }
 
+/// The claim occupies the original route slot. Older Servers reject its
+/// unknown schema rather than treating a not-yet-advertised Run as absent.
+/// Terminal receipts for claimed Runs are separately immutable; legacy
+/// schema-1 routes remain readable in their original location.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdmissionClaim {
+    schema: u32,
+    pub(super) run_id: String,
+    pub(super) client_id: String,
+    pub(super) runner_instance_id: String,
+    pub(super) authority_fingerprint: String,
+    pub(super) runtime_project_id: String,
+    pub(super) intent_fingerprint: String,
+    pub(super) provider_id: String,
+    pub(super) provider_instance_id: String,
+    pub(super) replay_window: Option<webcodex_core::coding_agent::retention::CodingAgentReplayWindow>,
+}
+
+impl AdmissionClaim {
+    pub(super) fn from_prepared(prepared: &super::CodingAgentPreparedStart) -> Self {
+        Self {
+            schema: 2,
+            run_id: prepared.run_id.clone(),
+            client_id: prepared.client.client_id.clone(),
+            runner_instance_id: prepared.client.runner_instance_id.clone(),
+            authority_fingerprint: prepared.authority_fingerprint.clone(),
+            runtime_project_id: prepared.runtime_project_id.clone(),
+            intent_fingerprint: prepared.intent_fingerprint.clone(),
+            provider_id: prepared.provider_id.clone(),
+            provider_instance_id: prepared.provider_instance_id.clone(),
+            replay_window: prepared.replay_window,
+        }
+    }
+
+    fn validate(&self, run_id: &str) -> Result<(), String> {
+        validate_run_id(&self.run_id)?;
+        validate_authority_fingerprint(&self.authority_fingerprint)?;
+        webcodex_core::coding_agent::validate_intent_fingerprint(&self.intent_fingerprint)?;
+        if self.schema != 2
+            || self.run_id != run_id
+            || !self.runtime_project_id.starts_with(&format!("agent:{}:", self.client_id))
+            || self.runtime_project_id.len() > 1024
+            || [&self.client_id, &self.runner_instance_id, &self.provider_id, &self.provider_instance_id]
+                .iter().any(|value| value.is_empty() || value.len() > 512)
+            || self.replay_window.is_some_and(|window| window.expires_at().is_err())
+        {
+            return Err("ACP admission claim is invalid".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn matches_snapshot(&self, client_id: &str, run: &CodingAgentRunSnapshot) -> bool {
+        self.client_id == client_id
+            && self.run_id == run.run_id
+            && self.authority_fingerprint == run.authority_fingerprint
+            && self.runtime_project_id == run.runtime_project_id
+            && self.intent_fingerprint == run.intent_fingerprint
+            && self.provider_id == run.provider_id
+            && self.provider_instance_id == run.provider_instance_id
+            && self.replay_window == run.replay_window
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum RouteSlot {
+    Receipt(ArchiveRoute),
+    Claim(AdmissionClaim),
+}
+
+impl RouteSlot {
+    fn validate(&self, run_id: &str) -> Result<(), String> {
+        match self {
+            Self::Receipt(route) => route.validate(run_id),
+            Self::Claim(claim) => claim.validate(run_id),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ArchiveRoutes {
     root: PathBuf,
@@ -90,9 +170,45 @@ impl ArchiveRoutes {
         self.root.join(&key[..2]).join(format!("{key}.json"))
     }
 
-    pub(super) fn read(&self, run_id: &str) -> Result<Option<ArchiveRoute>, String> {
+    pub(super) fn lookup(&self, run_id: &str) -> Result<(Option<AdmissionClaim>, Option<ArchiveRoute>), String> {
         validate_run_id(run_id)?;
         let path = self.path(run_id);
+        let receipt_path = path.with_extension("receipt.json");
+        match self.read_slot(run_id, &path)? {
+            Some(RouteSlot::Claim(claim)) => {
+                let receipt = match self.read_slot(run_id, &receipt_path)? {
+                    Some(RouteSlot::Receipt(receipt))
+                        if receipt.client_id == claim.client_id
+                            && receipt.authority_fingerprint == claim.authority_fingerprint => Some(receipt),
+                    None => None,
+                    _ => return Err("ACP admission claim conflicts with terminal receipt".into()),
+                };
+                Ok((Some(claim), receipt))
+            }
+            Some(RouteSlot::Receipt(receipt)) => Ok((None, Some(receipt))),
+            None => {
+                if self.read_slot(run_id, &receipt_path)?.is_some() {
+                    return Err("ACP admission claim is missing for retained receipt".into());
+                }
+                Ok((None, None))
+            }
+        }
+    }
+
+    pub(super) fn read(&self, run_id: &str) -> Result<Option<ArchiveRoute>, String> {
+        self.lookup(run_id).map(|(_, receipt)| receipt)
+    }
+
+    pub(super) fn claim(&self, claim: &AdmissionClaim, allow_exact_retry: bool) -> Result<(), String> {
+        claim.validate(&claim.run_id)?;
+        let (existing, receipt) = self.lookup(&claim.run_id)?;
+        if receipt.is_some() || existing.as_ref().is_some_and(|existing| !allow_exact_retry || existing != claim) {
+            return Err("ACP Run is already bound to a different admission or terminal receipt; reconcile the original Run".into());
+        }
+        self.persist_slot(&claim.run_id, &self.path(&claim.run_id), &RouteSlot::Claim(claim.clone()), allow_exact_retry)
+    }
+
+    fn read_slot(&self, run_id: &str, path: &Path) -> Result<Option<RouteSlot>, String> {
         let shard = path.parent().ok_or("ACP archive route shard unavailable")?;
         let private_dir = self.root.parent().ok_or("ACP private state unavailable")?;
         if !real_directory_exists(private_dir)? {
@@ -101,7 +217,7 @@ impl ArchiveRoutes {
         if !private_directory_exists(&self.root)? || !private_directory_exists(shard)? {
             return Ok(None);
         }
-        let metadata = match fs::symlink_metadata(&path) {
+        let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err("ACP archive routing receipt metadata unavailable".into()),
@@ -121,8 +237,14 @@ impl ArchiveRoutes {
             }
         }
         #[cfg(windows)]
-        webcodex_environment::runtime_entry::validate_windows_env_acl(&path)?;
-        let file = File::open(&path).map_err(|_| "ACP archive routing receipt unavailable")?;
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err("ACP archive route is a reparse point".into());
+            }
+            webcodex_environment::runtime_entry::validate_windows_env_acl(path)?;
+        }
+        let file = File::open(path).map_err(|_| "ACP archive routing receipt unavailable")?;
         let mut bytes = Vec::new();
         file.take(MAX_RECEIPT_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -130,18 +252,36 @@ impl ArchiveRoutes {
         if bytes.len() as u64 > MAX_RECEIPT_BYTES {
             return Err("ACP archive routing receipt exceeds bound".into());
         }
-        let route: ArchiveRoute = serde_json::from_slice(&bytes)
+        let slot: RouteSlot = serde_json::from_slice(&bytes)
             .map_err(|_| "ACP archive routing receipt is malformed")?;
-        route.validate(run_id)?;
-        Ok(Some(route))
+        slot.validate(run_id)?;
+        Ok(Some(slot))
     }
 
-    pub(super) fn persist(&self, route: &ArchiveRoute) -> Result<(), String> {
+    pub(super) fn persist(&self, route: &ArchiveRoute, run: &CodingAgentRunSnapshot) -> Result<(), String> {
         route.validate(&route.run_id)?;
-        let path = self.path(&route.run_id);
+        if !route.matches(&route.client_id, run) || !run.state.terminal() {
+            return Err("ACP terminal receipt does not match the observed Run".into());
+        }
+        let (claim, receipt) = self.lookup(&route.run_id)?;
+        if receipt.as_ref().is_some_and(|existing| existing != route) {
+            return Err("ACP archive routing identity conflict".into());
+        }
+        let mut path = self.path(&route.run_id);
+        if let Some(claim) = claim {
+            if !claim.matches_snapshot(&route.client_id, run) {
+                return Err("ACP terminal receipt conflicts with admission claim".into());
+            }
+            path = path.with_extension("receipt.json");
+        }
+        self.persist_slot(&route.run_id, &path, &RouteSlot::Receipt(route.clone()), true)
+    }
+
+    fn persist_slot(&self, run_id: &str, path: &Path, slot: &RouteSlot, accept_existing: bool) -> Result<(), String> {
+        slot.validate(run_id)?;
         let shard = path.parent().ok_or("ACP archive route shard unavailable")?;
-        if let Some(existing) = self.read(&route.run_id)? {
-            if existing != *route {
+        if let Some(existing) = self.read_slot(run_id, path)? {
+            if !accept_existing || existing != *slot {
                 return Err("ACP archive routing identity conflict".into());
             }
             sync_dir(self.root.parent().ok_or("ACP private state unavailable")?)?;
@@ -150,11 +290,9 @@ impl ArchiveRoutes {
         }
         ensure_private_directory(&self.root)?;
         ensure_private_directory(shard)?;
-        // Publish the directory ancestry before publishing a receipt. The private
-        // state directory itself is owned/created by the Server.
         sync_dir(self.root.parent().ok_or("ACP private state unavailable")?)?;
         sync_dir(&self.root)?;
-        let bytes = serde_json::to_vec(route).map_err(|_| "ACP archive route encoding failed")?;
+        let bytes = serde_json::to_vec(slot).map_err(|_| "ACP archive route encoding failed")?;
         if bytes.len() as u64 > MAX_RECEIPT_BYTES {
             return Err("ACP archive routing receipt exceeds bound".into());
         }
@@ -176,10 +314,10 @@ impl ArchiveRoutes {
                 .and_then(|_| file.sync_all())
                 .map_err(|_| "ACP archive route write failed")?;
             drop(file);
-            // Immutable, non-replacing publication. Concurrent exact writes
-            // converge; a different receipt must never overwrite a fence.
-            if publish_new(&temp, &path).is_err() {
-                if self.read(&route.run_id)?.as_ref() != Some(route) {
+            // Claims and receipts are immutable. Concurrent exact writes
+            // converge; different identities cannot overwrite the fence.
+            if publish_new(&temp, path).is_err() {
+                if !accept_existing || self.read_slot(run_id, path)?.as_ref() != Some(slot) {
                     return Err("ACP archive route publication failed or conflicted".into());
                 }
             }

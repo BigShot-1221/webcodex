@@ -277,6 +277,7 @@ fn cleanup_expired_archives_acknowledged_expired_hot_terminal() {
     store.write(&durable_terminal_record(&expired)).unwrap();
     manager.inventory();
     assert!(manager.runs.lock().unwrap().contains_key(&expired.run_id));
+    manager.sync_hot_index_from_store_for_test();
     manager.cleanup_expired(&[
         webcodex_core::coding_agent::archive_identity_fingerprint(&recent),
         webcodex_core::coding_agent::archive_identity_fingerprint(&expired),
@@ -444,6 +445,7 @@ fn enforce_durable_capacity_archives_uncertain_without_losing_replay_identity() 
             .unwrap()
             .insert(run_id.clone(), Arc::new(RunEntry::new(lost)));
     }
+    manager.sync_hot_index_from_store_for_test();
     // Without exact durable Server acknowledgements no uncertain identity may leave inventory.
     assert!(manager
         .enforce_durable_capacity_for_admission(None, &[])
@@ -455,6 +457,7 @@ fn enforce_durable_capacity_archives_uncertain_without_losing_replay_identity() 
             webcodex_core::coding_agent::archive_identity_fingerprint(&run)
         })
         .collect::<Vec<_>>();
+    manager.sync_hot_index_from_store_for_test();
     manager
         .enforce_durable_capacity_for_admission(None, &acknowledgements)
         .unwrap();
@@ -693,6 +696,7 @@ fn enforce_durable_capacity_fails_closed_without_durable_receipts() {
             .unwrap()
             .insert(run_id.clone(), Arc::new(RunEntry::new(snapshot)));
     }
+    manager.sync_hot_index_from_store_for_test();
     let error = manager
         .enforce_durable_capacity_for_admission(Some("wc_agent_run_new_admission"), &[])
         .unwrap_err();

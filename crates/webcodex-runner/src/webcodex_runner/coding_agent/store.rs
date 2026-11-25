@@ -8,7 +8,7 @@ const STORE_ARCHIVE_MARKER: &str = "archive-required-v1";
 const STORE_ARCHIVE_MARKER_BYTES: &[u8] = b"webcodex-acp-archive-v1\n";
 const STORE_MAX_BYTES: usize = 64 * 1024;
 /// One recoverable overflow directory above the normal inventory bound.
-const STORE_MAX_RUN_DIR_SCAN: usize = CODING_AGENT_MAX_INVENTORY_RUNS + 1;
+pub(super) const STORE_MAX_RUN_DIR_SCAN: usize = CODING_AGENT_MAX_INVENTORY_RUNS + 1;
 // A separate, sharded replay ledger. The hot inventory limit is not a limit
 // on historical uncertain identities. Each record is size-bounded; lookup
 // never scans the archive. Storage failures, not an arbitrary count of

@@ -225,6 +225,7 @@ pub(crate) struct CodingAgentManager {
     max_concurrent_runs: usize,
     permission_timeout: Duration,
     store: DurableRunStore,
+    hot_index: HotInventoryIndex,
     admission: Mutex<()>,
     runs: Mutex<HashMap<String, Arc<RunEntry>>>,
     accepting: AtomicBool,
@@ -387,6 +388,7 @@ impl CodingAgentManager {
             max_concurrent_runs: config.max_concurrent_runs,
             permission_timeout: Duration::from_secs(config.permission_timeout_secs),
             store: DurableRunStore::new(DurableRunStore::default_root(client_id, server_url)?),
+            hot_index: HotInventoryIndex::new(),
             admission: Mutex::new(()),
             runs: Mutex::new(HashMap::new()),
             accepting: AtomicBool::new(true),
@@ -431,6 +433,7 @@ impl CodingAgentManager {
             max_concurrent_runs: config.max_concurrent_runs,
             permission_timeout: Duration::from_secs(config.permission_timeout_secs),
             store: DurableRunStore::new(root),
+            hot_index: HotInventoryIndex::new(),
             admission: Mutex::new(()),
             runs: Mutex::new(HashMap::new()),
             accepting: AtomicBool::new(true),
@@ -895,13 +898,7 @@ impl CodingAgentManager {
                 "reobserve",
             );
         }
-        let active = self
-            .runs
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|entry| !entry.snapshot().state.terminal())
-            .count();
+        let active = self.hot_index.active_live_count();
         if active >= self.max_concurrent_runs {
             return response_error(
                 CodingAgentDispatchState::NotStarted,
@@ -923,21 +920,23 @@ impl CodingAgentManager {
                 );
             }
         };
-        self.cleanup_expired(request.archive_acknowledged_runs.as_deref().unwrap_or_default());
-        if let Err(error) = self.enforce_durable_capacity_for_admission(
-            Some(&request.run_id),
-            request
-                .archive_acknowledged_runs
-                .as_deref()
-                .unwrap_or_default(),
-        ) {
-            return response_error(
-                CodingAgentDispatchState::NotStarted,
-                "coding_agent_retention_capacity_exhausted",
-                error,
-                "capacity",
-                "wait",
-            );
+        let archive_acknowledgements = request
+            .archive_acknowledged_runs
+            .as_deref()
+            .unwrap_or_default();
+        if self.hot_index.admission_pressure() {
+            if let Err(error) = self.coordinate_admission_pressure(
+                Some(&request.run_id),
+                archive_acknowledgements,
+            ) {
+                return response_error(
+                    CodingAgentDispatchState::NotStarted,
+                    "coding_agent_retention_capacity_exhausted",
+                    error,
+                    "capacity",
+                    "wait",
+                );
+            }
         }
 
         let timestamp = now();
@@ -963,19 +962,31 @@ impl CodingAgentManager {
         #[cfg(test)]
         self.initial_claim_writes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.hot_index.reserve_admission_placeholder(&request.run_id);
         if let Err(error) = self.store.write(&record) {
             // Admission has not launched the ACP turn yet. Remove any partial
             // directory/state residue so the documented retry_same response
             // cannot later be mistaken for a previously dispatched Run.
-            self.store.remove(&request.run_id);
-            return response_error(
-                CodingAgentDispatchState::NotStarted,
-                "coding_agent_admission_persist_failed",
-                error,
-                "io",
-                "retry_same",
-            );
+            let cleanup = self.store.remove_checked(&request.run_id);
+            return match cleanup {
+                Ok(()) => {
+                    self.hot_index.release_admission_placeholder(&request.run_id);
+                    response_error(
+                        CodingAgentDispatchState::NotStarted,
+                        "coding_agent_admission_persist_failed",
+                        error, "io", "retry_same",
+                    )
+                }
+                Err(cleanup) => response_error(
+                    CodingAgentDispatchState::NotStarted,
+                    "coding_agent_admission_persist_failed",
+                    format!("{error}; durable cleanup also failed: {cleanup}"),
+                    "io", "reconcile",
+                ),
+            };
         }
+        self.hot_index.on_record_written(&record, true);
+        self.hot_index.mark_active(&request.run_id);
         let entry = Arc::new(RunEntry::new(record.snapshot(0)));
         self.runs
             .lock()
@@ -1021,6 +1032,7 @@ impl CodingAgentManager {
 }
 
 mod diagnose;
+mod index;
 mod lifecycle;
 mod permission;
 mod protocol;
@@ -1031,6 +1043,7 @@ mod store;
 use permission::permission_outcome_for_acp;
 use permission::{permission_result_json, PermissionSlot};
 
+use index::HotInventoryIndex;
 use store::{DurableDispatchPhase, DurableRunRecord, DurableRunStore, STORE_SCHEMA_VERSION};
 
 use lifecycle::select_bounded_inventory_runs;

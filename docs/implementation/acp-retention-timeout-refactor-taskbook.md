@@ -191,4 +191,3 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 - 实际修正 `src/tool_runtime/coding_agent.rs`：删除第四批改用注册库存分页后无消费者的 `by_client_receipt` 和候选/pressure 方法，Server 仅索引允许容量淘汰的普通终态；期限淘汰及容量淘汰均排除尚待提取 terminal lifecycle evidence 的 binding，attach/merge/take 更新同一索引、统一 index→runs 锁序。沿用现有 recorder 的一次提取/尝试语义，不声称 Workflow Session 持久化成功已得到额外确认。受保护/未获回执缓存仍保守驻留，不能承诺全部 Server 缓存有硬上限。
 - `src/tool_runtime/coding_agent_retention_maintenance.rs` 复用第五批 deadline-aware enqueue，防止等待 Registry 锁后派发过期维护；保留单 owner 关停 join 和在途耐久操作语义。`docs/agent/acp-coding-agent-run.md` 更新冷热保留、版本 key、能力协商、claim/sidecar 备份、请求超时和诊断说明，明确没有最终冷退休。
 - 七批交付为源码与静态复查，本轮没有运行测试、cargo check、编译、benchmark、安装、实际用户数据维护或远程 Git。历史任务记录保留在本文件，不再当作当前源码状态。仍需后续建立可证明的双端持久过期水位和降级拒绝契约，方可安全实现普通冷记录最终物理退休；异常/legacy/固定 key 无证据不删。未验证编译、断电/时钟回拨/磁盘故障、混合版本与并发实际运行、启动及内存/磁盘性能。后续运行验收须独立授权。
-

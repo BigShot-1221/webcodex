@@ -1,6 +1,6 @@
 # WebCodex ACP 生命周期、轻量归档与超时优化任务书
 
-> 建立：2026-11-25。状态：第一、二批已提交（静态交付、未运行验收）；第三批准入与索引源码完成静态复查，待本批独立提交；第四至七批待实施。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
+> 建立：2026-11-25。状态：第一、二批已提交（静态交付、未运行验收）；第三批 commit `8d0aec95a6480d3d7eeb0faaefd3b1ca8c924e19`（准入与索引，已提交）；第四批有界热维护源码已静态复查，冷退休按安全门槛保留，待本批独立提交；第五至七批待实施。本文件为个人二创版后续会话接续及七批任务验收入口，不是运行验收报告。
 
 ## 1. 范围、事实来源及目标
 
@@ -73,7 +73,7 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 | 1 官方兼容性与架构边界 | 核对最新双方源码、当前实现和消费者；列出归档/回执/重放/恢复不变量、启动链路和预算传递；定义分阶段观测指标、拟议模块边界及 D1-D5 决策，建立可比较基线 | 记录双方版本、证据与差异、已确认 D1-D5；架构契约已写入 4.1，静态完成（设计交付，无源码改动） |
 | 2 轻量化归档 | 在已确认契约内精简字段与存储职责，精确查询、冷热隔离，兼容旧格式和配套回执；清理重复实现 | 共享 replay/冷热契约与 v2 准入已实现；静态复查完成、无运行验收（见 §8 第二批记录） |
 | 3 准入与索引优化 | 定向重构 Server 启动前批量归档确认、Runner admission 及 capacity scan；增量索引、精确查找，缩小锁范围；保留原子预约/耐久声明/并发 fencing | 正常 start 全量扫描 0、无逐历史记录 RPC/持久化；新派发同 key 的耐久归属 fence、增量索引、压力反馈/分页及恢复路径已静态复查；运行验收待授权 |
-| 4 独立自动清理 | 按已确认保留策略实现生命周期所有者、分批维护、增量游标、压力有界回收、取消/关闭排空、失败诊断 | 运行中及未核对不确定 Run 不误删；故障/崩溃/部分清理可恢复；不阻塞普通准入；维护任务有界、无重复线程；待开始 |
+| 4 独立自动清理 | 按已确认保留策略实现生命周期所有者、分批维护、增量游标、压力有界回收、取消/关闭排空、失败诊断 | 15 分钟调度、64 条/2 秒协作预算、公平游标、capability 门控内部维护 RPC、关停停止派发并等待在途轮次；冷 replay 退休与水位推进仍 fail-closed；静态完成、运行验收待授权 |
 | 5 超时管理 | 复用 McpHostRuntimePolicy，贯穿剩余 request deadline，区分准入/ACP setup/Run 执行/观察/取消；检查各 adapter 与 Host 返回余量，保留 idempotent recovery | 单次观察等待不超过有效请求预算；无事件正常返回，外层 timeout 不自动取消 Run 或新 key 重派；准确区分 not_started/started/outcome_unknown；待开始 |
 | 6 诊断与恢复 | 增加必要阶段/耗时与结构化错误：准入、库存/回执、写入、spawn、initialize、session/new、prompt、首事件、terminal、Server 回传。安全有界采集错误类别；不直接持久化原始 stderr/Prompt/凭据；诊断与普通结果分离 | 能定位责任层而非笼统超时；无输出不等于失败；证据可关联同一 Run；不引入逐事件同步 I/O 或无限日志；待开始 |
 | 7 全链路复查与上游兼容 | 复查 Server/Runner/MCP/REST/CLI/Desktop/Workflow Session、协议、权限、取消、关停、Windows 文件与迁移路径；检查扩展边界、废弃代码/文档与具名消费者 | 静态审查完成、未验证项明确；获得独立授权后再做定向测试、基线复测、故障注入、编译/打包；待开始 |
@@ -159,4 +159,14 @@ Workflow Session 持久历史不适用此处 ACP 保留策略。
 - Runner `coding_agent.rs/index.rs/lifecycle.rs/store.rs`：先查已有 live/durable，活跃 ID、热库存占位/终态/receipt/期限增量更新；恢复 MAX+1 有界索引，不依赖无回执预清理；初始持久化失败且清理失败保留占位、返回 reconcile，不盲目释放；原子归档在 exact identity/terminal transition 栅栏后更新账本。常规准入没有全热历史扫描和逐历史回执写入。既有 fixture 同步索引，原断言保留；Server retention fixture 使用实际增量索引逻辑，不运行测试。
 - 静态证据：已复查 dispatch、reconcile、receipt、Registry 注册/精准查询、Runner recover/admission、terminal durable-before-live、archive_terminal、占位清理失败与压力候选。Git diff --check 无 whitespace error（存在 Windows LF/CRLF 提示）。本批仅静态交付，不声称编译或并发/磁盘/降级运行验证已完成。旧 Runner 缺新版耐久语义的不可观测 claim 保守拒绝；新 claim/receipt 的后续普通过期退休必须遵循第四批 D1-D5、安全水位与降级栅栏，尚无实际数据删除。
 - 第四批入口：建立独立生命周期维护、稳定有界游标与回执传递，证明安全退休策略；无安全证据的 legacy/uncertain 及不可判定 claim 保留。
+
+### 2026-11-25 第四批静态交付（复查修订）
+
+- 第三批已独立提交 `8d0aec95a6480d3d7eeb0faaefd3b1ca8c924e19`。原第四批 CLI Job `wc_job_wwyvCd4BRIhhYe6Z` 已终态、exit 0；指定 Composer 2.5，实际模型未独立证实。GPT 原生复查发现并修复初稿的未确认回执排除、全量扫描、每 Runner 重新计时、try_lock 未持有、move 后引用、Rust 可见性和 shutdown detach 风险。
+- 内部 `RetentionMaintenance` typed 请求/响应及新增 capability，仅由 Server 自身通过确切注册 Runner/provider fence 派发；旧 Runner 不接收。维护者在恢复提交屏障之后启动、每 15min 一轮、单一 JoinHandle，关闭后等待在途本地操作而非 detach；不启动 ACP。
+- 全局每轮只选择一个在线 Runner，按 client_id 游标轮换；复用 Registry 64 条滚动回执分页及第三批持久化确认，不扫描整个历史或复制第二份库存。不在 Server index/runs 锁内执行磁盘 I/O；未观察的终态也从 Runner 权威注册获得回执。确认后更新缓存索引；普通过期缓存按精确 key 剔除，保留待记录的 lifecycle evidence。
+- 2 秒为协作工作预算，Server 启动记录 I/O 前检查单调 deadline，将剩余毫秒传给 Runner；传输/排队观察另计，不承诺硬 I/O 超时。Runner 从精确 receipt index 选择候选，逐记录 try_lock（忙跳过）、检查接受状态、热到期、live/durable 一致并原子归档；每轮最多 64 个 identity。
+- **D3 安全门槛**：冷记录和 Server 主槽/回执仍保留。旧 Server 可能不能识别版本 key，单一 wall-clock 不能证明时钟回拨时安全；初稿未接入任何有效水位，故删除空壳而不是虚报冷退休。遵循 §4.1 “若不能证明安全，暂保留记录”；无用户数据删除或迁移，冷记录的最终物理退休仍未交付。旧格式读取、异常/固定 key 防重不变。
+- 实际修改：core coding_agent.rs/retention.rs/runner_protocol.rs、runner-config lib.rs、registry requests.rs/runners.rs、Runner coding_agent.rs/lifecycle.rs/transport/registration.rs、Server coding_agent.rs/new coding_agent_retention_maintenance.rs/mod.rs/lib.rs、本任务书。原草稿对 store/index/archive 的无效变更已移除，保留第三批实际内容。
+- 静态复查跨层请求、响应、能力、注册、精确路由、持久回执及生命周期关闭；Git diff --check（仅任务范围）通过，Windows LF/CRLF 提示不影响结果。未执行 cargo check/测试/编译/benchmark/实际维护。多 Runner 公平性、磁盘失败、时钟回拨和混合版本仍需独立运行验证。第五批入口为 Host request deadline，不改变 ACP 执行时限。
 

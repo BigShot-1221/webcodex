@@ -1984,18 +1984,32 @@ impl ToolRuntime {
         client: &crate::runner_protocol::RunnerView,
         auth: Option<&AuthContext>,
     ) -> Option<Vec<String>> {
+        self.archive_acknowledgements_bounded_until(
+            client, auth, std::time::Instant::now() + Duration::from_secs(2), false,
+        ).await
+    }
+
+    pub(super) async fn archive_acknowledgements_bounded_until(
+        &self,
+        client: &crate::runner_protocol::RunnerView,
+        auth: Option<&AuthContext>,
+        deadline: std::time::Instant,
+        maintenance: bool,
+    ) -> Option<Vec<String>> {
         let routes = self.coding_agent_runs.archive_routes.clone()?;
         let access = crate::runner_http::runner_access_from_auth(auth);
+        if std::time::Instant::now() >= deadline { return Some(Vec::new()); }
         let inventory = self.runner_registry.coding_agent_archive_inventory_for_runner(
             access.as_ref(), &client.client_id, &client.runner_instance_id,
             ADMISSION_ARCHIVE_RECEIPT_BUDGET,
         ).await.ok()?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let now = Utc::now().timestamp();
         let mut receipts = Vec::new();
         {
             let bindings = self.coding_agent_runs.runs.lock().await;
             for run in inventory.into_iter().filter(|run| {
-                run.state.terminal() && (client.capabilities.coding_agent_replay_expiry
+                (!maintenance || hot_inventory_expired(run, now))
+                    && run.state.terminal() && (client.capabilities.coding_agent_replay_expiry
                     || !coding_agent_run_retention_evictable(run))
             }).take(ADMISSION_ARCHIVE_RECEIPT_BUDGET) {
                 if std::time::Instant::now() >= deadline { break; }
@@ -2042,6 +2056,17 @@ impl ToolRuntime {
                 if route.matches(&binding.client_id, &binding.snapshot) {
                     binding.retention_route_confirmed = true;
                     index.note_binding(binding);
+                }
+            }
+        }
+        if maintenance {
+            // The receipt and exact terminal snapshot were published before
+            // hot eviction; retain pending lifecycle-recorder evidence.
+            for route in &confirmed_routes {
+                if bindings.get(&route.run_id).is_some_and(|binding|
+                    binding.recording_session_id.is_none() || binding.recorded_lifecycle_mask & 4 != 0)
+                {
+                    index.prune_expired_for_run(&mut bindings, &route.run_id, now);
                 }
             }
         }

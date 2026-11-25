@@ -2257,6 +2257,10 @@ impl RunnerRegistry {
         auth: Option<&crate::RunnerAccess>,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<CodingAgentResponse>), String> {
+        let retention_maintenance = matches!(&operation, CodingAgentRequest::RetentionMaintenance(_));
+        if retention_maintenance && (auth.is_some() || requested_by != "auth_server_acp_retention") {
+            return Err("ACP retention maintenance is internal only".into());
+        }
         validate_coding_agent_request(&operation)
             .map_err(|error| format!("invalid CodingAgentRun request: {error}"))?;
         if let Some((provider_id, provider_instance_id)) = operation.provider_binding() {
@@ -2289,6 +2293,13 @@ impl RunnerRegistry {
             .supports(RunnerFeature::CodingAgentRuns)
         {
             return Err("exact Runner does not support CodingAgentRun".to_string());
+        }
+        if retention_maintenance
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::CodingAgentRetentionMaintenance)
+        {
+            return Err("exact Runner does not support ACP retention maintenance".to_string());
         }
         if runner.runner_instance_id != expected_runner_instance_id {
             return Err("stale Runner identity; CodingAgentRun was not dispatched".to_string());

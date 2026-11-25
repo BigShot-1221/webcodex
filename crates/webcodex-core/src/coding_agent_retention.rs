@@ -9,6 +9,9 @@ pub const REPLAY_WINDOW_SECS: i64 = 24 * 60 * 60;
 pub const SUCCESS_HOT_RETENTION_SECS: i64 = 15 * 60;
 pub const FAILURE_HOT_RETENTION_SECS: i64 = 24 * 60 * 60;
 pub const ORDINARY_REPLAY_RETENTION_SECS: i64 = 24 * 60 * 60;
+pub const RETENTION_MAINTENANCE_INTERVAL_SECS: u64 = 15 * 60;
+pub const RETENTION_MAINTENANCE_ROUND_LIMIT: usize = 64;
+pub const RETENTION_MAINTENANCE_COOPERATIVE_SECS: u64 = 2;
 
 /// A single immutable, versioned key timestamp. The original key remains part
 /// of the deterministic Run identity, not a separately mutable expiry input.

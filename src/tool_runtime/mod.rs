@@ -26,6 +26,7 @@ mod closeout_evidence;
 mod closeout_facts;
 mod closeout_projection;
 mod coding_agent;
+pub(crate) mod coding_agent_retention_maintenance;
 mod coding_task;
 mod coding_task_tools;
 mod communication;

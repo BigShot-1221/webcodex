@@ -1169,6 +1169,12 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub coding_agent_replay_expiry: bool = false;
     }
+    /// Bounded internal hot-inventory retention maintenance without ACP launch.
+    CodingAgentRetentionMaintenance => RUNNER_CAPABILITY_CODING_AGENT_RETENTION_MAINTENANCE("coding_agent_retention_maintenance"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub coding_agent_retention_maintenance: bool = false;
+    }
     /// Runner-owned native Tool Plugin gateway and explicit dynamic reload support.
     /// Missing on older Runners is false and is never inferred from MCP inventory.
     NativeToolPlugins => RUNNER_CAPABILITY_NATIVE_TOOL_PLUGINS("native_tool_plugins"),
@@ -3067,6 +3073,7 @@ mod envelope_tests {
                 coding_agent_runs: false,
                 coding_agent_archive_lookup: false,
                 coding_agent_replay_expiry: false,
+                coding_agent_retention_maintenance: false,
                 native_tool_plugins: false,
                 mcp_gateway_resource_links: false,
                 managed_ssh_resources: false,

@@ -489,6 +489,12 @@ impl RunnerRegistry {
             inner.runners.get(&client_id),
             &runner_instance_id,
             &runner_features,
+            RunnerFeature::CodingAgentRetentionMaintenance,
+        )?;
+        reject_same_instance_feature_downgrade(
+            inner.runners.get(&client_id),
+            &runner_instance_id,
+            &runner_features,
             RunnerFeature::StructuredCargoTestExecutionPolicy,
         )?;
         reject_same_instance_feature_downgrade(
@@ -1714,6 +1720,25 @@ impl RunnerRegistry {
     /// Internal bounded inventory of one exact Runner registration. The caller
     /// persists only protected terminal routing identities, never exposes this
     /// inventory as a model-facing cross-Project listing.
+    /// Connected Runners that advertise internal ACP retention maintenance.
+    pub async fn coding_agent_retention_maintenance_target(
+        &self, after: Option<&str>,
+    ) -> Option<(RunnerView, webcodex_core::coding_agent::CodingAgentProvider)> {
+        let mut inner = self.inner.lock().await;
+        let now = now_ts();
+        self.prune_expired_shared_key_runners_locked(&mut inner, now);
+        let (client_id, runner) = inner.runners.iter()
+            .filter(|(_, runner)| now.saturating_sub(runner.last_seen) <= super::RUNNER_ONLINE_WINDOW_SECS
+                && runner.runner_features.supports(RunnerFeature::CodingAgentRetentionMaintenance)
+                && !runner.coding_agent_providers.is_empty())
+            .min_by(|(left, _), (right, _)| {
+                let left_wrapped = after.is_some_and(|after| left.as_str() <= after);
+                let right_wrapped = after.is_some_and(|after| right.as_str() <= after);
+                left_wrapped.cmp(&right_wrapped).then_with(|| left.cmp(right))
+            })?;
+        Some((Self::runner_view_locked(&inner, client_id)?, runner.coding_agent_providers.first()?.clone()))
+    }
+
     pub async fn coding_agent_archive_inventory_for_runner(
         &self,
         auth: Option<&crate::RunnerAccess>,

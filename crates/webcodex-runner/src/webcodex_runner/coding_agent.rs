@@ -678,6 +678,33 @@ impl CodingAgentManager {
                     },
                 }
             }
+            CodingAgentRequest::RetentionMaintenance(request) => {
+                if !self.accepting.load(Ordering::Acquire) {
+                    return response_error(
+                        CodingAgentDispatchState::NotStarted,
+                        "coding_agent_stopping",
+                        "Runner is stopping",
+                        "unavailable",
+                        "wait",
+                    );
+                }
+                if !self.providers.get(&request.provider_id)
+                    .is_some_and(|provider| provider.instance_id == request.provider_instance_id)
+                {
+                    return response_error(CodingAgentDispatchState::NotStarted,
+                        "stale_coding_agent_provider", "ACP provider instance was replaced",
+                        "stale_state", "reobserve");
+                }
+                let (archived_hot_count, skipped) = self.retention_maintenance_round(&request);
+                CodingAgentResponse {
+                    dispatch_state: CodingAgentDispatchState::Completed,
+                    payload: Some(CodingAgentResponsePayload::RetentionMaintenance {
+                        archived_hot_count,
+                        skipped_admission_busy: skipped,
+                    }),
+                    error: None,
+                }
+            }
             CodingAgentRequest::RespondPermission(request) => {
                 let entry = self.runs.lock().unwrap().get(&request.run_id).cloned();
                 match entry {

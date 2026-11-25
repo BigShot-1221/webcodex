@@ -399,6 +399,20 @@ pub struct CodingAgentDiagnoseRequest {
     pub include_live_acp: bool,
 }
 
+/// Internal bounded hot-inventory maintenance for one exact Runner/provider.
+/// Not a model tool; never launches ACP setup or prompt dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentRetentionMaintenanceRequest {
+    pub run_id: String,
+    pub provider_id: String,
+    pub provider_instance_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_acknowledged_runs: Vec<String>,
+    /// Remaining cooperative record-work budget after Server receipt publication.
+    pub work_budget_ms: u64,
+}
+
 /// How far a live ACP diagnostic reached before it stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -514,6 +528,7 @@ pub enum CodingAgentRequest {
     Cancel(CodingAgentCancelRequest),
     RespondPermission(CodingAgentRespondPermissionRequest),
     Diagnose(CodingAgentDiagnoseRequest),
+    RetentionMaintenance(CodingAgentRetentionMaintenanceRequest),
 }
 
 impl CodingAgentRequest {
@@ -524,6 +539,7 @@ impl CodingAgentRequest {
             Self::Cancel(request) => &request.run_id,
             Self::RespondPermission(request) => &request.run_id,
             Self::Diagnose(request) => &request.run_id,
+            Self::RetentionMaintenance(request) => &request.run_id,
         }
     }
 
@@ -531,6 +547,9 @@ impl CodingAgentRequest {
         match self {
             Self::Start(request) => Some((&request.provider_id, &request.provider_instance_id)),
             Self::Diagnose(request) => Some((&request.provider_id, &request.provider_instance_id)),
+            Self::RetentionMaintenance(request) => {
+                Some((&request.provider_id, &request.provider_instance_id))
+            }
             Self::Observe(_) | Self::Cancel(_) | Self::RespondPermission(_) => None,
         }
     }
@@ -573,6 +592,11 @@ pub enum CodingAgentResponsePayload {
         config_policy: CodingAgentConfigPolicyProjection,
         /// Present only when the request explicitly authorized the live probe.
         live_acp: Option<CodingAgentLiveAcpDiagnostic>,
+    },
+    RetentionMaintenance {
+        archived_hot_count: u32,
+        skipped_admission_busy: bool,
+
     },
 }
 
@@ -763,6 +787,27 @@ pub fn validate_request(request: &CodingAgentRequest) -> Result<(), String> {
                 return Err("diagnostic project_root is invalid".into());
             }
         }
+        CodingAgentRequest::RetentionMaintenance(request) => {
+            validate_provider_id(&request.provider_id)?;
+            validate_provider_instance_id(&request.provider_instance_id)?;
+            if request.archive_acknowledged_runs.len() > retention::RETENTION_MAINTENANCE_ROUND_LIMIT {
+                return Err("too many ACP archive acknowledgements".to_string());
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for identity in &request.archive_acknowledged_runs {
+                if identity.len() != 64
+                    || !identity
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || !seen.insert(identity)
+                {
+                    return Err("invalid ACP archive acknowledgement identity".to_string());
+                }
+            }
+            if request.work_budget_ms == 0 || request.work_budget_ms > retention::RETENTION_MAINTENANCE_COOPERATIVE_SECS * 1000 {
+                return Err("invalid ACP retention maintenance work budget".into());
+            }
+        }
     }
     Ok(())
 }
@@ -821,6 +866,16 @@ pub fn validate_response_for_request(
                 }
                 validate_live_acp_diagnostic(live)?;
             }
+        }
+        return Ok(());
+    }
+    if let (
+        CodingAgentRequest::RetentionMaintenance(request),
+        CodingAgentResponsePayload::RetentionMaintenance { archived_hot_count, .. },
+    ) = (request, payload)
+    {
+        if *archived_hot_count as usize > request.archive_acknowledged_runs.len() {
+            return Err("ACP retention maintenance counts exceed acknowledged identities".into());
         }
         return Ok(());
     }

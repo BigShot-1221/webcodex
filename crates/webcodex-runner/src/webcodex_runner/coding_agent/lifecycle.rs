@@ -8,6 +8,7 @@ use super::*;
 use webcodex_core::coding_agent::retention::{
     hot_inventory_expired, is_ordinary_terminal,
 };
+use webcodex_core::coding_agent::CodingAgentRetentionMaintenanceRequest;
 
 pub(super) fn coding_agent_run_retention_evictable(snapshot: &CodingAgentRunSnapshot) -> bool {
     is_ordinary_terminal(snapshot)
@@ -191,6 +192,31 @@ impl CodingAgentManager {
 
     pub(super) fn cleanup_expired(&self, archive_acknowledgements: &[String]) {
         self.cleanup_expired_indexed(archive_acknowledgements);
+    }
+
+    pub(super) fn retention_maintenance_round(
+        &self,
+        request: &CodingAgentRetentionMaintenanceRequest,
+    ) -> (u32, bool) {
+        let deadline = Instant::now() + Duration::from_millis(request.work_budget_ms);
+        let mut archived = 0;
+        for record in self.hot_index.acknowledged_candidates(None, &request.archive_acknowledged_runs) {
+            if Instant::now() >= deadline || !self.accepting.load(Ordering::Acquire) { break; }
+            // Acquire only for one record. Never wait behind a concurrent Start.
+            let Ok(_admission) = self.admission.try_lock() else {
+                return (archived, true);
+            };
+            if !self.accepting.load(Ordering::Acquire) { break; }
+            if !hot_inventory_expired(&record.snapshot(0), now()) { continue; }
+            match self.try_evict_retained_durable_run(&record.run_id, &record) {
+                Ok(true) => archived += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(run_id = %record.run_id, %error, "ACP hot archival incomplete"),
+            }
+        }
+        // Cold retirement remains prohibited until downgrade and clock-waterline
+        // protection can be proved for every supported consumer.
+        (archived, false)
     }
 
     fn cleanup_expired_stale_candidates(&self, timestamp: i64, stale_candidate_run_ids: Vec<String>, archive_acknowledgements: &[String]) {

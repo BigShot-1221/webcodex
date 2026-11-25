@@ -456,6 +456,11 @@ explicitly allow remote shared-key auth."
     if let Some(pending) = pending_restore.as_mut() {
         pending.commit_after_session_database(db.as_ref())?;
     }
+    let acp_retention_maintenance =
+        tool_runtime::coding_agent_retention_maintenance::spawn_coding_agent_retention_maintenance(
+            tool_runtime.clone(),
+            shutdown_coordinator.background_services_stop_receiver(),
+        );
     tracing::info!(
         project_scoped = project_auth.is_configured(),
         "Adaptive Runtime enabled"
@@ -1002,6 +1007,10 @@ explicitly allow remote shared-key auth."
             }
         }
     }
+    acp_retention_maintenance.request_shutdown();
+    acp_retention_maintenance
+        .shutdown_and_wait_in_flight()
+        .await;
     if let Err(error) = backup_maintenance.request_shutdown() {
         tracing::warn!(
             error = %error,

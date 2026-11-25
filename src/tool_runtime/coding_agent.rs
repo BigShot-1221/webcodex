@@ -307,6 +307,29 @@ impl CodingAgentStartFailure {
     }
 }
 
+fn trace_acp_server_stage(run_id: &str, stage: &'static str, started: RequestInstant, outcome: &'static str) {
+    tracing::debug!(target: "webcodex::acp_timing", layer = "server", run_id, stage,
+        elapsed_ms = started.elapsed().as_millis() as u64, outcome, "ACP stage finished");
+}
+
+async fn wait_acp_response(
+    run_id: &str,
+    stage: &'static str,
+    deadline: RequestInstant,
+    receiver: tokio::sync::oneshot::Receiver<CodingAgentResponse>,
+) -> Result<Result<CodingAgentResponse, tokio::sync::oneshot::error::RecvError>, tokio::time::error::Elapsed> {
+    let started = RequestInstant::now();
+    let result = tokio::time::timeout_at(deadline, receiver).await;
+    let outcome = match &result {
+        Ok(Ok(response)) if response.error.is_some() => "runner_error_response",
+        Ok(Ok(_)) => "response_received",
+        Ok(Err(_)) => "channel_closed",
+        Err(_) => "request_deadline",
+    };
+    trace_acp_server_stage(run_id, stage, started, outcome);
+    result
+}
+
 fn coding_agent_budget_failure(run_id: &str) -> CodingAgentStartFailure {
     CodingAgentStartFailure {
         kind: "coding_agent_request_budget_exhausted".into(),
@@ -800,6 +823,7 @@ impl ToolRuntime {
         timeout_secs: Option<u64>,
         auth: Option<&AuthContext>,
     ) -> Result<CodingAgentPreparedStart, ToolResult> {
+        let prepare_started = RequestInstant::now();
         let request_deadline = self.coding_agent_request_deadline(START_RESPONSE_WAIT_SECS, false);
         if let Err(error) = validate_start_input(
             &provider_id,
@@ -912,6 +936,7 @@ impl ToolRuntime {
             &config,
             timeout_secs,
         );
+        trace_acp_server_stage(&run_id, "prepare", prepare_started, "prepared");
         Ok(CodingAgentPreparedStart {
             run_id,
             authority_fingerprint,
@@ -936,10 +961,12 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> CodingAgentTypedStartOutcome {
         let deadline = prepared.request_deadline;
-        let existing = match self
+        let lookup_started = RequestInstant::now();
+        let existing_result = self
             .reconcile_run_with_claim(&prepared.run_id, &prepared.authority_fingerprint, auth, true, deadline)
-            .await
-        {
+            .await;
+        trace_acp_server_stage(&prepared.run_id, "reconcile", lookup_started, if existing_result.is_ok() { "resolved" } else { "unavailable" });
+        let existing = match existing_result {
             Ok(existing) => existing,
             Err(message) => {
                 return CodingAgentTypedStartOutcome::Failure(CodingAgentStartFailure {
@@ -973,7 +1000,10 @@ impl ToolRuntime {
             return CodingAgentTypedStartOutcome::Run(existing.snapshot);
         }
 
-        let archive_acknowledged_runs = match tokio::time::timeout_at(deadline, self.archive_acknowledgements_for_start(&prepared.client, auth, deadline)).await {
+        let receipts_started = RequestInstant::now();
+        let receipt_result = tokio::time::timeout_at(deadline, self.archive_acknowledgements_for_start(&prepared.client, auth, deadline)).await;
+        trace_acp_server_stage(&prepared.run_id, "archive_receipts", receipts_started, if receipt_result.is_ok() { "returned" } else { "request_deadline" });
+        let archive_acknowledged_runs = match receipt_result {
             Ok(value) => value,
             Err(_) => return CodingAgentTypedStartOutcome::Failure(coding_agent_budget_failure(&prepared.run_id)),
         };
@@ -988,8 +1018,14 @@ impl ToolRuntime {
         // This immutable owner/intent fence must be durable before transport
         // dispatch. It closes the gap between Runner admission and inventory
         // registration, including Server restart and cross-Runner retries.
+        tracing::debug!(target: "webcodex::acp_timing", layer = "server", run_id = %prepared.run_id,
+            receipt_count = archive_acknowledged_runs.as_ref().map_or(0, Vec::len), "ACP admission receipt count");
+        let claim_started = RequestInstant::now();
         let claim_result = tokio::time::timeout_at(deadline, self.coding_agent_runs
             .reserve_admission(AdmissionClaim::from_prepared(&prepared), prepared.client.capabilities.coding_agent_replay_expiry)).await;
+        trace_acp_server_stage(&prepared.run_id, "durable_claim", claim_started, match &claim_result {
+            Ok(Ok(())) => "persisted", Ok(Err(_)) => "rejected", Err(_) => "request_deadline",
+        });
         let claim_result = match claim_result {
             Ok(result) => result,
             Err(_) => return CodingAgentTypedStartOutcome::Failure(coding_agent_budget_failure(&prepared.run_id)),
@@ -1022,7 +1058,8 @@ impl ToolRuntime {
             replay_window: prepared.replay_window,
             archive_acknowledged_runs,
         });
-        let (request_id, receiver) = match self
+        let enqueue_started = RequestInstant::now();
+        let enqueue_result = self
             .runner_registry
             .enqueue_coding_agent_until(
                 Some(deadline),
@@ -1034,8 +1071,9 @@ impl ToolRuntime {
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
                 prepared.authority_fingerprint.clone(),
             )
-            .await
-        {
+            .await;
+        trace_acp_server_stage(&prepared.run_id, "enqueue", enqueue_started, if enqueue_result.is_ok() { "queued" } else { "rejected" });
+        let (request_id, receiver) = match enqueue_result {
             Ok(value) => value,
             Err(error) => {
                 return CodingAgentTypedStartOutcome::Failure(CodingAgentStartFailure {
@@ -1048,7 +1086,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout_at(deadline, receiver)
+            match wait_acp_response(&prepared.run_id, "start_response", deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1303,7 +1341,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout_at(deadline, receiver)
+            match wait_acp_response(&run_id, "observe_response", deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1492,7 +1530,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout_at(deadline, receiver)
+            match wait_acp_response(&run_id, "permission_response", deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1618,7 +1656,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout_at(deadline, receiver)
+            match wait_acp_response(&run_id, "cancel_response", deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -1906,7 +1944,7 @@ impl ToolRuntime {
             }
         };
         let response =
-            match tokio::time::timeout_at(deadline, receiver)
+            match wait_acp_response(run_id, "diagnose_response", deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,
@@ -2042,10 +2080,12 @@ impl ToolRuntime {
         let routes = self.coding_agent_runs.archive_routes.clone()?;
         let access = crate::runner_http::runner_access_from_auth(auth);
         if std::time::Instant::now() >= deadline { return Some(Vec::new()); }
+        let page_started = RequestInstant::now();
         let inventory = self.runner_registry.coding_agent_archive_inventory_for_runner(
             access.as_ref(), &client.client_id, &client.runner_instance_id,
             ADMISSION_ARCHIVE_RECEIPT_BUDGET,
         ).await.ok()?;
+        let inventory_count = inventory.len();
         let now = Utc::now().timestamp();
         let mut receipts = Vec::new();
         {
@@ -2069,6 +2109,7 @@ impl ToolRuntime {
                 receipts.push((route, run, confirmed));
             }
         }
+        let receipt_candidates = receipts.len();
         let confirmed_routes = tokio::task::spawn_blocking(move || {
             let mut acknowledged = Vec::new();
             for (route, run, confirmed) in receipts {
@@ -2092,6 +2133,9 @@ impl ToolRuntime {
             }
             acknowledged
         }).await.ok()?;
+        tracing::debug!(target: "webcodex::acp_timing", layer = "server", stage = "receipt_page", maintenance,
+            inventory_count, receipt_candidates, confirmed_count = confirmed_routes.len(),
+            elapsed_ms = page_started.elapsed().as_millis() as u64, "ACP bounded receipt page");
         let mut index = self.coding_agent_runs.retention_index.lock().await;
         let mut bindings = self.coding_agent_runs.runs.lock().await;
         for route in &confirmed_routes {
@@ -2158,7 +2202,7 @@ impl ToolRuntime {
             )
             .await?;
         let response =
-            match tokio::time::timeout_at(deadline, receiver)
+            match wait_acp_response(&route.run_id, "archived_observe_response", deadline, receiver)
                 .await
             {
                 Ok(Ok(response)) => response,

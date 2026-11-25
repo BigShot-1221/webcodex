@@ -500,6 +500,7 @@ impl CodingAgentManager {
             self.terminate_run_io(child, outbound);
             return None;
         }
+        let initialize_timing = AcpStageTiming::new(&request.run_id, "initialize");
         let initialize_id = next_id;
         next_id += 1;
         if !self.write_pre_prompt_frame(
@@ -569,6 +570,8 @@ impl CodingAgentManager {
             return None;
         }
 
+        initialize_timing.complete();
+        let session_new_timing = AcpStageTiming::new(&request.run_id, "session_new");
         let new_id = next_id;
         next_id += 1;
         if !self.write_pre_prompt_frame(
@@ -634,6 +637,8 @@ impl CodingAgentManager {
                 return None;
             }
         };
+        session_new_timing.complete();
+        let config_timing = AcpStageTiming::new(&request.run_id, "config_negotiation");
         let session_id = new_session.session_id.to_string();
         let mut advertised = new_session.config_options.unwrap_or_default();
 
@@ -800,6 +805,7 @@ impl CodingAgentManager {
             &self.forced_config,
             &request.config,
         );
+        config_timing.complete();
         Some((session_id, next_id, live_confirmed))
     }
 }

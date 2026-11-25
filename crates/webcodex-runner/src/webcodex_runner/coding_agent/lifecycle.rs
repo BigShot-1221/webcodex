@@ -113,7 +113,11 @@ impl CodingAgentManager {
     }
 
     pub(super) fn recover(&self) -> Result<(), String> {
+        let recover_started = Instant::now();
         let mut listing = self.store.list_records_for_retention()?;
+        tracing::debug!(target: "webcodex::acp_timing", layer = "runner", stage = "recovery_scan",
+            entry_count = listing.entry_count, elapsed_ms = recover_started.elapsed().as_millis() as u64,
+            "ACP bounded hot recovery scan");
         if listing.entry_count > STORE_MAX_RUN_DIR_SCAN {
             return Err("ACP Run durable state exceeds bounded record count".to_string());
         }
@@ -481,8 +485,14 @@ impl CodingAgentManager {
         candidate.execution_state = desired_execution_state;
         candidate.updated_at = desired_terminal.completed_at;
         candidate.terminal = Some(desired_terminal);
+        let terminal_started = Instant::now();
         let durable = durable_record_from_snapshot(run_id, &candidate, DurableDispatchPhase::Terminal)
             .and_then(|record| self.store.write(&record).map(|()| record));
+        tracing::debug!(target: "webcodex::acp_timing", layer = "runner", run_id, stage = "terminal_commit",
+            elapsed_ms = terminal_started.elapsed().as_millis() as u64, durable = durable.is_ok(),
+            state = ?candidate.state, execution_state = ?candidate.execution_state,
+            error_code = ?candidate.terminal.as_ref().and_then(|terminal| terminal.error_code.as_deref()),
+            "ACP terminal durable transition");
         match durable {
             Ok(record) => {
                 self.hot_index.on_record_written(&record, false);

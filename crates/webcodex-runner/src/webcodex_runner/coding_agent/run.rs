@@ -102,6 +102,8 @@ impl CodingAgentManager {
         environment: Vec<(String, std::ffi::OsString)>,
         entry: Arc<RunEntry>,
     ) {
+        // Lifetime scope ends on every exit; terminal result is logged separately.
+        let _run_timing = AcpStageTiming::new(&request.run_id, "worker_lifetime");
         let run_deadline = Instant::now() + Duration::from_secs(request.timeout_secs);
         if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline, "initialize") {
             return;
@@ -116,6 +118,7 @@ impl CodingAgentManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let process_spawn = AcpStageTiming::new(&request.run_id, "provider_spawn");
         let mut child = match ManagedChild::spawn_background(&mut command) {
             Ok(child) => child,
             Err(error) => {
@@ -133,6 +136,7 @@ impl CodingAgentManager {
                 return;
             }
         };
+        process_spawn.complete();
         if self.pre_prompt_should_stop(&request.run_id, &entry, run_deadline, "initialize") {
             let _ = child.terminate_tree();
             let _ = child.wait();
@@ -233,6 +237,7 @@ impl CodingAgentManager {
             }
         };
 
+        let setup_timing = AcpStageTiming::new(&request.run_id, "setup_total");
         let Some((session_id, next_id, live_confirmed_effective_config)) = self.initialize_session(
             &request,
             &provider,
@@ -244,6 +249,7 @@ impl CodingAgentManager {
         ) else {
             return;
         };
+        setup_timing.complete();
         if !live_confirmed_effective_config.is_empty() {
             entry.update_snapshot(|snapshot| {
                 snapshot.live_confirmed_effective_config =
@@ -303,6 +309,7 @@ impl CodingAgentManager {
 
         // Irreversible uncertainty barrier: durable state is committed before the
         // first byte of session/prompt can be handed to the sole stdin writer.
+        let barrier_timing = AcpStageTiming::new(&request.run_id, "prompt_durable_barrier");
         if self
             .persist_phase(
                 &request.run_id,
@@ -324,6 +331,7 @@ impl CodingAgentManager {
             self.terminate_run_io(&mut child, &mut outbound);
             return;
         }
+        barrier_timing.complete();
         #[cfg(test)]
         {
             let delay = *self.prompt_after_barrier_test_delay.lock().unwrap();
@@ -352,6 +360,7 @@ impl CodingAgentManager {
         // If the bounded queue handoff itself fails, no prompt byte was writable,
         // so restore the in-memory gate while it is still exclusively held.
         *prompt_gate = PromptDispatchGateState::PromptDispatchMayHaveOccurred;
+        let prompt_write = AcpStageTiming::new(&request.run_id, "prompt_write");
         let prompt_pending = match outbound.start_frame(prompt_frame) {
             Ok(pending) => pending,
             Err(error) => {
@@ -378,6 +387,7 @@ impl CodingAgentManager {
             Some(&self.accepting),
         ) {
             OutboundWriteOutcome::Written => {
+                prompt_write.complete();
                 entry.update_snapshot(|snapshot| {
                     snapshot.execution_state = CodingAgentExecutionState::Started
                 });
@@ -404,6 +414,7 @@ impl CodingAgentManager {
             }
         }
 
+        let mut first_event = Some(AcpStageTiming::new(&request.run_id, "first_provider_event"));
         let mut cancel_sent = false;
         let mut cancel_deadline = None;
         loop {
@@ -442,6 +453,7 @@ impl CodingAgentManager {
                 Ok(ReaderEvent::Message(message)) => {
                     if message.get("method").and_then(Value::as_str) == Some("session/update") {
                         if let Some(event) = normalize_update(&message) {
+                            if let Some(timing) = first_event.take() { timing.complete(); }
                             entry.push_event(event);
                         }
                         continue;
@@ -481,6 +493,7 @@ impl CodingAgentManager {
                                 return;
                             }
                         };
+                        if let Some(timing) = first_event.take() { timing.complete(); }
                         entry.push_event(permission_event(&pending));
                         entry.update_snapshot(|snapshot| {
                             snapshot.state = CodingAgentRunState::WaitingPermission;
@@ -587,6 +600,7 @@ impl CodingAgentManager {
                         continue;
                     }
                     if message.get("id").and_then(Value::as_u64) == Some(prompt_id) {
+                        if let Some(timing) = first_event.take() { timing.complete(); }
                         if let Some(error) = message.get("error") {
                             let failure = AcpFailure::rpc_rejected(error).diagnose(
                                 &request.run_id,

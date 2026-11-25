@@ -55,6 +55,32 @@ const CODING_AGENT_TERMINAL_PERSISTENCE_UNCERTAIN: &str =
     "coding_agent_terminal_persistence_uncertain";
 const TERMINAL_PERSISTENCE_UNCERTAIN_MESSAGE: &str = "ACP terminal transition was observed in memory, but its durable commit was not confirmed; reconcile or reobserve instead of treating the original terminal outcome as durable truth";
 
+// Bounded stage timing: at most one event per stage instance, no ACP payloads.
+struct AcpStageTiming<'a> {
+    run_id: &'a str,
+    stage: &'static str,
+    started: Instant,
+    completed: bool,
+}
+
+impl<'a> AcpStageTiming<'a> {
+    fn new(run_id: &'a str, stage: &'static str) -> Self {
+        Self { run_id, stage, started: Instant::now(), completed: false }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for AcpStageTiming<'_> {
+    fn drop(&mut self) {
+        tracing::debug!(target: "webcodex::acp_timing", layer = "runner", run_id = %self.run_id,
+            stage = self.stage, elapsed_ms = self.started.elapsed().as_millis() as u64,
+            outcome = if self.completed { "completed" } else { "scope_exit" }, "ACP stage finished");
+    }
+}
+
 #[derive(Debug)]
 struct ProviderEntry {
     config: AcpAgentConfig,
@@ -768,7 +794,10 @@ impl CodingAgentManager {
         // run identity and max_concurrent_runs. It intentionally ends once the
         // durable BeforePromptBarrier claim and in-memory RunEntry both exist;
         // provider execution is never serialized by this lock.
+        let lock_wait = AcpStageTiming::new(&request.run_id, "admission_lock_wait");
         let admission = self.admission.lock().unwrap();
+        lock_wait.complete();
+        let lock_hold = AcpStageTiming::new(&request.run_id, "admission_lock_hold");
         if !self.accepting.load(Ordering::Acquire) {
             return response_error(
                 CodingAgentDispatchState::NotStarted,
@@ -791,7 +820,10 @@ impl CodingAgentManager {
                 barrier.wait();
             }
         }
-        if let Some(existing) = self.runs.lock().unwrap().get(&request.run_id).cloned() {
+        let live_lookup = AcpStageTiming::new(&request.run_id, "live_lookup");
+        let existing = self.runs.lock().unwrap().get(&request.run_id).cloned();
+        live_lookup.complete();
+        if let Some(existing) = existing {
             let snapshot = existing.snapshot();
             if snapshot.intent_fingerprint != request.intent_fingerprint
                 || snapshot.authority_fingerprint != request.authority_fingerprint
@@ -815,7 +847,10 @@ impl CodingAgentManager {
         }
         // A durable replay fence is resolved before new-run capacity checks.
         // Never reinsert an archived terminal into the bounded live inventory.
-        match self.store.read_retained_terminal(&request.run_id) {
+        let durable_lookup = AcpStageTiming::new(&request.run_id, "durable_lookup");
+        let retained = self.store.read_retained_terminal(&request.run_id);
+        durable_lookup.complete();
+        match retained {
             Ok(Some(record)) => {
                 let snapshot = record.snapshot(0);
                 if snapshot.intent_fingerprint != request.intent_fingerprint
@@ -952,6 +987,9 @@ impl CodingAgentManager {
             .as_deref()
             .unwrap_or_default();
         if self.hot_index.admission_pressure() {
+            let pressure = AcpStageTiming::new(&request.run_id, "capacity_pressure");
+            tracing::debug!(target: "webcodex::acp_timing", layer = "runner", run_id = %request.run_id,
+                active_runs = active, receipt_count = archive_acknowledgements.len(), "ACP admission capacity pressure");
             if let Err(error) = self.coordinate_admission_pressure(
                 Some(&request.run_id),
                 archive_acknowledgements,
@@ -964,6 +1002,7 @@ impl CodingAgentManager {
                     "wait",
                 );
             }
+            pressure.complete();
         }
 
         let timestamp = now();
@@ -990,6 +1029,7 @@ impl CodingAgentManager {
         self.initial_claim_writes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.hot_index.reserve_admission_placeholder(&request.run_id);
+        let claim_timing = AcpStageTiming::new(&request.run_id, "durable_claim");
         if let Err(error) = self.store.write(&record) {
             // Admission has not launched the ACP turn yet. Remove any partial
             // directory/state residue so the documented retry_same response
@@ -1012,6 +1052,7 @@ impl CodingAgentManager {
                 ),
             };
         }
+        claim_timing.complete();
         self.hot_index.on_record_written(&record, true);
         self.hot_index.mark_active(&request.run_id);
         let entry = Arc::new(RunEntry::new(record.snapshot(0)));
@@ -1021,11 +1062,13 @@ impl CodingAgentManager {
             .insert(request.run_id.clone(), Arc::clone(&entry));
         let worker_guard = self.workers.enter();
         drop(admission);
+        lock_hold.complete();
         let _ = self.worker_threads.reap_finished();
         let run_id = request.run_id.clone();
         let thread_entry = Arc::clone(&entry);
         let thread_manager = Arc::clone(self);
         let (start_tx, start_rx) = mpsc::sync_channel(0);
+        let worker_spawn = AcpStageTiming::new(&run_id, "worker_spawn");
         let spawn_result = thread::Builder::new()
             .name(format!(
                 "wc-acp-{}",
@@ -1041,6 +1084,7 @@ impl CodingAgentManager {
             Ok(handle) => {
                 self.worker_threads.register(handle);
                 let _ = start_tx.send(());
+                worker_spawn.complete();
             }
             Err(error) => {
                 manager_finish_setup_failure(

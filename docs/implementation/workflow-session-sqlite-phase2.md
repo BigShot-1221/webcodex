@@ -1,12 +1,14 @@
 # Workflow Session SQLite fusion — Phase 2 interface and progress
 
+> **历史记录（2026-11-25 标记）：** 原 Phase-2 任务接续契约已被 2026-11-24 官方 SQLite 融合方向替代，不再作为当前开发任务书或当前历史保留规则。现行融合决策与验收边界见 [融合进度记录](upstream-main-fusion-progress-2026-11-24.md)。以下保留原始设计、恢复安全审查、未验证事项及历史 Run 证据，仅供追溯，不据此重启旧任务或认定当前行为。
+
+
 Durable implementation record for the Fork’s incremental SQLite Workflow Session
 persistence. Phase 1 adds a crate-private DB backend; Phase 2 wires it into
 `SessionStore`, `LedgerWriterGuard`, and runtime startup without replacing Fork
 retention, writer scheduling, or close/barrier semantics.
 
-**This document is the coordination contract for parallel Agent work.** It does
-not authorize commits, builds, tests, or deployment.
+**Historical coordination contract for parallel Agent work at the original Phase-2 baseline; superseded for current development.** It does not authorize commits, builds, tests, or deployment.
 
 Related Fork docs: [`session-project-identity-1386.md`](session-project-identity-1386.md),
 [`session-store-access-and-write-scheduling.md`](session-store-access-and-write-scheduling.md),

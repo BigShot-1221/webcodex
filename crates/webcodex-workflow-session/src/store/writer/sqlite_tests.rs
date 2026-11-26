@@ -7,6 +7,62 @@ use crate::{
 use webcodex_core::workflow_session_contract::SessionMode;
 
 #[test]
+fn upstream_historical_project_identity_loads_without_rewriting_or_retargeting() {
+    let (temporary, store) = persistent_fixture(Duration::from_secs(60));
+    let id = store
+        .start_session(Some("agent:historical:repo".into()), None)
+        .session_id;
+    append_read_fixture(&store, &id, 1);
+    store.flush_persistence();
+    drop(store);
+    let db = rusqlite::Connection::open(temporary.path().join("sessions.sqlite3")).unwrap();
+    let fingerprint = "a".repeat(64);
+    db.execute(
+        "UPDATE workflow_sessions SET state_json=json_set(state_json,'$.project_identity',?1) WHERE session_id=?2",
+        rusqlite::params![fingerprint, id],
+    ).unwrap();
+    let before: String = db
+        .query_row(
+            "SELECT state_json FROM workflow_sessions WHERE session_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let restored =
+        super::super::SessionStore::with_persistence(temporary.path().join("sessions.json"), 1, 20);
+    assert_eq!(restored.summary(&id, Some(5)).unwrap().events_total, 2);
+    restored.flush_persistence();
+    assert!(restored.status().last_persist_error.is_none());
+    let after: String = db
+        .query_row(
+            "SELECT state_json FROM workflow_sessions WHERE session_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after).unwrap()["project_identity"],
+        fingerprint
+    );
+    append_read_fixture(&restored, &id, 2);
+    restored.flush_persistence();
+    assert!(restored.status().last_persist_error.is_none());
+    let updated: String = db
+        .query_row(
+            "SELECT state_json FROM workflow_sessions WHERE session_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&updated).unwrap()["project_identity"],
+        fingerprint
+    );
+    assert_eq!(restored.summary(&id, Some(5)).unwrap().events_total, 4);
+}
+
+#[test]
 fn long_history_is_not_rewritten_and_cold_entries_do_not_own_it() {
     let (temporary, store) = persistent_fixture(Duration::from_secs(60));
     let id = store.start_session(None, None).session_id;

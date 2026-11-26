@@ -140,16 +140,78 @@ pub struct SessionLifecycleDenial {
 /// creation. It is descriptive durable authority metadata and never re-derived
 /// from today's Runner inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(
+    try_from = "PersistedProjectIdentity",
+    into = "PersistedProjectIdentity"
+)]
 pub struct SessionProjectIdentity {
     /// Runner-observed canonical root fingerprint captured at Session creation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_fingerprint: Option<String>,
     /// Legacy compatibility field; may round-trip old rows, but is never minted
     /// for new identity or used for authorization.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_path: Option<String>,
     pub registration_incarnation: String,
+    // Preserve the upstream historical witness verbatim; it cannot identify a
+    // current Runner registration and must never acquire live authority.
+    historical_fingerprint: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedProjectIdentity {
+    Structured(StructuredProjectIdentity),
+    Historical(String),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredProjectIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registered_path: Option<String>,
+    registration_incarnation: String,
+}
+
+impl TryFrom<PersistedProjectIdentity> for SessionProjectIdentity {
+    type Error = &'static str;
+
+    fn try_from(value: PersistedProjectIdentity) -> Result<Self, Self::Error> {
+        match value {
+            PersistedProjectIdentity::Structured(value) => Ok(Self {
+                root_fingerprint: value.root_fingerprint,
+                registered_path: value.registered_path,
+                registration_incarnation: value.registration_incarnation,
+                historical_fingerprint: None,
+            }),
+            PersistedProjectIdentity::Historical(value)
+                if super::persistence::is_lower_hex_sha256(&value) =>
+            {
+                Ok(Self {
+                    root_fingerprint: None,
+                    registered_path: None,
+                    registration_incarnation: String::new(),
+                    historical_fingerprint: Some(value),
+                })
+            }
+            PersistedProjectIdentity::Historical(_) => {
+                Err("invalid historical Project fingerprint")
+            }
+        }
+    }
+}
+
+impl From<SessionProjectIdentity> for PersistedProjectIdentity {
+    fn from(value: SessionProjectIdentity) -> Self {
+        match value.historical_fingerprint {
+            Some(fingerprint) => Self::Historical(fingerprint),
+            None => Self::Structured(StructuredProjectIdentity {
+                root_fingerprint: value.root_fingerprint,
+                registered_path: value.registered_path,
+                registration_incarnation: value.registration_incarnation,
+            }),
+        }
+    }
 }
 
 impl SessionProjectIdentity {
@@ -170,6 +232,12 @@ impl SessionProjectIdentity {
     /// Persisted compatibility is weaker than live authority. Validate the
     /// original witness without inventing a root for historical path-only rows.
     pub(crate) fn is_well_formed(&self) -> bool {
+        if let Some(fingerprint) = &self.historical_fingerprint {
+            return super::persistence::is_lower_hex_sha256(fingerprint)
+                && self.root_fingerprint.is_none()
+                && self.registered_path.is_none()
+                && self.registration_incarnation.is_empty();
+        }
         Self::valid_registration_incarnation(self.registration_incarnation.trim())
             && self
                 .root_fingerprint
@@ -184,9 +252,11 @@ impl SessionProjectIdentity {
     /// True when both durable identity fields are present and canonical. Legacy
     /// path-only rows deserialize but remain unauthorized for live retargeting.
     pub fn is_strong_identity(&self) -> bool {
-        self.root_fingerprint
-            .as_deref()
-            .is_some_and(Self::valid_root_fingerprint)
+        self.historical_fingerprint.is_none()
+            && self
+                .root_fingerprint
+                .as_deref()
+                .is_some_and(Self::valid_root_fingerprint)
             && Self::valid_registration_incarnation(self.registration_incarnation.trim())
     }
 
@@ -207,6 +277,7 @@ impl SessionProjectIdentity {
             root_fingerprint: Some(root_fingerprint),
             registered_path: None,
             registration_incarnation,
+            historical_fingerprint: None,
         })
     }
 }

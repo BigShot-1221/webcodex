@@ -151,6 +151,25 @@ fn current_registration_filters_discovery_and_console_before_counting() {
         uuid::Uuid::new_v4().to_string(),
     )
     .unwrap();
+    let historical_json = serde_json::json!("c".repeat(64));
+    let historical: SessionProjectIdentity =
+        serde_json::from_value(historical_json.clone()).unwrap();
+    assert!(historical.is_well_formed());
+    assert!(!historical.is_strong_identity());
+    assert_eq!(serde_json::to_value(&historical).unwrap(), historical_json);
+    assert_eq!(
+        serde_json::from_value::<SessionProjectIdentity>(serde_json::to_value(&current).unwrap())
+            .unwrap(),
+        current
+    );
+    for invalid in ["", "abc", &"A".repeat(64), &"a".repeat(65)] {
+        assert!(
+            serde_json::from_value::<SessionProjectIdentity>(serde_json::json!(invalid)).is_err()
+        );
+    }
+    let mut unknown_field = serde_json::to_value(&current).unwrap();
+    unknown_field["unexpected_identity"] = serde_json::json!("must reject");
+    assert!(serde_json::from_value::<SessionProjectIdentity>(unknown_field).is_err());
     let create = |identity: &SessionProjectIdentity| {
         store
             .start_session_with_options(
@@ -167,12 +186,14 @@ fn current_registration_filters_discovery_and_console_before_counting() {
             .session_id
     };
     let old_id = create(&old);
+    let historical_id = create(&historical);
     let current_id = create(&current);
     let page = store.discover_sessions_for_registration("project", &owner, &current, None, 0, 1);
     assert_eq!(page.total, 1);
     assert_eq!(page.sessions[0].session_id, current_id);
     assert!(page.next_offset.is_none());
     assert!(store.contains_session(&old_id));
+    assert!(store.contains_session(&historical_id));
     let hooks = ConsoleValidationHooks {
         event_observes_validation_activity: |_| false,
         validation_summary_from_events: |_, _| serde_json::json!({}),
@@ -182,6 +203,9 @@ fn current_registration_filters_discovery_and_console_before_counting() {
     assert_eq!(lists["project"].total, 1);
     assert_eq!(lists["project"].sessions[0].session_id, current_id);
     assert!(!lists["project"].truncated);
+    assert!(store
+        .console_detail_for_registration("project", &historical_id, Some(&current), None, hooks)
+        .is_none());
     assert!(store
         .console_detail_for_registration("project", &old_id, Some(&current), None, hooks)
         .is_none());
